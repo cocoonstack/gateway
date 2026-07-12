@@ -121,14 +121,19 @@ impl DagNode for QuotaCheck {
         if ctx.cache_hit {
             return Ok(()); // cache hit doesn't consume quota
         }
-        if !ctx.state.quota.check(&ctx.ak.ak, ctx.ak.daily_token_quota) {
+        if !ctx
+            .state
+            .governance
+            .quota_check(&ctx.ak.ak, ctx.ak.daily_token_quota)
+            .await
+        {
             return Err(GatewayError::new(
                 ErrCode::STOP_LIMIT_MSG,
                 429,
                 format!("daily token quota exhausted for ak {}", ctx.ak.ak),
             ));
         }
-        let used = ctx.state.quota.used(&ctx.ak.ak);
+        let used = ctx.state.governance.quota_used(&ctx.ak.ak).await;
         let quota = ctx.ak.daily_token_quota;
         ctx.decide("quota_check", format!("used {used}/{quota}"));
         Ok(())
@@ -181,7 +186,12 @@ impl DagNode for RateLimit {
         if ctx.cache_hit {
             return Ok(());
         }
-        if !ctx.state.limiter.allow(&ctx.ak.ak, ctx.ak.qps) {
+        if !ctx
+            .state
+            .governance
+            .rate_allow(&ctx.ak.ak, ctx.ak.qps)
+            .await
+        {
             return Err(GatewayError::new(
                 ErrCode::STOP_LIMIT_MSG,
                 429,
@@ -214,7 +224,12 @@ impl DagNode for ProductQpmLimit {
             return Ok(());
         };
         let window = std::time::Duration::from_secs(60);
-        if !ctx.state.product_qpm.allow(&ctx.ak.product, qpm, window) {
+        if !ctx
+            .state
+            .governance
+            .window_allow(&format!("product:{}", ctx.ak.product), qpm, window)
+            .await
+        {
             return Err(GatewayError::new(
                 ErrCode::STOP_LIMIT_MSG,
                 429,
@@ -250,7 +265,12 @@ impl DagNode for ModelQpmLimit {
             return Ok(());
         };
         let window = std::time::Duration::from_secs(60);
-        if !ctx.state.qpm.allow(&param.model_name, qpm, window) {
+        if !ctx
+            .state
+            .governance
+            .window_allow(&format!("model:{}", param.model_name), qpm, window)
+            .await
+        {
             return Err(GatewayError::new(
                 ErrCode::STOP_LIMIT_MSG,
                 429,
@@ -283,7 +303,12 @@ impl DagNode for AkTpmLimit {
             return Ok(());
         };
         let window = std::time::Duration::from_secs(60);
-        if !ctx.state.tpm.check(&ctx.ak.ak, tpm, window) {
+        if !ctx
+            .state
+            .governance
+            .token_window_check(&ctx.ak.ak, tpm, window)
+            .await
+        {
             return Err(GatewayError::new(
                 ErrCode::STOP_LIMIT_MSG,
                 429,
@@ -460,11 +485,12 @@ impl DagNode for CostCalc {
         let public_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
         let (p_in, p_out) = ctx.cfg.prices_for(public_name);
         let cost = prompt * p_in / 1000 + completion * p_out / 1000;
-        ctx.state.quota.consume(&ctx.ak.ak, total);
+        ctx.state.governance.quota_consume(&ctx.ak.ak, total).await;
         // TPM window accounting (post-hoc accumulation)
         ctx.state
-            .tpm
-            .add(&ctx.ak.ak, total, std::time::Duration::from_secs(60));
+            .governance
+            .token_window_add(&ctx.ak.ak, total, std::time::Duration::from_secs(60))
+            .await;
         let record = BillingRecord {
             ak: ctx.ak.ak.clone(),
             product: ctx.ak.product.clone(),

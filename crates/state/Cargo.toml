@@ -13,6 +13,7 @@ ap-config = { workspace = true }
 dashmap = { workspace = true }
 moka = { workspace = true }
 governor = { workspace = true }
+redis = { workspace = true }
 sqlx = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

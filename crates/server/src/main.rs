@@ -46,6 +46,17 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(cfg);
     let mut state = GatewayState::from_config(&cfg);
+    if !cfg.storage.redis_url.is_empty() {
+        match ap_state::RedisGovernance::connect(&cfg.storage.redis_url).await {
+            Ok(g) => {
+                state.governance = Arc::new(g);
+                tracing::info!(url = %cfg.storage.redis_url, "governance = redis");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "redis connect failed; staying in-process");
+            }
+        }
+    }
     if !cfg.storage.sqlite_path.is_empty() {
         state.store = Arc::new(
             ap_state::SqliteStore::open_with_cap(

@@ -1,8 +1,7 @@
-//! In-process gateway state, kept entirely in memory.
-//!
-//! No external storage: everything lives in process memory — an AK table, a
-//! GCRA rate limiter, a daily token quota counter, a priority/round-robin
-//! account pool, and a billing ledger. Layer L2.
+//! Gateway state: AK table, account pool, account health, response cache, and
+//! two pluggable seams — the durable [`Store`] and rate/quota [`Governance`].
+//! Both default to in-process; the store can be SQLite and governance can be
+//! Redis for multi-replica deployments. Layer L2.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -14,8 +13,10 @@ use ap_consts::Protocol;
 use ap_models::Account;
 use dashmap::DashMap;
 
+pub mod governance;
 pub mod store;
 
+pub use governance::{Governance, MemoryGovernance, RedisGovernance};
 pub use store::*;
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
@@ -360,18 +361,11 @@ impl moka::Expiry<String, (ap_models::GatewayResponse, Duration)> for PerEntryTt
 #[derive(Debug)]
 pub struct GatewayState {
     pub auth: AkAuth,
-    pub limiter: RateLimiter,
-    pub quota: QuotaStore,
+    pub governance: Arc<dyn Governance>,
     pub pool: AccountPool,
     /// Durable records (ledger/files/batches): memory by default, sqlite when
     /// `storage.sqlite_path` is configured (swapped in by the server at boot).
     pub store: Arc<dyn Store>,
-    /// Model-level QPM window.
-    pub qpm: WindowCounter,
-    /// Product-level QPM window.
-    pub product_qpm: WindowCounter,
-    /// AK-level TPM window.
-    pub tpm: TokenWindow,
     /// Account health (cooldown/recovery).
     pub health: AccountHealth,
     /// Request-level response cache.
@@ -382,13 +376,9 @@ impl Default for GatewayState {
     fn default() -> Self {
         Self {
             auth: AkAuth::default(),
-            limiter: RateLimiter::default(),
-            quota: QuotaStore::default(),
+            governance: Arc::new(MemoryGovernance::default()),
             pool: AccountPool::default(),
             store: Arc::new(MemoryStore::default()),
-            qpm: WindowCounter::default(),
-            product_qpm: WindowCounter::default(),
-            tpm: TokenWindow::default(),
             health: AccountHealth::default(),
             cache: ResponseCache::default(),
         }
@@ -466,19 +456,14 @@ mod tests {
         assert!(s.auth.authenticate("nope").is_none());
     }
 
-    #[test]
-    fn rate_limit_qps1_blocks_second_immediate_call() {
+    #[tokio::test]
+    async fn governance_rate_and_quota_via_state() {
         let s = state();
-        assert!(s.limiter.allow("k", 1.0));
-        assert!(!s.limiter.allow("k", 1.0));
-    }
-
-    #[test]
-    fn quota_check_and_consume() {
-        let s = state();
-        assert!(s.quota.check("a", 10));
-        s.quota.consume("a", 10);
-        assert!(!s.quota.check("a", 10));
+        assert!(s.governance.rate_allow("k", 1.0).await);
+        assert!(!s.governance.rate_allow("k", 1.0).await);
+        assert!(s.governance.quota_check("a", 10).await);
+        s.governance.quota_consume("a", 10).await;
+        assert!(!s.governance.quota_check("a", 10).await);
     }
 
     #[test]

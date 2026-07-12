@@ -29,9 +29,8 @@ open-source impl now, alternatives pluggable":
 - [x] `Store` (billing ledger, files, batches): async trait with
       `MemoryStore` (default, tests) and `SqliteStore` (sqlx, WAL; selected
       by `storage.sqlite_path`, survives restarts).
-- [x] `RateLimiter`: GCRA via `governor` behind the existing facade;
-      quota/window counters stay in-memory KV. Redis backends (and the dyn
-      trait they justify) land in M5.
+- [x] `RateLimiter`: GCRA via `governor`; quota/window counters in-memory
+      KV. The `Governance` trait (M5) makes the whole set pluggable.
 - [x] `Cache`: request-level TTL cache backed by `moka` (per-entry TTL,
       bounded capacity) behind the existing facade.
 

@@ -20,7 +20,7 @@ pub fn spawn_quota_reset(
         tick.tick().await; // first tick fires immediately; skip it
         loop {
             tick.tick().await;
-            state.quota.reset_all();
+            state.governance.quota_reset_all().await;
             tracing::info!(target: "task", "quota_reset: all AK daily counters cleared");
         }
     })
@@ -36,17 +36,17 @@ mod tests {
     #[tokio::test]
     async fn quota_reset_clears_counters() {
         let state = Arc::new(GatewayState::default());
-        state.quota.consume("ak-x", 42);
-        assert_eq!(state.quota.used("ak-x"), 42);
+        state.governance.quota_consume("ak-x", 42).await;
+        assert_eq!(state.governance.quota_used("ak-x").await, 42);
         let handle = spawn_quota_reset(state.clone(), Duration::from_millis(20));
         // wait for at least one reset tick
         for _ in 0..50 {
-            if state.quota.used("ak-x") == 0 {
+            if state.governance.quota_used("ak-x").await == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(state.quota.used("ak-x"), 0);
+        assert_eq!(state.governance.quota_used("ak-x").await, 0);
         handle.abort();
     }
 }

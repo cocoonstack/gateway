@@ -53,6 +53,7 @@ bytes = "1"
 dashmap = "6"
 moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"
 metrics = "0.24"

@@ -220,7 +220,11 @@ async fn realtime_session(
                     .await;
                 // Bill each turn (reuses the same ledger)
                 let (p_in, p_out) = s.handler.cfg.prices_for(&model);
-                s.handler.state.quota.consume(&ak.ak, it + ot);
+                s.handler
+                    .state
+                    .governance
+                    .quota_consume(&ak.ak, it + ot)
+                    .await;
                 let record = ap_state::BillingRecord {
                     ak: ak.ak.clone(),
                     product: ak.product.clone(),
