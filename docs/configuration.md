@@ -5,7 +5,8 @@ One YAML file configures the gateway. Resolution order:
 1. `AP_GATEWAY_CONF=<path>` — explicit config file
 2. otherwise the embedded default (the repo's `conf/gateway.yaml`)
 
-`AP_PORT` overrides `listen.port` at runtime.
+`AP_HOST` / `AP_PORT` override `listen.host` / `listen.port` at runtime
+(the container image sets `AP_HOST=0.0.0.0`).
 
 ## Sections
 

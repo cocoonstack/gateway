@@ -36,12 +36,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // AP_PORT wins over the config file.
+    // AP_HOST / AP_PORT win over the config file (AP_HOST=0.0.0.0 for containers).
+    let host = env::var("AP_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
     let port = env::var("AP_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(cfg.listen.port);
-    let addr = format!("{}:{port}", cfg.listen.host);
+    let addr = format!("{host}:{port}");
 
     let cfg = Arc::new(cfg);
     let mut state = GatewayState::from_config(&cfg);

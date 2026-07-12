@@ -41,14 +41,32 @@ AP_GATEWAY_CONF=conf/gateway.yaml cargo run -p ap-server
 
 Guides: [Architecture](docs/architecture.md) · [Configuration](docs/configuration.md) · [Roadmap](ROADMAP.md)
 
+## Docker
+
+```bash
+docker build -t gateway .
+docker run -p 8080:8080 gateway            # embedded demo config
+docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
+  -e AP_GATEWAY_CONF=/etc/gateway.yaml gateway
+```
+
+The image binds `0.0.0.0` (`AP_HOST`) and ships a `/health` HEALTHCHECK.
+Published multi-arch to `ghcr.io/cmgs/gateway` on push.
+
 ## Development
 
 ```bash
-cargo build --workspace                              # build
-cargo test --workspace                               # unit + integration tests (offline)
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
+make all      # fmt + lint + test + build
+make test     # cargo test --workspace
+make lint     # clippy -D warnings
+make fmt      # cargo fmt --all
+make deny     # cargo deny check (advisories + licenses)
+make release  # optimized ap-server binary (--locked)
+make docker   # build the container image
 ```
+
+CI runs fmt/clippy/test + `cargo deny` on every push; tagged `v*` pushes
+build multi-arch binaries (release) and a multi-arch image (docker).
 
 ## License
 
