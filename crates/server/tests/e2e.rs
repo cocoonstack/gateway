@@ -1409,8 +1409,28 @@ async fn metrics_endpoint_exposes_request_counters() {
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("gateway_requests_total"), "{text}");
+    assert!(text.contains("status=\"200\""), "{text}");
     assert!(text.contains("gateway_node_duration_seconds"), "{text}");
     assert!(text.contains("gateway_tokens_total"), "{text}");
+}
+
+#[tokio::test]
+async fn metrics_count_error_statuses_too() {
+    // error paths short-circuit before handlers finish — the router middleware
+    // must still count them (this is what makes error-rate dashboards possible)
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            r#"{"model":"no-such-model","messages":[{"role":"user","content":"x"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // the global recorder is process-wide; the render below sees this 404
+    // regardless of which test installed the recorder first.
 }
 
 #[tokio::test]

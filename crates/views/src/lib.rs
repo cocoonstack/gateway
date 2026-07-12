@@ -93,7 +93,29 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/realtime", get(realtime_ws))
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
+        .layer(axum::middleware::from_fn(track_requests))
         .with_state(state)
+}
+
+/// Counts every response (all statuses, every surface) with bounded labels:
+/// the matched route template and the status code.
+async fn track_requests(
+    matched: Option<axum::extract::MatchedPath>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = matched.map(|m| m.as_str().to_owned()).unwrap_or_default();
+    let started = Instant::now();
+    let resp = next.run(req).await;
+    metrics::counter!(
+        "gateway_requests_total",
+        "route" => route.clone(),
+        "status" => resp.status().as_u16().to_string(),
+    )
+    .increment(1);
+    metrics::histogram!("gateway_request_duration_seconds", "route" => route)
+        .record(started.elapsed().as_secs_f64());
+    resp
 }
 
 /// GET /v1/realtime?model=... (WebSocket upgrade; azure/gemini/glm...)
@@ -210,7 +232,12 @@ async fn realtime_session(
                     cost_micros: it * p_in / 1000 + ot * p_out / 1000,
                     ptu_spillover: false,
                 };
+                metrics::counter!("gateway_tokens_total", "kind" => "prompt")
+                    .increment(it.max(0) as u64);
+                metrics::counter!("gateway_tokens_total", "kind" => "completion")
+                    .increment(ot.max(0) as u64);
                 if let Err(e) = s.handler.state.store.ledger_add(record).await {
+                    metrics::counter!("gateway_ledger_write_failures_total").increment(1);
                     tracing::error!(error = %e, "realtime billing write failed");
                 }
             }
@@ -231,7 +258,7 @@ async fn realtime_session(
 /// One structured access-log line per served request
 /// (ak/model/account/prompt_tokens/.../latency_ms); local
 /// stdout only (zero-egress default build).
-fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
+fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
     let (model, mt) = ctx
         .request
         .model_param_v2
@@ -256,15 +283,6 @@ fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
         })
         .unwrap_or_default();
     let latency = started.elapsed();
-    metrics::counter!(
-        "gateway_requests_total",
-        "surface" => surface.to_owned(),
-        "protocol" => mt.to_owned(),
-        "status" => status.to_string(),
-    )
-    .increment(1);
-    metrics::histogram!("gateway_request_duration_seconds", "surface" => surface.to_owned())
-        .record(latency.as_secs_f64());
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
@@ -275,7 +293,6 @@ fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
         model = %model,
         protocol = mt,
         account,
-        status,
         prompt_tokens = pt,
         completion_tokens = ct,
         total_tokens = tt,
@@ -478,7 +495,7 @@ async fn chat_completions(
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
-    log_access("chat_completions", &ctx, 200, started);
+    log_access("chat_completions", &ctx, started);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -620,7 +637,7 @@ async fn messages(
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
-    log_access("messages", &ctx, 200, started);
+    log_access("messages", &ctx, started);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -758,7 +775,7 @@ async fn completions(
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
-    log_access("completions", &ctx, 200, started);
+    log_access("completions", &ctx, started);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -819,7 +836,7 @@ async fn responses(
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
-    log_access("responses", &ctx, 200, started);
+    log_access("responses", &ctx, started);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -918,7 +935,7 @@ async fn embeddings(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    log_access("embeddings", &ctx, 200, started);
+    log_access("embeddings", &ctx, started);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -955,7 +972,7 @@ async fn images_generations(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    log_access("images", &ctx, 200, started);
+    log_access("images", &ctx, started);
     match ctx.outcome.and_then(|o| o.response.response_v2) {
         Some(v) => (StatusCode::OK, Json(v)).into_response(),
         None => error_response(500, "image engine returned no payload"),
@@ -992,7 +1009,7 @@ async fn images_edits(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    log_access("images_edits", &ctx, 200, started);
+    log_access("images_edits", &ctx, started);
     match ctx.outcome.and_then(|o| o.response.response_v2) {
         Some(v) => (StatusCode::OK, Json(v)).into_response(),
         None => error_response(500, "image engine returned no payload"),
@@ -1024,7 +1041,7 @@ async fn audio_speech(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    log_access("audio_speech", &ctx, 200, started);
+    log_access("audio_speech", &ctx, started);
     let Some(b64) = ctx
         .outcome
         .and_then(|o| o.response.response_v2)
@@ -1063,7 +1080,7 @@ async fn audio_transcriptions(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    log_access("audio_transcriptions", &ctx, 200, started);
+    log_access("audio_transcriptions", &ctx, started);
     match ctx.outcome {
         Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
         None => error_response(500, "stt engine returned no outcome"),

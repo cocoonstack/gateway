@@ -94,7 +94,9 @@ pub struct StoredFile {
 pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()>;
     /// Total record count plus the most recent `limit` records in
-    /// chronological order.
+    /// chronological order. Count and page may be read without a shared
+    /// transaction; the ledger is append-only, so the skew is at most a
+    /// just-appended record and self-heals on the next read.
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
 
     /// Store `content` under a fresh id; returns the file metadata.
