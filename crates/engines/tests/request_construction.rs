@@ -131,7 +131,7 @@ async fn openai_streaming_requests_usage() {
 #[tokio::test]
 async fn anthropic_request_shape() {
     let t = RecordingTransport::new(
-        r#"{"model":"anthropic-messages","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
     let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
     if let Some(p) = req.model_param_v2.as_mut() {
@@ -168,7 +168,7 @@ async fn anthropic_multimodal_content_preserved() {
     // multimodal input (text + image block) must reach the vendor as content
     // blocks, not be flattened to text.
     let t = RecordingTransport::new(
-        r#"{"model":"anthropic-messages","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
     let mut req = GatewayRequest {
         model_param_v2: Some(ModelParamV2::with_name(
@@ -227,7 +227,7 @@ async fn go_live_seam_routes_to_configured_endpoint() {
 
     // Claude → x-api-key + real /v1/messages endpoint.
     let t = RecordingTransport::new(
-        r#"{"model":"anthropic-messages","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
     let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
     req.account = Some(Account {

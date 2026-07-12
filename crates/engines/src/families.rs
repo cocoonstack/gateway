@@ -1,5 +1,5 @@
-//! Family engines beyond the two chat protocols.
-//! Engines are merged by protocol family (consts::Protocol):
+//! The non-chat protocol engines.
+//! One engine per Protocol variant (AudioEngine covers tts/stt/audio via AudioKind):
 //!   Vertex generateContent / Embeddings / Image / Audio(TTS·STT·other) /
 //!   Video(async task) / Search / Passthrough(register+misc).
 //! Each engine only does "build request → Transport → parse response" — nothing else

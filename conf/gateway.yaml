@@ -121,7 +121,7 @@ accounts:
   - name: mock-openai-1
     provider: openai
     priority: 1
-    protocols: ["openai-chat", "completions", "openai-chat"]
+    protocols: ["openai-chat", "completions"]
   - name: mock-openai-2
     provider: openai
     priority: 2
@@ -187,7 +187,7 @@ accounts:
   - name: mock-dashscope-1 # bespoke wire e2e
     provider: alibaba
     priority: 1
-    protocols: ["dashscope", "dashscope"]
+    protocols: ["dashscope"]
 
 # Local security policy (rule-based; no cloud security service)
 security:

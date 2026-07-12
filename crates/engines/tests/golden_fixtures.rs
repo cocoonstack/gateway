@@ -117,7 +117,7 @@ fn claude_req() -> GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
         model_param_v2: Some(ModelParamV2::with_name(
             Protocol::AnthropicMessages,
-            "anthropic-messages",
+            "claude-test",
         )),
         ..Default::default()
     }

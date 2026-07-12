@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Global constants: error codes, ModelType dispatch enum, mappings."
+description = "Global constants: error codes and the Protocol enum."
 
 [dependencies]
 serde = { workspace = true }

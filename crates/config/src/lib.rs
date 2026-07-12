@@ -16,9 +16,9 @@ pub enum ConfigError {
     },
     #[error("parse config: {0}")]
     Parse(#[from] serde_yaml::Error),
-    #[error("account `{account}` references unknown model type `{wire}`")]
+    #[error("account `{account}` references unknown protocol `{wire}`")]
     UnknownProtocol { account: String, wire: String },
-    #[error("model `{model}` references unknown model type `{wire}`")]
+    #[error("model `{model}` references unknown protocol `{wire}`")]
     UnknownModelMapping { model: String, wire: String },
     #[error("provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini)")]
     UnknownProviderKind { provider: String, kind: String },
