@@ -116,15 +116,31 @@ pub struct MemoryStore {
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
     seq: AtomicUsize,
+    /// oldest records beyond this are pruned on write; 0 = unlimited.
+    ledger_max_rows: usize,
+}
+
+impl MemoryStore {
+    pub fn with_ledger_cap(max_rows: usize) -> Self {
+        Self {
+            ledger_max_rows: max_rows,
+            ..Self::default()
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
-        self.records
+        let mut records = self
+            .records
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(r);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        records.push(r);
+        if self.ledger_max_rows > 0 && records.len() > self.ledger_max_rows {
+            let excess = records.len() - self.ledger_max_rows;
+            records.drain(..excess);
+        }
         Ok(())
     }
 
@@ -199,11 +215,17 @@ impl Store for MemoryStore {
 #[derive(Debug)]
 pub struct SqliteStore {
     pool: sqlx::SqlitePool,
+    ledger_max_rows: u64,
 }
 
 impl SqliteStore {
     /// Open (creating if missing) the database at `path` and ensure the schema.
     pub async fn open(path: &str) -> GResult<Self> {
+        Self::open_with_cap(path, 0).await
+    }
+
+    /// `ledger_max_rows` > 0 prunes the oldest billing rows past the cap on write.
+    pub async fn open_with_cap(path: &str, ledger_max_rows: u64) -> GResult<Self> {
         let opts = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -243,7 +265,10 @@ impl SqliteStore {
             .execute(&pool)
             .await
             .map_err(|e| store_err("sweep orphaned batches", e))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            ledger_max_rows,
+        })
     }
 }
 
@@ -268,6 +293,13 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|e| store_err("insert billing record", e))?;
+        if self.ledger_max_rows > 0 {
+            sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?")
+                .bind(self.ledger_max_rows as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| store_err("prune billing records", e))?;
+        }
         Ok(())
     }
 
@@ -502,6 +534,28 @@ mod tests {
     #[tokio::test]
     async fn memory_store_roundtrip() {
         exercise(&MemoryStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn ledger_retention_caps_both_stores() {
+        let mem = MemoryStore::with_ledger_cap(2);
+        for m in ["a", "b", "c"] {
+            mem.ledger_add(record(m)).await.unwrap();
+        }
+        let (total, page) = mem.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page[0].model, "b"); // oldest pruned first
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open_with_cap(dir.path().join("r.db").to_str().unwrap(), 2)
+            .await
+            .unwrap();
+        for m in ["a", "b", "c"] {
+            store.ledger_add(record(m)).await.unwrap();
+        }
+        let (total, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page[0].model, "b");
     }
 
     #[tokio::test]

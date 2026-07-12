@@ -158,6 +158,9 @@ pub struct StorageConf {
     /// SQLite database path for the ledger/files/batches store; empty = in-memory.
     #[serde(default)]
     pub sqlite_path: String,
+    /// Keep at most this many billing records (oldest pruned first); 0 = unlimited.
+    #[serde(default)]
+    pub ledger_max_rows: u64,
 }
 
 /// Product-level governance.

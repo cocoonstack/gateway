@@ -77,7 +77,7 @@ open-source impl now, alternatives pluggable":
       tokens/latency)
 - [x] Ledger snapshot pagination (`?limit=`, count stays the total);
       retention policy still open
-- [ ] Ledger retention policy
+- [x] Ledger retention (`storage.ledger_max_rows`, oldest pruned on write)
 
 ## M5 — Persistence backends
 

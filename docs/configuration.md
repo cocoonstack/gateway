@@ -22,6 +22,7 @@ listen:
 ```yaml
 storage:
   sqlite_path: /var/lib/ap/store.db   # empty/absent = in-memory
+  ledger_max_rows: 100000             # prune oldest billing rows past the cap; 0 = unlimited
 ```
 
 The billing ledger, uploaded files, and batch jobs live here. In-memory

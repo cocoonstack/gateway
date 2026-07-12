@@ -46,7 +46,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
     let mut state = GatewayState::from_config(&cfg);
     if !cfg.storage.sqlite_path.is_empty() {
-        state.store = Arc::new(ap_state::SqliteStore::open(&cfg.storage.sqlite_path).await?);
+        state.store = Arc::new(
+            ap_state::SqliteStore::open_with_cap(
+                &cfg.storage.sqlite_path,
+                cfg.storage.ledger_max_rows,
+            )
+            .await?,
+        );
         tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
     }
     let state = Arc::new(state);
