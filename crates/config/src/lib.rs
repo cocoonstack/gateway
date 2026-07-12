@@ -3,7 +3,7 @@
 //! There is no config center: everything comes from a local YAML file. Layer L1 —
 //! depends only on ap-consts.
 
-use ap_consts::ModelType;
+use ap_consts::Protocol;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,14 +17,14 @@ pub enum ConfigError {
     #[error("parse config: {0}")]
     Parse(#[from] serde_yaml::Error),
     #[error("account `{account}` references unknown model type `{wire}`")]
-    UnknownModelType { account: String, wire: String },
+    UnknownProtocol { account: String, wire: String },
     #[error("model `{model}` references unknown model type `{wire}`")]
     UnknownModelMapping { model: String, wire: String },
     #[error("provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini)")]
     UnknownProviderKind { provider: String, kind: String },
     #[error("model `{model}` references unknown provider `{provider}`")]
     UnknownProvider { model: String, provider: String },
-    #[error("model `{model}` needs either model_type or provider")]
+    #[error("model `{model}` needs either protocol or provider")]
     ModelNeedsDispatch { model: String },
 }
 
@@ -54,8 +54,8 @@ pub struct ModelConf {
     pub name: String,
     /// Engine dispatch wire type; may be omitted when `provider` implies it.
     #[serde(default)]
-    pub model_type: String,
-    /// Provider shorthand: fills model_type with the provider kind's default.
+    pub protocol: String,
+    /// Provider shorthand: fills protocol with the provider kind's default.
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -71,8 +71,8 @@ pub struct ModelConf {
 }
 
 impl ModelConf {
-    pub fn model_type(&self) -> Option<ModelType> {
-        ModelType::from_wire(&self.model_type)
+    pub fn protocol(&self) -> Option<Protocol> {
+        Protocol::from_wire(&self.protocol)
     }
 }
 
@@ -100,7 +100,7 @@ pub struct AccountConf {
     /// api_key_env = access key). Leave empty for non-AWS providers.
     #[serde(default)]
     pub secret_key_env: String,
-    pub model_types: Vec<String>,
+    pub protocols: Vec<String>,
 }
 
 fn default_priority() -> i32 {
@@ -190,19 +190,19 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
             endpoint: "https://api.openai.com",
             wires: &[
                 "openai-chat",
-                "openai-embeddings",
-                "images/generations",
-                "openai-tts",
-                "audio/transcriptions",
+                "embeddings",
+                "image",
+                "tts",
+                "stt",
                 "responses",
-                "openai-completions",
+                "completions",
             ],
             default_model_wire: "openai-chat",
         },
         "anthropic" => ProviderPreset {
             endpoint: "https://api.anthropic.com",
-            wires: &["claude"],
-            default_model_wire: "claude",
+            wires: &["anthropic-messages"],
+            default_model_wire: "anthropic-messages",
         },
         "gemini" => ProviderPreset {
             endpoint: "https://generativelanguage.googleapis.com",
@@ -250,7 +250,7 @@ impl GatewayConfig {
     /// synthesize an account per provider (explicit same-name accounts win).
     fn normalize(&mut self) -> Result<(), ConfigError> {
         for m in &mut self.models {
-            if !m.model_type.is_empty() {
+            if !m.protocol.is_empty() {
                 continue;
             }
             let Some(pname) = m.provider.as_deref() else {
@@ -272,7 +272,7 @@ impl GatewayConfig {
                     kind: provider.kind.clone(),
                 }
             })?;
-            m.model_type = preset.default_model_wire.to_owned();
+            m.protocol = preset.default_model_wire.to_owned();
         }
         for p in &self.providers {
             let preset =
@@ -295,7 +295,7 @@ impl GatewayConfig {
                 },
                 api_key_env: p.api_key_env.clone(),
                 secret_key_env: p.secret_key_env.clone(),
-                model_types: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
+                protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
             });
         }
         Ok(())
@@ -314,20 +314,20 @@ impl GatewayConfig {
         Self::from_yaml(DEFAULT_YAML)
     }
 
-    /// Every wire string must resolve to a known ModelType up front.
+    /// Every wire string must resolve to a known Protocol up front.
     fn validate(&self) -> Result<(), ConfigError> {
         for m in &self.models {
-            if m.model_type().is_none() {
+            if m.protocol().is_none() {
                 return Err(ConfigError::UnknownModelMapping {
                     model: m.name.clone(),
-                    wire: m.model_type.clone(),
+                    wire: m.protocol.clone(),
                 });
             }
         }
         for a in &self.accounts {
-            for w in &a.model_types {
-                if ModelType::from_wire(w).is_none() {
-                    return Err(ConfigError::UnknownModelType {
+            for w in &a.protocols {
+                if Protocol::from_wire(w).is_none() {
+                    return Err(ConfigError::UnknownProtocol {
                         account: a.name.clone(),
                         wire: w.clone(),
                     });
@@ -371,24 +371,24 @@ providers:
 models:
   - {name: gpt-x, provider: openai}
   - {name: claude-x, provider: anthropic}
-  - {name: gemini-x, provider: gemini, model_type: gemini}
+  - {name: gemini-x, provider: gemini, protocol: gemini}
 "#;
 
     #[test]
     fn provider_presets_expand_to_accounts_and_model_defaults() {
         let cfg = GatewayConfig::from_yaml(PROVIDER_YAML).unwrap();
         assert_eq!(
-            cfg.find_model("gpt-x").unwrap().model_type(),
-            Some(ModelType::OpenaiChat)
+            cfg.find_model("gpt-x").unwrap().protocol(),
+            Some(Protocol::OpenaiChat)
         );
         assert_eq!(
-            cfg.find_model("claude-x").unwrap().model_type(),
-            Some(ModelType::Claude)
+            cfg.find_model("claude-x").unwrap().protocol(),
+            Some(Protocol::AnthropicMessages)
         );
         let acc = cfg.accounts.iter().find(|a| a.name == "openai").unwrap();
         assert_eq!(acc.endpoint, "https://api.openai.com");
         assert_eq!(acc.api_key_env, "OPENAI_API_KEY");
-        assert!(acc.model_types.iter().any(|w| w == "openai-embeddings"));
+        assert!(acc.protocols.iter().any(|w| w == "embeddings"));
         // endpoint override wins over the preset default
         let gem = cfg.accounts.iter().find(|a| a.name == "gemini").unwrap();
         assert_eq!(gem.endpoint, "https://gw.example.com");
@@ -422,7 +422,7 @@ listen: {host: h, port: 1}";
 listen: {host: h, port: 1}
 providers: [{name: openai, kind: openai}]
 accounts:
-  - {name: openai, provider: openai, priority: 5, model_types: ["openai-chat"], endpoint: "https://mine.example.com"}
+  - {name: openai, provider: openai, priority: 5, protocols: ["openai-chat"], endpoint: "https://mine.example.com"}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
         let matching: Vec<_> = cfg.accounts.iter().filter(|a| a.name == "openai").collect();
@@ -436,15 +436,15 @@ accounts:
         assert_eq!(cfg.listen.port, 8080);
         assert!(cfg.find_ak("ak-demo-123").is_some());
         let m = cfg.find_model("gpt-4o").unwrap();
-        assert_eq!(m.model_type(), Some(ModelType::OpenaiChat));
+        assert_eq!(m.protocol(), Some(Protocol::OpenaiChat));
         assert_eq!(cfg.prices_for("claude-sonnet"), (3000, 15000));
     }
 
     #[test]
-    fn bad_model_type_rejected() {
+    fn bad_protocol_rejected() {
         let yaml = r#"
 listen: { host: 127.0.0.1, port: 1 }
-models: [{ name: x, model_type: nope }]
+models: [{ name: x, protocol: nope }]
 "#;
         assert!(matches!(
             GatewayConfig::from_yaml(yaml),

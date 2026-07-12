@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ap_config::GatewayConfig;
-use ap_consts::ModelType;
+use ap_consts::Protocol;
 use ap_models::Account;
 use dashmap::DashMap;
 
@@ -120,37 +120,49 @@ pub struct AccountPool {
 }
 
 impl AccountPool {
-    pub fn select(&self, mt: ModelType) -> Option<Account> {
-        self.select_excluding(mt, &[])
+    pub fn select(&self, p: Protocol, provider: Option<&str>) -> Option<Account> {
+        self.select_excluding(p, provider, &[])
     }
 
     /// Same as `select_excluding`, plus a health filter: accounts in cooldown are
     /// excluded.
     pub fn select_healthy(
         &self,
-        mt: ModelType,
+        p: Protocol,
+        provider: Option<&str>,
         excluded: &[String],
         health: &AccountHealth,
     ) -> Option<Account> {
         let unhealthy: Vec<String> = self
             .accounts
             .iter()
-            .filter(|a| a.model_types.contains(&mt) && !health.available(&a.name))
+            .filter(|a| a.protocols.contains(&p) && !health.available(&a.name))
             .map(|a| a.name.clone())
             .collect();
         let mut all_excluded = excluded.to_vec();
         all_excluded.extend(unhealthy);
-        self.select_excluding(mt, &all_excluded)
+        self.select_excluding(p, provider, &all_excluded)
     }
 
     /// PTU decision + failover exclusion: PTU (provisioned throughput)
     /// accounts are preferred over paygo; accounts in `excluded` (failed accounts
     /// from a failover) are skipped. Within a tier, pick by priority then round-robin.
-    pub fn select_excluding(&self, mt: ModelType, excluded: &[String]) -> Option<Account> {
+    /// A model bound to a `provider` only uses that provider's accounts;
+    /// unbound models draw from every account serving the protocol.
+    pub fn select_excluding(
+        &self,
+        p: Protocol,
+        provider: Option<&str>,
+        excluded: &[String],
+    ) -> Option<Account> {
         let candidates: Vec<&Account> = self
             .accounts
             .iter()
-            .filter(|a| a.model_types.contains(&mt) && !excluded.contains(&a.name))
+            .filter(|a| {
+                a.protocols.contains(&p)
+                    && !excluded.contains(&a.name)
+                    && provider.is_none_or(|want| a.provider == want)
+            })
             .collect();
         // PTU first, spill to paygo only when no PTU slot remains
         let tier: Vec<&Account> = {
@@ -410,10 +422,10 @@ impl GatewayState {
                 api_key_env: a.api_key_env.clone(),
                 secret_key_env: a.secret_key_env.clone(),
                 // validated by GatewayConfig::validate, so unwrap-free filter is safe
-                model_types: a
-                    .model_types
+                protocols: a
+                    .protocols
                     .iter()
-                    .filter_map(|w| ModelType::from_wire(w))
+                    .filter_map(|w| Protocol::from_wire(w))
                     .collect(),
             })
             .collect();
@@ -473,29 +485,43 @@ mod tests {
     fn pool_prefers_priority_then_round_robins() {
         let s = state();
         // openai-chat has priority-1 mock-openai-1 and priority-2 mock-openai-2
-        let a = s.pool.select(ModelType::OpenaiChat).unwrap();
-        let b = s.pool.select(ModelType::OpenaiChat).unwrap();
+        let a = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
+        let b = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
         assert_eq!(a.name, "mock-openai-1");
         assert_eq!(b.name, "mock-openai-1"); // only one slot at best priority
         assert_eq!(
-            s.pool.select(ModelType::Claude).unwrap().name,
+            s.pool
+                .select(Protocol::AnthropicMessages, None)
+                .unwrap()
+                .name,
             "mock-anthropic-1"
         );
-        // sora has no account slot in the embedded config
-        assert!(s.pool.select(ModelType::Sora).is_none());
+        // no account in the embedded config serves this provider binding
+        assert!(
+            s.pool
+                .select(Protocol::Video, Some("nonexistent"))
+                .is_none()
+        );
     }
 
     #[test]
     fn pool_prefers_ptu_then_excludes_failed() {
         let s = state();
         // hunyuan: the ptu account (named "down") is preferred over paygo
-        let first = s.pool.select(ModelType::Hunyuan).unwrap();
+        let first = s
+            .pool
+            .select(Protocol::OpenaiChat, Some("tencent"))
+            .unwrap();
         assert_eq!(first.name, "mock-hunyuan-ptu-down");
         assert!(first.is_ptu());
         // after failover exclusion it falls back to paygo
         let next = s
             .pool
-            .select_excluding(ModelType::Hunyuan, &["mock-hunyuan-ptu-down".into()])
+            .select_excluding(
+                Protocol::OpenaiChat,
+                Some("tencent"),
+                &["mock-hunyuan-ptu-down".into()],
+            )
             .unwrap();
         assert_eq!(next.name, "mock-hunyuan-paygo");
         assert!(!next.is_ptu());

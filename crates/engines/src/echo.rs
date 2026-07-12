@@ -30,7 +30,7 @@ impl ModelEngine for EchoEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let model = self
             .request
-            .model_type()
+            .protocol()
             .map(|m| m.as_str())
             .unwrap_or("<none>");
         let message = format!(
@@ -59,14 +59,14 @@ impl ModelEngine for EchoEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_consts::ModelType;
+    use ap_consts::Protocol;
     use ap_models::ModelParamV2;
 
     #[tokio::test]
-    async fn echoes_model_type() {
+    async fn echoes_protocol() {
         let req = GatewayRequest {
             is_online: true,
-            model_param_v2: Some(ModelParamV2::new(ModelType::OpenaiChat)),
+            model_param_v2: Some(ModelParamV2::new(Protocol::OpenaiChat)),
             ..Default::default()
         };
         let engine = EchoEngine::new(req);

@@ -1,14 +1,14 @@
 //! The default node set for the online chat pipeline.
 //! Metrics-reporting nodes are dropped by design.
 
-use ap_consts::{ErrCode, ModelType};
+use ap_consts::{ErrCode, Protocol};
 use ap_models::{GResult, GatewayError};
 use ap_state::BillingRecord;
 
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
 
-/// preprocess/resolve_model: public model name -> ModelType.
+/// preprocess/resolve_model: public model name -> Protocol.
 pub struct ResolveModel;
 
 #[async_trait::async_trait]
@@ -24,10 +24,10 @@ impl DagNode for ResolveModel {
             .ok_or_else(|| GatewayError::bad_request("request missing model param"))?;
         let name = param.model_name.clone();
         let mt = if let Some(conf) = ctx.cfg.find_model(&name) {
-            conf.model_type().ok_or_else(|| {
+            conf.protocol().ok_or_else(|| {
                 GatewayError::internal(format!("config maps `{name}` to unknown type"))
             })?
-        } else if let Some(direct) = ModelType::from_wire(&name) {
+        } else if let Some(direct) = Protocol::from_wire(&name) {
             direct // callers may address a wire model type directly
         } else {
             return Err(GatewayError::new(
@@ -36,7 +36,7 @@ impl DagNode for ResolveModel {
                 format!("unknown model: {name}"),
             ));
         };
-        param.model_type = mt;
+        param.protocol = mt;
         ctx.decide("resolve_model", format!("{name} -> {mt}"));
         Ok(())
     }
@@ -148,12 +148,13 @@ impl DagNode for SelectAccount {
         }
         let mt = ctx
             .request
-            .model_type()
+            .protocol()
             .ok_or_else(|| GatewayError::internal("select_account before resolve_model"))?;
+        let provider = model_provider(ctx);
         let account = ctx
             .state
             .pool
-            .select_healthy(mt, &[], &ctx.state.health)
+            .select_healthy(mt, provider.as_deref(), &[], &ctx.state.health)
             .ok_or_else(|| {
                 GatewayError::new(
                     ErrCode::SYSTEM_ERROR,
@@ -335,7 +336,7 @@ impl DagNode for CallEngine {
             Err(first_err) if first_err.http_status >= 500 => {
                 let mt = ctx
                     .request
-                    .model_type()
+                    .protocol()
                     .ok_or_else(|| GatewayError::internal("call_engine without model type"))?;
                 let failed = ctx.request.account.clone().unwrap_or_default();
                 // failure count -> cooldown once the threshold is reached
@@ -352,8 +353,10 @@ impl DagNode for CallEngine {
                         ),
                     );
                 }
+                let provider = model_provider(ctx);
                 let Some(next) = ctx.state.pool.select_healthy(
                     mt,
+                    provider.as_deref(),
                     std::slice::from_ref(&failed.name),
                     &ctx.state.health,
                 ) else {
@@ -465,8 +468,8 @@ impl DagNode for CostCalc {
             ak: ctx.ak.ak.clone(),
             product: ctx.ak.product.clone(),
             model: public_name.to_owned(),
-            model_type: param
-                .map(|p| p.model_type.as_str().to_owned())
+            protocol: param
+                .map(|p| p.protocol.as_str().to_owned())
                 .unwrap_or_default(),
             account: ctx
                 .request
@@ -564,4 +567,14 @@ pub fn default_layers() -> Vec<Layer> {
             ],
         },
     ]
+}
+
+/// The provider a model is bound to in config, if any.
+fn model_provider(ctx: &DagContext) -> Option<String> {
+    let name = ctx
+        .request
+        .model_param_v2
+        .as_ref()
+        .map(|p| p.model_name.clone())?;
+    ctx.cfg.find_model(&name).and_then(|m| m.provider.clone())
 }

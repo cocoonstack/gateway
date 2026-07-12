@@ -1,15 +1,13 @@
 //! Global constants for the gateway.
 //!
 //! Layer L0: depends on nothing internal. Holds the error-code model and the
-//! `ModelType` dispatch enum that the engine factory switches on.
+//! `Protocol` enum the engine factory dispatches on.
 
 pub mod error_code;
-pub mod family;
-pub mod model_type;
+pub mod protocol;
 
 pub use error_code::{ErrCode, ErrorException};
-pub use family::ModelFamily;
-pub use model_type::{ModelType, UnknownModelType};
+pub use protocol::Protocol;
 
 /// Chat roles.
 pub mod role {

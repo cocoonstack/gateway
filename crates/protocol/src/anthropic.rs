@@ -225,7 +225,7 @@ mod tests {
     fn stream_event_sequence_shape() {
         let ev = stream_events(
             "msg-1",
-            "claude",
+            "anthropic-messages",
             &["he".into(), "llo".into()],
             "end_turn",
             &AnthUsage {

@@ -17,7 +17,7 @@ pub struct BillingRecord {
     pub ak: String,
     pub product: String,
     pub model: String,
-    pub model_type: String,
+    pub protocol: String,
     pub account: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -210,7 +210,7 @@ impl SqliteStore {
             "CREATE TABLE IF NOT EXISTS billing (
                 n INTEGER PRIMARY KEY AUTOINCREMENT,
                 ak TEXT NOT NULL, product TEXT NOT NULL, model TEXT NOT NULL,
-                model_type TEXT NOT NULL, account TEXT NOT NULL,
+                protocol TEXT NOT NULL, account TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
                 ptu_spillover INTEGER NOT NULL DEFAULT 0)",
@@ -245,14 +245,14 @@ impl SqliteStore {
 impl Store for SqliteStore {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
         sqlx::query(
-            "INSERT INTO billing (ak, product, model, model_type, account, prompt_tokens,
+            "INSERT INTO billing (ak, product, model, protocol, account, prompt_tokens,
              completion_tokens, total_tokens, cost_micros, ptu_spillover)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.ak)
         .bind(&r.product)
         .bind(&r.model)
-        .bind(&r.model_type)
+        .bind(&r.protocol)
         .bind(&r.account)
         .bind(r.prompt_tokens)
         .bind(r.completion_tokens)
@@ -267,7 +267,7 @@ impl Store for SqliteStore {
 
     async fn ledger_snapshot(&self) -> GResult<Vec<BillingRecord>> {
         let rows = sqlx::query(
-            "SELECT ak, product, model, model_type, account, prompt_tokens,
+            "SELECT ak, product, model, protocol, account, prompt_tokens,
              completion_tokens, total_tokens, cost_micros, ptu_spillover
              FROM billing ORDER BY n",
         )
@@ -280,7 +280,7 @@ impl Store for SqliteStore {
                 ak: row.get(0),
                 product: row.get(1),
                 model: row.get(2),
-                model_type: row.get(3),
+                protocol: row.get(3),
                 account: row.get(4),
                 prompt_tokens: row.get(5),
                 completion_tokens: row.get(6),
@@ -425,7 +425,7 @@ mod tests {
             ak: "ak-t".into(),
             product: "p".into(),
             model: model.into(),
-            model_type: "openai-chat".into(),
+            protocol: "openai-chat".into(),
             account: "acc".into(),
             prompt_tokens: 3,
             completion_tokens: 5,

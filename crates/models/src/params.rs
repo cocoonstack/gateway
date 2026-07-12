@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Typed params, one variant per protocol family (consts::ModelFamily).
+/// Typed params, one variant per protocol family (consts::Protocol).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "family", rename_all = "snake_case")]
 pub enum TypedParams {

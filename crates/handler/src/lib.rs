@@ -101,7 +101,7 @@ impl OnlineHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_consts::ModelType;
+    use ap_consts::Protocol;
     use ap_models::{ChatMsg, ModelParamV2};
 
     fn handler() -> OnlineHandler {
@@ -118,7 +118,7 @@ mod tests {
         GatewayRequest {
             is_online: true,
             message: vec![ChatMsg::text("user", content)],
-            model_param_v2: Some(ModelParamV2::with_name(ModelType::OpenaiChat, name)),
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, name)),
             ..Default::default()
         }
     }

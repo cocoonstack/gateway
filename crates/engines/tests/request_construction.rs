@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ap_consts::ModelType;
+use ap_consts::Protocol;
 use ap_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 use ap_engines::{
     AudioEngine, AudioKind, ClaudeEngine, CohereEngine, CompletionsEngine, DashScopeEngine,
@@ -65,7 +65,7 @@ impl Transport for RecordingTransport {
     }
 }
 
-fn chat_req(mt: ModelType, name: &str) -> GatewayRequest {
+fn chat_req(mt: Protocol, name: &str) -> GatewayRequest {
     GatewayRequest {
         message: vec![
             ChatMsg::text("system", "be brief"),
@@ -81,7 +81,7 @@ async fn openai_request_shape() {
     let t = RecordingTransport::new(
         r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
-    let mut req = chat_req(ModelType::OpenaiChat, "gpt-4o");
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4o");
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             temperature: Some(0.5),
@@ -120,7 +120,7 @@ async fn openai_streaming_requests_usage() {
     let t = RecordingTransport::new(
         r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
-    let mut req = chat_req(ModelType::OpenaiChat, "gpt-4o");
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4o");
     req.stream = true;
     let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
@@ -131,9 +131,9 @@ async fn openai_streaming_requests_usage() {
 #[tokio::test]
 async fn anthropic_request_shape() {
     let t = RecordingTransport::new(
-        r#"{"model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        r#"{"model":"anthropic-messages","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
-    let mut req = chat_req(ModelType::Claude, "claude-sonnet");
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             max_tokens: Some(512),
@@ -168,10 +168,13 @@ async fn anthropic_multimodal_content_preserved() {
     // multimodal input (text + image block) must reach the vendor as content
     // blocks, not be flattened to text.
     let t = RecordingTransport::new(
-        r#"{"model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        r#"{"model":"anthropic-messages","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
     let mut req = GatewayRequest {
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::Claude, "claude-sonnet")),
+        model_param_v2: Some(ModelParamV2::with_name(
+            Protocol::AnthropicMessages,
+            "claude-sonnet",
+        )),
         ..Default::default()
     };
     let mut msg = ChatMsg::text("user", "what is in this image?");
@@ -195,7 +198,7 @@ async fn vertex_request_shape() {
     let t = RecordingTransport::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
-    let mut req = chat_req(ModelType::Gemini, "gemini-pro");
+    let mut req = chat_req(Protocol::Gemini, "gemini-pro");
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             temperature: Some(0.4),
@@ -224,9 +227,9 @@ async fn go_live_seam_routes_to_configured_endpoint() {
 
     // Claude → x-api-key + real /v1/messages endpoint.
     let t = RecordingTransport::new(
-        r#"{"model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        r#"{"model":"anthropic-messages","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
-    let mut req = chat_req(ModelType::Claude, "claude-sonnet");
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
     req.account = Some(Account {
         name: "live-anthropic".into(),
         endpoint: "https://api.anthropic.com".into(),
@@ -245,7 +248,7 @@ async fn go_live_seam_routes_to_configured_endpoint() {
     let t2 = RecordingTransport::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
-    let mut req2 = chat_req(ModelType::Gemini, "gemini-pro");
+    let mut req2 = chat_req(Protocol::Gemini, "gemini-pro");
     req2.account = Some(Account {
         name: "live-vertex".into(),
         endpoint: "https://us-central1-aiplatform.googleapis.com".into(),
@@ -276,7 +279,7 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
     let t = RecordingTransport::new(
         r#"{"text":"ok","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
-    let mut req = chat_req(ModelType::AwsCohereCommand, "cohere.command-r");
+    let mut req = chat_req(Protocol::AwsCohere, "cohere.command-r");
     req.account = Some(Account {
         name: "live-bedrock".into(),
         endpoint: "https://bedrock-runtime.eu-west-1.amazonaws.com".into(),
@@ -318,7 +321,7 @@ async fn go_live_seam_bespoke_dashscope() {
     let t = RecordingTransport::new(
         r#"{"output":{"text":"ok","finish_reason":"stop"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
     );
-    let mut req = chat_req(ModelType::AliQwen, "qwen-max");
+    let mut req = chat_req(Protocol::Dashscope, "qwen-max");
     req.account = Some(Account {
         name: "live-dashscope".into(),
         endpoint: "https://dashscope.aliyuncs.com".into(),
@@ -342,7 +345,7 @@ async fn legacy_completions_sends_prompt_not_messages() {
     let t = RecordingTransport::new(
         r#"{"id":"cmpl-1","object":"text_completion","model":"instruct","choices":[{"text":"ok","index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
     );
-    let mut req = chat_req(ModelType::OpenaiCompletions, "gpt-3.5-turbo-instruct");
+    let mut req = chat_req(Protocol::Completions, "gpt-3.5-turbo-instruct");
     // the view carries the prompt as a single message; engine joins message text.
     req.message = vec![ChatMsg::text("user", "once upon a time")];
     if let Some(p) = req.model_param_v2.as_mut() {
@@ -374,7 +377,7 @@ async fn responses_api_forwards_native_body() {
         r#"{"id":"resp_1","object":"response","model":"gpt-5","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#,
     );
     let mut req = GatewayRequest {
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::Responses, "gpt-5")),
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::Responses, "gpt-5")),
         ..Default::default()
     };
     req.model_param_v2.as_mut().unwrap().raw = serde_json::json!({
@@ -403,7 +406,7 @@ async fn vertex_multimodal_image_becomes_inline_data() {
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
     let mut req = GatewayRequest {
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::Gemini, "gemini-pro")),
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::Gemini, "gemini-pro")),
         ..Default::default()
     };
     let mut msg = ChatMsg::text("user", "what is this?");
@@ -430,7 +433,7 @@ async fn ernie_request_shape() {
     let t = RecordingTransport::new(
         r#"{"result":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
-    let _ = ErnieEngine::new(chat_req(ModelType::BaiduErnie, "ernie-4.0"), t.clone())
+    let _ = ErnieEngine::new(chat_req(Protocol::Ernie, "ernie-4.0"), t.clone())
         .run()
         .await
         .unwrap();
@@ -454,7 +457,7 @@ async fn bespoke_forwards_raw_passthrough_params() {
     let t = RecordingTransport::new(
         r#"{"result":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
-    let mut req = chat_req(ModelType::BaiduErnie, "ernie-4.0");
+    let mut req = chat_req(Protocol::Ernie, "ernie-4.0");
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             temperature: Some(0.3),
@@ -481,7 +484,7 @@ async fn minimax_v1_request_shape() {
     let t = RecordingTransport::new(
         r#"{"reply":"ok","usage":{"total_tokens":2},"base_resp":{"status_code":0,"status_msg":""}}"#,
     );
-    let _ = MinimaxV1Engine::new(chat_req(ModelType::MiniMax, "abab6.5"), t.clone())
+    let _ = MinimaxV1Engine::new(chat_req(Protocol::MinimaxV1, "abab6.5"), t.clone())
         .run()
         .await
         .unwrap();
@@ -498,13 +501,10 @@ async fn cohere_request_shape_with_sigv4() {
     let t = RecordingTransport::new(
         r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
-    let _ = CohereEngine::new(
-        chat_req(ModelType::AwsCohereCommand, "command-r"),
-        t.clone(),
-    )
-    .run()
-    .await
-    .unwrap();
+    let _ = CohereEngine::new(chat_req(Protocol::AwsCohere, "command-r"), t.clone())
+        .run()
+        .await
+        .unwrap();
     let b = t.body_json();
     assert_eq!(b["message"], "hello"); // last user turn becomes `message`
     assert!(b["chat_history"].is_array());
@@ -524,7 +524,7 @@ async fn llama_request_shape_with_sigv4() {
     let t = RecordingTransport::new(
         r#"{"generation":"ok","prompt_token_count":1,"generation_token_count":1,"stop_reason":"stop"}"#,
     );
-    let _ = LlamaEngine::new(chat_req(ModelType::AwsLlama, "llama3-70b"), t.clone())
+    let _ = LlamaEngine::new(chat_req(Protocol::AwsLlama, "llama3-70b"), t.clone())
         .run()
         .await
         .unwrap();
@@ -547,7 +547,7 @@ async fn dashscope_request_shape() {
     let t = RecordingTransport::new(
         r#"{"output":{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
     );
-    let _ = DashScopeEngine::new(chat_req(ModelType::AliQwen, "qwen-max"), t.clone())
+    let _ = DashScopeEngine::new(chat_req(Protocol::Dashscope, "qwen-max"), t.clone())
         .run()
         .await
         .unwrap();
@@ -562,7 +562,7 @@ async fn dashscope_request_shape() {
 
 // --- non-chat families: request-side alignment across all engine families ---
 
-fn typed_req(mt: ModelType, name: &str, typed: TypedParams) -> GatewayRequest {
+fn typed_req(mt: Protocol, name: &str, typed: TypedParams) -> GatewayRequest {
     let mut p = ModelParamV2::with_name(mt, name);
     p.typed = Some(typed);
     GatewayRequest {
@@ -577,7 +577,7 @@ async fn embeddings_request_shape() {
         r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#,
     );
     let req = typed_req(
-        ModelType::OpenaiEmbeddings,
+        Protocol::Embeddings,
         "text-embedding-3",
         TypedParams::Embeddings(EmbeddingParams {
             input: vec!["a".into(), "b".into()],
@@ -601,7 +601,7 @@ async fn embeddings_request_shape() {
 async fn image_request_shape() {
     let t = RecordingTransport::new(r#"{"created":1,"data":[{"b64_json":"x"}]}"#);
     let req = typed_req(
-        ModelType::ImageGenerations,
+        Protocol::Image,
         "dall-e-3",
         TypedParams::Image(ImageParams {
             prompt: "a cat".into(),
@@ -626,7 +626,7 @@ async fn image_edit_routes_to_edits_endpoint() {
     // source image (+ optional mask), not /images/generations.
     let t = RecordingTransport::new(r#"{"created":1,"data":[{"b64_json":"AAAA"}]}"#);
     let req = typed_req(
-        ModelType::ImageGenerations,
+        Protocol::Image,
         "dall-e-2",
         TypedParams::Image(ImageParams {
             prompt: "add a hat".into(),
@@ -648,7 +648,7 @@ async fn image_edit_routes_to_edits_endpoint() {
 async fn tts_request_shape() {
     let t = RecordingTransport::new(r#"{"audio_b64":"x","characters":3}"#);
     let req = typed_req(
-        ModelType::OpenaiTts,
+        Protocol::Tts,
         "tts-1",
         TypedParams::AudioTts(TtsParams {
             input: "read this".into(),
@@ -672,7 +672,7 @@ async fn tts_request_shape() {
 async fn stt_request_shape() {
     let t = RecordingTransport::new(r#"{"text":"transcribed"}"#);
     let req = typed_req(
-        ModelType::Whisper,
+        Protocol::Stt,
         "whisper-1",
         TypedParams::AudioStt(SttParams {
             audio_b64: "TU9DSw==".into(),
@@ -699,7 +699,7 @@ async fn video_request_shape() {
         r#"{"task_id":"v","status":"succeeded","video_url":"mock://v.mp4"}"#,
     );
     let req = typed_req(
-        ModelType::Kling,
+        Protocol::Video,
         "kling-video",
         TypedParams::Video(VideoParams {
             prompt: "a dog surfing".into(),
@@ -722,7 +722,7 @@ async fn search_request_shape() {
         r#"{"query":"q","results":[{"title":"t","url":"u","snippet":"s"}]}"#,
     );
     let req = typed_req(
-        ModelType::Brave,
+        Protocol::Search,
         "brave-search",
         TypedParams::Search(SearchParams {
             query: "rust dag".into(),

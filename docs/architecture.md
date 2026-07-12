@@ -9,7 +9,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 
 | Crate       | Layer | Role |
 |-------------|-------|------|
-| `consts`    | L0    | error codes, `ModelType` + `ModelFamily` enums |
+| `consts`    | L0    | error codes, the `Protocol` enum |
 | `utils`     | L0    | shared utilities |
 | `models`    | L1    | request/response domain types, typed params, usage, cost |
 | `protocol`  | L1    | OpenAI / Anthropic wire types, DSL response transforms |

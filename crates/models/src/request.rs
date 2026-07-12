@@ -37,8 +37,8 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     /// The model type to dispatch on, if a v2 param is present.
-    pub fn model_type(&self) -> Option<ap_consts::ModelType> {
-        self.model_param_v2.as_ref().map(|p| p.model_type)
+    pub fn protocol(&self) -> Option<ap_consts::Protocol> {
+        self.model_param_v2.as_ref().map(|p| p.protocol)
     }
 }
 
@@ -50,13 +50,13 @@ pub mod domain {
     use crate::params::TypedParams;
 
     /// Typed, dispatch-aware payload for a model call.
-    /// `model_type` is the dispatch key; `model_name` is the public model name the
-    /// caller sent (e.g. "gpt-4o") which config maps to a ModelType; `typed` holds
+    /// `protocol` is the dispatch key; `model_name` is the public model name the
+    /// caller sent (e.g. "gpt-4o") which config maps to a Protocol; `typed` holds
     /// the family-typed params; vendor extras ride in `raw`.
-    /// (No derived `Default` — `ModelType` has none; a manual impl lives in the parent module.)
+    /// (No derived `Default` — `Protocol` has none; a manual impl lives in the parent module.)
     #[derive(Debug, Clone)]
     pub struct ModelParamV2 {
-        pub model_type: ap_consts::ModelType,
+        pub protocol: ap_consts::Protocol,
         /// public model name from the caller, pre-mapping. Empty if caller sent a wire type directly.
         pub model_name: String,
         /// family-typed params (chat/embeddings/image/audio/video/search).
@@ -66,18 +66,18 @@ pub mod domain {
     }
 
     impl ModelParamV2 {
-        pub fn new(model_type: ap_consts::ModelType) -> Self {
+        pub fn new(protocol: ap_consts::Protocol) -> Self {
             Self {
-                model_type,
+                protocol,
                 model_name: String::new(),
                 typed: None,
                 raw: Value::Null,
             }
         }
 
-        pub fn with_name(model_type: ap_consts::ModelType, name: impl Into<String>) -> Self {
+        pub fn with_name(protocol: ap_consts::Protocol, name: impl Into<String>) -> Self {
             Self {
-                model_type,
+                protocol,
                 model_name: name.into(),
                 typed: None,
                 raw: Value::Null,
@@ -141,7 +141,7 @@ pub mod domain {
         /// AWS SigV4 accounts only: env var holding the secret access key (paired
         /// with `api_key_env` = the access key id). Empty for non-AWS vendors.
         pub secret_key_env: String,
-        pub model_types: Vec<ap_consts::ModelType>,
+        pub protocols: Vec<ap_consts::Protocol>,
     }
 
     impl Account {
@@ -270,12 +270,12 @@ pub mod domain {
         RealtimeParam);
 }
 
-// ap_consts::ModelType has no Default; give ModelParamV2's field a sensible one
+// ap_consts::Protocol has no Default; give ModelParamV2's field a sensible one
 // via a wrapper Default on the whole struct instead.
 impl Default for ModelParamV2 {
     fn default() -> Self {
         Self {
-            model_type: ap_consts::ModelType::OpenaiChat,
+            protocol: ap_consts::Protocol::OpenaiChat,
             model_name: String::new(),
             typed: None,
             raw: serde_json::Value::Null,
@@ -286,17 +286,17 @@ impl Default for ModelParamV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_consts::ModelType;
+    use ap_consts::Protocol;
 
     #[test]
-    fn dispatch_model_type() {
+    fn dispatch_protocol() {
         let empty = GatewayRequest::default();
-        assert!(empty.model_type().is_none());
+        assert!(empty.protocol().is_none());
         let req = GatewayRequest {
-            model_param_v2: Some(ModelParamV2::new(ModelType::Claude)),
+            model_param_v2: Some(ModelParamV2::new(Protocol::AnthropicMessages)),
             ..Default::default()
         };
-        assert_eq!(req.model_type(), Some(ModelType::Claude));
+        assert_eq!(req.protocol(), Some(Protocol::AnthropicMessages));
     }
 
     #[test]

@@ -115,14 +115,14 @@ async fn model_failure_modes_404_503_501() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // valid wire type but no account slot serves it → select_account 503
+    // valid protocol but no account slot serves it → select_account 503
     // (account selection precedes engine creation, matching the pipeline layer order)
     let resp = app
         .clone()
         .oneshot(post(
             "/v1/chat/completions",
             Some("ak-demo-123"),
-            r#"{"model":"sora","messages":[{"role":"user","content":"x"}]}"#,
+            r#"{"model":"aws-llama","messages":[{"role":"user","content":"x"}]}"#,
         ))
         .await
         .unwrap();
@@ -133,7 +133,7 @@ async fn model_failure_modes_404_503_501() {
         .oneshot(post(
             "/v1/chat/completions",
             Some("ak-demo-123"),
-            r#"{"model":"glm-realtime","messages":[{"role":"user","content":"x"}]}"#,
+            r#"{"model":"realtime","messages":[{"role":"user","content":"x"}]}"#,
         ))
         .await
         .unwrap();
@@ -712,7 +712,7 @@ async fn bespoke_ernie_full_pipeline() {
     // billed through the same pipeline
     let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
-    assert_eq!(j["records"][0]["model_type"], "ernie");
+    assert_eq!(j["records"][0]["protocol"], "ernie");
     assert!(j["records"][0]["cost_micros"].as_i64().unwrap() > 0);
 }
 
@@ -1136,7 +1136,7 @@ async fn realtime_websocket_mock_session() {
         axum::serve(listener, application).await.unwrap();
     });
 
-    let mut req = format!("ws://{addr}/v1/realtime?model=glm-realtime")
+    let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
         .unwrap();
     req.headers_mut()

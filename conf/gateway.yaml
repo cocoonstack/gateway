@@ -38,69 +38,78 @@ access_keys:
     qps: 100
     daily_token_quota: 1000000
 
-# Public model name → engine dispatch type (wire value of consts::ModelType),
-# plus demo prices used by the cost node (micros per 1k tokens).
+# Public model name → wire protocol, optional provider binding (only that
+# provider's accounts serve the model), plus demo prices (micros per 1k tokens).
 models:
   - name: gpt-4o
-    model_type: openai-chat
+    protocol: openai-chat
+    provider: openai
     input_price_per_1k_micros: 2500
     output_price_per_1k_micros: 10000
   - name: gpt-4o-mini
-    model_type: openai-chat
+    protocol: openai-chat
+    provider: openai
     input_price_per_1k_micros: 150
     output_price_per_1k_micros: 600
   - name: claude-sonnet
-    model_type: claude
+    protocol: anthropic-messages
     input_price_per_1k_micros: 3000
     output_price_per_1k_micros: 15000
   - name: gemini-pro
-    model_type: gemini
+    protocol: gemini
     input_price_per_1k_micros: 1250
     output_price_per_1k_micros: 5000
   - name: text-embedding-3 # embeddings family
-    model_type: openai-embeddings
+    protocol: embeddings
     input_price_per_1k_micros: 20
     output_price_per_1k_micros: 0
   - name: dall-e-3 # image family
-    model_type: images/generations
+    protocol: image
   - name: tts-1 # audio tts family
-    model_type: openai-tts
+    protocol: tts
   - name: whisper-1 # audio stt family
-    model_type: audio/transcriptions
+    protocol: stt
   - name: kling-video # video family
-    model_type: kling
+    protocol: video
   - name: brave-search # search family
-    model_type: brave
+    protocol: search
   - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
-    model_type: hunyuan
+    protocol: openai-chat
+    provider: tencent
     input_price_per_1k_micros: 100
     output_price_per_1k_micros: 100
   - name: ernie-4.0 # bespoke wire: Baidu ERNIE
-    model_type: ernie
+    protocol: ernie
     input_price_per_1k_micros: 300
     output_price_per_1k_micros: 900
   - name: qpm-mini # e2e: model-level QPM limit (2 per minute)
-    model_type: openai-chat
+    protocol: openai-chat
+    provider: openai
     qpm: 2
   - name: cached-mini # e2e: request-level cache (TTL 60s, hits aren't billed)
-    model_type: openai-chat
+    protocol: openai-chat
+    provider: openai
     input_price_per_1k_micros: 150
     output_price_per_1k_micros: 600
     cache_ttl_seconds: 60
   - name: spark-lite # e2e: account cooldown (sole account stays down -> cooldown -> recovers on expiry)
-    model_type: spark
+    protocol: openai-chat
+    provider: iflytek
   - name: erroring-model # e2e: vendor returns an error envelope -> client gets the mapped error status
-    model_type: moonshot
+    protocol: openai-chat
+    provider: flaky
   - name: qwen-max # bespoke wire: Alibaba DashScope native (not the openai-compatible mode)
-    model_type: ali_qwen
+    protocol: dashscope
     input_price_per_1k_micros: 400
     output_price_per_1k_micros: 1200
   - name: gpt-5-responses # OpenAI Responses API (/v1/responses, not the chat shape)
-    model_type: responses
+    protocol: responses
+    provider: openai
     input_price_per_1k_micros: 1250
     output_price_per_1k_micros: 10000
   - name: gpt-3.5-turbo-instruct # legacy text completion (/v1/completions, prompt shape)
-    model_type: openai-completions
+    protocol: completions
+    provider: openai
     input_price_per_1k_micros: 1500
     output_price_per_1k_micros: 2000
 
@@ -112,73 +121,73 @@ accounts:
   - name: mock-openai-1
     provider: openai
     priority: 1
-    model_types: ["openai-chat", "openai-completions", "chat/completions"]
+    protocols: ["openai-chat", "completions", "openai-chat"]
   - name: mock-openai-2
     provider: openai
     priority: 2
-    model_types: ["openai-chat"]
+    protocols: ["openai-chat"]
   - name: mock-anthropic-1
     provider: anthropic
     priority: 1
-    model_types: ["claude"]
+    protocols: ["anthropic-messages"]
   - name: mock-vertex-1
     provider: google
     priority: 1
-    model_types: ["gemini"]
+    protocols: ["gemini"]
   - name: mock-embed-1
     provider: openai
     priority: 1
-    model_types: ["openai-embeddings"]
+    protocols: ["embeddings"]
   - name: mock-image-1
     provider: openai
     priority: 1
-    model_types: ["images/generations"]
+    protocols: ["image"]
   - name: mock-audio-1
     provider: openai
     priority: 1
-    model_types: ["openai-tts", "audio/transcriptions"]
+    protocols: ["tts", "stt"]
   - name: mock-video-1
     provider: kling
     priority: 1
-    model_types: ["kling"]
+    protocols: ["video"]
   - name: mock-search-1
     provider: brave
     priority: 1
-    model_types: ["brave"]
+    protocols: ["search"]
   - name: mock-responses-1 # OpenAI Responses API surface
     provider: openai
     priority: 1
-    model_types: ["responses"]
+    protocols: ["responses"]
   - name: mock-realtime-1 # e2e: the account exists but the realtime engine returns 501 by design
     provider: azure
     priority: 1
-    model_types: ["glm-realtime"]
+    protocols: ["realtime"]
   - name: mock-hunyuan-ptu-down # e2e: PTU account (simulated down)
     provider: tencent
     priority: 1
     tier: ptu
-    model_types: ["hunyuan"]
+    protocols: ["openai-chat"]
   - name: mock-hunyuan-paygo # e2e: paygo fallback account
     provider: tencent
     priority: 1
     tier: paygo
-    model_types: ["hunyuan"]
+    protocols: ["openai-chat"]
   - name: mock-ernie-1 # bespoke wire e2e
     provider: baidu
     priority: 1
-    model_types: ["ernie"]
+    protocols: ["ernie"]
   - name: mock-spark-down # e2e: sole account stays down -> consecutive failures trigger cooldown
     provider: iflytek
     priority: 1
-    model_types: ["spark"]
+    protocols: ["openai-chat"]
   - name: mock-erroring # e2e: vendor error envelope (name containing "erroring" triggers the mock)
-    provider: openai
+    provider: flaky
     priority: 1
-    model_types: ["moonshot"]
+    protocols: ["openai-chat"]
   - name: mock-dashscope-1 # bespoke wire e2e
     provider: alibaba
     priority: 1
-    model_types: ["ali_qwen", "ali_qwen_vl"]
+    protocols: ["dashscope", "dashscope"]
 
 # Local security policy (rule-based; no cloud security service)
 security:

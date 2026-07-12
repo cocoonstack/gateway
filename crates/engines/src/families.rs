@@ -1,5 +1,5 @@
 //! Family engines beyond the two chat protocols.
-//! Engines are merged by protocol family (consts::ModelFamily):
+//! Engines are merged by protocol family (consts::Protocol):
 //!   Vertex generateContent / Embeddings / Image / Audio(TTS·STT·other) /
 //!   Video(async task) / Search / Passthrough(register+misc).
 //! Each engine only does "build request → Transport → parse response" — nothing else
@@ -79,7 +79,7 @@ impl Base {
     ) -> GResult<UpstreamResponse> {
         let param = self.param()?;
         let up = UpstreamRequest {
-            model_type: param.model_type,
+            protocol: param.protocol,
             method: "POST".to_owned(),
             url: url.to_owned(),
             headers: vec![
@@ -968,14 +968,14 @@ impl ModelEngine for ResponsesEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::ModelType;
+    use ap_consts::Protocol;
     use ap_models::{
         ChatMsg, EmbeddingParams, ImageParams, ModelParamV2, SearchParams, SttParams, TtsParams,
         VideoParams,
     };
     use std::sync::Arc;
 
-    fn req(mt: ModelType, name: &str, typed: Option<TypedParams>) -> GatewayRequest {
+    fn req(mt: Protocol, name: &str, typed: Option<TypedParams>) -> GatewayRequest {
         let mut p = ModelParamV2::with_name(mt, name);
         p.typed = typed;
         GatewayRequest {
@@ -991,7 +991,7 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_round_trip() {
-        let e = VertexEngine::new(req(ModelType::Gemini, "gemini-pro", None), t());
+        let e = VertexEngine::new(req(Protocol::Gemini, "gemini-pro", None), t());
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said: hello families"));
         assert!(out.response.total_tokens > 0);
@@ -1002,7 +1002,7 @@ mod tests {
     async fn embeddings_round_trip() {
         let e = EmbeddingsEngine::new(
             req(
-                ModelType::OpenaiEmbeddings,
+                Protocol::Embeddings,
                 "text-embedding-mock",
                 Some(TypedParams::Embeddings(EmbeddingParams {
                     input: vec!["abc".into(), "def".into()],
@@ -1020,7 +1020,7 @@ mod tests {
     async fn image_round_trip() {
         let e = ImageEngine::new(
             req(
-                ModelType::ImageGenerations,
+                Protocol::Image,
                 "img-mock",
                 Some(TypedParams::Image(ImageParams {
                     prompt: "a cat".into(),
@@ -1040,7 +1040,7 @@ mod tests {
     async fn audio_tts_and_stt() {
         let tts = AudioEngine::new(
             req(
-                ModelType::OpenaiTts,
+                Protocol::Tts,
                 "tts-mock",
                 Some(TypedParams::AudioTts(TtsParams {
                     input: "read this".into(),
@@ -1062,7 +1062,7 @@ mod tests {
 
         let stt = AudioEngine::new(
             req(
-                ModelType::Whisper,
+                Protocol::Stt,
                 "whisper-mock",
                 Some(TypedParams::AudioStt(SttParams {
                     audio_b64: "TU9DSw==".into(),
@@ -1086,7 +1086,7 @@ mod tests {
     async fn video_and_search_and_passthrough() {
         let v = VideoEngine::new(
             req(
-                ModelType::Kling,
+                Protocol::Video,
                 "kling-mock",
                 Some(TypedParams::Video(VideoParams {
                     prompt: "a dog surfing".into(),
@@ -1102,7 +1102,7 @@ mod tests {
 
         let s = SearchEngine::new(
             req(
-                ModelType::Brave,
+                Protocol::Search,
                 "brave-mock",
                 Some(TypedParams::Search(SearchParams {
                     query: "rust dag".into(),
@@ -1114,13 +1114,13 @@ mod tests {
         let out = s.run().await.unwrap();
         assert!(out.response.message.contains("result 1 for rust dag"));
 
-        let p = PassthroughEngine::new(req(ModelType::E2BSandbox, "e2b", None), t());
+        let p = PassthroughEngine::new(req(Protocol::Passthrough, "e2b", None), t());
         assert_eq!(p.run().await.unwrap().response.message, "ok");
     }
 
     #[tokio::test]
     async fn down_account_fails_upstream() {
-        let mut r = req(ModelType::Gemini, "gemini-pro", None);
+        let mut r = req(Protocol::Gemini, "gemini-pro", None);
         r.account = Some(ap_models::Account {
             name: "mock-vertex-down".into(),
             ..Default::default()
@@ -1135,7 +1135,7 @@ mod tests {
         // Responses request: native body lives in `raw` (the client's Responses
         // shape). Engine forwards it, parses output-item text and input/output
         // token usage.
-        let mut r = req(ModelType::Responses, "gpt-5-responses", None);
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({
             "input": "summarize this",
             "instructions": "be terse",
@@ -1163,7 +1163,7 @@ mod tests {
     async fn responses_api_streaming() {
         // stream=true → engine decodes response.output_text.delta frames into
         // chunks and reads final usage from the response.completed frame.
-        let mut r = req(ModelType::Responses, "gpt-5-responses", None);
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.stream = true;
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"input": "stream this"});
         let out = ResponsesEngine::new(r, t()).run().await.unwrap();

@@ -122,20 +122,23 @@ async fn realtime_ws(
         .handler
         .cfg
         .find_model(&model)
-        .and_then(|m| m.model_type())
-        .or_else(|| ap_consts::ModelType::from_wire(&model));
+        .and_then(|m| m.protocol())
+        .or_else(|| ap_consts::Protocol::from_wire(&model));
     let Some(mt) = mt else {
         return error_response(404, format!("unknown model: {model}"));
     };
-    if mt.family() != ap_consts::ModelFamily::Realtime {
+    if mt != ap_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
-    let Some(account) = s
-        .handler
-        .state
-        .pool
-        .select_healthy(mt, &[], &s.handler.state.health)
-    else {
+    let Some(account) = s.handler.state.pool.select_healthy(
+        mt,
+        s.handler
+            .cfg
+            .find_model(&model)
+            .and_then(|m| m.provider.as_deref()),
+        &[],
+        &s.handler.state.health,
+    ) else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
     ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
@@ -147,7 +150,7 @@ async fn realtime_session(
     s: AppState,
     ak: AkInfo,
     model: String,
-    mt: ap_consts::ModelType,
+    mt: ap_consts::Protocol,
     account: String,
 ) {
     use axum::extract::ws::Message;
@@ -197,7 +200,7 @@ async fn realtime_session(
                     ak: ak.ak.clone(),
                     product: ak.product.clone(),
                     model: model.clone(),
-                    model_type: mt.as_str().to_owned(),
+                    protocol: mt.as_str().to_owned(),
                     account: account.clone(),
                     prompt_tokens: it,
                     completion_tokens: ot,
@@ -231,7 +234,7 @@ fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
         .request
         .model_param_v2
         .as_ref()
-        .map(|p| (p.model_name.clone(), p.model_type.as_str()))
+        .map(|p| (p.model_name.clone(), p.protocol.as_str()))
         .unwrap_or_default();
     let account = ctx
         .request
@@ -256,7 +259,7 @@ fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
         ak = %ctx.ak.ak,
         product = %ctx.ak.product,
         model = %model,
-        model_type = mt,
+        protocol = mt,
         account,
         status,
         prompt_tokens = pt,
@@ -279,11 +282,11 @@ async fn list_models(State(s): State<AppState>) -> Json<Value> {
         .models
         .iter()
         .map(|m| {
-            let implemented = m.model_type().map(is_implemented).unwrap_or(false);
+            let implemented = m.protocol().map(is_implemented).unwrap_or(false);
             json!({
                 "id": m.name,
                 "object": "model",
-                "model_type": m.model_type,
+                "protocol": m.protocol,
                 "implemented": implemented,
             })
         })
@@ -313,7 +316,7 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
                 "priority": a.priority,
                 "tier": if a.tier.is_empty() { "paygo" } else { a.tier.as_str() },
                 "health": s.handler.state.health.status(&a.name),
-                "model_types": a.model_types,
+                "protocols": a.protocols,
             })
         })
         .collect();
@@ -435,7 +438,7 @@ async fn chat_completions(
     });
     let mut param = ModelParamV2::with_name(
         // placeholder type; the resolve_model DAG node maps model_name properly
-        ap_consts::ModelType::OpenaiChat,
+        ap_consts::Protocol::OpenaiChat,
         body.model.clone(),
     );
     param.typed = Some(typed);
@@ -567,7 +570,8 @@ async fn messages(
         system: body.system_text(),
         ..Default::default()
     });
-    let mut param = ModelParamV2::with_name(ap_consts::ModelType::Claude, body.model.clone());
+    let mut param =
+        ModelParamV2::with_name(ap_consts::Protocol::AnthropicMessages, body.model.clone());
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra.clone());
 
@@ -672,7 +676,7 @@ async fn run_family(
     typed: TypedParams,
     messages: Vec<ChatMsg>,
 ) -> Result<DagContext, Response> {
-    let mut param = ModelParamV2::with_name(ap_consts::ModelType::OpenaiChat, model);
+    let mut param = ModelParamV2::with_name(ap_consts::Protocol::OpenaiChat, model);
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
@@ -720,7 +724,7 @@ async fn completions(
         temperature: body["temperature"].as_f64(),
         ..Default::default()
     });
-    let mut param = ModelParamV2::with_name(ap_consts::ModelType::OpenaiCompletions, model);
+    let mut param = ModelParamV2::with_name(ap_consts::Protocol::Completions, model);
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
@@ -780,8 +784,8 @@ async fn responses(
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
     // native passthrough: the whole Responses-shaped body rides in `raw`;
-    // resolve_model maps `model` → ModelType::Responses → ResponsesEngine.
-    let mut param = ModelParamV2::with_name(ap_consts::ModelType::Responses, model);
+    // resolve_model maps `model` → Protocol::Responses → ResponsesEngine.
+    let mut param = ModelParamV2::with_name(ap_consts::Protocol::Responses, model);
     param.raw = body;
     let request = GatewayRequest {
         is_online: true,

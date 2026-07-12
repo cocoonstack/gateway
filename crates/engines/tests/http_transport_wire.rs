@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ap_consts::ModelType;
+use ap_consts::Protocol;
 use ap_engines::http_transport::{DispatchTransport, HttpTransport};
 use ap_engines::transport::{Transport, UpstreamBody, UpstreamRequest};
 use ap_engines::{ModelEngine, OpenAiEngine};
@@ -72,7 +72,7 @@ async fn http_transport_json_over_real_socket() {
     let base = spawn_vendor().await;
     let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
     let req = UpstreamRequest {
-        model_type: ModelType::OpenaiChat,
+        protocol: Protocol::OpenaiChat,
         method: "POST".into(),
         url: format!("{base}/v1/chat/completions"),
         headers: vec![("content-type".into(), "application/json".into())],
@@ -97,7 +97,7 @@ async fn http_transport_sse_over_real_socket() {
     let base = spawn_vendor().await;
     let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
     let req = UpstreamRequest {
-        model_type: ModelType::OpenaiChat,
+        protocol: Protocol::OpenaiChat,
         method: "POST".into(),
         url: format!("{base}/v1/chat/completions"),
         headers: vec![("content-type".into(), "application/json".into())],
@@ -125,7 +125,7 @@ async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
     let transport = DispatchTransport::new(Duration::from_secs(5)).unwrap();
 
     let req = |url: String| UpstreamRequest {
-        model_type: ModelType::OpenaiChat,
+        protocol: Protocol::OpenaiChat,
         method: "POST".into(),
         url,
         headers: vec![("content-type".into(), "application/json".into())],
@@ -184,7 +184,7 @@ async fn engine_through_real_http_transport_end_to_end() {
     let request = GatewayRequest {
         account: Some(account),
         message: vec![ChatMsg::text("user", "over the wire")],
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::OpenaiChat, "srv")),
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "srv")),
         ..Default::default()
     };
     let engine = OpenAiEngine::new(request, transport);

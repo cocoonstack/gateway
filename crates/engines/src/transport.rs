@@ -8,14 +8,14 @@
 
 use std::sync::Arc;
 
-use ap_consts::ModelType;
+use ap_consts::Protocol;
 use ap_models::{GResult, GatewayError};
 use serde_json::{Value, json};
 
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
-    pub model_type: ModelType,
+    pub protocol: Protocol,
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -281,7 +281,7 @@ impl MockTransport {
     }
 
     fn minimax_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "minimax")?;
+        let body = Self::parse(&req.body, "minimax-v1")?;
         let user = body["messages"]
             .as_array()
             .and_then(|ms| ms.iter().rev().find(|m| m["sender_type"] == "USER"))
@@ -418,7 +418,7 @@ impl MockTransport {
 
     fn passthrough_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        Self::ok_json(json!({"ok": true, "model_type": req.model_type.as_str(), "echo": body}))
+        Self::ok_json(json!({"ok": true, "protocol": req.protocol.as_str(), "echo": body}))
     }
 
     /// Legacy text-completions reply (the `.../completions` endpoint):

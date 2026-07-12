@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use ap_consts::ModelType;
+use ap_consts::Protocol;
 use ap_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 use ap_engines::{ClaudeEngine, ModelEngine, OpenAiEngine, VertexEngine, extract_common_usage};
 use ap_models::{ChatMsg, GResult, GatewayRequest, ModelParamV2};
@@ -38,7 +38,7 @@ impl Transport for FixtureTransport {
 fn openai_req() -> GatewayRequest {
     GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::OpenaiChat, "gpt")),
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
         ..Default::default()
     }
 }
@@ -115,7 +115,10 @@ fn anthropic_common_usage_matches_semantics() {
 fn claude_req() -> GatewayRequest {
     GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::Claude, "claude")),
+        model_param_v2: Some(ModelParamV2::with_name(
+            Protocol::AnthropicMessages,
+            "anthropic-messages",
+        )),
         ..Default::default()
     }
 }
@@ -193,7 +196,7 @@ async fn family_and_bespoke_engines_surface_errors() {
     let v = VertexEngine::new(
         GatewayRequest {
             message: vec![ChatMsg::text("user", "x")],
-            model_param_v2: Some(ModelParamV2::with_name(ModelType::Gemini, "g")),
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::Gemini, "g")),
             ..Default::default()
         },
         Arc::new(FixtureTransport {
@@ -207,7 +210,7 @@ async fn family_and_bespoke_engines_surface_errors() {
     let e = ErnieEngine::new(
         GatewayRequest {
             message: vec![ChatMsg::text("user", "x")],
-            model_param_v2: Some(ModelParamV2::with_name(ModelType::BaiduErnie, "e")),
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::Ernie, "e")),
             ..Default::default()
         },
         Arc::new(FixtureTransport {
@@ -218,7 +221,7 @@ async fn family_and_bespoke_engines_surface_errors() {
     assert_eq!(expect_err(e).await, 429);
 
     // embeddings (family) — also needs typed input to build a request
-    let mut p = ModelParamV2::with_name(ModelType::OpenaiEmbeddings, "emb");
+    let mut p = ModelParamV2::with_name(Protocol::Embeddings, "emb");
     p.typed = Some(ap_models::TypedParams::Embeddings(
         ap_models::EmbeddingParams {
             input: vec!["a".into()],
@@ -280,7 +283,7 @@ fn openai_req_stream() -> GatewayRequest {
     GatewayRequest {
         stream: true,
         message: vec![ChatMsg::text("user", "hi")],
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::OpenaiChat, "gpt")),
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
         ..Default::default()
     }
 }
@@ -354,7 +357,7 @@ async fn gemini_usage_metadata_matches_go_recorded() {
     });
     let req = GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
-        model_param_v2: Some(ModelParamV2::with_name(ModelType::Gemini, "gemini-pro")),
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::Gemini, "gemini-pro")),
         ..Default::default()
     };
     let out = VertexEngine::new(req, transport).run().await.unwrap();

@@ -53,7 +53,7 @@ impl OfflineHandler {
                     ak: ak.ak.clone(),
                     message: item.messages,
                     model_param_v2: Some(ModelParamV2::with_name(
-                        ap_consts::ModelType::OpenaiChat, // rewritten by the resolve_model node
+                        ap_consts::Protocol::OpenaiChat, // rewritten by the resolve_model node
                         model.clone(),
                     )),
                     ..Default::default()

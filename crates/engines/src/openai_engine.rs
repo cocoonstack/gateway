@@ -135,7 +135,7 @@ impl OpenAiEngine {
             .and_then(|a| a.api_key())
             .unwrap_or_else(|| "mock".to_owned());
         Ok(UpstreamRequest {
-            model_type: param.model_type,
+            protocol: param.protocol,
             method: "POST".to_owned(),
             url: format!("{base}/v1/chat/completions"),
             headers: vec![
@@ -264,7 +264,7 @@ impl ModelEngine for OpenAiEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::ModelType;
+    use ap_consts::Protocol;
     use ap_models::{ChatMsg, ChatParams, ModelParamV2};
     use std::sync::Arc;
 
@@ -272,7 +272,7 @@ mod tests {
         GatewayRequest {
             stream,
             message: vec![ChatMsg::text("user", "hello world")],
-            model_param_v2: Some(ModelParamV2::with_name(ModelType::OpenaiChat, "gpt-4o")),
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
             ..Default::default()
         }
     }

@@ -43,7 +43,7 @@ access_keys:
 ```yaml
 models:
   - name: gpt-4o                     # name clients request
-    model_type: openai-chat          # engine dispatch type (wire value)
+    protocol: openai-chat            # wire protocol (or set `provider:` instead)
     input_price_per_1k_micros: 2500  # billing rates (micros per 1k tokens)
     output_price_per_1k_micros: 10000
     qpm: 60                          # optional model-level rate limit
@@ -59,7 +59,8 @@ providers:
     api_key_env: OPENAI_API_KEY
 models:
   - name: gpt-4o
-    provider: openai          # fills model_type with the kind's default
+    provider: openai          # fills the protocol with the kind's default
+                              # and pins the model to that provider's accounts
 ```
 
 A provider entry expands into an upstream account with the kind's preset
@@ -75,7 +76,7 @@ accounts:
     provider: openai
     priority: 1                # lower = preferred
     tier: ptu                  # ptu (provisioned, preferred) | paygo (default)
-    model_types: ["openai-chat", "openai-embeddings"]
+    protocols: ["openai-chat", "embeddings"]
     endpoint: ""               # empty → mock transport; real base URL → real upstream
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)

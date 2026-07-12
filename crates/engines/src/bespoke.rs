@@ -111,7 +111,7 @@ impl Base {
             headers.insert(0, ("content-type".into(), "application/json".into()));
         }
         let up = UpstreamRequest {
-            model_type: param.model_type,
+            protocol: param.protocol,
             method: "POST".to_owned(),
             url: url.to_owned(),
             headers,
@@ -568,11 +568,11 @@ impl ModelEngine for DashScopeEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::ModelType;
+    use ap_consts::Protocol;
     use ap_models::{ChatMsg, ModelParamV2};
     use std::sync::Arc;
 
-    fn req(mt: ModelType, name: &str) -> GatewayRequest {
+    fn req(mt: Protocol, name: &str) -> GatewayRequest {
         GatewayRequest {
             message: vec![ChatMsg::text("user", "hello bespoke")],
             model_param_v2: Some(ModelParamV2::with_name(mt, name)),
@@ -586,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn ernie_wire_shape() {
-        let e = ErnieEngine::new(req(ModelType::BaiduErnie, "ernie-4.0"), t());
+        let e = ErnieEngine::new(req(Protocol::Ernie, "ernie-4.0"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -599,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn minimax_v1_wire_shape() {
-        let e = MinimaxV1Engine::new(req(ModelType::MiniMax, "abab6.5"), t());
+        let e = MinimaxV1Engine::new(req(Protocol::MinimaxV1, "abab6.5"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -611,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn cohere_wire_shape() {
-        let e = CohereEngine::new(req(ModelType::AwsCohereCommand, "command-r"), t());
+        let e = CohereEngine::new(req(Protocol::AwsCohere, "command-r"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -623,14 +623,14 @@ mod tests {
 
     #[tokio::test]
     async fn llama_wire_shape() {
-        let e = LlamaEngine::new(req(ModelType::AwsLlama, "llama3-70b"), t());
+        let e = LlamaEngine::new(req(Protocol::AwsLlama, "llama3-70b"), t());
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("[mock-llama]"));
         assert!(out.response.total_tokens > 0);
     }
     #[tokio::test]
     async fn dashscope_wire_shape() {
-        let e = DashScopeEngine::new(req(ModelType::AliQwen, "qwen-max"), t());
+        let e = DashScopeEngine::new(req(Protocol::Dashscope, "qwen-max"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response

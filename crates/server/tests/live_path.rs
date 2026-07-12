@@ -107,11 +107,11 @@ listen: {{ host: 127.0.0.1, port: 0 }}
 access_keys:
   - {{ ak: ak-live, product: demo, qps: 100, daily_token_quota: 1000000 }}
 models:
-  - {{ name: gpt-live, model_type: openai-chat, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000 }}
-  - {{ name: claude-live, model_type: claude, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000 }}
+  - {{ name: gpt-live, protocol: openai-chat, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000 }}
+  - {{ name: claude-live, protocol: anthropic-messages, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000 }}
 accounts:
-  - {{ name: live-acct, provider: openai, priority: 1, endpoint: "{vendor_url}", model_types: ["openai-chat"] }}
-  - {{ name: live-anthropic, provider: anthropic, priority: 1, endpoint: "{vendor_url}", model_types: ["claude"] }}
+  - {{ name: live-acct, provider: openai, priority: 1, endpoint: "{vendor_url}", protocols: ["openai-chat"] }}
+  - {{ name: live-anthropic, provider: anthropic, priority: 1, endpoint: "{vendor_url}", protocols: ["anthropic-messages"] }}
 "#
     );
     let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).expect("config"));

@@ -40,8 +40,10 @@ open-source impl now, alternatives pluggable":
 - [x] Provider presets: `providers:` config (kinds openai / anthropic /
       gemini) expand into accounts with preset endpoints + key env vars;
       models take a `provider:` shorthand
-- [ ] Full config-driven provider + model catalog replacing the hardcoded
-      `ModelType` enum
+- [x] Config-driven catalog: the per-model wire-type enum is retired — a
+      model binds a name to one of 19 `Protocol`s (directly or via its
+      provider), and a `provider:` binding pins it to that provider's
+      accounts
 - [x] OpenAI-protocol path verified live against an OpenAI-compatible
       upstream: non-stream + streaming SSE + streamed-usage billing all
       confirmed end to end (provider preset + `endpoint:` override)
