@@ -45,6 +45,53 @@ fn chat_req() -> Request<Body> {
         .expect("request")
 }
 
+/// A large request: 24-turn history, each turn ~2KB — the shape where the
+/// per-request GatewayRequest clone in CallEngine actually costs something.
+fn big_chat_req() -> Request<Body> {
+    let turn = "x".repeat(2000);
+    let msgs: Vec<String> = (0..24)
+        .map(|i| {
+            format!(
+                r#"{{"role":"{}","content":"{turn}"}}"#,
+                if i % 2 == 0 { "user" } else { "assistant" }
+            )
+        })
+        .collect();
+    let body = format!(r#"{{"model":"gpt-4o","messages":[{}]}}"#, msgs.join(","));
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer ak-bench")
+        .body(Body::from(body))
+        .expect("request")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+async fn bench_big_payload() {
+    let app = app();
+    for _ in 0..20 {
+        app.clone().oneshot(big_chat_req()).await.unwrap();
+    }
+    const N: usize = 2000;
+    let mut lat_us = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = Instant::now();
+        let resp = app.clone().oneshot(big_chat_req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        lat_us.push(t.elapsed().as_micros() as u64);
+    }
+    lat_us.sort_unstable();
+    let pct = |p: f64| lat_us[((lat_us.len() as f64 * p) as usize).min(lat_us.len() - 1)];
+    println!(
+        "big-payload serial: n={N} p50={}us p95={}us p99={}us",
+        pct(0.50),
+        pct(0.95),
+        pct(0.99),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark; run with --ignored --nocapture"]
 async fn bench_chat_completions() {
