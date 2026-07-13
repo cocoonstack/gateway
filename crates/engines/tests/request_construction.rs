@@ -211,7 +211,15 @@ async fn vertex_request_shape() {
     // gemini uses contents[].parts[].text with role "user"/"model"
     let contents = b["contents"].as_array().unwrap();
     assert_eq!(contents.last().unwrap()["parts"][0]["text"], "hello");
-    assert!(t.url().contains(":generateContent"), "url: {}", t.url());
+    assert!(
+        t.url()
+            .contains("/v1beta/models/gemini-pro:generateContent"),
+        "url: {}",
+        t.url()
+    );
+    // Gemini API auth: an x-goog-api-key header, never a Bearer token
+    assert!(t.header("x-goog-api-key").is_some());
+    assert!(t.header("authorization").is_none());
     // sampling params reach Gemini via generationConfig (not silently dropped)
     assert_eq!(b["generationConfig"]["temperature"], 0.4);
     assert_eq!(b["generationConfig"]["maxOutputTokens"], 128);
@@ -244,24 +252,25 @@ async fn go_live_seam_routes_to_configured_endpoint() {
     // key comes from the account's env var (unset here → inert "mock", never a panic)
     assert!(t.header("x-api-key").is_some());
 
-    // Vertex (family engine) → real generateContent endpoint.
+    // Vertex (family engine) → real generateContent endpoint, x-goog-api-key auth.
     let t2 = RecordingTransport::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
     let mut req2 = chat_req(Protocol::Gemini, "gemini-pro");
     req2.account = Some(Account {
-        name: "live-vertex".into(),
-        endpoint: "https://us-central1-aiplatform.googleapis.com".into(),
+        name: "live-gemini".into(),
+        endpoint: "https://generativelanguage.googleapis.com".into(),
         ..Default::default()
     });
     let _ = VertexEngine::new(req2, t2.clone()).run().await.unwrap();
     assert!(
         t2.url()
-            .starts_with("https://us-central1-aiplatform.googleapis.com/v1/models/"),
+            .starts_with("https://generativelanguage.googleapis.com/v1beta/models/"),
         "url: {}",
         t2.url()
     );
     assert!(t2.url().ends_with(":generateContent"));
+    assert!(t2.header("x-goog-api-key").is_some());
 }
 
 #[tokio::test]

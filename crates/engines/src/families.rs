@@ -69,11 +69,21 @@ impl Base {
             .ok_or_else(|| GatewayError::bad_request("missing model param"))
     }
 
-    /// Build and send an upstream POST, returning the raw reply (Json or Sse).
-    /// Engines that stream dispatch on the body type themselves.
+    /// Bearer auth headers (the OpenAI-shaped families); real key when the
+    /// account is live, inert "mock" otherwise.
+    fn bearer_headers(&self) -> Vec<(String, String)> {
+        vec![
+            ("content-type".into(), "application/json".into()),
+            ("authorization".into(), format!("Bearer {}", self.api_key())),
+        ]
+    }
+
+    /// Build and send an upstream POST with explicit headers, returning the raw
+    /// reply (Json or Sse). Engines that stream dispatch on the body type themselves.
     async fn send_upstream(
         &self,
         url: &str,
+        headers: Vec<(String, String)>,
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -82,12 +92,7 @@ impl Base {
             protocol: param.protocol,
             method: "POST".to_owned(),
             url: url.to_owned(),
-            headers: vec![
-                ("content-type".into(), "application/json".into()),
-                // Bearer for the OpenAI-shaped families + Vertex OAuth; real key
-                // when the account is live, inert "mock" otherwise.
-                ("authorization".into(), format!("Bearer {}", self.api_key())),
-            ],
+            headers,
             body: body.to_string().into_bytes(),
             stream,
             account: self.account(),
@@ -98,9 +103,19 @@ impl Base {
         }
     }
 
-    /// POST body to `url`, expect JSON back (non-streaming).
+    /// POST body to `url` with Bearer auth, expect JSON back (non-streaming).
     async fn round_trip(&self, url: &str, body: Value) -> GResult<(u16, Value)> {
-        let reply = self.send_upstream(url, body, false).await?;
+        self.round_trip_with(url, self.bearer_headers(), body).await
+    }
+
+    /// POST body to `url` with explicit headers, expect JSON back (non-streaming).
+    async fn round_trip_with(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Value,
+    ) -> GResult<(u16, Value)> {
+        let reply = self.send_upstream(url, headers, body, false).await?;
         let bytes = match &reply.body {
             UpstreamBody::Json(b) => b,
             UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
@@ -223,12 +238,18 @@ impl ModelEngine for VertexEngine {
                 body["generationConfig"] = gen_cfg;
             }
         }
+        // Gemini API: /v1beta path, auth via the x-goog-api-key header — an API
+        // key is not an OAuth Bearer token and Google rejects it as one.
         let url = format!(
-            "{}/v1/models/{}:generateContent",
+            "{}/v1beta/models/{}:generateContent",
             self.base.base_url("mock://vertex.googleapis.com"),
             self.base.param()?.model_name
         );
-        let (status, v) = self.base.round_trip(&url, body).await?;
+        let headers = vec![
+            ("content-type".into(), "application/json".into()),
+            ("x-goog-api-key".into(), self.base.api_key()),
+        ];
+        let (status, v) = self.base.round_trip_with(&url, headers, body).await?;
         let text: String = v["candidates"][0]["content"]["parts"]
             .as_array()
             .map(|ps| ps.iter().filter_map(|p| p["text"].as_str()).collect())
@@ -932,7 +953,7 @@ impl ResponsesEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for ResponsesEngine {
-    /// OpenAI Responses API (POST /openai/responses).
+    /// OpenAI Responses API (POST /v1/responses).
     /// Native body passthrough (param.raw holds the client's Responses-shaped request)
     /// + ensures the model field. Non-streaming parses output items + usage; streaming
     /// parses output_text.delta + response.completed. usage dialect
@@ -941,7 +962,7 @@ impl ModelEngine for ResponsesEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         // native passthrough: forward the client's Responses-shaped body verbatim,
-        // ensuring `model` is present (live integration swaps in the real endpoint+version).
+        // ensuring `model` is present.
         let mut body = match &param.raw {
             Value::Object(_) => param.raw.clone(),
             _ => json!({}),
@@ -951,12 +972,17 @@ impl ModelEngine for ResponsesEngine {
                 .or_insert_with(|| json!(param.model_name));
         }
         let url = format!(
-            "{}/openai/responses",
+            "{}/v1/responses",
             self.base.base_url("mock://api.openai.com")
         );
         let reply = self
             .base
-            .send_upstream(&url, body, self.base.request.stream)
+            .send_upstream(
+                &url,
+                self.base.bearer_headers(),
+                body,
+                self.base.request.stream,
+            )
             .await?
             .buffered()
             .await?;
