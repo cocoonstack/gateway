@@ -706,9 +706,11 @@ impl ModelEngine for CompletionsEngine {
                 .to_owned(),
             prompt_tokens: pt,
             completion_tokens: ct,
+            // floor a present-but-negative upstream total too, not just the sum
             total_tokens: usage["total_tokens"]
                 .as_i64()
-                .unwrap_or(pt.saturating_add(ct)),
+                .unwrap_or(pt.saturating_add(ct))
+                .max(0),
             raw_usage_json: if usage.is_null() {
                 vec![]
             } else {

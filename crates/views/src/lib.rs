@@ -722,39 +722,57 @@ async fn realtime_bridge(
             },
             m = up_rx.next() => match m {
                 Some(Ok(UMsg::Text(t))) => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&t)
-                        && let Some((it, ot)) = realtime_usage(&account.provider, &v)
-                    {
-                        // a turn ended — settle the matching admitted turn (FIFO),
-                        // so a zero-usage terminal frame refunds its reserve here
-                        // instead of orphaning it at the head. A boundary with no
-                        // gated turn (ungated dialect) bills unreserved, and only
-                        // when it produced tokens.
-                        match pending.pop_front() {
-                            Some(a) => {
-                                bill_realtime_turn(&s, &a, &model, mt, &account.name, it, ot).await
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        // Server-VAD: OpenAI auto-starts a turn (`response.created`)
+                        // with no client `response.create`, so gate it here when no
+                        // manually-gated turn is pending. This gives automatic turns
+                        // the same admission + fresh-key attribution as manual ones;
+                        // a denied turn is cancelled upstream and error'd downstream.
+                        if v["type"] == "response.created" && pending.is_empty() {
+                            match realtime_gate(&s, &ak, &model).await {
+                                Ok(admit) => pending.push_back(admit),
+                                Err(denied) => {
+                                    let _ = up_tx
+                                        .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
+                                        .await;
+                                    let _ = cl_tx
+                                        .send(CMsg::Text(send_err(denied).to_string().into()))
+                                        .await;
+                                }
                             }
-                            None if it + ot > 0 => {
-                                let unreserved = RealtimeAdmit {
-                                    ak: ak.clone(),
-                                    reserved: 0,
-                                    tpm_reserved: None,
-                                    at: gw_state::epoch_secs(),
-                                };
-                                bill_realtime_turn(
-                                    &s,
-                                    &unreserved,
-                                    &model,
-                                    mt,
-                                    &account.name,
-                                    it,
-                                    ot,
-                                )
-                                .await
+                        } else if let Some((it, ot)) = realtime_usage(&account.provider, &v) {
+                            // a turn ended — settle the matching admitted turn (FIFO),
+                            // so a zero-usage terminal frame refunds its reserve here
+                            // instead of orphaning it at the head. A boundary with no
+                            // gated turn (ungated dialect) bills unreserved, and only
+                            // when it produced tokens.
+                            match pending.pop_front() {
+                                Some(a) => {
+                                    bill_realtime_turn(&s, &a, &model, mt, &account.name, it, ot)
+                                        .await
+                                }
+                                None if it.saturating_add(ot) > 0 => {
+                                    let unreserved = RealtimeAdmit {
+                                        ak: ak.clone(),
+                                        reserved: 0,
+                                        tpm_reserved: None,
+                                        at: gw_state::epoch_secs(),
+                                    };
+                                    bill_realtime_turn(
+                                        &s,
+                                        &unreserved,
+                                        &model,
+                                        mt,
+                                        &account.name,
+                                        it,
+                                        ot,
+                                    )
+                                    .await
+                                }
+                                None => {}
                             }
-                            None => {}
+                            recognized += 1;
                         }
-                        recognized += 1;
                     }
                     if cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
                         break;

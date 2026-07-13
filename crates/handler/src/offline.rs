@@ -126,9 +126,12 @@ impl OfflineHandler {
             // synchronous fence before starting each item: if we were reclaimed
             // while stalled, learn it here and stop before running/billing the
             // next item — so at most the one item already in flight double-runs
-            // (the resume/dedup path tolerates exactly that). claim 0 = in-process,
-            // unfenced (the local store's touch is a no-op that returns true).
-            if claim != 0 && matches!(store.batch_touch(id, claim).await, Ok(false)) {
+            // (the resume/dedup path tolerates exactly that). Fail CLOSED: a
+            // touch that can't confirm ownership (reclaimed OR the store is
+            // unreachable) stops us, so a partitioned worker can't keep charging
+            // items it may no longer own. claim 0 = in-process, unfenced (the
+            // local store's touch is a no-op that returns Ok(true)).
+            if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
                 break;
             }
@@ -186,8 +189,9 @@ impl OfflineHandler {
             return; // the reclaiming instance owns the terminal status now
         }
         // final ownership check right before the terminal write, so a reclaim
-        // during the last item can't be clobbered by our stale Completed/Failed
-        if claim != 0 && matches!(store.batch_touch(id, claim).await, Ok(false)) {
+        // during the last item can't be clobbered by our stale Completed/Failed;
+        // fail closed (skip the write) if ownership can't be confirmed
+        if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
             return;
         }
         // Completed only if every result persisted; a lost write means missing
