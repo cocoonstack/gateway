@@ -1066,16 +1066,36 @@ async fn messages(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-/// The anthropic-shaped tool_use blocks inside an engine's tool_calls value.
+/// The anthropic tool_use blocks for an engine's tool_calls value: native
+/// blocks pass through; OpenAI-shaped calls (a cross-protocol model behind
+/// /v1/messages) run through the dsl's data-driven openai→anthropic mapping.
 fn anthropic_tool_blocks(tool_calls: &Option<Value>) -> Vec<Value> {
-    match tool_calls {
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|b| b["type"] == "tool_use")
-            .cloned()
-            .collect(),
-        _ => Vec::new(),
+    let Some(Value::Array(blocks)) = tool_calls else {
+        return Vec::new();
+    };
+    let native: Vec<Value> = blocks
+        .iter()
+        .filter(|b| b["type"] == "tool_use")
+        .cloned()
+        .collect();
+    if !native.is_empty() {
+        return native;
     }
+    if !blocks.iter().any(|b| b.get("function").is_some()) {
+        return Vec::new();
+    }
+    let envelope = json!({"choices": [{"message": {"tool_calls": blocks}}]});
+    let converted =
+        gw_protocol::dsl::transform(&envelope, &gw_protocol::dsl::openai_to_anthropic());
+    converted["content"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|b| b["type"] == "tool_use")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Streaming /v1/messages: pipeline chunks re-emitted incrementally as the
@@ -1100,6 +1120,9 @@ fn messages_stream_response(
         /// index of the open text content block, if any.
         text_idx: Option<usize>,
         next_idx: usize,
+        /// OpenAI-shaped tool-call fragments from a cross-protocol upstream,
+        /// accumulated until the stream ends (arguments arrive in pieces).
+        tool_frags: Option<Value>,
         pending_finish: Option<String>,
         ended: bool,
     }
@@ -1171,6 +1194,11 @@ fn messages_stream_response(
 
         fn finish(&mut self, input_tokens: i64, output_tokens: i64) {
             self.ensure_message_start();
+            if let Some(frags) = self.tool_frags.take() {
+                for block in anthropic_tool_blocks(&Some(frags)) {
+                    self.emit_tool_block(&block);
+                }
+            }
             self.close_text();
             let stop = self
                 .pending_finish
@@ -1195,6 +1223,7 @@ fn messages_stream_response(
         started_msg: false,
         text_idx: None,
         next_idx: 0,
+        tool_frags: None,
         pending_finish: None,
         ended: false,
     };
@@ -1227,8 +1256,17 @@ fn messages_stream_response(
                     }
                     if let Some(tc) = &c.tool_calls {
                         st.ensure_message_start();
-                        for block in anthropic_tool_blocks(&Some(tc.clone())) {
-                            st.emit_tool_block(&block);
+                        let native = tc
+                            .as_array()
+                            .map(|a| a.iter().any(|b| b["type"] == "tool_use"))
+                            .unwrap_or(false);
+                        if native {
+                            for block in anthropic_tool_blocks(&Some(tc.clone())) {
+                                st.emit_tool_block(&block);
+                            }
+                        } else {
+                            // cross-protocol fragments: assemble, convert at end
+                            gw_engines::merge_tool_call_fragments(&mut st.tool_frags, tc);
                         }
                     }
                     if let Some(fr) = c.finish_reason {

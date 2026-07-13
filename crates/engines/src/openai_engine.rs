@@ -99,7 +99,7 @@ impl OpenAiEngine {
                 body.insert("stop".into(), v.clone());
             }
             if let Some(v) = &p.tools {
-                body.insert("tools".into(), v.clone());
+                body.insert("tools".into(), normalize_tools_openai(v));
             }
             if let Some(v) = &p.tool_choice {
                 body.insert("tool_choice".into(), v.clone());
@@ -269,7 +269,7 @@ fn apply_sse_event(
 /// OpenAI streams tool calls as fragments keyed by `index`: the first fragment
 /// of a call carries id/type/function.name, later ones append to
 /// function.arguments. Overwriting would keep only the last fragment.
-fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
+pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
     let Some(frags) = fragment.as_array() else {
         return;
     };
@@ -306,6 +306,30 @@ fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
             call["function"]["arguments"] = json!(joined);
         }
     }
+}
+
+/// Tool definitions in the OpenAI wire shape. Cross-protocol requests carry
+/// anthropic-shaped defs ({name, description, input_schema}) — wrap those into
+/// the function envelope; native defs pass through.
+fn normalize_tools_openai(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    Value::Array(
+        arr.iter()
+            .map(|t| {
+                if t.get("input_schema").is_some() && t.get("function").is_none() {
+                    json!({"type": "function", "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["input_schema"],
+                    }})
+                } else {
+                    t.clone()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Copy token fields + keep the raw usage subtree bytes for the DAG node.

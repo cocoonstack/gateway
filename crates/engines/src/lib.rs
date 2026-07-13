@@ -28,7 +28,7 @@ pub use families::{
     AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, PassthroughEngine,
     ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
 };
-pub use openai_engine::OpenAiEngine;
+pub use openai_engine::{OpenAiEngine, merge_tool_call_fragments};
 pub use sse::SseDecoder;
 pub use transport::{
     MockTransport, SharedTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,

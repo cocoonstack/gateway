@@ -73,7 +73,7 @@ impl ClaudeEngine {
                 body.insert("top_p".into(), json!(t));
             }
             if let Some(tools) = &p.tools {
-                body.insert("tools".into(), tools.clone());
+                body.insert("tools".into(), normalize_tools_anthropic(tools));
             }
             if let Some(tc) = &p.tool_choice {
                 body.insert("tool_choice".into(), tc.clone());
@@ -213,6 +213,30 @@ impl ModelEngine for ClaudeEngine {
     fn recorder(&self) -> &dyn Recorder {
         &self.recorder
     }
+}
+
+/// Tool definitions in the anthropic wire shape. Cross-protocol requests carry
+/// OpenAI-shaped defs ({type:"function", function:{name, parameters}}) —
+/// flatten those; native defs pass through.
+fn normalize_tools_anthropic(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    Value::Array(
+        arr.iter()
+            .map(|t| {
+                if let Some(f) = t.get("function") {
+                    json!({
+                        "name": f["name"],
+                        "description": f["description"],
+                        "input_schema": f["parameters"],
+                    })
+                } else {
+                    t.clone()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Accumulating state for the anthropic streaming event sequence, shared by

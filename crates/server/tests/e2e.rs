@@ -571,6 +571,45 @@ async fn messages_errors_are_anthropic_shaped() {
 }
 
 #[tokio::test]
+async fn messages_cross_protocol_converts_tool_calls_to_tool_use() {
+    // an openai-family model behind /v1/messages: anthropic-shaped tool defs
+    // must reach the vendor as function defs, and the returned tool_calls must
+    // come back as anthropic tool_use blocks (the dsl mapping at work)
+    let app = app();
+    let body = r#"{"model":"gpt-4o","max_tokens":64,
+        "messages":[{"role":"user","content":"use the tool"}],
+        "tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object"}}]}"#;
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/messages", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let block = j["content"]
+        .as_array()
+        .and_then(|c| c.iter().find(|b| b["type"] == "tool_use"))
+        .cloned()
+        .expect("tool_use block from a cross-protocol model");
+    assert_eq!(block["name"], "get_weather");
+    assert!(block["input"].is_object(), "arguments parsed: {block}");
+    assert_eq!(j["stop_reason"], "tool_use");
+
+    // streaming: same conversion, emitted as tool_use content blocks
+    let body = r#"{"model":"gpt-4o","max_tokens":64,"stream":true,
+        "messages":[{"role":"user","content":"use the tool"}],
+        "tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object"}}]}"#;
+    let resp = app
+        .oneshot(post("/v1/messages", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(text.contains(r#""type":"tool_use""#), "sse: {text}");
+    assert!(text.contains("get_weather"), "sse: {text}");
+}
+
+#[tokio::test]
 async fn anthropic_streaming_carries_tool_use_blocks() {
     let app = app();
     let body = r#"{"model":"claude-sonnet","stream":true,"max_tokens":64,
