@@ -67,7 +67,7 @@ pub struct GatewayResponse {
     /// minimax voice clone/design extra cost.
     pub minimax_voice_generate_tokens: i64,
     /// sora2 async step marker.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub step: String,
 
     pub product_switched: bool,

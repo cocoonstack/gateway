@@ -230,6 +230,10 @@ pub struct StorageConf {
     /// Redis URL for shared rate/quota governance across replicas; empty = in-process.
     #[serde(default)]
     pub redis_url: String,
+    /// Share the response cache in Redis too (needs `redis_url`); off = each
+    /// instance caches in-process (a miss just recomputes).
+    #[serde(default)]
+    pub shared_cache: bool,
     /// Keep at most this many billing records (oldest pruned first); 0 = unlimited.
     #[serde(default)]
     pub ledger_max_rows: u64,

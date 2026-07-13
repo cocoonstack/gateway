@@ -595,14 +595,22 @@ impl AccountHealth {
     }
 }
 
-/// Request-level response cache with per-entry TTL and bounded capacity
-/// (moka).
+/// Request-level response cache: per-entry TTL, keyed by the request hash.
+/// In-process by default; Redis when `storage.shared_cache` is set, so a hit
+/// on one instance serves the whole fleet.
+#[async_trait::async_trait]
+pub trait ResponseCache: Send + Sync + std::fmt::Debug {
+    async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse>;
+    async fn put(&self, key: String, resp: gw_models::GatewayResponse, ttl: Duration);
+}
+
+/// In-process response cache (moka, bounded, per-entry TTL). The default.
 #[derive(Debug)]
-pub struct ResponseCache {
+pub struct MemoryResponseCache {
     entries: moka::sync::Cache<String, (gw_models::GatewayResponse, Duration)>,
 }
 
-impl Default for ResponseCache {
+impl Default for MemoryResponseCache {
     fn default() -> Self {
         Self {
             entries: moka::sync::Cache::builder()
@@ -613,13 +621,73 @@ impl Default for ResponseCache {
     }
 }
 
-impl ResponseCache {
-    pub fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
+#[async_trait::async_trait]
+impl ResponseCache for MemoryResponseCache {
+    async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
         self.entries.get(key).map(|(resp, _)| resp)
     }
 
-    pub fn put(&self, key: String, resp: gw_models::GatewayResponse, ttl: Duration) {
+    async fn put(&self, key: String, resp: gw_models::GatewayResponse, ttl: Duration) {
         self.entries.insert(key, (resp, ttl));
+    }
+}
+
+/// Fleet-shared response cache in Redis (`gw:cache:*`, JSON values, PX TTL).
+/// Errors degrade to a miss — the request just recomputes.
+pub struct RedisResponseCache {
+    conn: redis::aio::ConnectionManager,
+}
+
+impl std::fmt::Debug for RedisResponseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedisResponseCache")
+    }
+}
+
+impl RedisResponseCache {
+    pub async fn connect(url: &str) -> Result<Self, String> {
+        let client = redis::Client::open(url).map_err(|e| format!("redis open: {e}"))?;
+        let conn = redis::aio::ConnectionManager::new(client)
+            .await
+            .map_err(|e| format!("redis connect: {e}"))?;
+        Ok(Self { conn })
+    }
+}
+
+#[async_trait::async_trait]
+impl ResponseCache for RedisResponseCache {
+    async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
+        let mut conn = self.conn.clone();
+        let raw: Option<String> = redis::cmd("GET")
+            .arg(format!("gw:cache:{key}"))
+            .query_async(&mut conn)
+            .await
+            .ok()
+            .flatten();
+        raw.and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "cached response failed to parse; treating as miss");
+                None
+            }
+        })
+    }
+
+    async fn put(&self, key: String, resp: gw_models::GatewayResponse, ttl: Duration) {
+        let Ok(raw) = serde_json::to_string(&resp) else {
+            return;
+        };
+        let mut conn = self.conn.clone();
+        if let Err(e) = redis::cmd("SET")
+            .arg(format!("gw:cache:{key}"))
+            .arg(raw)
+            .arg("PX")
+            .arg(ttl.as_millis() as u64)
+            .query_async::<()>(&mut conn)
+            .await
+        {
+            tracing::warn!(error = %e, "redis cache put failed");
+        }
     }
 }
 
@@ -662,8 +730,8 @@ pub struct GatewayState {
     /// Account health (cooldown/recovery): in-process by default, Redis for
     /// fleet-wide cooldown.
     pub health: Arc<dyn HealthStore>,
-    /// Request-level response cache.
-    pub cache: Arc<ResponseCache>,
+    /// Request-level response cache: in-process by default, Redis when shared.
+    pub cache: Arc<dyn ResponseCache>,
 }
 
 impl Default for GatewayState {
@@ -674,7 +742,7 @@ impl Default for GatewayState {
             governance: Arc::new(MemoryGovernance::default()),
             store: Arc::new(MemoryStore::default()),
             health: Arc::new(AccountHealth::default()),
-            cache: Arc::new(ResponseCache::default()),
+            cache: Arc::new(MemoryResponseCache::default()),
         }
     }
 }
@@ -727,6 +795,17 @@ impl GatewayState {
             tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
         }
         if !cfg.storage.redis_url.is_empty() {
+            if cfg.storage.shared_cache {
+                match RedisResponseCache::connect(&cfg.storage.redis_url).await {
+                    Ok(c) => {
+                        state.cache = Arc::new(c);
+                        tracing::info!("response cache = redis (fleet-shared)");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "redis cache connect failed; staying in-process")
+                    }
+                }
+            }
             match RedisGovernance::connect(&cfg.storage.redis_url).await {
                 Ok(g) => {
                     state.governance = Arc::new(g);
@@ -1005,6 +1084,29 @@ mod tests {
             auth.authenticate("ak-adm").is_none(),
             "config-claimed key is revocable by config"
         );
+    }
+
+    /// Set GW_TEST_REDIS_URL to run this.
+    #[tokio::test]
+    async fn redis_response_cache_roundtrip() {
+        let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
+            return;
+        };
+        let c = RedisResponseCache::connect(&url).await.expect("connect");
+        let key = format!("t{}", std::process::id());
+        let resp = gw_models::GatewayResponse {
+            message: "cached hello".into(),
+            prompt_tokens: 3,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        serde_json::from_str::<gw_models::GatewayResponse>(&json).expect("serde roundtrip");
+        c.put(key.clone(), resp, Duration::from_millis(500)).await;
+        let got = c.get(&key).await.expect("hit");
+        assert_eq!(got.message, "cached hello");
+        assert_eq!(got.prompt_tokens, 3);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(c.get(&key).await.is_none(), "TTL expires");
     }
 
     #[test]

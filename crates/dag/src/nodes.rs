@@ -186,7 +186,7 @@ impl DagNode for CacheLookup {
         let Some(key) = cache_key_of(ctx) else {
             return Ok(());
         };
-        if let Some(cached) = ctx.state.cache.get(&key) {
+        if let Some(cached) = ctx.state.cache.get(&key).await {
             ctx.decide("cache_lookup", format!("hit ttl={ttl}s"));
             metrics::counter!("gateway_cache_hits_total").increment(1);
             ctx.cache_hit = true;
@@ -794,11 +794,14 @@ impl DagNode for CacheStore {
             return Ok(());
         };
         if outcome.http_code == 200 && !outcome.block.block && !outcome.response.aborted {
-            ctx.state.cache.put(
-                key.clone(),
-                outcome.response.clone(),
-                std::time::Duration::from_secs(ttl),
-            );
+            ctx.state
+                .cache
+                .put(
+                    key.clone(),
+                    outcome.response.clone(),
+                    std::time::Duration::from_secs(ttl),
+                )
+                .await;
             ctx.decide("cache_store", format!("stored ttl={ttl}s"));
         }
         Ok(())
