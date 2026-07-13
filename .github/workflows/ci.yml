@@ -11,6 +11,28 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Real backing services so the Postgres/Redis integration tests (gated on
+    # GW_TEST_PG_URL / GW_TEST_REDIS_URL) actually execute in CI instead of
+    # silently self-skipping.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: gwtest
+          POSTGRES_DB: gw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      GW_TEST_PG_URL: postgres://postgres:gwtest@127.0.0.1:5432/gw
+      GW_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -7,21 +7,16 @@ shared, what stays local, and what the LB needs to do.
 
 | State | Backend | Shared across the fleet? |
 |-------|---------|--------------------------|
-| Rate limits / quotas (`Governance`) | Redis (`storage.redis_url`) | ✅ yes, when Redis is set |
-| Billing ledger / files / batches (`Store`) | SQLite (`storage.sqlite_path`) | ❌ SQLite is local; needs a networked backend |
-| Account health / cooldown | in-process | ❌ per-instance |
+| Rate limits / quotas / TPM (`Governance`) | Redis (`storage.redis_url`) | ✅ when Redis is set (includes pooled tenant QPS) |
+| Account health / cooldown (`HealthStore`) | Redis (`storage.redis_url`) | ✅ when Redis is set — one instance's cooldown benches the account for all |
+| Config: keys/models/providers/tenants (`ConfigStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — versioned documents + a change feed |
+| Access-key table (`KeyStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — admin key CRUD is fleet-wide within ~2s and survives restarts |
+| Billing ledger / files / batches (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres; SQLite stays per-node |
 | Request cache | in-process (moka) | ❌ per-instance (a miss just recomputes) |
-| Config (keys, models, providers) | local YAML | ❌ loaded at boot per instance |
 
-**For a correct fleet you need:**
-
-1. **Redis** for `Governance` — so per-key QPS/quota/TPM hold across all
-   instances instead of each counting on its own.
-2. A **shared config** so every instance authenticates the same keys and
-   routes the same models (see [Dynamic config](#dynamic-config) below).
-3. A **shared `Store`** if you rely on the ledger/files/batches being visible
-   from any instance — SQLite is per-node. A networked Store (Postgres) is planned; until then, either pin ledger reads to one node or accept
-   per-node ledgers aggregated at scrape time.
+**A correct fleet = one Postgres (`storage.postgres_url`) + one Redis
+(`storage.redis_url`) shared by every instance.** Without them each instance
+counts, authenticates, and records on its own.
 
 ## Load balancer
 
@@ -49,15 +44,15 @@ Use the sample [`deploy/nginx.conf`](../deploy/nginx.conf). The essentials:
 
 ## Dynamic config
 
-Config is currently a YAML file loaded at boot; changing keys or models needs
-a restart. For a fleet you want to change keys without redeploying. The
-roadmap direction:
+With `storage.postgres_url` set, config lives in the Postgres config store as
+versioned documents; the local YAML file only seeds an empty store. To change
+config fleet-wide, `PUT /admin/config` (global admin token) on any instance:
+the document is validated, stored as a new version, and every instance —
+including the publisher — reloads through the store's change feed, atomically
+and with no dropped connections. `SIGHUP` and `POST /admin/reload` still
+re-read the source for single-node or file-based setups.
 
-1. Hot reload: `SIGHUP` / an admin endpoint re-reads the config source and
-   swaps it atomically (no dropped connections). Combined with a shared source
-   (a mounted ConfigMap, an object in Redis), all instances pick up changes.
-2. A `KeyStore` seam backed by Redis/SQL with an admin API to create, revoke,
-   and re-quota keys at runtime — every instance reads the live source, so a
-   key issued once is valid fleet-wide immediately.
-
-See the [issue tracker](https://github.com/cocoonstack/gateway/issues) for status.
+Access keys are higher-churn and have their own seam: `/admin/keys` CRUD
+writes the shared Postgres key table directly (no config publish needed); a
+key created, re-quota'd, banned, or revoked on one instance is live on all
+within the ~2s auth-cache TTL. See [API — Admin](api.md#admin-dynamic-config).

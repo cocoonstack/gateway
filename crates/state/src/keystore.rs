@@ -5,10 +5,10 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use gw_models::{GResult, GatewayError};
 use sqlx::Row;
 
 use crate::{AkInfo, KeySource};
-use gw_models::{GResult, GatewayError};
 
 /// How long an instance may serve a stale key view: the fleet-wide bound on
 /// create/revoke propagation (a local write invalidates its own cache at once).
@@ -54,6 +54,9 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
 pub struct PostgresKeyStore {
     pool: sqlx::PgPool,
     cache: moka::sync::Cache<String, Option<AkInfo>>,
+    /// Bumped on every write: an authenticate that overlapped a write skips
+    /// caching its (possibly pre-write) fetch instead of poisoning the cache.
+    write_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl PostgresKeyStore {
@@ -85,7 +88,14 @@ impl PostgresKeyStore {
                 .max_capacity(AUTH_CACHE_MAX)
                 .time_to_live(AUTH_CACHE_TTL)
                 .build(),
+            write_epoch: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    fn note_write(&self, ak: &str) {
+        self.write_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.cache.invalidate(ak);
     }
 
     async fn fetch(&self, ak: &str) -> Result<Option<AkInfo>, sqlx::Error> {
@@ -106,9 +116,12 @@ impl KeyStore for PostgresKeyStore {
         if let Some(cached) = self.cache.get(ak) {
             return cached;
         }
+        let epoch = self.write_epoch.load(std::sync::atomic::Ordering::Acquire);
         match self.fetch(ak).await {
             Ok(info) => {
-                self.cache.insert(ak.to_owned(), info.clone());
+                if self.write_epoch.load(std::sync::atomic::Ordering::Acquire) == epoch {
+                    self.cache.insert(ak.to_owned(), info.clone());
+                }
                 info
             }
             Err(e) => {
@@ -148,7 +161,7 @@ impl KeyStore for PostgresKeyStore {
         .execute(&self.pool)
         .await
         .map_err(|e| key_err("upsert access key", e))?;
-        self.cache.invalidate(&info.ak);
+        self.note_write(&info.ak);
         Ok(())
     }
 
@@ -161,8 +174,7 @@ impl KeyStore for PostgresKeyStore {
         expires_at_epoch_secs: Option<Option<i64>>,
         banned: Option<bool>,
     ) -> GResult<Option<AkInfo>> {
-        // read-modify-write under FOR UPDATE: concurrent patches serialize
-        // instead of clobbering each other's untouched fields.
+        // FOR UPDATE: concurrent patches serialize instead of clobbering fields
         let mut tx = self
             .pool
             .begin()
@@ -209,7 +221,7 @@ impl KeyStore for PostgresKeyStore {
         .await
         .map_err(|e| key_err("apply patch", e))?;
         tx.commit().await.map_err(|e| key_err("commit patch", e))?;
-        self.cache.invalidate(ak);
+        self.note_write(ak);
         Ok(Some(info))
     }
 
@@ -220,7 +232,7 @@ impl KeyStore for PostgresKeyStore {
             .await
             .map_err(|e| key_err("revoke key", e))?
             .rows_affected();
-        self.cache.invalidate(ak);
+        self.note_write(ak);
         Ok(n > 0)
     }
 
@@ -276,6 +288,8 @@ impl KeyStore for PostgresKeyStore {
             .map_err(|e| key_err("re-apply config key", e))?;
         }
         tx.commit().await.map_err(|e| key_err("commit reload", e))?;
+        self.write_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.cache.invalidate_all();
         Ok(())
     }
@@ -332,14 +346,12 @@ mod tests {
             return;
         };
         let ks = PostgresKeyStore::connect(&url).await.expect("pg connect");
-        // isolate from previous runs
         sqlx::query("TRUNCATE access_keys")
             .execute(&ks.pool)
             .await
             .unwrap();
         ks.cache.invalidate_all();
 
-        // create-and-use, negative caching, revoke
         ks.put(info("pk-a", 1.0), KeySource::Admin).await.unwrap();
         assert_eq!(ks.authenticate("pk-a").await.unwrap().qps, 1.0);
         assert!(ks.authenticate("pk-nope").await.is_none());
@@ -350,7 +362,6 @@ mod tests {
         );
         assert!(!ks.revoke("pk-a").await.unwrap());
 
-        // patch tri-state
         ks.put(info("pk-b", 2.0), KeySource::Admin).await.unwrap();
         let p = ks
             .patch("pk-b", Some(9.0), None, Some(Some(5)), None, Some(true))
@@ -366,7 +377,6 @@ mod tests {
         assert_eq!(p.tokens_per_minute, None);
         assert!(p.banned, "untouched fields survive a partial patch");
 
-        // config reload semantics: sticky source + admin keys survive
         let cfg = gw_config::GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: pk-cfg, product: p, qps: 1, daily_token_quota: 5}]",
         )
@@ -377,7 +387,6 @@ mod tests {
             ks.authenticate("pk-b").await.is_some(),
             "admin key survives reload"
         );
-        // admin overwrite must not defeat config revocation
         ks.put(info("pk-cfg", 3.0), KeySource::Admin).await.unwrap();
         let empty =
             gw_config::GatewayConfig::from_yaml("listen: {host: h, port: 1}\naccess_keys: []")

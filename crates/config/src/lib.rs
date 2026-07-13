@@ -34,6 +34,8 @@ pub enum ConfigError {
     ModelNeedsDispatch { model: String },
     #[error("duplicate {kind} name `{name}`")]
     DuplicateName { kind: &'static str, name: String },
+    #[error("{kind} with an empty name")]
+    EmptyName { kind: &'static str },
     #[error("access key `{ak}` references undeclared tenant `{tenant}`")]
     UnknownTenant { ak: String, tenant: String },
     #[error("tenant `{tenant}` entitles unknown model `{model}`")]
@@ -53,14 +55,18 @@ fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashM
         .collect()
 }
 
-/// Reject duplicate names — name lookups are last-wins, so a duplicate is an
-/// ambiguous config that should fail at load, not silently pick one entry.
+/// Reject duplicate and empty names — name lookups are last-wins, so a
+/// duplicate is ambiguous, and an empty name is unreachable (e.g. a tenant
+/// named "" can never be referenced: empty key tenants coerce to `default`).
 fn check_unique<'a>(
     kind: &'static str,
     names: impl Iterator<Item = &'a str>,
 ) -> Result<(), ConfigError> {
     let mut seen = std::collections::HashSet::new();
     for name in names {
+        if name.is_empty() {
+            return Err(ConfigError::EmptyName { kind });
+        }
         if !seen.insert(name) {
             return Err(ConfigError::DuplicateName {
                 kind,

@@ -51,9 +51,10 @@ State that must be shared across replicas has a backend:
 
 ```yaml
 storage:
-  sqlite_path: /var/lib/gw/store.db    # durable ledger/files/batches
+  postgres_url: "postgres://gw:secret@db:5432/gw"  # fleet config + keys + ledger/files/batches
+  redis_url: "redis://redis:6379"      # shared rate limits + quotas + account health
   ledger_max_rows: 1000000             # prune oldest billing rows past the cap
-  redis_url: "redis://redis:6379"      # shared rate limits + quotas
+  # sqlite_path: /var/lib/gw/store.db  # single-node alternative to postgres_url
 ```
 
 - **Durable records** (ledger, files, batches): SQLite when `sqlite_path` is

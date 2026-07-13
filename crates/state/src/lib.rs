@@ -235,32 +235,40 @@ impl KeyStore for AkAuth {
 /// Rate limiter (GCRA via governor), one limiter per AK.
 #[derive(Default)]
 pub struct RateLimiter {
-    buckets: DashMap<String, Arc<governor::DefaultDirectRateLimiter>>,
+    buckets: DashMap<String, (f64, Arc<governor::DefaultDirectRateLimiter>)>,
 }
 
 impl RateLimiter {
     /// Take one permit. qps >= 1: replenish/burst = round(qps); 0 < qps < 1:
     /// one permit per 1/qps seconds (burst 1); qps <= 0: always denied.
+    /// A bucket whose stored qps differs is rebuilt, so an admin PATCH or a
+    /// config reload takes effect immediately (a rebuilt bucket starts full).
     pub fn allow(&self, key: &str, qps: f64) -> bool {
         if qps <= 0.0 {
             return false;
         }
-        let limiter = self
+        let mut e = self
             .buckets
             .entry(key.to_owned())
-            .or_insert_with(|| {
-                let quota = if qps < 1.0 {
-                    governor::Quota::with_period(Duration::from_secs_f64(1.0 / qps))
-                        .unwrap_or_else(|| governor::Quota::per_second(NonZeroU32::MIN))
-                } else {
-                    let per_sec = qps.round().clamp(1.0, u32::MAX as f64) as u32;
-                    governor::Quota::per_second(NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MIN))
-                };
-                Arc::new(governor::RateLimiter::direct(quota))
-            })
-            .clone();
+            .or_insert_with(|| (qps, new_bucket(qps)));
+        if e.0 != qps {
+            *e = (qps, new_bucket(qps));
+        }
+        let limiter = e.1.clone();
+        drop(e);
         limiter.check().is_ok()
     }
+}
+
+fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
+    let quota = if qps < 1.0 {
+        governor::Quota::with_period(Duration::from_secs_f64(1.0 / qps))
+            .unwrap_or_else(|| governor::Quota::per_second(NonZeroU32::MIN))
+    } else {
+        let per_sec = qps.round().clamp(1.0, u32::MAX as f64) as u32;
+        governor::Quota::per_second(NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MIN))
+    };
+    Arc::new(governor::RateLimiter::direct(quota))
 }
 
 impl std::fmt::Debug for RateLimiter {
@@ -659,12 +667,17 @@ pub struct Snapshot {
 #[derive(Clone)]
 pub struct SharedConfig {
     inner: Arc<arc_swap::ArcSwap<Snapshot>>,
+    /// Serializes reloads: two divergent concurrent reloads (SIGHUP racing the
+    /// config feed) would otherwise interleave key-table writes and could pair
+    /// one reload's cfg pointer with the other's key set.
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SharedConfig {
     pub fn new(cfg: Arc<GatewayConfig>, state: Arc<GatewayState>) -> Self {
         Self {
             inner: Arc::new(arc_swap::ArcSwap::from_pointee(Snapshot { cfg, state })),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -676,6 +689,7 @@ impl SharedConfig {
     /// Swap in a new config, rebuilding derived state and preserving seams.
     /// On error (networked key table unreachable) the old snapshot stays live.
     pub async fn reload(&self, cfg: GatewayConfig) -> gw_models::GResult<()> {
+        let _serialized = self.reload_lock.lock().await;
         let prev = self.inner.load();
         let state = GatewayState::reload_from(&cfg, &prev.state).await?;
         self.inner.store(Arc::new(Snapshot {
@@ -698,6 +712,17 @@ mod tests {
 
     fn state() -> GatewayState {
         GatewayState::from_config(&GatewayConfig::embedded_default().unwrap())
+    }
+
+    #[test]
+    fn rate_limit_qps_change_takes_effect_immediately() {
+        let rl = RateLimiter::default();
+        assert!(rl.allow("k", 1.0));
+        assert!(!rl.allow("k", 1.0), "second call at qps=1 denied");
+        assert!(rl.allow("k", 100.0), "raised qps rebuilds the bucket");
+        assert!(rl.allow("k", 100.0));
+        assert!(rl.allow("k", 0.5), "lowered qps rebuilds too (burst 1)");
+        assert!(!rl.allow("k", 0.5), "and throttles at the new rate");
     }
 
     #[test]

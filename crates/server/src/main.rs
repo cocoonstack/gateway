@@ -1,9 +1,11 @@
 //! Service entrypoint.
 //!
-//! Load local config (GW_CONFIG path, else the embedded default), build
-//! in-process state, select the upstream transport (`GW_TRANSPORT`), spawn local
-//! background tasks, serve the views router with graceful shutdown
-//! (SIGINT/SIGTERM → drain).
+//! Load config (GW_CONFIG path, else the embedded default; with
+//! `storage.postgres_url` set the Postgres config store is the source of truth
+//! and the file only seeds it), build state with the configured backends,
+//! select the upstream transport (`GW_TRANSPORT`), spawn local background
+//! tasks and the config change feed, serve the views router with graceful
+//! shutdown (SIGINT/SIGTERM → drain).
 //!
 //! Accounts with a configured `endpoint` egress to real vendors; accounts
 //! without one are served by the in-process mock. `GW_TRANSPORT=mock` forces
@@ -177,6 +179,11 @@ async fn main() -> anyhow::Result<()> {
                 match gw_state::configstore::subscribe(&postgres_url).await {
                     Ok(mut versions) => {
                         tracing::info!("config change feed connected");
+                        // catch up: a publish during a reconnect gap fired its
+                        // NOTIFY to no one, so re-read latest on every connect
+                        if let Err(e) = app.reload().await {
+                            tracing::error!(error = %e, "config feed: catch-up reload failed");
+                        }
                         while let Some(version) = versions.recv().await {
                             match app.reload().await {
                                 Ok(()) => tracing::info!(version, "config feed: reloaded"),

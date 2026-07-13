@@ -81,9 +81,8 @@ impl RedisHealth {
 impl HealthStore for RedisHealth {
     async fn record_failure(&self, name: &str, threshold: usize, cooldown: Duration) -> bool {
         let mut conn = self.conn.clone();
-        // One atomic step: bump the streak and trip the cooldown flag when the
-        // threshold is reached and no cooldown is already active (an expired
-        // flag no longer EXISTS, so a still-failing account re-arms).
+        // Atomic trip; an expired flag no longer EXISTS, so a still-failing
+        // account re-arms.
         let script = redis::Script::new(
             "local f = redis.call('INCR', KEYS[1])
              redis.call('PEXPIRE', KEYS[1], ARGV[3])

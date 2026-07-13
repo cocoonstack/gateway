@@ -493,6 +493,34 @@ access_keys:
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
 
+    // creating a key under an undeclared tenant is rejected even for the
+    // global admin (it would silently be unrestricted)
+    let r = app
+        .clone()
+        .oneshot(admin(
+            "POST",
+            "/admin/keys",
+            "g-secret",
+            Some(r#"{"ak":"x","product":"p","tenant":"acmee"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // config publish: global-only, and 400 without a configured config store
+    let r = app
+        .clone()
+        .oneshot(admin("PUT", "/admin/config", "t-secret", Some("x: 1")))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = app
+        .clone()
+        .oneshot(admin("PUT", "/admin/config", "g-secret", Some("x: 1")))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "no config store wired");
+
     // listing is scoped; the global token sees everything
     let r = app
         .clone()
@@ -561,6 +589,93 @@ access_keys:
         .map(|u| u["tenant"].as_str().unwrap())
         .collect();
     assert_eq!(tenants, vec!["acme", "beta"], "global usage sees all");
+}
+
+/// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw) to
+/// run this: the PUT /admin/config success path against a real config store.
+#[tokio::test]
+async fn admin_config_publish_reloads_from_store() {
+    let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+        return;
+    };
+    const BOOT: &str = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_TEST_ADMIN_TOKEN_CFGPUB}
+models: [{name: gpt-4o, protocol: openai-chat}]
+accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
+access_keys: [{ak: ak-boot, product: demo, qps: 100, daily_token_quota: 1000000}]
+"#;
+    // SAFETY: unique var name for this test; no concurrent reader of it.
+    unsafe { std::env::set_var("GW_TEST_ADMIN_TOKEN_CFGPUB", "cfg-secret") };
+    let store = Arc::new(
+        gw_state::PostgresConfigStore::connect(&url)
+            .await
+            .expect("config store"),
+    );
+    store.publish(BOOT).await.expect("seed");
+    let cfg = Arc::new(GatewayConfig::from_yaml(BOOT).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let loader: gw_views::ConfigLoader = {
+        let store = store.clone();
+        Arc::new(move || {
+            let store = store.clone();
+            Box::pin(async move {
+                match store.load_latest().await.map_err(|e| e.to_string())? {
+                    Some((_, yaml)) => GatewayConfig::from_yaml(&yaml).map_err(|e| e.to_string()),
+                    None => Err("empty store".to_owned()),
+                }
+            }) as gw_views::ConfigFuture
+        })
+    };
+    let app = gw_views::app(
+        AppState::with_config(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+            Some(loader),
+        )
+        .with_config_store(store),
+    );
+    let put = |body: &str| {
+        Request::builder()
+            .method("PUT")
+            .uri("/admin/config")
+            .header("authorization", "Bearer cfg-secret")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    };
+
+    // an invalid document is rejected before it reaches the store
+    let r = app
+        .clone()
+        .oneshot(put("models: [{name: x}]"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // a valid publish returns the version and reloads this instance
+    let v2 = BOOT.replace("ak-boot", "ak-pushed");
+    let r = app.clone().oneshot(put(&v2)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(body_json(r).await["version"].as_i64().unwrap() >= 2);
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-pushed"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "published key live after reload"
+    );
+    let r = app
+        .oneshot(post("/v1/chat/completions", Some("ak-boot"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::UNAUTHORIZED,
+        "old config key dropped"
+    );
 }
 
 #[tokio::test]

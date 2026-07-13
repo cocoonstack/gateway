@@ -18,16 +18,23 @@ listen:
   port: 8080
 ```
 
-### `storage` — durable records backend
+### `storage` — durable records and fleet backends
 
 ```yaml
 storage:
   sqlite_path: /var/lib/gw/store.db   # empty/absent = in-memory
+  postgres_url: postgres://gw:secret@db.internal/gw   # fleet-shared backend
+  redis_url: redis://cache.internal:6379              # shared counters + health
   ledger_max_rows: 100000             # prune oldest billing rows past the cap; 0 = unlimited
 ```
 
-The billing ledger, uploaded files, and batch jobs live here. In-memory
-by default (lost on restart); a SQLite path makes them durable.
+The billing ledger, uploaded files, and batch jobs live here. In-memory by
+default (lost on restart); a SQLite path makes them durable on one node.
+`postgres_url` turns Postgres into the fleet backend: the source of truth for
+config (versioned documents + a change feed every instance follows), the
+shared access-key table, and the shared ledger/files/batches store.
+`redis_url` shares rate/quota/TPM counters and account-health cooldowns across
+instances.
 
 ### `access_keys` — client authentication and per-key governance
 
@@ -35,10 +42,32 @@ by default (lost on restart); a SQLite path makes them durable.
 access_keys:
   - ak: ak-demo-123          # bearer / x-api-key value clients send
     product: demo            # product group (for product-level QPM)
+    tenant: acme             # optional; absent = the unrestricted `default` tenant
     qps: 100                 # per-key request rate
     daily_token_quota: 1000000
     tokens_per_minute: 600   # optional TPM window limit
+    expires_at_epoch_secs: 1767225600  # optional expiry (403 after)
+    banned: false            # optional; a banned key 403s but stays listed
+    model_quotas:            # optional per-model daily caps (override tenant defaults)
+      gpt-4o: 200000
 ```
+
+### `tenants` — pooled limits, entitlement, quota defaults
+
+```yaml
+tenants:
+  - name: acme
+    qps: 50                  # pooled across ALL of acme's keys
+    models: [gpt-4o, gpt-4o-mini]   # entitlement allowlist; absent = every model
+    model_quotas:            # per-model daily-token defaults, applied per key
+      gpt-4o: 100000
+    fallback_model: gpt-4o-mini     # over-quota requests degrade here instead of failing
+    admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
+```
+
+Keys without a `tenant` join the implicit `default` tenant (no pooled limits,
+entitled to every model), so a flat config keeps working unchanged. The model
+catalog (`GET /v1/models`) filters to the caller's entitlement.
 
 ### `models` — public model names and dispatch
 

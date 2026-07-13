@@ -360,7 +360,10 @@ async fn realtime_session(
                     (input.len() as i64 / 4).max(1) + 3,
                     (reply.len() as i64 / 4).max(1),
                 );
-                let mid = reply.len() / 2;
+                let mid = (0..=reply.len() / 2)
+                    .rev()
+                    .find(|&i| reply.is_char_boundary(i))
+                    .unwrap_or(0);
                 let (a, b) = reply.split_at(mid);
                 let _ = socket
                     .send(send(json!({"type":"response.delta","delta": a})))
@@ -716,7 +719,8 @@ impl AdminScope {
     }
 }
 
-/// Admin surface gate: a bearer check against the global admin token, then
+/// Admin surface gate: a bearer check against the global admin token first
+/// (a tenant token colliding with it grants global, never the reverse), then
 /// each tenant's scoped token. Disabled (404) while no admin token of any kind
 /// is configured, so probing the surface can't tell it apart from a
 /// nonexistent route.
@@ -733,17 +737,26 @@ fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, (u16, &'s
     let Some(presented) = presented else {
         return Err((401, "invalid admin token"));
     };
-    if global.as_deref() == Some(presented) {
+    if global.is_some_and(|g| ct_eq(&g, presented)) {
         return Ok(AdminScope::Global);
     }
     if let Some(t) = cfg
         .tenants
         .iter()
-        .find(|t| t.admin_token().as_deref() == Some(presented))
+        .find(|t| t.admin_token().is_some_and(|tok| ct_eq(&tok, presented)))
     {
         return Ok(AdminScope::Tenant(t.name.clone()));
     }
     Err((401, "invalid admin token"))
+}
+
+/// Constant-time string equality for bearer-token checks.
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// POST /admin/reload — re-read config from source and swap it in atomically
@@ -810,10 +823,16 @@ async fn admin_key_create(
     if !scope.covers(tenant) {
         return error_response(403, "tenant admin may only create keys in its own tenant");
     }
+    // A typo'd tenant would silently produce an unrestricted key (no tenant
+    // entry = no entitlement/pooled limits), so reject undeclared tenants here
+    // exactly like config-file validation does.
+    if tenant != gw_config::DEFAULT_TENANT && s.handler.cfg().find_tenant(tenant).is_none() {
+        return error_response(400, format!("unknown tenant `{tenant}`"));
+    }
     if let Some(existing) = s.handler.state().auth.authenticate(ak).await
         && !scope.covers(&existing.tenant)
     {
-        return error_response(403, "key exists under another tenant");
+        return error_response(404, "not found");
     }
     let info = AkInfo {
         ak: ak.to_owned(),
@@ -876,7 +895,8 @@ async fn admin_key_patch(
     // how qps/daily_token_quota ignore malformed input.
     let tri = |field: &str| match body.get(field) {
         Some(Value::Null) => Some(None),
-        Some(v) if v.is_i64() || v.is_u64() => Some(v.as_i64()),
+        // out-of-range u64 falls through to "leave unchanged", never "clear"
+        Some(v) if v.is_i64() || v.is_u64() => v.as_i64().map(Some),
         _ => None,
     };
     let patched = s

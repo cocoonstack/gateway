@@ -1,14 +1,19 @@
-# gw — local gateway config.
-# Local file only; there is no config center.
+# gw — gateway config.
+# This file is the config source for a single node. With storage.postgres_url
+# set, the Postgres config store becomes the fleet source of truth: this file
+# only seeds an empty store, and updates flow through PUT /admin/config.
 
 listen:
   host: 127.0.0.1
   port: 8080
 
 # Durable records (billing ledger, files, batches). Empty/absent = in-memory;
-# set a path to persist across restarts.
+# sqlite persists on one node; postgres shares config/keys/records across a
+# fleet (and redis_url shares rate/quota counters + account health).
 # storage:
 #   sqlite_path: /var/lib/gw/store.db
+#   postgres_url: postgres://gw:secret@db.internal/gw
+#   redis_url: redis://cache.internal:6379
 
 # Dynamic-config admin surface (SIGHUP / POST /admin/reload, key CRUD).
 # Disabled unless token_env names an env var holding a bearer token. Keep it on

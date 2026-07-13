@@ -14,7 +14,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 | `models`    | L1    | request/response domain types, typed params, usage, cost |
 | `protocol`  | L1    | OpenAI / Anthropic wire types, DSL response transforms |
 | `config`    | L1    | YAML config loading (`conf/gateway.yaml`) |
-| `state`     | L2    | auth, account pool, quotas, rate limits, ledger, batch/file stores (in-process) |
+| `state`     | L2    | auth, account pool, quotas, rate limits, ledger, batch/file stores (in-process defaults; Postgres/Redis fleet backends) |
 | `engines`   | L3    | engine implementations behind the `Transport` seam, SSE decoding, usage extraction, SigV4 |
 | `dag`       | L3    | 4-layer pipeline executor + nodes |
 | `handler`   | L4    | online/offline orchestration, DLP/blocklist plugins |
@@ -60,8 +60,20 @@ default, so the whole pipeline is testable offline:
   a request path: its consumer is token-aware PTU sizing, which is not
   ported yet.
 - **`Store`** — durable records (billing ledger, uploaded files, batch
-  jobs). `MemoryStore` by default; `SqliteStore` (sqlx) when
-  `storage.sqlite_path` is configured, surviving restarts.
+  jobs). `MemoryStore` by default; `SqliteStore` when `storage.sqlite_path`
+  is configured; `PostgresStore` when `storage.postgres_url` is — shared
+  across a fleet.
+- **`KeyStore`** — the live access-key table. `AkAuth` (in-process DashMap)
+  by default; `PostgresKeyStore` with `storage.postgres_url` — fleet-shared
+  behind a 2s auth cache, admin key CRUD survives restarts.
+- **`HealthStore`** — account cooldown/recovery. In-process breaker by
+  default; `RedisHealth` with `storage.redis_url` — a tripped account is
+  skipped by every instance.
+- **`Governance`** — rate/quota/TPM counters. In-process by default;
+  `RedisGovernance` shares them (including pooled tenant QPS) fleet-wide.
+- **config store** — with `storage.postgres_url`, config is versioned
+  documents in Postgres (`PUT /admin/config` publishes; a LISTEN/NOTIFY
+  change feed reloads every instance).
 - **metrics facade** — `metrics` crate macros throughout; the server
   installs a Prometheus recorder and serves `/metrics`.
 - Planned: see the [issue tracker](https://github.com/cocoonstack/gateway/issues).

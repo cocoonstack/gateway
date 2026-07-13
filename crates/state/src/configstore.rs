@@ -2,9 +2,8 @@
 //! A publish inserts a new version and fires a `gw_config` NOTIFY, so every
 //! instance's listener reloads without a per-instance SIGHUP.
 
-use sqlx::Row;
-
 use gw_models::{GResult, GatewayError};
+use sqlx::Row;
 
 /// Superseded versions kept for operator inspection/rollback.
 const KEEP_VERSIONS: i64 = 20;
@@ -86,10 +85,10 @@ pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
                 Ok(n) => {
                     let version = n.payload().parse().unwrap_or(0);
                     if tx.send(version).await.is_err() {
-                        return; // subscriber gone
+                        return;
                     }
                 }
-                Err(_) => return, // connection dropped; closing tx signals resubscribe
+                Err(_) => return, // closing tx signals resubscribe
             }
         }
     });
@@ -125,7 +124,6 @@ mod tests {
         assert_eq!(id, v2);
         assert!(yaml.contains("host: b"));
 
-        // the publish reached the change feed with the version id as payload
         let n = listener.recv().await.expect("notify");
         assert_eq!(n.channel(), CONFIG_CHANNEL);
         assert_eq!(n.payload(), v1.to_string());

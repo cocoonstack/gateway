@@ -107,19 +107,27 @@ surface on a private network regardless.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/admin/reload` | re-read config from source and swap it in atomically |
-| POST | `/admin/keys` | create/replace a key: `{ak, product, qps, daily_token_quota, tokens_per_minute?}` |
-| PATCH | `/admin/keys/{ak}` | re-quota: any of `qps` / `daily_token_quota` / `tokens_per_minute` (null clears TPM) |
+| POST | `/admin/reload` | re-read config from source and swap it in atomically (global token only) |
+| PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed (global token; needs `storage.postgres_url`) |
+| GET | `/admin/keys` | list keys (a tenant token sees only its own tenant's) |
+| POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` |
+| PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
+| GET | `/admin/usage` | ledger rollup by tenant × model; `?tenant=` filter for the global token |
 
-A reload rebuilds the AK table (config keys), models, providers, and accounts
-while preserving the runtime seams — governance counters, the durable store,
-account health, and the response cache. Storage-backend URL changes
-(`storage.redis_url` / `sqlite_path`) still need a restart. Reload is also
-triggered by `SIGHUP`.
+Two token tiers: the global token (`admin.token_env`) manages everything; a
+tenant's `admin_token_env` token manages only that tenant's keys and usage
+(cross-tenant keys answer 404, reload/config-publish answer 403).
+
+A reload rebuilds the AK table (config keys), models, providers, tenants, and
+accounts while preserving the runtime seams — governance counters, the durable
+store, account health, and the response cache. Storage-backend URL changes
+(`storage.postgres_url` / `redis_url` / `sqlite_path`) still need a restart.
+Reload is also triggered by `SIGHUP` and, with the Postgres config store, by
+any instance publishing via `PUT /admin/config`.
 
 Keys have their own lifecycle: the config file's `access_keys` are the boot
 baseline and are re-applied on every reload, while keys created via
-`/admin/keys` survive reloads (they are dropped only by an explicit DELETE or a
-restart). Persistent, fleet-shared key storage arrives with the Postgres backend
-(see [clustering](https://github.com/cocoonstack/gateway/issues/2)).
+`/admin/keys` survive reloads. With `storage.postgres_url` set the key table is
+fleet-shared and persistent — a key created on one instance is valid on all
+within ~2s and survives restarts.

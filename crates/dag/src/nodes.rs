@@ -141,7 +141,9 @@ impl DagNode for TenantEntitlement {
 /// engine/billing nodes all short-circuit.
 pub struct CacheLookup;
 
-/// Cache key: sha256 of model name + messages + typed params + passthrough params.
+/// Cache key: sha256 of model name + messages + typed params + passthrough
+/// params. Not keyed by tenant: entitlement gates before the cache, and a
+/// per-tenant split would only shrink the hit rate.
 fn cache_key_of(ctx: &DagContext) -> Option<String> {
     use sha2::{Digest, Sha256};
     let param = ctx.request.model_param_v2.as_ref()?;
@@ -573,6 +575,9 @@ impl DagNode for CommonUsageNode {
         "common_usage"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        if ctx.cache_hit {
+            return Ok(());
+        }
         if let Some(outcome) = ctx.outcome.as_mut() {
             let resp = &mut outcome.response;
             resp.common_usage =
@@ -668,9 +673,8 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         .map(|o| o.response.ptu_spillover)
         .unwrap_or(false);
     let param = ctx.request.model_param_v2.as_ref();
-    // served = what actually ran (post-fallback); requested = what the caller
-    // asked for. Cost bills at the served model's price; the (AK, model)
-    // counter accrues against the requested name.
+    // cost bills at the served (post-fallback) model's price; the (AK, model)
+    // counter accrues against the requested name
     let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
