@@ -148,11 +148,6 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<BatchJob> {
         self.batch_create(ak, model, items.len()).await
     }
-    /// Result indices already recorded for a batch — the drain loop resumes
-    /// past them after a reclaim instead of re-running (and re-billing) them.
-    async fn batch_result_indices(&self, _id: &str) -> GResult<std::collections::HashSet<usize>> {
-        Ok(std::collections::HashSet::new())
-    }
     /// Load a batch's input items for execution.
     async fn batch_load_items(&self, _id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
         Ok(Vec::new())
@@ -672,6 +667,10 @@ impl PostgresStore {
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (batch_id, idx))",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
+            // dedup any (batch_id, idx) rows the pre-fix plain-INSERT could have
+            // left, so the unique index below builds on an already-upgraded fleet
+            "DELETE FROM batch_results a USING batch_results b
+             WHERE a.ctid < b.ctid AND a.batch_id = b.batch_id AND a.idx = b.idx",
             "CREATE UNIQUE INDEX IF NOT EXISTS batch_results_uidx
              ON batch_results (batch_id, idx)",
         ] {
@@ -956,15 +955,6 @@ impl Store for PostgresStore {
             total: items.len(),
             results: Vec::new(),
         })
-    }
-
-    async fn batch_result_indices(&self, id: &str) -> GResult<std::collections::HashSet<usize>> {
-        let rows = sqlx::query("SELECT idx FROM batch_results WHERE batch_id = $1")
-            .bind(id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read batch result indices", e))?;
-        Ok(rows.iter().map(|r| r.get::<i64, _>(0) as usize).collect())
     }
 
     async fn batch_load_items(&self, id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {

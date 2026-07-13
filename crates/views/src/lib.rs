@@ -427,10 +427,10 @@ fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
         // frames, so bill only the turn/generation-complete frame — otherwise a
         // turn is billed once per interim frame.
         "google" | "gemini" | "vertex" => {
-            let sc = &frame["serverContent"];
-            let complete = sc["turnComplete"] == Value::Bool(true)
-                || sc["generationComplete"] == Value::Bool(true);
-            if !complete {
+            // turnComplete is the single definitive turn boundary; billing on
+            // generationComplete too would double-count when both frames carry
+            // the cumulative usageMetadata
+            if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
                 return None;
             }
             let u = &frame["usageMetadata"];
@@ -2427,8 +2427,16 @@ mod tests {
         // Gemini Live bills only the turn-complete frame (usageMetadata is cumulative)
         let g = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}});
         assert_eq!(realtime_usage("gemini", &g), Some((5, 9)));
-        let g2 = json!({"serverContent":{"generationComplete":true},"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
+        let g2 = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
         assert_eq!(realtime_usage("google", &g2), Some((5, 7)));
+        // generationComplete alone (no turnComplete) is an interim frame — not billed
+        assert_eq!(
+            realtime_usage(
+                "gemini",
+                &json!({"serverContent":{"generationComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}})
+            ),
+            None
+        );
         // an interim Gemini frame carrying cumulative usage is NOT billed
         assert_eq!(
             realtime_usage(

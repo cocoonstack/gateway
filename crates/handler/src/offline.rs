@@ -60,8 +60,19 @@ impl OfflineHandler {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
         // resume past items already recorded by a prior (crashed) executor, so
-        // a reclaim re-runs and re-bills at most the one item that was in flight
-        let done_indices = store.batch_result_indices(id).await.unwrap_or_default();
+        // a reclaim re-runs and re-bills at most the one item that was in flight;
+        // seed any_fail from those prior results so a pre-crash failure still
+        // makes the resumed batch terminal-Failed
+        let prior = store
+            .batch_get(id)
+            .await
+            .ok()
+            .flatten()
+            .map(|j| j.results)
+            .unwrap_or_default();
+        let done_indices: std::collections::HashSet<usize> =
+            prior.iter().map(|r| r.index).collect();
+        let mut any_fail = prior.iter().any(|r| !r.ok);
         // heartbeat claimed_at while items run so a slow item isn't judged
         // stale and reclaimed by another instance mid-execution
         let hb = {
@@ -76,7 +87,6 @@ impl OfflineHandler {
                 }
             })
         };
-        let mut any_fail = false;
         for (index, messages) in items.into_iter().enumerate() {
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
