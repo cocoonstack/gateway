@@ -462,34 +462,33 @@ impl DagNode for CostCalc {
             return Ok(()); // nothing to bill
         };
         let resp = &outcome.response;
-        // An aborted stream never received the vendor's usage frame, but the
-        // tokens were generated and delivered — estimate them from the request
-        // and the delivered text instead of billing zero.
-        if resp.aborted && resp.total_tokens == 0 {
+        // An aborted stream broke before the vendor's completion usage arrived,
+        // but the generated text WAS delivered to the client — bill it. The
+        // gate is `completion_tokens == 0`, not `total_tokens == 0`: Anthropic
+        // reports input_tokens up front in message_start (so total is already
+        // nonzero mid-stream), yet output_tokens only in the final message_delta
+        // that the break skipped. Estimate the missing completion from the
+        // delivered text; keep the real prompt count when the vendor gave one.
+        if resp.aborted && resp.completion_tokens == 0 {
             let enc = gw_models::token_estimate::default_encoder();
-            let tools = ctx
-                .request
-                .model_param_v2
-                .as_ref()
-                .and_then(|p| p.typed.as_ref())
-                .and_then(|t| match t {
-                    gw_models::TypedParams::Chat(c) => c.tools.clone(),
-                    _ => None,
-                });
-            let model_name = ctx
-                .request
-                .model_param_v2
-                .as_ref()
-                .map(|p| p.model_name.as_str())
-                .unwrap_or_default();
-            let pt = gw_models::estimate_prompt_tokens(
-                &ctx.request.message,
-                tools.as_ref(),
-                model_name,
-                enc,
-            );
+            let param = ctx.request.model_param_v2.as_ref();
+            let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
+                gw_models::TypedParams::Chat(c) => c.tools.clone(),
+                _ => None,
+            });
+            let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+            let pt = if resp.prompt_tokens > 0 {
+                resp.prompt_tokens
+            } else {
+                gw_models::estimate_prompt_tokens(
+                    &ctx.request.message,
+                    tools.as_ref(),
+                    model_name,
+                    enc,
+                )
+            };
             let ct = enc.encode_len(&resp.message) as i64;
-            ctx.decide("cost_calc", format!("aborted stream, estimated {pt}+{ct}"));
+            ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
             return bill(ctx, pt, ct, pt + ct).await;
         }
         // platform_total via the weighted formula: default rate is 1:1, so `total`

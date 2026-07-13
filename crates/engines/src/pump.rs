@@ -77,7 +77,21 @@ where
                     let v: Value = serde_json::from_str(&data).map_err(|e| {
                         GatewayError::internal(format!("parse {vendor} sse frame")).with_source(e)
                     })?;
-                    for chunk in apply(&v)? {
+                    // A vendor error frame (or any apply failure) after bytes
+                    // reached the client is a committed abort, NOT a failover
+                    // signal — replaying would splice a second generation onto
+                    // the same stream.
+                    let chunks = match apply(&v) {
+                        Ok(c) => c,
+                        Err(e) if sent_any => {
+                            tracing::warn!(vendor, error = %e, "vendor error frame after commit");
+                            out.aborted = true;
+                            out.streamed_live = tx.is_some();
+                            return Ok(out);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    for chunk in chunks {
                         match &tx {
                             Some(sender) => {
                                 if sender.send(chunk).await.is_err() {

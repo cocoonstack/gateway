@@ -284,8 +284,8 @@ async fn client_disconnect_midstream_is_499_not_500() {
     assert_eq!(err.http_status, 499, "disconnect must not look like a 5xx");
 }
 
-/// An upstream error AFTER the first chunk reached the client must also be 499
-/// (terminal) so failover never splices a second generation into the stream.
+/// A transport error AFTER the first chunk reached the client aborts (committed,
+/// billed from delivered content) so failover never splices a second generation.
 #[tokio::test]
 async fn midstream_upstream_error_after_send_aborts_without_failover() {
     use futures::StreamExt;
@@ -327,6 +327,54 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
         .await
         .unwrap();
     assert!(out.response.aborted, "post-send break must mark aborted");
+    assert!(out.streamed_live);
+    assert_eq!(out.response.message, "partial");
+}
+
+/// A well-formed vendor error frame (Ok bytes, not a transport error) AFTER a
+/// chunk reached the client must also abort without failover — otherwise a
+/// retry splices a second generation onto the committed stream.
+#[tokio::test]
+async fn vendor_error_frame_after_send_aborts_without_failover() {
+    use futures::StreamExt;
+    use gw_engines::transport::UpstreamResponse;
+
+    #[derive(Debug)]
+    struct ErrorFrameStream;
+    #[async_trait::async_trait]
+    impl Transport for ErrorFrameStream {
+        async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                )),
+                // a vendor overload error delivered as a normal SSE frame
+                Ok(bytes::Bytes::from(
+                    "data: {\"error\":{\"message\":\"overloaded\"}}\n\n",
+                )),
+            ];
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+            })
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut request = GatewayRequest {
+        message: vec![ChatMsg::text("user", "hi")],
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
+        stream: true,
+        ..Default::default()
+    };
+    request.stream_tx = Some(tx);
+
+    let out = OpenAiEngine::new(request, Arc::new(ErrorFrameStream))
+        .run()
+        .await
+        .expect("committed vendor error must not be a failover-eligible Err");
+    assert!(out.response.aborted, "vendor error after send must abort");
     assert!(out.streamed_live);
     assert_eq!(out.response.message, "partial");
 }

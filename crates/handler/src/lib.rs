@@ -253,6 +253,63 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct BreakingAnthropicStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for BreakingAnthropicStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            // Anthropic reports input_tokens up front in message_start, so total
+            // is nonzero mid-stream; output_tokens would only arrive in the
+            // final message_delta that this break skips.
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":100}}}\n\n",
+                )),
+                Ok(bytes::Bytes::from(
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"delivered words here\"}}\n\n",
+                )),
+                Err("connection reset".to_owned()),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_anthropic_stream_bills_delivered_completion() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(cfg, state, Arc::new(BreakingAnthropicStream));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut req = chat_req("claude-sonnet", "please stream something");
+        req.stream = true;
+        req.stream_tx = Some(tx);
+        let ctx = h.run(req, ak(&h)).await.unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert!(out.response.aborted);
+        assert_eq!(out.response.message, "delivered words here");
+        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        // the real prompt count is kept (100), completion is estimated from the
+        // delivered text — NOT billed as zero
+        assert_eq!(ledger[0].prompt_tokens, 100);
+        assert!(
+            ledger[0].completion_tokens > 0,
+            "delivered completion must not bill zero: {:?}",
+            ledger[0]
+        );
+    }
+
     #[tokio::test]
     async fn batch_items_bypass_the_cache_and_bill_each() {
         let h = handler();
