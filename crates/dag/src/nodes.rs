@@ -81,13 +81,16 @@ impl DagNode for CacheLookup {
             Some(p) => p,
             None => return Ok(()),
         };
-        // only enabled for models with cache_ttl configured, and non-streaming requests
+        // Cache serves online, non-streaming requests on cache_ttl models only.
+        // Offline batch items bypass it entirely (read and write): a cache hit
+        // is free — billing/quota are skipped — and batches promise per-item
+        // billing.
         let ttl = ctx
             .cfg
             .find_model(&param.model_name)
             .and_then(|m| m.cache_ttl_seconds);
         let Some(ttl) = ttl else { return Ok(()) };
-        if ctx.request.stream {
+        if ctx.request.stream || !ctx.request.is_online {
             return Ok(());
         }
         let Some(key) = cache_key_of(ctx) else {
@@ -346,7 +349,10 @@ impl DagNode for CallEngine {
         let engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
         match engine.run().await {
             Ok(outcome) => {
-                if let Some(a) = ctx.request.account.as_ref() {
+                // an aborted stream is neither a success nor an account fault
+                if !outcome.response.aborted
+                    && let Some(a) = ctx.request.account.as_ref()
+                {
                     ctx.state.health.record_success(&a.name);
                 }
                 ctx.decide(
@@ -456,6 +462,36 @@ impl DagNode for CostCalc {
             return Ok(()); // nothing to bill
         };
         let resp = &outcome.response;
+        // An aborted stream never received the vendor's usage frame, but the
+        // tokens were generated and delivered — estimate them from the request
+        // and the delivered text instead of billing zero.
+        if resp.aborted && resp.total_tokens == 0 {
+            let enc = gw_models::token_estimate::default_encoder();
+            let tools = ctx
+                .request
+                .model_param_v2
+                .as_ref()
+                .and_then(|p| p.typed.as_ref())
+                .and_then(|t| match t {
+                    gw_models::TypedParams::Chat(c) => c.tools.clone(),
+                    _ => None,
+                });
+            let model_name = ctx
+                .request
+                .model_param_v2
+                .as_ref()
+                .map(|p| p.model_name.as_str())
+                .unwrap_or_default();
+            let pt = gw_models::estimate_prompt_tokens(
+                &ctx.request.message,
+                tools.as_ref(),
+                model_name,
+                enc,
+            );
+            let ct = enc.encode_len(&resp.message) as i64;
+            ctx.decide("cost_calc", format!("aborted stream, estimated {pt}+{ct}"));
+            return bill(ctx, pt, ct, pt + ct).await;
+        }
         // platform_total via the weighted formula: default rate is 1:1, so `total`
         // == prompt+completion, but the formula handles cache-normalization/weights/
         // rounding correctly for future rates.
@@ -481,44 +517,54 @@ impl DagNode for CostCalc {
                 resp.prompt_tokens + resp.completion_tokens,
             ),
         };
-        let param = ctx.request.model_param_v2.as_ref();
-        let public_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-        let (p_in, p_out) = ctx.cfg.prices_for(public_name);
-        let cost = prompt * p_in / 1000 + completion * p_out / 1000;
-        ctx.state.governance.quota_consume(&ctx.ak.ak, total).await;
-        // TPM window accounting (post-hoc accumulation)
-        ctx.state
-            .governance
-            .token_window_add(&ctx.ak.ak, total, std::time::Duration::from_secs(60))
-            .await;
-        let record = BillingRecord {
-            ak: ctx.ak.ak.clone(),
-            product: ctx.ak.product.clone(),
-            model: public_name.to_owned(),
-            protocol: param
-                .map(|p| p.protocol.as_str().to_owned())
-                .unwrap_or_default(),
-            account: ctx
-                .request
-                .account
-                .as_ref()
-                .map(|a| a.name.clone())
-                .unwrap_or_default(),
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-            cost_micros: cost,
-            ptu_spillover: resp.ptu_spillover,
-        };
-        // A ledger write failure must not fail a response that already succeeded
-        // upstream (quota/tpm are already consumed); log and continue.
-        if let Err(e) = ctx.state.store.ledger_add(record).await {
-            metrics::counter!("gateway_ledger_write_failures_total").increment(1);
-            tracing::error!(error = %e, "billing ledger write failed");
-        }
-        ctx.decide("cost_calc", format!("tokens={total} cost_micros={cost}"));
-        Ok(())
+        bill(ctx, prompt, completion, total).await
     }
+}
+
+/// Consume quota/TPM and write the ledger record for one served request.
+async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) -> GResult<()> {
+    let ptu_spillover = ctx
+        .outcome
+        .as_ref()
+        .map(|o| o.response.ptu_spillover)
+        .unwrap_or(false);
+    let param = ctx.request.model_param_v2.as_ref();
+    let public_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+    let (p_in, p_out) = ctx.cfg.prices_for(public_name);
+    let cost = prompt * p_in / 1000 + completion * p_out / 1000;
+    ctx.state.governance.quota_consume(&ctx.ak.ak, total).await;
+    // TPM window accounting (post-hoc accumulation)
+    ctx.state
+        .governance
+        .token_window_add(&ctx.ak.ak, total, std::time::Duration::from_secs(60))
+        .await;
+    let record = BillingRecord {
+        ak: ctx.ak.ak.clone(),
+        product: ctx.ak.product.clone(),
+        model: public_name.to_owned(),
+        protocol: param
+            .map(|p| p.protocol.as_str().to_owned())
+            .unwrap_or_default(),
+        account: ctx
+            .request
+            .account
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_default(),
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+        cost_micros: cost,
+        ptu_spillover,
+    };
+    // A ledger write failure must not fail a response that already succeeded
+    // upstream (quota/tpm are already consumed); log and continue.
+    if let Err(e) = ctx.state.store.ledger_add(record).await {
+        metrics::counter!("gateway_ledger_write_failures_total").increment(1);
+        tracing::error!(error = %e, "billing ledger write failed");
+    }
+    ctx.decide("cost_calc", format!("tokens={total} cost_micros={cost}"));
+    Ok(())
 }
 
 /// post_process/cache_store: successful non-streaming responses are written to the TTL cache.
@@ -533,7 +579,7 @@ impl DagNode for CacheStore {
         &["cost_calc"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit || ctx.request.stream {
+        if ctx.cache_hit || ctx.request.stream || !ctx.request.is_online {
             return Ok(());
         }
         let (Some(key), Some(outcome)) = (ctx.cache_key.as_ref(), ctx.outcome.as_ref()) else {
@@ -549,7 +595,7 @@ impl DagNode for CacheStore {
         else {
             return Ok(());
         };
-        if outcome.http_code == 200 && !outcome.block.block {
+        if outcome.http_code == 200 && !outcome.block.block && !outcome.response.aborted {
             ctx.state.cache.put(
                 key.clone(),
                 outcome.response.clone(),

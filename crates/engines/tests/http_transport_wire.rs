@@ -287,7 +287,7 @@ async fn client_disconnect_midstream_is_499_not_500() {
 /// An upstream error AFTER the first chunk reached the client must also be 499
 /// (terminal) so failover never splices a second generation into the stream.
 #[tokio::test]
-async fn midstream_upstream_error_after_send_is_499() {
+async fn midstream_upstream_error_after_send_aborts_without_failover() {
     use futures::StreamExt;
     use gw_engines::transport::UpstreamResponse;
 
@@ -320,12 +320,13 @@ async fn midstream_upstream_error_after_send_is_499() {
     };
     request.stream_tx = Some(tx);
 
-    let err = OpenAiEngine::new(request, Arc::new(FlakyStream))
+    // committed response: no error, no failover — the delivered part is kept
+    // (and billed from) as an aborted outcome
+    let out = OpenAiEngine::new(request, Arc::new(FlakyStream))
         .run()
         .await
-        .unwrap_err();
-    assert_eq!(
-        err.http_status, 499,
-        "post-send upstream error must not failover"
-    );
+        .unwrap();
+    assert!(out.response.aborted, "post-send break must mark aborted");
+    assert!(out.streamed_live);
+    assert_eq!(out.response.message, "partial");
 }

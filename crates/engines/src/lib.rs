@@ -13,6 +13,7 @@ pub mod factory;
 pub mod families;
 pub mod http_transport;
 pub mod openai_engine;
+pub mod pump;
 pub mod sigv4;
 pub mod sse;
 pub mod transport;

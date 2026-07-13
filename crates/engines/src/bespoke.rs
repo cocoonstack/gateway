@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sigv4::{SigV4Params, sign};
-use crate::sse::SseDecoder;
 use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
 struct Base {
@@ -552,10 +551,9 @@ impl DashScopeEngine {
     }
 
     /// Native DashScope streaming: SSE frames decoded as they arrive and
-    /// forwarded through `stream_tx` when the request carries one (same
-    /// live-pump contract as the OpenAI engine).
+    /// forwarded through `stream_tx` when the request carries one (the shared
+    /// live-pump contract).
     async fn run_stream(&self) -> GResult<EngineOutcome> {
-        use futures::StreamExt;
         let body = self.build_body(true)?;
         let reply = self
             .base
@@ -567,67 +565,24 @@ impl DashScopeEngine {
             http_code: status as i64,
             ..Default::default()
         };
-        let mut full = String::new();
-        let mut chunks = Vec::new();
-        let tx = self.base.request.stream_tx.clone();
-        let mut sent_any = false;
-        match reply.body {
-            UpstreamBody::Json(b) => {
-                // a stream request answered with JSON is an error body
-                let v: Value = serde_json::from_slice(&b)
-                    .map_err(|e| GatewayError::internal("parse dashscope reply").with_source(e))?;
-                if let Some(err) = crate::engine::vendor_error(status, &v) {
-                    return Err(err);
-                }
-                return Err(GatewayError::internal(
-                    "expected sse from dashscope streaming",
-                ));
-            }
-            UpstreamBody::Sse(b) => {
-                let (events, _done) = SseDecoder::decode_all(&b);
-                for ev in events {
-                    let v: Value = serde_json::from_slice(ev.as_bytes()).map_err(|e| {
-                        GatewayError::internal("parse dashscope sse frame").with_source(e)
-                    })?;
-                    chunks.extend(dashscope_apply_frame(&v, status, &mut resp, &mut full)?);
-                }
-            }
-            UpstreamBody::SseStream(mut s) => {
-                let mut dec = SseDecoder::default();
-                while let Some(item) = s.next().await {
-                    let bytes = item.map_err(|e| {
-                        if sent_any {
-                            GatewayError::client_closed(format!(
-                                "upstream stream failed mid-response: {e}"
-                            ))
-                        } else {
-                            GatewayError::new(
-                                gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-                                502,
-                                format!("upstream stream failed: {e}"),
-                            )
-                        }
-                    })?;
-                    for data in dec.feed(&bytes) {
-                        let v: Value = serde_json::from_str(&data).map_err(|e| {
-                            GatewayError::internal("parse dashscope sse frame").with_source(e)
-                        })?;
-                        for chunk in dashscope_apply_frame(&v, status, &mut resp, &mut full)? {
-                            match &tx {
-                                Some(tx) => {
-                                    tx.send(chunk).await.map_err(|_| {
-                                        GatewayError::client_closed("client stream closed")
-                                    })?;
-                                    sent_any = true;
-                                }
-                                None => chunks.push(chunk),
-                            }
-                        }
-                    }
-                }
+        if let UpstreamBody::Json(b) = &reply.body {
+            // a stream request answered with JSON is an error body
+            let v: Value = serde_json::from_slice(b)
+                .map_err(|e| GatewayError::internal("parse dashscope reply").with_source(e))?;
+            if let Some(err) = crate::engine::vendor_error(status, &v) {
+                return Err(err);
             }
         }
+        let mut full = String::new();
+        let r = crate::pump::pump_sse(
+            "dashscope",
+            reply.body,
+            self.base.request.stream_tx.clone(),
+            |v| dashscope_apply_frame(v, status, &mut resp, &mut full),
+        )
+        .await?;
         resp.message = full;
+        resp.aborted = r.aborted;
         if resp.total_tokens == 0 {
             resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
         }
@@ -635,8 +590,8 @@ impl DashScopeEngine {
         Ok(EngineOutcome {
             response: resp,
             http_code: status,
-            chunks,
-            streamed_live: sent_any,
+            chunks: r.chunks,
+            streamed_live: r.streamed_live,
             ..Default::default()
         })
     }

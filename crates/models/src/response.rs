@@ -77,6 +77,10 @@ pub struct GatewayResponse {
     pub common_usage: Option<CommonUsage>,
 
     // --- runtime-only, not part of the serialized model ---
+    /// the stream was committed to the client and then broke off; `message`
+    /// holds what was delivered (billing estimates from it when usage is absent).
+    #[serde(skip)]
+    pub aborted: bool,
     /// original engine recorder, kept for downstream fallback.
     #[serde(skip)]
     pub engine_recorder: Option<Arc<dyn Recorder>>,

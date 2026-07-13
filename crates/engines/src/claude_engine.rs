@@ -12,7 +12,6 @@ use gw_models::{
 use serde_json::{Map, Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
-use crate::sse::SseDecoder;
 use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest};
 
 pub struct ClaudeEngine {
@@ -176,84 +175,25 @@ impl ClaudeEngine {
         })
     }
 
-    /// Decode a fully buffered anthropic streaming event sequence.
-    fn parse_sse(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let (events, _done) = SseDecoder::decode_all(bytes);
+    /// Buffered or live anthropic event sequence through the shared pump.
+    async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
         let mut resp = GatewayResponse {
             is_messages_protocol: true,
             http_code: status as i64,
             ..Default::default()
         };
         let mut st = SseState::default();
-        let mut chunks = Vec::new();
-        for ev in events {
-            let v: Value = serde_json::from_slice(ev.as_bytes())
-                .map_err(|e| GatewayError::internal("parse anthropic sse frame").with_source(e))?;
-            chunks.extend(st.apply(&v, status, &mut resp)?);
-        }
-        st.finish(&mut resp);
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks,
-            ..Default::default()
+        let r = crate::pump::pump_sse("anthropic", body, self.request.stream_tx.clone(), |v| {
+            st.apply(v, status, &mut resp)
         })
-    }
-
-    /// Incremental variant of `parse_sse`: frames are decoded as vendor bytes
-    /// arrive and forwarded through `stream_tx` when the request carries one
-    /// (same live-pump contract as the OpenAI engine).
-    async fn pump_sse(
-        &self,
-        status: u16,
-        mut s: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
-    ) -> GResult<EngineOutcome> {
-        use futures::StreamExt;
-        let tx = self.request.stream_tx.clone();
-        let mut dec = SseDecoder::default();
-        let mut st = SseState::default();
-        let mut chunks = Vec::new();
-        let mut resp = GatewayResponse {
-            is_messages_protocol: true,
-            http_code: status as i64,
-            ..Default::default()
-        };
-        let mut sent_any = false;
-        while let Some(item) = s.next().await {
-            let bytes = item.map_err(|e| {
-                if sent_any {
-                    GatewayError::client_closed(format!("upstream stream failed mid-response: {e}"))
-                } else {
-                    GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-                        502,
-                        format!("upstream stream failed: {e}"),
-                    )
-                }
-            })?;
-            for data in dec.feed(&bytes) {
-                let v: Value = serde_json::from_str(&data).map_err(|e| {
-                    GatewayError::internal("parse anthropic sse frame").with_source(e)
-                })?;
-                for chunk in st.apply(&v, status, &mut resp)? {
-                    match &tx {
-                        Some(tx) => {
-                            tx.send(chunk)
-                                .await
-                                .map_err(|_| GatewayError::client_closed("client stream closed"))?;
-                            sent_any = true;
-                        }
-                        None => chunks.push(chunk),
-                    }
-                }
-            }
-        }
+        .await?;
         st.finish(&mut resp);
+        resp.aborted = r.aborted;
         Ok(EngineOutcome {
             response: resp,
             http_code: status,
-            chunks,
-            streamed_live: sent_any,
+            chunks: r.chunks,
+            streamed_live: r.streamed_live,
             ..Default::default()
         })
     }
@@ -266,8 +206,7 @@ impl ModelEngine for ClaudeEngine {
         let reply = self.transport.send(up).await?;
         match reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
-            UpstreamBody::Sse(b) => self.parse_sse(reply.status, &b),
-            UpstreamBody::SseStream(s) => self.pump_sse(reply.status, s).await,
+            body => self.run_sse(reply.status, body).await,
         }
     }
 

@@ -14,7 +14,6 @@ use gw_models::{
 use serde_json::{Map, Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
-use crate::sse::SseDecoder;
 use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest};
 
 pub struct OpenAiEngine {
@@ -180,85 +179,24 @@ impl OpenAiEngine {
         })
     }
 
-    fn parse_sse(&self, status: u16, body: &[u8]) -> GResult<EngineOutcome> {
-        let (events, _done) = SseDecoder::decode_all(body);
-        let mut chunks = Vec::new();
-        let mut full = String::new();
+    /// Buffered or live SSE reply through the shared pump.
+    async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
         let mut resp = GatewayResponse {
             http_code: status as i64,
             ..Default::default()
         };
-        for ev in events {
-            let v: Value = serde_json::from_slice(ev.as_bytes())
-                .map_err(|e| GatewayError::internal("parse openai sse frame").with_source(e))?;
-            chunks.extend(apply_sse_event(&v, status, &mut resp, &mut full)?);
-        }
-        resp.message = full;
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks,
-            ..Default::default()
+        let mut full = String::new();
+        let r = crate::pump::pump_sse("openai", body, self.request.stream_tx.clone(), |v| {
+            apply_sse_event(v, status, &mut resp, &mut full)
         })
-    }
-
-    /// Incremental variant of `parse_sse`: frames are decoded as vendor bytes
-    /// arrive and forwarded through `stream_tx` when the request carries one.
-    async fn pump_sse(
-        &self,
-        status: u16,
-        mut s: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
-    ) -> GResult<EngineOutcome> {
-        use futures::StreamExt;
-        let tx = self.request.stream_tx.clone();
-        let mut dec = SseDecoder::default();
-        let mut chunks = Vec::new();
-        let mut full = String::new();
-        // Once a byte has reached the client the response is committed:
-        // failover would splice a second generation into the same stream, so a
-        // later error must terminate (499), not fault the account / retry.
-        let mut sent_any = false;
-        let mut resp = GatewayResponse {
-            http_code: status as i64,
-            ..Default::default()
-        };
-        while let Some(item) = s.next().await {
-            let bytes = item.map_err(|e| {
-                if sent_any {
-                    GatewayError::client_closed(format!("upstream stream failed mid-response: {e}"))
-                } else {
-                    GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-                        502,
-                        format!("upstream stream failed: {e}"),
-                    )
-                }
-            })?;
-            for data in dec.feed(&bytes) {
-                let v: Value = serde_json::from_str(&data)
-                    .map_err(|e| GatewayError::internal("parse openai sse frame").with_source(e))?;
-                for chunk in apply_sse_event(&v, status, &mut resp, &mut full)? {
-                    match &tx {
-                        Some(tx) => {
-                            tx.send(chunk)
-                                .await
-                                .map_err(|_| GatewayError::client_closed("client stream closed"))?;
-                            sent_any = true;
-                        }
-                        None => chunks.push(chunk),
-                    }
-                }
-            }
-            if dec.is_done() {
-                break;
-            }
-        }
+        .await?;
         resp.message = full;
+        resp.aborted = r.aborted;
         Ok(EngineOutcome {
             response: resp,
             http_code: status,
-            chunks,
-            streamed_live: tx.is_some(),
+            chunks: r.chunks,
+            streamed_live: r.streamed_live,
             ..Default::default()
         })
     }
@@ -270,9 +208,8 @@ impl ModelEngine for OpenAiEngine {
         let up = self.build_upstream()?;
         let reply = self.transport.send(up).await?;
         match reply.body {
-            UpstreamBody::Sse(bytes) => self.parse_sse(reply.status, &bytes),
             UpstreamBody::Json(bytes) => self.parse_json(reply.status, &bytes),
-            UpstreamBody::SseStream(s) => self.pump_sse(reply.status, s).await,
+            body => self.run_sse(reply.status, body).await,
         }
     }
 
