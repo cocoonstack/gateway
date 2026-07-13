@@ -1318,6 +1318,125 @@ async fn realtime_websocket_mock_session() {
 }
 
 #[tokio::test]
+async fn realtime_bridges_to_a_real_upstream_websocket() {
+    use axum::routing::any;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    // fake vendor: a loopback realtime websocket that answers response.create
+    // with two output_text deltas and a response.done carrying usage
+    async fn vendor_ws(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
+        ws.on_upgrade(|mut socket| async move {
+            use axum::extract::ws::Message as M;
+            let send = |v: Value| M::Text(v.to_string().into());
+            let _ = socket
+                .send(send(serde_json::json!({"type":"session.created","session":{"vendor":"fake"}})))
+                .await;
+            while let Some(Ok(M::Text(t))) = socket.recv().await {
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
+                if v["type"] == "response.create" {
+                    let _ = socket
+                        .send(send(
+                            serde_json::json!({"type":"response.output_text.delta","delta":"bridge "}),
+                        ))
+                        .await;
+                    let _ = socket
+                        .send(send(
+                            serde_json::json!({"type":"response.output_text.delta","delta":"ok"}),
+                        ))
+                        .await;
+                    let _ = socket
+                        .send(send(serde_json::json!({"type":"response.done",
+                            "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}})))
+                        .await;
+                }
+            }
+        })
+    }
+    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vendor_addr = vendor_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            vendor_listener,
+            axum::Router::new().route("/v1/realtime", any(vendor_ws)),
+        )
+        .await
+        .unwrap();
+    });
+
+    // gateway configured with a realtime account whose endpoint is the fake vendor
+    let yaml = format!(
+        r#"
+listen: {{host: 127.0.0.1, port: 0}}
+access_keys:
+  - {{ak: ak-rt, product: rt, qps: 100, daily_token_quota: 1000000}}
+accounts:
+  - {{name: rt-vendor, provider: openai, endpoint: "http://{vendor_addr}", protocols: ["realtime"]}}
+models:
+  - {{name: rt-model, protocol: realtime}}
+"#
+    );
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-rt".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+
+    // vendor's session.created is relayed through the bridge
+    let first = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "session.created");
+    assert_eq!(v["session"]["vendor"], "fake");
+
+    ws.send(Message::text(
+        serde_json::json!({"type":"response.create"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut assembled = String::new();
+    let mut done_usage = None;
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        match v["type"].as_str().unwrap() {
+            "response.output_text.delta" => assembled.push_str(v["delta"].as_str().unwrap()),
+            "response.done" => {
+                done_usage = Some(v["response"]["usage"].clone());
+                break;
+            }
+            other => panic!("unexpected event {other}"),
+        }
+    }
+    assert_eq!(assembled, "bridge ok");
+    assert_eq!(done_usage.unwrap()["total_tokens"], 13);
+
+    // the vendor-reported usage was billed to the ledger
+    let (count, records) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(records[0].model, "rt-model");
+    assert_eq!(records[0].account, "rt-vendor");
+    assert_eq!(records[0].total_tokens, 13);
+}
+
+#[tokio::test]
 async fn realtime_turns_are_rate_limited() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

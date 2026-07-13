@@ -37,6 +37,8 @@ futures = "0.3"
 # --- web (server) ---
 axum = { version = "0.8", features = ["ws"] } # ws: the /v1/realtime session surface
 tower = "0.5"
+# realtime upstream bridging (client side of /v1/realtime)
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # OPTIONAL, behind engines' `http` feature; default builds have zero egress.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 # --- serde ---

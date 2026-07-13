@@ -30,7 +30,7 @@ tower = { workspace = true }
 serde_json = { workspace = true }
 gw-protocol = { workspace = true }
 # ws e2e: loopback connection, zero egress
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 
 [package.metadata.dist]

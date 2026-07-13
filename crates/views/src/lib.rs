@@ -121,9 +121,10 @@ async fn track_requests(
     resp
 }
 
-/// GET /v1/realtime?model=... (WebSocket upgrade; azure/gemini/glm...)
-/// Local mock session: event semantics mimic OpenAI Realtime (session.created / input_text →
-/// response.delta×n → response.done). Real vendor bidirectional streaming is future work.
+/// GET /v1/realtime?model=... (WebSocket upgrade).
+/// An account with a real endpoint bridges the session to the vendor's
+/// realtime WebSocket; an endpoint-less account serves the local mock session
+/// (session.created / input_text → response.delta×n → response.done).
 async fn realtime_ws(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -168,7 +169,73 @@ async fn realtime_ws(
     ) else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
-    ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
+    // an account with a real endpoint bridges to the vendor; else the local mock
+    if account.endpoint.is_empty() {
+        ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
+    } else {
+        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, model, mt, account))
+    }
+}
+
+/// Same governance gates as the REST surfaces — the realtime surface bills,
+/// so it must also be rate/quota limited. `None` = admitted.
+async fn realtime_gate(s: &AppState, ak: &AkInfo) -> Option<String> {
+    let gov = &s.handler.state.governance;
+    if !gov.rate_allow(&ak.ak, ak.qps).await {
+        return Some(format!(
+            "rate limit exceeded for ak {} (qps {})",
+            ak.ak, ak.qps
+        ));
+    }
+    if !gov.quota_check(&ak.ak, ak.daily_token_quota).await {
+        return Some(format!("daily token quota exhausted for ak {}", ak.ak));
+    }
+    if let Some(tpm) = ak.tokens_per_minute
+        && !gov
+            .token_window_check(&ak.ak, tpm, std::time::Duration::from_secs(60))
+            .await
+    {
+        return Some(format!(
+            "token-per-minute limit exceeded for ak {} (tpm {tpm})",
+            ak.ak
+        ));
+    }
+    None
+}
+
+/// Bill one realtime generation (quota + TPM window + ledger + metrics).
+async fn bill_realtime_turn(
+    s: &AppState,
+    ak: &AkInfo,
+    model: &str,
+    mt: gw_consts::Protocol,
+    account: &str,
+    it: i64,
+    ot: i64,
+) {
+    let (p_in, p_out) = s.handler.cfg.prices_for(model);
+    let gov = &s.handler.state.governance;
+    gov.quota_consume(&ak.ak, it + ot).await;
+    gov.token_window_add(&ak.ak, it + ot, std::time::Duration::from_secs(60))
+        .await;
+    let record = gw_state::BillingRecord {
+        ak: ak.ak.clone(),
+        product: ak.product.clone(),
+        model: model.to_owned(),
+        protocol: mt.as_str().to_owned(),
+        account: account.to_owned(),
+        prompt_tokens: it,
+        completion_tokens: ot,
+        total_tokens: it + ot,
+        cost_micros: it * p_in / 1000 + ot * p_out / 1000,
+        ptu_spillover: false,
+    };
+    metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it.max(0) as u64);
+    metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot.max(0) as u64);
+    if let Err(e) = s.handler.state.store.ledger_add(record).await {
+        metrics::counter!("gateway_ledger_write_failures_total").increment(1);
+        tracing::error!(error = %e, "realtime billing write failed");
+    }
 }
 
 /// One mock realtime session (upstream is mocked).
@@ -202,30 +269,9 @@ async fn realtime_session(
         };
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
-                // Same governance gates as the REST surfaces — this surface
-                // bills, so it must also be rate/quota limited.
-                let gov = &s.handler.state.governance;
-                if !gov.rate_allow(&ak.ak, ak.qps).await {
+                if let Some(denied) = realtime_gate(&s, &ak).await {
                     let _ = socket
-                        .send(send(json!({"type":"error",
-                            "message": format!("rate limit exceeded for ak {} (qps {})", ak.ak, ak.qps)})))
-                        .await;
-                    continue;
-                }
-                if !gov.quota_check(&ak.ak, ak.daily_token_quota).await {
-                    let _ = socket
-                        .send(send(json!({"type":"error",
-                            "message": format!("daily token quota exhausted for ak {}", ak.ak)})))
-                        .await;
-                    continue;
-                }
-                let window = std::time::Duration::from_secs(60);
-                if let Some(tpm) = ak.tokens_per_minute
-                    && !gov.token_window_check(&ak.ak, tpm, window).await
-                {
-                    let _ = socket
-                        .send(send(json!({"type":"error",
-                            "message": format!("token-per-minute limit exceeded for ak {} (tpm {tpm})", ak.ak)})))
+                        .send(send(json!({"type":"error","message": denied})))
                         .await;
                     continue;
                 }
@@ -247,38 +293,7 @@ async fn realtime_session(
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
                     .await;
-                // Bill each turn (reuses the same ledger)
-                let (p_in, p_out) = s.handler.cfg.prices_for(&model);
-                s.handler
-                    .state
-                    .governance
-                    .quota_consume(&ak.ak, it + ot)
-                    .await;
-                s.handler
-                    .state
-                    .governance
-                    .token_window_add(&ak.ak, it + ot, window)
-                    .await;
-                let record = gw_state::BillingRecord {
-                    ak: ak.ak.clone(),
-                    product: ak.product.clone(),
-                    model: model.clone(),
-                    protocol: mt.as_str().to_owned(),
-                    account: account.clone(),
-                    prompt_tokens: it,
-                    completion_tokens: ot,
-                    total_tokens: it + ot,
-                    cost_micros: it * p_in / 1000 + ot * p_out / 1000,
-                    ptu_spillover: false,
-                };
-                metrics::counter!("gateway_tokens_total", "kind" => "prompt")
-                    .increment(it.max(0) as u64);
-                metrics::counter!("gateway_tokens_total", "kind" => "completion")
-                    .increment(ot.max(0) as u64);
-                if let Err(e) = s.handler.state.store.ledger_add(record).await {
-                    metrics::counter!("gateway_ledger_write_failures_total").increment(1);
-                    tracing::error!(error = %e, "realtime billing write failed");
-                }
+                bill_realtime_turn(&s, &ak, &model, mt, &account, it, ot).await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -290,6 +305,122 @@ async fn realtime_session(
                         "message": format!("unsupported event type `{other}`")})))
                     .await;
             }
+        }
+    }
+}
+
+/// Bridge one realtime session to a real upstream over WebSocket: a transparent
+/// relay (the client speaks the vendor's realtime dialect through us) plus the
+/// gateway's own concerns — auth, per-generation governance gates on
+/// `response.create`, and billing from the vendor's `response.done` usage.
+async fn realtime_bridge(
+    mut client: axum::extract::ws::WebSocket,
+    s: AppState,
+    ak: AkInfo,
+    model: String,
+    mt: gw_consts::Protocol,
+    account: gw_models::Account,
+) {
+    use axum::extract::ws::Message as CMsg;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as UMsg;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let send_err = |m: String| json!({"type":"error","error":{"type":"gateway_error","message":m}});
+
+    // wss URL from the account's https endpoint
+    let base = account.endpoint.trim_end_matches('/');
+    let ws_base = base
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1);
+    let url = format!("{ws_base}/v1/realtime?model={model}");
+    let mut req = match url.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = client
+                .send(CMsg::Text(
+                    send_err(format!("bad upstream url: {e}"))
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    };
+    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
+    if let Ok(v) = format!("Bearer {key}").parse() {
+        req.headers_mut().insert("authorization", v);
+    }
+    let upstream = match tokio_tungstenite::connect_async(req).await {
+        Ok((u, _)) => u,
+        Err(e) => {
+            let _ = client
+                .send(CMsg::Text(
+                    send_err(format!("upstream realtime connect failed: {e}"))
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    };
+    let (mut up_tx, mut up_rx) = upstream.split();
+    let (mut cl_tx, mut cl_rx) = client.split();
+
+    loop {
+        tokio::select! {
+            m = cl_rx.next() => match m {
+                Some(Ok(CMsg::Text(t))) => {
+                    // gate each generation trigger, not every control frame
+                    let is_generate = serde_json::from_str::<Value>(&t)
+                        .map(|v| v["type"] == "response.create")
+                        .unwrap_or(false);
+                    if is_generate && let Some(denied) = realtime_gate(&s, &ak).await {
+                        if cl_tx
+                            .send(CMsg::Text(send_err(denied).to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if up_tx.send(UMsg::text(t.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(CMsg::Binary(b))) => {
+                    if up_tx.send(UMsg::binary(b)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {} // ping/pong handled by the ws stacks
+            },
+            m = up_rx.next() => match m {
+                Some(Ok(UMsg::Text(t))) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&t)
+                        && v["type"] == "response.done"
+                    {
+                        let usage = &v["response"]["usage"];
+                        let it = usage["input_tokens"].as_i64().unwrap_or(0);
+                        let ot = usage["output_tokens"].as_i64().unwrap_or(0);
+                        if it + ot > 0 {
+                            bill_realtime_turn(&s, &ak, &model, mt, &account.name, it, ot).await;
+                        }
+                    }
+                    if cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(UMsg::Binary(b))) => {
+                    if cl_tx.send(CMsg::Binary(b)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(UMsg::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {} // ping/pong handled by the ws stacks
+            },
         }
     }
 }

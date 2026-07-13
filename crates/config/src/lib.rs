@@ -246,6 +246,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
                 "stt",
                 "responses",
                 "completions",
+                "realtime",
             ],
             default_model_wire: "openai-chat",
         },
