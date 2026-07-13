@@ -98,6 +98,19 @@ pub struct StoredFile {
     pub content: String,
 }
 
+/// One row of the per-(tenant, model) usage rollup.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UsageRow {
+    pub tenant: String,
+    pub model: String,
+    pub requests: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub cost_micros: i64,
+    pub vendor_cost_micros: i64,
+}
+
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()>;
@@ -106,6 +119,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// transaction; the ledger is append-only, so the skew is at most a
     /// just-appended record and self-heals on the next read.
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
+    /// Usage rolled up by (tenant, requested model), sorted; the SQL backends
+    /// aggregate server-side instead of paging the whole ledger out.
+    async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>>;
 
     /// Store `content` under a fresh id; returns the file metadata.
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile>;
@@ -160,6 +176,39 @@ impl Store for MemoryStore {
         let total = records.len();
         let page = records[total.saturating_sub(limit)..].to_vec();
         Ok((total, page))
+    }
+
+    async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rollup: std::collections::BTreeMap<(String, String), UsageRow> =
+            std::collections::BTreeMap::new();
+        for r in records.iter() {
+            if tenant.is_some_and(|t| t != r.tenant) {
+                continue;
+            }
+            let e = rollup
+                .entry((r.tenant.clone(), r.model.clone()))
+                .or_insert_with(|| UsageRow {
+                    tenant: r.tenant.clone(),
+                    model: r.model.clone(),
+                    requests: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cost_micros: 0,
+                    vendor_cost_micros: 0,
+                });
+            e.requests += 1;
+            e.prompt_tokens += r.prompt_tokens;
+            e.completion_tokens += r.completion_tokens;
+            e.total_tokens += r.total_tokens;
+            e.cost_micros += r.cost_micros;
+            e.vendor_cost_micros += r.vendor_cost_micros;
+        }
+        Ok(rollup.into_values().collect())
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -241,6 +290,25 @@ where
         cost_micros: row.get(10),
         vendor_cost_micros: row.get(11),
         ptu_spillover: row.get(12),
+    }
+}
+
+fn usage_row<'r, R>(row: &'r R) -> UsageRow
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    UsageRow {
+        tenant: row.get(0),
+        model: row.get(1),
+        requests: row.get(2),
+        prompt_tokens: row.get(3),
+        completion_tokens: row.get(4),
+        total_tokens: row.get(5),
+        cost_micros: row.get(6),
+        vendor_cost_micros: row.get(7),
     }
 }
 
@@ -374,6 +442,31 @@ impl Store for SqliteStore {
         .map_err(|e| crate::sqlx_err("read billing records", e))?;
         rows.reverse();
         Ok((total as usize, rows.iter().map(row_to_billing).collect()))
+    }
+
+    async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
+        let rows =
+            match tenant {
+                Some(t) => sqlx::query(
+                    "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+                     FROM billing WHERE tenant = ?
+                     GROUP BY tenant, model ORDER BY tenant, model",
+                )
+                .bind(t)
+                .fetch_all(&self.pool)
+                .await,
+                None => sqlx::query(
+                    "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+                     FROM billing
+                     GROUP BY tenant, model ORDER BY tenant, model",
+                )
+                .fetch_all(&self.pool)
+                .await,
+            }
+            .map_err(|e| crate::sqlx_err("roll up usage", e))?;
+        Ok(rows.iter().map(usage_row).collect())
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -612,6 +705,38 @@ impl Store for PostgresStore {
         .map_err(|e| crate::sqlx_err("read billing records", e))?;
         rows.reverse();
         Ok((total as usize, rows.iter().map(row_to_billing).collect()))
+    }
+
+    async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
+        let rows = match tenant {
+            Some(t) => {
+                sqlx::query(
+                    "SELECT tenant, model, COUNT(*),
+                     SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
+                     SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
+                     SUM(vendor_cost_micros)::BIGINT
+                     FROM billing WHERE tenant = $1
+                     GROUP BY tenant, model ORDER BY tenant, model",
+                )
+                .bind(t)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT tenant, model, COUNT(*),
+                     SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
+                     SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
+                     SUM(vendor_cost_micros)::BIGINT
+                     FROM billing
+                     GROUP BY tenant, model ORDER BY tenant, model",
+                )
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| crate::sqlx_err("roll up usage", e))?;
+        Ok(rows.iter().map(usage_row).collect())
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -895,6 +1020,11 @@ mod tests {
         }
         let store = SqliteStore::open(path).await.unwrap();
         assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 2);
+        let usage = store.ledger_usage(Some("default")).await.unwrap();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].requests, 1);
+        assert_eq!(usage[0].vendor_cost_micros, 7);
+        assert!(store.ledger_usage(Some("ghost")).await.unwrap().is_empty());
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
         assert_eq!(job.status, BatchStatus::Completed);
     }
@@ -911,6 +1041,8 @@ mod tests {
         let (total, page) = store.ledger_snapshot(5).await.unwrap();
         assert!(total >= 1);
         assert_eq!(page.last().unwrap().model, "gpt-4o");
+        let usage = store.ledger_usage(Some("default")).await.unwrap();
+        assert!(usage.iter().any(|u| u.model == "gpt-4o" && u.requests >= 1));
 
         let f = store.file_put("batch", "hello pg".into()).await.unwrap();
         assert!(f.id.starts_with("file-"));

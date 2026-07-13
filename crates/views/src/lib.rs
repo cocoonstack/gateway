@@ -1042,44 +1042,16 @@ async fn admin_usage(
         AdminScope::Tenant(t) => Some(t.clone()),
         AdminScope::Global => q.get("tenant").cloned(),
     };
-    let (_, records) = match s.handler.state().store.ledger_snapshot(usize::MAX).await {
-        Ok(v) => v,
+    let usage = match s
+        .handler
+        .state()
+        .store
+        .ledger_usage(filter.as_deref())
+        .await
+    {
+        Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
-    #[derive(Default)]
-    struct Agg {
-        requests: i64,
-        prompt: i64,
-        completion: i64,
-        total: i64,
-        cost_micros: i64,
-        vendor_cost_micros: i64,
-    }
-    let mut rollup: std::collections::BTreeMap<(String, String), Agg> =
-        std::collections::BTreeMap::new();
-    for r in records {
-        if filter.as_deref().is_some_and(|t| t != r.tenant) {
-            continue;
-        }
-        let e = rollup.entry((r.tenant, r.model)).or_default();
-        e.requests += 1;
-        e.prompt += r.prompt_tokens;
-        e.completion += r.completion_tokens;
-        e.total += r.total_tokens;
-        e.cost_micros += r.cost_micros;
-        e.vendor_cost_micros += r.vendor_cost_micros;
-    }
-    let usage: Vec<Value> = rollup
-        .into_iter()
-        .map(|((tenant, model), a)| {
-            json!({
-                "tenant": tenant, "model": model, "requests": a.requests,
-                "prompt_tokens": a.prompt, "completion_tokens": a.completion,
-                "total_tokens": a.total, "cost_micros": a.cost_micros,
-                "vendor_cost_micros": a.vendor_cost_micros,
-            })
-        })
-        .collect();
     Json(json!({ "usage": usage })).into_response()
 }
 
