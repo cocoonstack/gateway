@@ -352,6 +352,11 @@ impl SseState {
                     });
                 }
                 self.output = v["usage"]["output_tokens"].as_i64().unwrap_or(self.output);
+                // Anthropic reports input_tokens in message_start; some
+                // compatible vendors (MiniMax) only report it here.
+                if let Some(it) = v["usage"]["input_tokens"].as_i64() {
+                    self.input = it;
+                }
             }
             _ => {} // message_stop
         }
@@ -437,7 +442,8 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"sf\\\"}\"}}\n\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            // input_tokens here, not in message_start — the MiniMax placement
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":5}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
         let mut r = base_req();
@@ -449,6 +455,9 @@ mod tests {
         assert_eq!(tc[0]["name"], "get_weather");
         assert_eq!(tc[0]["input"]["city"], "sf");
         assert!(out.chunks.iter().any(|c| c.tool_calls.is_some()));
+        // message_delta's input_tokens wins over message_start's
+        assert_eq!(out.response.prompt_tokens, 9);
+        assert_eq!(out.response.completion_tokens, 5);
     }
 
     #[tokio::test]
