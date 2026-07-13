@@ -132,9 +132,12 @@ mod tests {
             gw_state::AkInfo {
                 ak: "t".into(),
                 product: "demo".into(),
+                tenant: "default".into(),
                 qps: 10.0,
                 daily_token_quota: 1000,
                 tokens_per_minute: None,
+                expires_at_epoch_secs: None,
+                banned: false,
             },
         )
     }

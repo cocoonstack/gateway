@@ -16,6 +16,7 @@ use sqlx::Row;
 pub struct BillingRecord {
     pub ak: String,
     pub product: String,
+    pub tenant: String,
     pub model: String,
     pub protocol: String,
     pub account: String,
@@ -237,7 +238,8 @@ impl SqliteStore {
         for ddl in [
             "CREATE TABLE IF NOT EXISTS billing (
                 n INTEGER PRIMARY KEY AUTOINCREMENT,
-                ak TEXT NOT NULL, product TEXT NOT NULL, model TEXT NOT NULL,
+                ak TEXT NOT NULL, product TEXT NOT NULL,
+                tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
                 protocol TEXT NOT NULL, account TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
@@ -258,6 +260,16 @@ impl SqliteStore {
                 .await
                 .map_err(|e| store_err("create schema", e))?;
         }
+        // Pre-tenant databases lack the column; the ALTER fails once with
+        // "duplicate column name" on every later boot, so that error is ignored.
+        if let Err(e) =
+            sqlx::query("ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'")
+                .execute(&pool)
+                .await
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(store_err("migrate billing schema", e));
+        }
         // Jobs left pending/running by a dead process can never progress
         // (single-instance store) — surface them as failed instead of letting
         // clients poll a job that will never finish.
@@ -276,12 +288,13 @@ impl SqliteStore {
 impl Store for SqliteStore {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
         sqlx::query(
-            "INSERT INTO billing (ak, product, model, protocol, account, prompt_tokens,
+            "INSERT INTO billing (ak, product, tenant, model, protocol, account, prompt_tokens,
              completion_tokens, total_tokens, cost_micros, ptu_spillover)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.ak)
         .bind(&r.product)
+        .bind(&r.tenant)
         .bind(&r.model)
         .bind(&r.protocol)
         .bind(&r.account)
@@ -309,7 +322,7 @@ impl Store for SqliteStore {
             .await
             .map_err(|e| store_err("count billing records", e))?;
         let mut rows = sqlx::query(
-            "SELECT ak, product, model, protocol, account, prompt_tokens,
+            "SELECT ak, product, tenant, model, protocol, account, prompt_tokens,
              completion_tokens, total_tokens, cost_micros, ptu_spillover
              FROM billing ORDER BY n DESC LIMIT ?",
         )
@@ -324,14 +337,15 @@ impl Store for SqliteStore {
                 .map(|row| BillingRecord {
                     ak: row.get(0),
                     product: row.get(1),
-                    model: row.get(2),
-                    protocol: row.get(3),
-                    account: row.get(4),
-                    prompt_tokens: row.get(5),
-                    completion_tokens: row.get(6),
-                    total_tokens: row.get(7),
-                    cost_micros: row.get(8),
-                    ptu_spillover: row.get(9),
+                    tenant: row.get(2),
+                    model: row.get(3),
+                    protocol: row.get(4),
+                    account: row.get(5),
+                    prompt_tokens: row.get(6),
+                    completion_tokens: row.get(7),
+                    total_tokens: row.get(8),
+                    cost_micros: row.get(9),
+                    ptu_spillover: row.get(10),
                 })
                 .collect(),
         ))
@@ -470,6 +484,7 @@ mod tests {
         BillingRecord {
             ak: "ak-t".into(),
             product: "p".into(),
+            tenant: "default".into(),
             model: model.into(),
             protocol: "openai-chat".into(),
             account: "acc".into(),

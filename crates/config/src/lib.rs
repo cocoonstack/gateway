@@ -6,6 +6,10 @@
 use gw_consts::Protocol;
 use serde::Deserialize;
 
+/// The implicit tenant for keys that don't declare one: unrestricted unless a
+/// `tenants` entry named `default` gives it limits.
+pub const DEFAULT_TENANT: &str = "default";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("read config file {path}: {source}")]
@@ -30,6 +34,10 @@ pub enum ConfigError {
     ModelNeedsDispatch { model: String },
     #[error("duplicate {kind} name `{name}`")]
     DuplicateName { kind: &'static str, name: String },
+    #[error("access key `{ak}` references undeclared tenant `{tenant}`")]
+    UnknownTenant { ak: String, tenant: String },
+    #[error("tenant `{tenant}` entitles unknown model `{model}`")]
+    UnknownEntitledModel { tenant: String, model: String },
 }
 
 /// Build a name → slot-index map for O(1) lookups.
@@ -70,6 +78,9 @@ pub struct Listen {
 pub struct AkConf {
     pub ak: String,
     pub product: String,
+    /// Tenant this key belongs to; empty = the implicit `default` tenant.
+    #[serde(default)]
+    pub tenant: String,
     /// requests per second allowed for this AK.
     pub qps: f64,
     /// daily token budget for this AK.
@@ -77,6 +88,12 @@ pub struct AkConf {
     /// tokens-per-minute window limit; None = unlimited.
     #[serde(default)]
     pub tokens_per_minute: Option<i64>,
+    /// Unix seconds after which the key stops authenticating; None = never.
+    #[serde(default)]
+    pub expires_at_epoch_secs: Option<i64>,
+    /// A banned key stays in the table but fails auth with a distinct 403.
+    #[serde(default)]
+    pub banned: bool,
 }
 
 /// Public model name → dispatch type + demo pricing + per-model governance.
@@ -229,6 +246,19 @@ pub struct ProductConfEntry {
     pub qpm: Option<i64>,
 }
 
+/// Tenant-level pooled governance and model entitlement. All of a tenant's
+/// keys share one rate bucket; the entitlement gates which models they may call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenantConf {
+    pub name: String,
+    /// Pooled requests-per-second across all the tenant's keys; None = unlimited.
+    #[serde(default)]
+    pub qps: Option<f64>,
+    /// Models this tenant may call; None = every configured model.
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+}
+
 /// First-class provider preset: `kind` fixes the endpoint, auth style, and
 /// served wire types, so going live is `kind` + `api_key_env`.
 #[derive(Debug, Clone, Deserialize)]
@@ -314,6 +344,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub products: Vec<ProductConfEntry>,
     #[serde(default)]
+    pub tenants: Vec<TenantConf>,
+    #[serde(default)]
     pub storage: StorageConf,
     /// First-class provider presets; each expands into an upstream account.
     #[serde(default)]
@@ -328,6 +360,8 @@ pub struct GatewayConfig {
     ak_idx: std::collections::HashMap<String, usize>,
     #[serde(skip)]
     product_idx: std::collections::HashMap<String, usize>,
+    #[serde(skip)]
+    tenant_idx: std::collections::HashMap<String, usize>,
 }
 
 /// The repo's default config, embedded so tests and `cargo run` work with zero setup.
@@ -346,11 +380,17 @@ impl GatewayConfig {
         self.model_idx = index_by(&self.models, |m| &m.name);
         self.ak_idx = index_by(&self.access_keys, |a| &a.ak);
         self.product_idx = index_by(&self.products, |p| &p.name);
+        self.tenant_idx = index_by(&self.tenants, |t| &t.name);
     }
 
     /// Expand provider presets: fill each model's default wire type and
     /// synthesize an account per provider (explicit same-name accounts win).
     fn normalize(&mut self) -> Result<(), ConfigError> {
+        for k in &mut self.access_keys {
+            if k.tenant.is_empty() {
+                k.tenant = DEFAULT_TENANT.to_owned();
+            }
+        }
         for m in &mut self.models {
             if !m.protocol.is_empty() {
                 continue;
@@ -442,6 +482,27 @@ impl GatewayConfig {
         check_unique("access_key", self.access_keys.iter().map(|a| a.ak.as_str()))?;
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
+        check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
+        // A typo'd tenant on a key would otherwise silently fall back to the
+        // unrestricted default tenant — reject undeclared references at load.
+        for k in &self.access_keys {
+            if k.tenant != DEFAULT_TENANT && !self.tenants.iter().any(|t| t.name == k.tenant) {
+                return Err(ConfigError::UnknownTenant {
+                    ak: k.ak.clone(),
+                    tenant: k.tenant.clone(),
+                });
+            }
+        }
+        for t in &self.tenants {
+            for m in t.models.iter().flatten() {
+                if !self.models.iter().any(|c| &c.name == m) {
+                    return Err(ConfigError::UnknownEntitledModel {
+                        tenant: t.name.clone(),
+                        model: m.clone(),
+                    });
+                }
+            }
+        }
         // account health and failover exclusion key by name — duplicates would
         // cool down / exclude the wrong physical account.
         check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
@@ -450,6 +511,19 @@ impl GatewayConfig {
 
     pub fn find_product(&self, name: &str) -> Option<&ProductConfEntry> {
         self.products.get(*self.product_idx.get(name)?)
+    }
+
+    pub fn find_tenant(&self, name: &str) -> Option<&TenantConf> {
+        self.tenants.get(*self.tenant_idx.get(name)?)
+    }
+
+    /// Whether `tenant` may call `model`: no tenant entry or no allowlist =
+    /// every model; otherwise the allowlist decides.
+    pub fn tenant_allows_model(&self, tenant: &str, model: &str) -> bool {
+        match self.find_tenant(tenant).and_then(|t| t.models.as_ref()) {
+            Some(allow) => allow.iter().any(|m| m == model),
+            None => true,
+        }
     }
 
     pub fn find_ak(&self, ak: &str) -> Option<&AkConf> {
@@ -638,6 +712,53 @@ accounts:
         let m = cfg.find_model("gpt-4o").unwrap();
         assert_eq!(m.protocol(), Some(Protocol::OpenaiChat));
         assert_eq!(cfg.prices_for("claude-sonnet"), (3000, 15000));
+    }
+
+    #[test]
+    fn tenant_validation_and_entitlement() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat}, {name: m2, protocol: openai-chat}]
+tenants: [{name: t1, qps: 5, models: [m1]}]
+access_keys:
+  - {ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 10}
+  - {ak: k2, product: p, qps: 1, daily_token_quota: 10}
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        assert_eq!(cfg.find_ak("k2").unwrap().tenant, DEFAULT_TENANT);
+        assert!(cfg.tenant_allows_model("t1", "m1"));
+        assert!(!cfg.tenant_allows_model("t1", "m2"));
+        assert!(cfg.tenant_allows_model(DEFAULT_TENANT, "m2"));
+        assert_eq!(cfg.find_tenant("t1").unwrap().qps, Some(5.0));
+
+        let undeclared = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat}]
+access_keys: [{ak: k1, tenant: ghost, product: p, qps: 1, daily_token_quota: 10}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(undeclared),
+            Err(ConfigError::UnknownTenant { .. })
+        ));
+
+        let bad_model = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat}]
+tenants: [{name: t1, models: [nope]}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(bad_model),
+            Err(ConfigError::UnknownEntitledModel { .. })
+        ));
+
+        let dup = r#"
+listen: {host: h, port: 1}
+tenants: [{name: t1}, {name: t1}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(dup),
+            Err(ConfigError::DuplicateName { kind: "tenant", .. })
+        ));
     }
 
     #[test]

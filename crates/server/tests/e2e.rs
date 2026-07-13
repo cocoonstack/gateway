@@ -306,7 +306,11 @@ async fn health_and_models() {
     let resp = app.clone().oneshot(get("/health")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = app.oneshot(get("/v1/models")).await.unwrap();
+    // the catalog requires auth (it's filtered per tenant)
+    let resp = app.clone().oneshot(get("/v1/models")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app.oneshot(get_authed("/v1/models")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     let ids: Vec<&str> = j["data"]
@@ -322,6 +326,101 @@ async fn health_and_models() {
             .unwrap()
             .iter()
             .all(|m| m["implemented"] == Value::Bool(true))
+    );
+}
+
+#[tokio::test]
+async fn banned_and_expired_keys_get_distinct_403s() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-banned"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let j = body_json(resp).await;
+    assert!(j["error"]["message"].as_str().unwrap().contains("banned"));
+
+    let resp = app
+        .oneshot(post("/v1/chat/completions", Some("ak-expired"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let j = body_json(resp).await;
+    assert!(j["error"]["message"].as_str().unwrap().contains("expired"));
+}
+
+#[tokio::test]
+async fn tenant_entitlement_gates_models_and_catalog() {
+    let app = app();
+    // acme is entitled to gpt-4o only
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-acme-1"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-acme-1"),
+            r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"x"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let j = body_json(resp).await;
+    assert!(j["error"]["message"].as_str().unwrap().contains("entitled"));
+
+    // the catalog view shrinks to the entitlement
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer ak-acme-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let ids: Vec<&str> = j["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["gpt-4o"]);
+}
+
+#[tokio::test]
+async fn tenant_rate_limit_pools_across_keys() {
+    let app = app();
+    // acme's pooled bucket is qps 2: two calls from different keys pass,
+    // the third (either key) is rejected with the tenant message.
+    for ak in ["ak-acme-1", "ak-acme-2"] {
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/chat/completions", Some(ak), CHAT_BODY))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "warm-up call for {ak}");
+    }
+    let resp = app
+        .oneshot(post("/v1/chat/completions", Some("ak-acme-2"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tenant rate limit"),
+        "pooled limit must fire at the tenant tier, not per key"
     );
 }
 

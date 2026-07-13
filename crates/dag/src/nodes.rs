@@ -42,6 +42,39 @@ impl DagNode for ResolveModel {
     }
 }
 
+/// preprocess/tenant_entitlement: per-tenant model allowlist. Runs before the
+/// cache so an unentitled model can't be served from another tenant's entry.
+pub struct TenantEntitlement;
+
+#[async_trait::async_trait]
+impl DagNode for TenantEntitlement {
+    fn name(&self) -> &'static str {
+        "tenant_entitlement"
+    }
+    fn deps(&self) -> &'static [&'static str] {
+        &["resolve_model"]
+    }
+    async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        let name = ctx
+            .request
+            .model_param_v2
+            .as_ref()
+            .map(|p| p.model_name.as_str())
+            .unwrap_or_default();
+        if !ctx.cfg.tenant_allows_model(&ctx.ak.tenant, name) {
+            return Err(GatewayError::new(
+                ErrCode::PERMISSION_CHECK,
+                403,
+                format!(
+                    "model `{name}` is not entitled for tenant `{}`",
+                    ctx.ak.tenant
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// preprocess/cache_lookup: request-level cache lookup (in-memory, TTL-based).
 /// On a hit, outcome is produced directly and the downstream account/rate-limit/
 /// engine/billing nodes all short-circuit.
@@ -74,7 +107,7 @@ impl DagNode for CacheLookup {
         "cache_lookup"
     }
     fn deps(&self) -> &'static [&'static str] {
-        &["resolve_model"]
+        &["tenant_entitlement"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let param = match ctx.request.model_param_v2.as_ref() {
@@ -177,6 +210,41 @@ impl DagNode for SelectAccount {
     }
 }
 
+/// model_access/tenant_rate: pooled tenant QPS — all of a tenant's keys share
+/// one bucket, checked ahead of the per-AK limit.
+pub struct TenantRateLimit;
+
+#[async_trait::async_trait]
+impl DagNode for TenantRateLimit {
+    fn name(&self) -> &'static str {
+        "tenant_rate"
+    }
+    async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        if ctx.cache_hit {
+            return Ok(());
+        }
+        let Some(qps) = ctx.cfg.find_tenant(&ctx.ak.tenant).and_then(|t| t.qps) else {
+            return Ok(());
+        };
+        if !ctx
+            .state
+            .governance
+            .rate_allow(&format!("tenant:{}", ctx.ak.tenant), qps)
+            .await
+        {
+            return Err(GatewayError::new(
+                ErrCode::STOP_LIMIT_MSG,
+                429,
+                format!(
+                    "tenant rate limit exceeded for `{}` (qps {qps})",
+                    ctx.ak.tenant
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// model_access/rate_limit: AK-level QPS limiting.
 pub struct RateLimit;
 
@@ -184,6 +252,9 @@ pub struct RateLimit;
 impl DagNode for RateLimit {
     fn name(&self) -> &'static str {
         "rate_limit"
+    }
+    fn deps(&self) -> &'static [&'static str] {
+        &["tenant_rate"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         if ctx.cache_hit {
@@ -540,6 +611,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let record = BillingRecord {
         ak: ctx.ak.ak.clone(),
         product: ctx.ak.product.clone(),
+        tenant: ctx.ak.tenant.clone(),
         model: public_name.to_owned(),
         protocol: param
             .map(|p| p.protocol.as_str().to_owned())
@@ -613,6 +685,7 @@ pub fn default_layers() -> Vec<Layer> {
             name: "preprocess",
             nodes: vec![
                 Box::new(ResolveModel),
+                Box::new(TenantEntitlement),
                 Box::new(CacheLookup),
                 Box::new(QuotaCheck),
             ],
@@ -624,6 +697,7 @@ pub fn default_layers() -> Vec<Layer> {
         Layer {
             name: "model_access",
             nodes: vec![
+                Box::new(TenantRateLimit),
                 Box::new(RateLimit),
                 Box::new(ProductQpmLimit),
                 Box::new(ModelQpmLimit),

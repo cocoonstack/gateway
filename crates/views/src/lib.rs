@@ -187,7 +187,10 @@ async fn realtime_ws(
         Ok(ak) => ak,
         Err((st, msg)) => {
             match ws_subprotocol_ak(&headers).and_then(|k| snap.state.auth.authenticate(&k)) {
-                Some(ak) => ak,
+                Some(ak) => match check_key_status(&ak) {
+                    Ok(()) => ak,
+                    Err((st, msg)) => return error_response(st, msg),
+                },
                 None => return error_response(st, msg),
             }
         }
@@ -268,6 +271,7 @@ async fn bill_realtime_turn(
     let record = gw_state::BillingRecord {
         ak: ak.ak.clone(),
         product: ak.product.clone(),
+        tenant: ak.tenant.clone(),
         model: model.to_owned(),
         protocol: mt.as_str().to_owned(),
         account: account.to_owned(),
@@ -557,13 +561,17 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": "gw" }))
 }
 
-/// Configured public models (the gateway's catalog view).
-async fn list_models(State(s): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = s
-        .handler
-        .cfg()
+/// Configured public models, filtered to the caller's tenant entitlement.
+async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let ak = match authenticate(&s, &headers) {
+        Ok(ak) => ak,
+        Err((st, msg)) => return error_response(st, msg),
+    };
+    let cfg = s.handler.cfg();
+    let data: Vec<Value> = cfg
         .models
         .iter()
+        .filter(|m| cfg.tenant_allows_model(&ak.tenant, &m.name))
         .map(|m| {
             let implemented = m.protocol().map(is_implemented).unwrap_or(false);
             json!({
@@ -574,7 +582,7 @@ async fn list_models(State(s): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "object": "list", "data": data }))
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 /// Local billing ledger snapshot.
@@ -627,11 +635,24 @@ fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'sta
             "missing api key (Authorization: Bearer <ak> or x-api-key)",
         ));
     };
-    s.handler
+    let info = s
+        .handler
         .state()
         .auth
         .authenticate(ak)
-        .ok_or((401, "invalid api key"))
+        .ok_or((401, "invalid api key"))?;
+    check_key_status(&info)?;
+    Ok(info)
+}
+
+/// Lifecycle gate shared by every auth path: banned and expired keys stay in
+/// the table but fail with distinct 403s (unlike a revoked key's 401).
+fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
+    match info.status_at(gw_state::epoch_secs()) {
+        gw_state::KeyStatus::Active => Ok(()),
+        gw_state::KeyStatus::Banned => Err((403, "access key is banned")),
+        gw_state::KeyStatus::Expired => Err((403, "access key has expired")),
+    }
 }
 
 fn error_response(status: u16, message: impl Into<String>) -> Response {
@@ -709,9 +730,16 @@ async fn admin_key_create(
     let info = AkInfo {
         ak: ak.to_owned(),
         product: product.to_owned(),
+        tenant: body["tenant"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .unwrap_or(gw_config::DEFAULT_TENANT)
+            .to_owned(),
         qps: body["qps"].as_f64().unwrap_or(0.0),
         daily_token_quota: body["daily_token_quota"].as_i64().unwrap_or(0),
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
+        expires_at_epoch_secs: body["expires_at_epoch_secs"].as_i64(),
+        banned: body["banned"].as_bool().unwrap_or(false),
     };
     s.handler.state().auth.put(info, gw_state::KeySource::Admin);
     (
@@ -749,9 +777,12 @@ async fn admin_key_patch(
         Some(info) => (
             StatusCode::OK,
             Json(json!({
-                "ak": info.ak, "product": info.product, "qps": info.qps,
+                "ak": info.ak, "product": info.product, "tenant": info.tenant,
+                "qps": info.qps,
                 "daily_token_quota": info.daily_token_quota,
                 "tokens_per_minute": info.tokens_per_minute,
+                "expires_at_epoch_secs": info.expires_at_epoch_secs,
+                "banned": info.banned,
             })),
         )
             .into_response(),

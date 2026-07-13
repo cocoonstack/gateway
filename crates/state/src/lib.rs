@@ -26,10 +26,29 @@ const CACHE_MAX_ENTRIES: u64 = 10_000;
 pub struct AkInfo {
     pub ak: String,
     pub product: String,
+    /// Tenant this key belongs to (`gw_config::DEFAULT_TENANT` when undeclared).
+    pub tenant: String,
     pub qps: f64,
     pub daily_token_quota: i64,
     /// tokens-per-minute window cap; None = unlimited.
     pub tokens_per_minute: Option<i64>,
+    /// Unix seconds after which the key stops authenticating; None = never.
+    pub expires_at_epoch_secs: Option<i64>,
+    /// A banned key stays in the table but fails auth with a distinct 403.
+    pub banned: bool,
+}
+
+impl AkInfo {
+    /// Lifecycle state at `now` (unix seconds). Ban wins over expiry.
+    pub fn status_at(&self, now_epoch_secs: i64) -> KeyStatus {
+        if self.banned {
+            return KeyStatus::Banned;
+        }
+        match self.expires_at_epoch_secs {
+            Some(t) if now_epoch_secs >= t => KeyStatus::Expired,
+            _ => KeyStatus::Active,
+        }
+    }
 }
 
 impl From<&gw_config::AkConf> for AkInfo {
@@ -37,11 +56,30 @@ impl From<&gw_config::AkConf> for AkInfo {
         Self {
             ak: k.ak.clone(),
             product: k.product.clone(),
+            tenant: k.tenant.clone(),
             qps: k.qps,
             daily_token_quota: k.daily_token_quota,
             tokens_per_minute: k.tokens_per_minute,
+            expires_at_epoch_secs: k.expires_at_epoch_secs,
+            banned: k.banned,
         }
     }
+}
+
+/// Key lifecycle state: expired and banned keys authenticate to distinct 403s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    Active,
+    Banned,
+    Expired,
+}
+
+/// Current unix seconds (0 if the clock reads before the epoch).
+pub fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Where a key came from: the config file (re-applied on reload) or the admin
@@ -650,9 +688,12 @@ mod tests {
             AkInfo {
                 ak: "ak-config".into(),
                 product: "p".into(),
+                tenant: "default".into(),
                 qps: 1.0,
                 daily_token_quota: 10,
                 tokens_per_minute: None,
+                expires_at_epoch_secs: None,
+                banned: false,
             },
             KeySource::Config,
         );
@@ -660,9 +701,12 @@ mod tests {
             AkInfo {
                 ak: "ak-admin".into(),
                 product: "p".into(),
+                tenant: "default".into(),
                 qps: 1.0,
                 daily_token_quota: 10,
                 tokens_per_minute: None,
+                expires_at_epoch_secs: None,
+                banned: false,
             },
             KeySource::Admin,
         );
@@ -702,9 +746,12 @@ mod tests {
             AkInfo {
                 ak: "ak-keep".into(),
                 product: "p".into(),
+                tenant: "default".into(),
                 qps: 1.0,
                 daily_token_quota: 10,
                 tokens_per_minute: None,
+                expires_at_epoch_secs: None,
+                banned: false,
             },
             KeySource::Config,
         );
@@ -727,9 +774,12 @@ mod tests {
         let info = |ak: &str| AkInfo {
             ak: ak.into(),
             product: "p".into(),
+            tenant: "default".into(),
             qps: 1.0,
             daily_token_quota: 10,
             tokens_per_minute: None,
+            expires_at_epoch_secs: None,
+            banned: false,
         };
         auth.put(info("ak-x"), KeySource::Config);
         // an admin write to a config key updates values but keeps Config ownership
@@ -757,6 +807,26 @@ mod tests {
             auth.authenticate("ak-adm").is_none(),
             "config-claimed key is revocable by config"
         );
+    }
+
+    #[test]
+    fn key_status_lifecycle() {
+        let mut info = AkInfo {
+            ak: "k".into(),
+            product: "p".into(),
+            tenant: "default".into(),
+            qps: 1.0,
+            daily_token_quota: 10,
+            tokens_per_minute: None,
+            expires_at_epoch_secs: None,
+            banned: false,
+        };
+        assert_eq!(info.status_at(i64::MAX), KeyStatus::Active);
+        info.expires_at_epoch_secs = Some(100);
+        assert_eq!(info.status_at(99), KeyStatus::Active);
+        assert_eq!(info.status_at(100), KeyStatus::Expired);
+        info.banned = true;
+        assert_eq!(info.status_at(0), KeyStatus::Banned, "ban wins over expiry");
     }
 
     #[test]

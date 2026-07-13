@@ -43,6 +43,33 @@ access_keys:
     product: qpmprod
     qps: 100
     daily_token_quota: 1000000
+  - ak: ak-acme-1 # e2e: tenant entitlement + pooled tenant rate (tenant=acme)
+    tenant: acme
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
+  - ak: ak-acme-2 # e2e: second key sharing acme's pooled rate bucket
+    tenant: acme
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
+  - ak: ak-banned # e2e: banned key -> distinct 403
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
+    banned: true
+  - ak: ak-expired # e2e: expired key -> distinct 403
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
+    expires_at_epoch_secs: 1
+
+# Tenants: pooled rate limits + model entitlement. Keys without a tenant join
+# the implicit unrestricted `default` tenant.
+tenants:
+  - name: acme # e2e: entitled to gpt-4o only; both acme keys share qps 2
+    qps: 2
+    models: [gpt-4o]
 
 # Public model name → wire protocol, optional provider binding (only that
 # provider's accounts serve the model), plus demo prices (micros per 1k tokens).
