@@ -66,6 +66,42 @@ fn big_chat_req() -> Request<Body> {
         .expect("request")
 }
 
+/// Isolates the per-request `GatewayRequest` clone in CallEngine at the same
+/// payload shape as `bench_big_payload`, plus a fat `raw` passthrough body —
+/// the evidence gate for an Arc/borrow change (issue #2 M8 carry-over).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+async fn bench_request_clone() {
+    let turn = "x".repeat(2000);
+    let message: Vec<gw_models::ChatMsg> = (0..24)
+        .map(|i| {
+            gw_models::ChatMsg::text(if i % 2 == 0 { "user" } else { "assistant" }, turn.clone())
+        })
+        .collect();
+    for (label, raw_kb) in [
+        ("48KB msgs, no raw", 0usize),
+        ("48KB msgs + 100KB raw", 100),
+    ] {
+        let mut param =
+            gw_models::ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, "gpt-4o");
+        if raw_kb > 0 {
+            param.raw = serde_json::json!({"input": "y".repeat(raw_kb * 1000)});
+        }
+        let req = gw_models::GatewayRequest {
+            is_online: true,
+            message: message.clone(),
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        const N: u32 = 10_000;
+        let t = Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(req.clone());
+        }
+        println!("clone [{label}]: {:?}/clone", t.elapsed() / N);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark; run with --ignored --nocapture"]
 async fn bench_big_payload() {
