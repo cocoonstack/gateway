@@ -55,10 +55,8 @@ impl OnlineHandler {
     pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
         // one consistent snapshot for the whole request
         let snap = self.config.load();
-        // --- plugin pre-stage ---
         let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
         if let Some(block) = plugins::security_check(&snap.cfg.security, &request) {
-            // security block hit: skips the engine and billing, returns the block message
             let mut ctx = DagContext::new(
                 snap.cfg.clone(),
                 snap.state.clone(),
@@ -98,7 +96,18 @@ impl OnlineHandler {
 
         gw_dag::run(&self.plan, &mut ctx).await?;
 
-        // --- plugin post-stage: outbound redaction ---
+        // a quota fallback served a different model; every surface echoes the
+        // requested name (the ledger keeps both)
+        if let Some(requested) = ctx
+            .request
+            .model_param_v2
+            .as_ref()
+            .and_then(|p| p.fallback_from.clone())
+            && let Some(outcome) = ctx.outcome.as_mut()
+        {
+            outcome.response.model = requested;
+        }
+
         if let Some(outcome) = ctx.outcome.as_mut() {
             let n = plugins::dlp_redact_response(&snap.cfg.security, &mut outcome.response);
             if n > 0 {
@@ -206,7 +215,6 @@ mod tests {
     #[tokio::test]
     async fn ptu_failover_spills_to_paygo() {
         let h = handler();
-        // hunyuan-lite: PTU account name contains "down" -> mock 503 -> fails over to paygo
         let ctx = h
             .run(chat_req("hunyuan-lite", "failover please"), ak(&h).await)
             .await
@@ -253,7 +261,6 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(BreakingStream),
         );
-        // client that consumes chunks (stays connected) — the upstream breaks
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let mut req = chat_req("gpt-4o", "please stream something long");
@@ -282,9 +289,6 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            // Anthropic reports input_tokens up front in message_start, so total
-            // is nonzero mid-stream; output_tokens would only arrive in the
-            // final message_delta that this break skips.
             let frames: Vec<Result<bytes::Bytes, String>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":100}}}\n\n",
@@ -322,8 +326,6 @@ mod tests {
         assert_eq!(out.response.message, "delivered words here");
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 1);
-        // the real prompt count is kept (100), completion is estimated from the
-        // delivered text — NOT billed as zero
         assert_eq!(ledger[0].prompt_tokens, 100);
         assert!(
             ledger[0].completion_tokens > 0,
@@ -336,8 +338,6 @@ mod tests {
     async fn batch_items_bypass_the_cache_and_bill_each() {
         let h = handler();
         let off = OfflineHandler::new(h.clone());
-        // two byte-identical items on the cached model: without the bypass the
-        // second would be a free cache hit and the ledger would miss a row
         let items = vec![
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
@@ -384,7 +384,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // poll until the background task finishes
         for _ in 0..100 {
             if let Some(j) = h.state().store.batch_get(&job.id).await.unwrap()
                 && matches!(

@@ -2,7 +2,7 @@
 //! A publish inserts a new version and fires a `gw_config` NOTIFY, so every
 //! instance's listener reloads without a per-instance SIGHUP.
 
-use gw_models::{GResult, GatewayError};
+use gw_models::GResult;
 use sqlx::Row;
 
 /// Superseded versions kept for operator inspection/rollback.
@@ -24,7 +24,7 @@ impl PostgresConfigStore {
             .max_connections(3)
             .connect(url)
             .await
-            .map_err(|e| cfg_err("connect postgres config store", e))?;
+            .map_err(|e| crate::sqlx_err("connect postgres config store", e))?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS gw_config (
                 id BIGSERIAL PRIMARY KEY,
@@ -33,7 +33,7 @@ impl PostgresConfigStore {
         )
         .execute(&pool)
         .await
-        .map_err(|e| cfg_err("create gw_config schema", e))?;
+        .map_err(|e| crate::sqlx_err("create gw_config schema", e))?;
         Ok(Self { pool })
     }
 
@@ -42,7 +42,7 @@ impl PostgresConfigStore {
         let row = sqlx::query("SELECT id, yaml FROM gw_config ORDER BY id DESC LIMIT 1")
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| cfg_err("read latest config", e))?;
+            .map_err(|e| crate::sqlx_err("read latest config", e))?;
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
@@ -57,12 +57,12 @@ impl PostgresConfigStore {
         .bind(CONFIG_CHANNEL)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| cfg_err("publish config", e))?;
+        .map_err(|e| crate::sqlx_err("publish config", e))?;
         sqlx::query("DELETE FROM gw_config WHERE id <= (SELECT MAX(id) FROM gw_config) - $1")
             .bind(KEEP_VERSIONS)
             .execute(&self.pool)
             .await
-            .map_err(|e| cfg_err("prune config versions", e))?;
+            .map_err(|e| crate::sqlx_err("prune config versions", e))?;
         Ok(id)
     }
 }
@@ -73,11 +73,11 @@ impl PostgresConfigStore {
 pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
     let mut listener = sqlx::postgres::PgListener::connect(url)
         .await
-        .map_err(|e| cfg_err("connect config listener", e))?;
+        .map_err(|e| crate::sqlx_err("connect config listener", e))?;
     listener
         .listen(CONFIG_CHANNEL)
         .await
-        .map_err(|e| cfg_err("listen on config channel", e))?;
+        .map_err(|e| crate::sqlx_err("listen on config channel", e))?;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
         loop {
@@ -93,10 +93,6 @@ pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
         }
     });
     Ok(rx)
-}
-
-fn cfg_err(what: &str, e: sqlx::Error) -> GatewayError {
-    GatewayError::internal(what).with_source(e)
 }
 
 #[cfg(test)]

@@ -36,8 +36,7 @@ impl DagNode for ModelQuotaGate {
         };
         let key = format!("{}|{requested}", ctx.ak.ak);
         let under = ctx.state.governance.quota_check(&key, limit).await;
-        // usage counts against the requested model either way, so a fallback
-        // period ends when the day resets, not when the fallback accrues usage
+        // usage accrues to the requested name either way: a fallback period ends at the daily reset
         ctx.model_quota_key = Some(key);
         if under {
             return Ok(());
@@ -153,11 +152,8 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     if let Some(t) = &param.typed {
         h.update(serde_json::to_vec(t).ok()?);
     }
-    // `raw` carries passthrough params (seed, response_format, and — via the
-    // bespoke engines' raw merge — arbitrary vendor params) that change the
-    // model's output. Omitting it collides distinct requests onto one cache
-    // entry, serving a stale response for different params. Null when unused, so
-    // this is stable for the common case.
+    // `raw` params (seed, response_format, vendor extras) change the output;
+    // omitting them would collide distinct requests onto one entry
     if !param.raw.is_null() {
         h.update(serde_json::to_vec(&param.raw).ok()?);
     }
@@ -177,10 +173,8 @@ impl DagNode for CacheLookup {
             Some(p) => p,
             None => return Ok(()),
         };
-        // Cache serves online, non-streaming requests on cache_ttl models only.
-        // Offline batch items bypass it entirely (read and write): a cache hit
-        // is free — billing/quota are skipped — and batches promise per-item
-        // billing.
+        // online non-streaming cache_ttl models only; batch items bypass —
+        // a hit is free (unbilled) and batches promise per-item billing
         let ttl = ctx
             .cfg
             .find_model(&param.model_name)
@@ -506,7 +500,6 @@ impl DagNode for CallEngine {
                     .protocol()
                     .ok_or_else(|| GatewayError::internal("call_engine without model type"))?;
                 let failed = ctx.request.account.clone().unwrap_or_default();
-                // failure count -> cooldown once the threshold is reached
                 if ctx
                     .state
                     .health
@@ -607,13 +600,9 @@ impl DagNode for CostCalc {
             return Ok(()); // nothing to bill
         };
         let resp = &outcome.response;
-        // An aborted stream broke before the vendor's completion usage arrived,
-        // but the generated text WAS delivered to the client — bill it. The
-        // gate is `completion_tokens == 0`, not `total_tokens == 0`: Anthropic
-        // reports input_tokens up front in message_start (so total is already
-        // nonzero mid-stream), yet output_tokens only in the final message_delta
-        // that the break skipped. Estimate the missing completion from the
-        // delivered text; keep the real prompt count when the vendor gave one.
+        // An aborted stream delivered text but never the final usage frame — bill it.
+        // Gate on completion_tokens==0, not total: Anthropic reports input up front,
+        // output only in the final message_delta the break skipped.
         if resp.aborted && resp.completion_tokens == 0 {
             let enc = gw_models::token_estimate::default_encoder();
             let param = ctx.request.model_param_v2.as_ref();
@@ -636,9 +625,7 @@ impl DagNode for CostCalc {
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
             return bill(ctx, pt, ct, pt + ct).await;
         }
-        // platform_total via the weighted formula: default rate is 1:1, so `total`
-        // == prompt+completion, but the formula handles cache-normalization/weights/
-        // rounding correctly for future rates.
+        // default rate is 1:1 (total == prompt+completion); the formula carries future weighted rates
         let (prompt, completion, total) = match &resp.common_usage {
             Some(u) => {
                 let ti = gw_models::TokenInput {
@@ -681,11 +668,16 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         .unwrap_or(served);
     let (p_in, p_out) = ctx.cfg.prices_for(served);
     let cost = prompt * p_in / 1000 + completion * p_out / 1000;
-    ctx.state.governance.quota_consume(&ctx.ak.ak, total).await;
-    if let Some(key) = &ctx.model_quota_key {
-        ctx.state.governance.quota_consume(key, total).await;
+    match &ctx.model_quota_key {
+        // independent keys — one concurrent round-trip instead of two
+        Some(key) => {
+            tokio::join!(
+                ctx.state.governance.quota_consume(&ctx.ak.ak, total),
+                ctx.state.governance.quota_consume(key, total)
+            );
+        }
+        None => ctx.state.governance.quota_consume(&ctx.ak.ak, total).await,
     }
-    // TPM window accounting (post-hoc accumulation)
     ctx.state
         .governance
         .token_window_add(&ctx.ak.ak, total, std::time::Duration::from_secs(60))
@@ -711,8 +703,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         cost_micros: cost,
         ptu_spillover,
     };
-    // A ledger write failure must not fail a response that already succeeded
-    // upstream (quota/tpm are already consumed); log and continue.
+    // a ledger write failure must not fail an already-served response
     if let Err(e) = ctx.state.store.ledger_add(record).await {
         metrics::counter!("gateway_ledger_write_failures_total").increment(1);
         tracing::error!(error = %e, "billing ledger write failed");

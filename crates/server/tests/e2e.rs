@@ -3,7 +3,6 @@
 //! call at a time: auth → resolve → quota → account → rate-limit → engine →
 //! usage → billing. No network leaves the process (zero-egress default build).
 
-// test scaffolding — unwrap/expect allowed as in #[test] fns (clippy.toml can't reach helpers here)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
@@ -30,8 +29,6 @@ fn app() -> Router {
 
 #[tokio::test]
 async fn admin_reload_is_gated_and_swaps_keys_live() {
-    // admin disabled by default (embedded config has no admin token) → 404, so a
-    // probe can't distinguish the surface from a missing route
     let r = app()
         .oneshot(
             Request::builder()
@@ -44,7 +41,6 @@ async fn admin_reload_is_gated_and_swaps_keys_live() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
-    // an app with admin enabled + a loader that returns the v2 key set on reload
     const V1: &str = r#"
 listen: {host: 127.0.0.1, port: 0}
 admin: {token_env: GW_TEST_ADMIN_TOKEN_E2E}
@@ -88,7 +84,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         b.body(Body::empty()).unwrap()
     };
 
-    // before reload: v1 key works, v2 key unknown
     assert_eq!(
         app.clone().oneshot(chat("ak-v1")).await.unwrap().status(),
         StatusCode::OK
@@ -97,7 +92,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         app.clone().oneshot(chat("ak-v2")).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    // reload gated: no/wrong token rejected
     assert_eq!(
         app.clone().oneshot(reload(None)).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
@@ -110,7 +104,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    // correct token reloads
     assert_eq!(
         app.clone()
             .oneshot(reload(Some("s3cret")))
@@ -119,7 +112,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
             .status(),
         StatusCode::OK
     );
-    // after reload: the swap is live — v2 works, v1 gone, no restart
     assert_eq!(
         app.clone().oneshot(chat("ak-v2")).await.unwrap().status(),
         StatusCode::OK
@@ -129,22 +121,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::UNAUTHORIZED
     );
 
-    // --- admin key CRUD, and admin keys survive a reload ---
-    let admin = |method: &str, uri: &str, token: Option<&str>, body: Option<&str>| {
-        let mut b = Request::builder().method(method).uri(uri);
-        if let Some(t) = token {
-            b = b.header("authorization", format!("Bearer {t}"));
-        }
-        match body {
-            Some(j) => b
-                .header("content-type", "application/json")
-                .body(Body::from(j.to_owned()))
-                .unwrap(),
-            None => b.body(Body::empty()).unwrap(),
-        }
-    };
-
-    // create ak-admin at runtime
     let r = app
         .clone()
         .oneshot(admin(
@@ -165,7 +141,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::OK,
         "admin-created key works immediately"
     );
-    // create is gated
     assert_eq!(
         app.clone()
             .oneshot(admin(
@@ -180,7 +155,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::UNAUTHORIZED
     );
 
-    // a reload (back to the v2 file key set) must NOT wipe the admin key
     assert_eq!(
         app.clone()
             .oneshot(reload(Some("s3cret")))
@@ -199,7 +173,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         "admin key survives a config reload"
     );
 
-    // revoke it
     let r = app
         .clone()
         .oneshot(admin(
@@ -220,7 +193,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::UNAUTHORIZED,
         "revoked key is rejected"
     );
-    // patch a nonexistent key → 404
     assert_eq!(
         app.clone()
             .oneshot(admin(
@@ -235,8 +207,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::NOT_FOUND
     );
 
-    // malformed tokens_per_minute in PATCH must not silently drop the cap:
-    // set a cap, then PATCH a non-integer value → cap unchanged
     app.clone()
         .oneshot(admin(
             "POST",
@@ -292,6 +262,21 @@ fn get(uri: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// Admin-surface request: optional bearer + optional JSON body.
+fn admin(method: &str, uri: &str, token: Option<&str>, body: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    match body {
+        Some(j) => b
+            .header("content-type", "application/json")
+            .body(Body::from(j.to_owned()))
+            .expect("request"),
+        None => b.body(Body::empty()).expect("request"),
+    }
+}
+
 /// GET with the demo AK — the files/batches read surfaces require auth.
 fn get_authed(uri: &str) -> Request<Body> {
     Request::builder()
@@ -309,7 +294,6 @@ async fn health_and_models() {
     let resp = app.clone().oneshot(get("/health")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // the catalog requires auth (it's filtered per tenant)
     let resp = app.clone().oneshot(get("/v1/models")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
@@ -356,7 +340,6 @@ async fn banned_and_expired_keys_get_distinct_403s() {
 #[tokio::test]
 async fn tenant_entitlement_gates_models_and_catalog() {
     let app = app();
-    // acme is entitled to gpt-4o only
     let resp = app
         .clone()
         .oneshot(post("/v1/chat/completions", Some("ak-acme-1"), CHAT_BODY))
@@ -377,7 +360,6 @@ async fn tenant_entitlement_gates_models_and_catalog() {
     let j = body_json(resp).await;
     assert!(j["error"]["message"].as_str().unwrap().contains("entitled"));
 
-    // the catalog view shrinks to the entitlement
     let resp = app
         .oneshot(
             Request::builder()
@@ -424,27 +406,13 @@ access_keys:
         state,
         Arc::new(gw_engines::MockTransport),
     ));
-    let admin = |method: &str, uri: &str, token: &str, body: Option<&str>| {
-        let b = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("authorization", format!("Bearer {token}"));
-        match body {
-            Some(j) => b
-                .header("content-type", "application/json")
-                .body(Body::from(j.to_owned()))
-                .unwrap(),
-            None => b.body(Body::empty()).unwrap(),
-        }
-    };
 
-    // tenant admin creates a key; tenant defaults to its own scope
     let r = app
         .clone()
         .oneshot(admin(
             "POST",
             "/admin/keys",
-            "t-secret",
+            Some("t-secret"),
             Some(r#"{"ak":"ak-acme-new","product":"demo","qps":100,"daily_token_quota":1000}"#),
         ))
         .await
@@ -457,13 +425,12 @@ access_keys:
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "tenant-created key serves");
 
-    // cross-tenant create is refused; cross-tenant patch/delete answer 404
     let r = app
         .clone()
         .oneshot(admin(
             "POST",
             "/admin/keys",
-            "t-secret",
+            Some("t-secret"),
             Some(r#"{"ak":"x","product":"p","tenant":"beta"}"#),
         ))
         .await
@@ -475,7 +442,7 @@ access_keys:
     ] {
         let r = app
             .clone()
-            .oneshot(admin(method, uri, "t-secret", Some(r#"{"qps":1}"#)))
+            .oneshot(admin(method, uri, Some("t-secret"), Some(r#"{"qps":1}"#)))
             .await
             .unwrap();
         assert_eq!(
@@ -485,46 +452,51 @@ access_keys:
         );
     }
 
-    // reload is global-only
     let r = app
         .clone()
-        .oneshot(admin("POST", "/admin/reload", "t-secret", None))
+        .oneshot(admin("POST", "/admin/reload", Some("t-secret"), None))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
 
-    // creating a key under an undeclared tenant is rejected even for the
-    // global admin (it would silently be unrestricted)
     let r = app
         .clone()
         .oneshot(admin(
             "POST",
             "/admin/keys",
-            "g-secret",
+            Some("g-secret"),
             Some(r#"{"ak":"x","product":"p","tenant":"acmee"}"#),
         ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
-    // config publish: global-only, and 400 without a configured config store
     let r = app
         .clone()
-        .oneshot(admin("PUT", "/admin/config", "t-secret", Some("x: 1")))
+        .oneshot(admin(
+            "PUT",
+            "/admin/config",
+            Some("t-secret"),
+            Some("x: 1"),
+        ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     let r = app
         .clone()
-        .oneshot(admin("PUT", "/admin/config", "g-secret", Some("x: 1")))
+        .oneshot(admin(
+            "PUT",
+            "/admin/config",
+            Some("g-secret"),
+            Some("x: 1"),
+        ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST, "no config store wired");
 
-    // listing is scoped; the global token sees everything
     let r = app
         .clone()
-        .oneshot(admin("GET", "/admin/keys", "t-secret", None))
+        .oneshot(admin("GET", "/admin/keys", Some("t-secret"), None))
         .await
         .unwrap();
     let j = body_json(r).await;
@@ -532,19 +504,18 @@ access_keys:
     assert_eq!(j["keys"][0]["ak"], "ak-acme-new");
     let r = app
         .clone()
-        .oneshot(admin("GET", "/admin/keys", "g-secret", None))
+        .oneshot(admin("GET", "/admin/keys", Some("g-secret"), None))
         .await
         .unwrap();
     let j = body_json(r).await;
     assert_eq!(j["count"], 2);
 
-    // tenant admin bans its own key via PATCH → the key 403s; unban restores it
     let r = app
         .clone()
         .oneshot(admin(
             "PATCH",
             "/admin/keys/ak-acme-new",
-            "t-secret",
+            Some("t-secret"),
             Some(r#"{"banned":true}"#),
         ))
         .await
@@ -557,7 +528,6 @@ access_keys:
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
 
-    // usage rollup: beta traffic exists, but the acme admin sees only acme
     let r = app
         .clone()
         .oneshot(post("/v1/chat/completions", Some("ak-beta-key"), CHAT_BODY))
@@ -566,7 +536,7 @@ access_keys:
     assert_eq!(r.status(), StatusCode::OK);
     let r = app
         .clone()
-        .oneshot(admin("GET", "/admin/usage", "t-secret", None))
+        .oneshot(admin("GET", "/admin/usage", Some("t-secret"), None))
         .await
         .unwrap();
     let j = body_json(r).await;
@@ -578,7 +548,7 @@ access_keys:
         .collect();
     assert_eq!(tenants, vec!["acme"], "usage is tenant-scoped");
     let r = app
-        .oneshot(admin("GET", "/admin/usage", "g-secret", None))
+        .oneshot(admin("GET", "/admin/usage", Some("g-secret"), None))
         .await
         .unwrap();
     let j = body_json(r).await;
@@ -635,16 +605,8 @@ access_keys: [{ak: ak-boot, product: demo, qps: 100, daily_token_quota: 1000000}
         )
         .with_config_store(store),
     );
-    let put = |body: &str| {
-        Request::builder()
-            .method("PUT")
-            .uri("/admin/config")
-            .header("authorization", "Bearer cfg-secret")
-            .body(Body::from(body.to_owned()))
-            .unwrap()
-    };
+    let put = |body: &str| admin("PUT", "/admin/config", Some("cfg-secret"), Some(body));
 
-    // an invalid document is rejected before it reaches the store
     let r = app
         .clone()
         .oneshot(put("models: [{name: x}]"))
@@ -652,7 +614,6 @@ access_keys: [{ak: ak-boot, product: demo, qps: 100, daily_token_quota: 1000000}
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
-    // a valid publish returns the version and reloads this instance
     let v2 = BOOT.replace("ak-boot", "ak-pushed");
     let r = app.clone().oneshot(put(&v2)).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
@@ -681,9 +642,6 @@ access_keys: [{ak: ak-boot, product: demo, qps: 100, daily_token_quota: 1000000}
 #[tokio::test]
 async fn model_quota_degrades_to_fallback() {
     let app = app();
-    // beta caps gpt-4o at 20 tokens/day per key; each mock call uses ~15.
-    // Calls 1-2 pass the pre-check (0, then 15 < 20); call 3 is over and
-    // degrades to gpt-4o-mini while still echoing the requested model name.
     for i in 1..=2 {
         let resp = app
             .clone()
@@ -717,7 +675,6 @@ async fn model_quota_degrades_to_fallback() {
         "over-quota call is served by the fallback model"
     );
 
-    // the ledger records both names on the degraded call
     let resp = app.oneshot(get_authed("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     let last = j["records"]
@@ -736,8 +693,6 @@ async fn model_quota_degrades_to_fallback() {
 #[tokio::test]
 async fn tenant_rate_limit_pools_across_keys() {
     let app = app();
-    // acme's pooled bucket is qps 2: two calls from different keys pass,
-    // the third (either key) is rejected with the tenant message.
     for ak in ["ak-acme-1", "ak-acme-2"] {
         let resp = app
             .clone()
@@ -780,7 +735,6 @@ async fn auth_is_enforced() {
 #[tokio::test]
 async fn model_failure_modes_404_503_501() {
     let app = app();
-    // name known to nobody → resolve_model 404
     let resp = app
         .clone()
         .oneshot(post(
@@ -792,8 +746,6 @@ async fn model_failure_modes_404_503_501() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // valid protocol but no account slot serves it → select_account 503
-    // (account selection precedes engine creation, matching the pipeline layer order)
     let resp = app
         .clone()
         .oneshot(post(
@@ -805,7 +757,6 @@ async fn model_failure_modes_404_503_501() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // realtime family: account exists but websocket upstream bridging is future work → 501
     let resp = app
         .oneshot(post(
             "/v1/chat/completions",
@@ -821,7 +772,6 @@ async fn model_failure_modes_404_503_501() {
 async fn embeddings_images_audio_families() {
     let app = app();
 
-    // embeddings
     let resp = app
         .clone()
         .oneshot(post(
@@ -838,7 +788,6 @@ async fn embeddings_images_audio_families() {
     assert_eq!(j["data"][0]["embedding"].as_array().unwrap().len(), 8);
     assert!(j["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
 
-    // images
     let resp = app
         .clone()
         .oneshot(post(
@@ -853,7 +802,6 @@ async fn embeddings_images_audio_families() {
     assert_eq!(j["data"].as_array().unwrap().len(), 2);
     assert!(j["data"][0]["b64_json"].is_string());
 
-    // audio tts → binary audio bytes
     let resp = app
         .clone()
         .oneshot(post(
@@ -875,7 +823,6 @@ async fn embeddings_images_audio_families() {
     let bytes = body_bytes(resp).await;
     assert_eq!(bytes, b"MOCKBYTES"); // MOCK_B64 decoded
 
-    // audio stt
     let resp = app
         .oneshot(post(
             "/v1/audio/transcriptions",
@@ -930,7 +877,6 @@ async fn batch_submit_and_poll() {
     let id = j["id"].as_str().unwrap().to_owned();
     assert_eq!(j["total"], 2);
 
-    // poll until the background worker finishes
     let mut done = None;
     for _ in 0..100 {
         let resp = app
@@ -961,7 +907,6 @@ async fn batch_submit_and_poll() {
 #[tokio::test]
 async fn ptu_failover_spills_to_paygo() {
     let app = app();
-    // hunyuan-lite's PTU account name contains "down" → mock upstream 503 → failover to paygo
     let resp = app
         .clone()
         .oneshot(post(
@@ -982,7 +927,6 @@ async fn ptu_failover_spills_to_paygo() {
 #[tokio::test]
 async fn security_block_and_dlp_redaction() {
     let app = app();
-    // security wordlist hit → 200 + content_filter, not billed
     let resp = app
         .clone()
         .oneshot(post(
@@ -998,7 +942,6 @@ async fn security_block_and_dlp_redaction() {
     let resp = app.clone().oneshot(get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(resp).await["count"], 0); // blocked → no billing
 
-    // DLP redaction: inbound email/phone are already replaced in the echo
     let resp = app
         .oneshot(post(
             "/v1/chat/completions",
@@ -1050,7 +993,6 @@ async fn chat_non_stream_full_pipeline_bills_the_ledger() {
     let total = j["usage"]["total_tokens"].as_i64().unwrap();
     assert!(total > 0);
 
-    // billing side effect visible through the local ledger
     let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     assert_eq!(j["count"], 1);
@@ -1089,7 +1031,6 @@ async fn chat_stream_emits_sse_chunks_and_done() {
     assert!(frames.len() >= 3, "sse frames: {frames:?}");
     assert_eq!(*frames.last().unwrap(), "[DONE]");
 
-    // reassemble deltas and check the finish frame carries usage
     let mut assembled = String::new();
     let mut saw_finish_with_usage = false;
     for f in &frames[..frames.len() - 1] {
@@ -1207,7 +1148,6 @@ async fn dashscope_stream_emits_incremental_deltas() {
 #[tokio::test]
 async fn messages_errors_are_anthropic_shaped() {
     let app = app();
-    // no api key → authentication_error with the anthropic discriminator
     let r = app
         .clone()
         .oneshot(post(
@@ -1222,7 +1162,6 @@ async fn messages_errors_are_anthropic_shaped() {
     assert_eq!(j["type"], "error");
     assert_eq!(j["error"]["type"], "authentication_error");
 
-    // unknown model → not_found_error
     let r = app
         .oneshot(post(
             "/v1/messages",
@@ -1240,9 +1179,6 @@ async fn messages_errors_are_anthropic_shaped() {
 
 #[tokio::test]
 async fn messages_cross_protocol_converts_tool_calls_to_tool_use() {
-    // an openai-family model behind /v1/messages: anthropic-shaped tool defs
-    // must reach the vendor as function defs, and the returned tool_calls must
-    // come back as anthropic tool_use blocks (the dsl mapping at work)
     let app = app();
     let body = r#"{"model":"gpt-4o","max_tokens":64,
         "messages":[{"role":"user","content":"use the tool"}],
@@ -1263,7 +1199,6 @@ async fn messages_cross_protocol_converts_tool_calls_to_tool_use() {
     assert!(block["input"].is_object(), "arguments parsed: {block}");
     assert_eq!(j["stop_reason"], "tool_use");
 
-    // streaming: same conversion, emitted as tool_use content blocks
     let body = r#"{"model":"gpt-4o","max_tokens":64,"stream":true,
         "messages":[{"role":"user","content":"use the tool"}],
         "tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object"}}]}"#;
@@ -1317,7 +1252,6 @@ async fn anthropic_messages_non_stream() {
     assert!(j["usage"]["input_tokens"].as_i64().unwrap() > 0);
     assert!(j["usage"]["output_tokens"].as_i64().unwrap() > 0);
 
-    // block-array content form also accepted
     let body = r#"{"model":"claude-sonnet","messages":[{"role":"user","content":[{"type":"text","text":"blocks"}]}]}"#;
     let resp = app
         .oneshot(post("/v1/messages", Some("ak-demo-123"), body))
@@ -1359,7 +1293,6 @@ async fn rate_limit_qps1_second_call_429() {
 #[tokio::test]
 async fn quota_exhaustion_second_call_429() {
     let app = app();
-    // daily_token_quota=1: first call passes the pre-check then consumes >1 token
     let first = app
         .clone()
         .oneshot(post(
@@ -1383,12 +1316,9 @@ async fn quota_exhaustion_second_call_429() {
     assert!(j["error"]["message"].as_str().unwrap().contains("quota"));
 }
 
-// ==================== governance & protocol-surface coverage ====================
-
 #[tokio::test]
 async fn tools_function_calling_round_trip() {
     let app = app();
-    // turn 1: model requests a tool call
     let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"what's the weather in sf"}],
         "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
         "tool_choice":"auto"}"#;
@@ -1404,7 +1334,6 @@ async fn tools_function_calling_round_trip() {
     assert_eq!(call["function"]["name"], "get_weather");
     assert!(j["choices"][0]["message"].get("content").is_none());
 
-    // turn 2: send the tool result back (no tools field) → normal text turn
     let body = r#"{"model":"gpt-4o","messages":[
         {"role":"user","content":"what's the weather in sf"},
         {"role":"assistant","content":null,"tool_calls":[{"id":"call-mock-1","type":"function",
@@ -1464,7 +1393,6 @@ async fn anthropic_streaming_event_sequence() {
     assert_eq!(events.last(), Some(&"message_stop"));
     assert!(events.contains(&"content_block_delta"));
     assert!(events.contains(&"message_delta"));
-    // reassemble text deltas
     let mut assembled = String::new();
     for l in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
         let v: Value = serde_json::from_str(l).unwrap();
@@ -1481,7 +1409,6 @@ async fn anthropic_streaming_event_sequence() {
 #[tokio::test]
 async fn anthropic_system_and_tools() {
     let app = app();
-    // system prompt reaches the vendor (mock echoes [sys:...])
     let body = r#"{"model":"claude-sonnet","system":"be brief","max_tokens":64,
         "messages":[{"role":"user","content":"sys check"}]}"#;
     let resp = app
@@ -1497,7 +1424,6 @@ async fn anthropic_system_and_tools() {
             .contains("[sys:be brief]")
     );
 
-    // tools → tool_use block + stop_reason=tool_use
     let body = r#"{"model":"claude-sonnet","max_tokens":64,
         "tools":[{"name":"get_weather","description":"d","input_schema":{"type":"object"}}],
         "messages":[{"role":"user","content":"weather in sf"}]}"#;
@@ -1514,7 +1440,6 @@ async fn anthropic_system_and_tools() {
 #[tokio::test]
 async fn cross_protocol_exchanger_both_ways() {
     let app = app();
-    // Anthropic surface → OpenAI-family model (gpt-4o)
     let body = r#"{"model":"gpt-4o","max_tokens":64,
         "messages":[{"role":"user","content":"cross to openai"}]}"#;
     let resp = app
@@ -1533,7 +1458,6 @@ async fn cross_protocol_exchanger_both_ways() {
             .contains("[mock-openai:gpt-4o]")
     );
 
-    // OpenAI surface → Claude-family model (claude-sonnet)
     let body =
         r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"cross to claude"}]}"#;
     let resp = app
@@ -1569,7 +1493,6 @@ async fn bespoke_ernie_full_pipeline() {
             .unwrap()
             .contains("[mock-ernie] you said: 你好文心")
     );
-    // billed through the same pipeline
     let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     assert_eq!(j["records"][0]["protocol"], "ernie");
@@ -1598,18 +1521,14 @@ async fn request_cache_hits_and_skips_billing() {
         j1["choices"][0]["message"]["content"],
         j2["choices"][0]["message"]["content"]
     );
-    // second call was a cache hit → only one billing record
     let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(resp).await["count"], 1);
 }
 
 #[tokio::test]
 async fn files_upload_then_batch_from_file() {
-    // OpenAI batch-from-file workflow: upload JSONL → create batch by input_file_id
-    // → poll → results. Also exercises /v1/files/{id}/content.
     let app = app();
 
-    // 1) upload a 2-line JSONL batch input file
     let jsonl = "{\"custom_id\":\"a\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"one\"}]}}\n{\"custom_id\":\"b\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"two\"}]}}";
     let upload_body = json!({"purpose": "batch", "file": jsonl}).to_string();
     let resp = app
@@ -1623,7 +1542,6 @@ async fn files_upload_then_batch_from_file() {
     assert_eq!(j["purpose"], "batch");
     let file_id = j["id"].as_str().unwrap().to_owned();
 
-    // 2) content requires auth (ids are sequential/enumerable) and is retrievable
     let resp = app
         .clone()
         .oneshot(get(&format!("/v1/files/{file_id}/content")))
@@ -1642,7 +1560,6 @@ async fn files_upload_then_batch_from_file() {
             .contains("custom_id")
     );
 
-    // 3) create a batch from the uploaded file (model inferred from the lines)
     let batch_body = json!({"input_file_id": file_id}).to_string();
     let resp = app
         .clone()
@@ -1654,7 +1571,6 @@ async fn files_upload_then_batch_from_file() {
     assert_eq!(j["total"], 2);
     let id = j["id"].as_str().unwrap().to_owned();
 
-    // 4) poll to completion
     let mut done = None;
     for _ in 0..100 {
         let resp = app
@@ -1690,8 +1606,6 @@ async fn batch_requires_items_or_file() {
 
 #[tokio::test]
 async fn image_edits_full_pipeline() {
-    // /v1/images/edits: source image + prompt → edited image (same data[].b64_json
-    // shape as generations). Requires image; 400 without it.
     let app = app();
     let ok = r#"{"model":"dall-e-3","prompt":"add a rainbow","image":"c3JjaW1nYnl0ZXM=","n":1}"#;
     let resp = app
@@ -1706,7 +1620,6 @@ async fn image_edits_full_pipeline() {
         "edited image returned"
     );
 
-    // missing image → 400
     let bad = r#"{"model":"dall-e-3","prompt":"add a rainbow"}"#;
     let resp = app
         .oneshot(post("/v1/images/edits", Some("ak-demo-123"), bad))
@@ -1717,7 +1630,6 @@ async fn image_edits_full_pipeline() {
 
 #[tokio::test]
 async fn legacy_completions_full_pipeline() {
-    // OpenAI legacy text-completions surface: {prompt} in, text_completion out.
     let app = app();
     let body =
         r#"{"model":"gpt-3.5-turbo-instruct","prompt":"the capital of France is","max_tokens":16}"#;
@@ -1729,7 +1641,6 @@ async fn legacy_completions_full_pipeline() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert_eq!(j["object"], "text_completion");
-    // legacy shape: choices[].text (not choices[].message.content)
     assert!(
         j["choices"][0]["text"]
             .as_str()
@@ -1741,7 +1652,6 @@ async fn legacy_completions_full_pipeline() {
         "must not be chat-shaped"
     );
     assert!(j["usage"]["total_tokens"].as_i64().unwrap() > 0);
-    // billed once
     let led = app.oneshot(get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(led).await["count"], 1);
 }
@@ -1762,8 +1672,6 @@ async fn legacy_completions_requires_prompt() {
 
 #[tokio::test]
 async fn responses_api_full_pipeline() {
-    // OpenAI Responses API surface: native body in, native Responses body out,
-    // billed on the ledger.
     let app = app();
     let body =
         r#"{"model":"gpt-5-responses","input":"summarize the quarter","instructions":"be terse"}"#;
@@ -1774,7 +1682,6 @@ async fn responses_api_full_pipeline() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    // native Responses shape: output[].content[].output_text
     assert_eq!(j["object"], "response");
     assert_eq!(j["status"], "completed");
     assert_eq!(j["output"][0]["content"][0]["type"], "output_text");
@@ -1784,17 +1691,13 @@ async fn responses_api_full_pipeline() {
             .unwrap()
             .contains("you said: summarize the quarter")
     );
-    // Responses usage present (input_tokens/output_tokens)
     assert!(j["usage"]["input_tokens"].as_i64().unwrap() > 0);
-    // the call was billed
     let led = app.oneshot(get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(led).await["count"], 1);
 }
 
 #[tokio::test]
 async fn responses_api_streaming_full_pipeline() {
-    // /v1/responses with stream:true → client-facing Responses SSE sequence
-    // (response.created → output_text.delta× → response.completed → [DONE]).
     let app = app();
     let body = r#"{"model":"gpt-5-responses","stream":true,"input":"stream this"}"#;
     let resp = app
@@ -1857,10 +1760,6 @@ async fn responses_api_requires_input() {
 
 #[tokio::test]
 async fn cache_key_distinguishes_raw_passthrough_params() {
-    // Two requests identical except for a passthrough param (`seed`, which lands
-    // in `raw`) must NOT collide onto one cache entry — different params can
-    // produce different model output, so the second must run, not serve a stale
-    // cached response. Proven via the ledger: 2 runs → 2 billing records.
     let app = app();
     let b1 = r#"{"model":"cached-mini","messages":[{"role":"user","content":"hi"}],"seed":1}"#;
     let b2 = r#"{"model":"cached-mini","messages":[{"role":"user","content":"hi"}],"seed":2}"#;
@@ -1876,7 +1775,6 @@ async fn cache_key_distinguishes_raw_passthrough_params() {
         .await
         .unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
-    // different `raw` → different cache key → both ran → 2 billing records.
     let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
     assert_eq!(
         body_json(resp).await["count"],
@@ -1937,7 +1835,6 @@ async fn ak_tpm_limit_second_call_429() {
 async fn account_cooldown_and_recovery() {
     let app = app();
     let body = r#"{"model":"spark-lite","messages":[{"role":"user","content":"x"}]}"#;
-    // 3 consecutive upstream failures (sole account, down, no backup) → cooldown
     for _ in 0..3 {
         let r = app
             .clone()
@@ -1946,7 +1843,6 @@ async fn account_cooldown_and_recovery() {
             .unwrap();
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
-    // health view shows cooling
     let r = app
         .clone()
         .oneshot(get("/internal/accounts"))
@@ -1961,7 +1857,6 @@ async fn account_cooldown_and_recovery() {
         .unwrap()
         .clone();
     assert_eq!(spark["health"], "cooling");
-    // while cooling: selection skips it → "no healthy upstream account"
     let r = app
         .clone()
         .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
@@ -1974,7 +1869,6 @@ async fn account_cooldown_and_recovery() {
             .unwrap()
             .contains("healthy")
     );
-    // cooldown_seconds=2 → auto-recovers on expiry
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
     let r = app.oneshot(get("/internal/accounts")).await.unwrap();
     let j = body_json(r).await;
@@ -1994,7 +1888,6 @@ async fn realtime_websocket_mock_session() {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    // spin the composed app on a loopback socket (local loopback, zero egress)
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let application = app();
@@ -2011,13 +1904,11 @@ async fn realtime_websocket_mock_session() {
         .await
         .expect("ws connect");
 
-    // 1) session.created
     let first = ws.next().await.unwrap().unwrap();
     let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
     assert_eq!(v["type"], "session.created");
     assert_eq!(v["session"]["account"], "mock-realtime-1");
 
-    // 2) input_text → response.delta ×2 → response.done(usage)
     ws.send(Message::text(
         serde_json::json!({"type":"input_text","text":"realtime hello"}).to_string(),
     ))
@@ -2044,7 +1935,6 @@ async fn realtime_websocket_mock_session() {
     assert!(usage["input_tokens"].as_i64().unwrap() > 0);
     assert!(usage["output_tokens"].as_i64().unwrap() > 0);
 
-    // 3) session.close → session.closed
     ws.send(Message::text(
         serde_json::json!({"type":"session.close"}).to_string(),
     ))
@@ -2062,8 +1952,6 @@ async fn realtime_bridges_to_a_real_upstream_websocket() {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    // fake vendor: a loopback realtime websocket that answers response.create
-    // with two output_text deltas and a response.done carrying usage
     async fn vendor_ws(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
         ws.on_upgrade(|mut socket| async move {
             use axum::extract::ws::Message as M;
@@ -2105,7 +1993,6 @@ async fn realtime_bridges_to_a_real_upstream_websocket() {
         .unwrap();
     });
 
-    // gateway configured with a realtime account whose endpoint is the fake vendor
     let yaml = format!(
         r#"
 listen: {{host: 127.0.0.1, port: 0}}
@@ -2139,7 +2026,6 @@ models:
         .await
         .expect("ws connect");
 
-    // vendor's session.created is relayed through the bridge
     let first = ws.next().await.unwrap().unwrap();
     let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
     assert_eq!(v["type"], "session.created");
@@ -2166,7 +2052,6 @@ models:
     assert_eq!(assembled, "bridge ok");
     assert_eq!(done_usage.unwrap()["total_tokens"], 13);
 
-    // the vendor-reported usage was billed to the ledger
     let (count, records) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
     assert_eq!(count, 1);
     assert_eq!(records[0].model, "rt-model");
@@ -2186,8 +2071,6 @@ async fn realtime_authenticates_via_ws_subprotocol() {
         axum::serve(listener, application).await.unwrap();
     });
 
-    // browser pattern: no Authorization header, the AK rides in the
-    // Sec-WebSocket-Protocol list
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
         .unwrap();
@@ -2208,7 +2091,6 @@ async fn realtime_authenticates_via_ws_subprotocol() {
     let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
     assert_eq!(v["type"], "session.created");
 
-    // a bogus subprotocol key (and no header) is rejected at the upgrade
     let mut bad = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
         .unwrap();
@@ -2235,7 +2117,6 @@ async fn realtime_turns_are_rate_limited() {
         axum::serve(listener, application).await.unwrap();
     });
 
-    // ak-limited: qps=1 → the second back-to-back turn must be denied
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
         .unwrap();
@@ -2250,7 +2131,6 @@ async fn realtime_turns_are_rate_limited() {
 
     let turn = serde_json::json!({"type":"input_text","text":"one"}).to_string();
     ws.send(Message::text(turn.clone())).await.unwrap();
-    // drain the first turn to its response.done
     loop {
         let msg = ws.next().await.unwrap().unwrap();
         let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
@@ -2312,9 +2192,6 @@ async fn product_qpm_limit_third_call_429() {
 
 #[tokio::test]
 async fn vendor_error_envelope_propagates_to_client() {
-    // full-pipeline coverage: a vendor 200-body error envelope must surface to the
-    // client as the mapped status (400), not a silent empty 200. (engine-level unit
-    // test exists; this verifies the whole DAG→views path end to end.)
     let app = app();
     let resp = app
         .oneshot(post(
@@ -2336,8 +2213,6 @@ async fn vendor_error_envelope_propagates_to_client() {
 
 #[tokio::test]
 async fn streaming_a_non_native_streaming_model_still_delivers_content() {
-    // Gemini's engine doesn't natively stream (returns a full response). Requesting
-    // stream:true must still deliver the content as SSE, not an empty stream.
     let app = app();
     let body = r#"{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"stream gemini"}]}"#;
     let resp = app
@@ -2375,8 +2250,6 @@ async fn streaming_a_non_native_streaming_model_still_delivers_content() {
 
 #[tokio::test]
 async fn messages_streaming_non_native_engine_delivers_content() {
-    // /v1/messages streamed with a non-native-streaming model (gemini) must still
-    // deliver the text via content_block_delta, not an empty message.
     let app = app();
     let body = r#"{"model":"gemini-pro","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"msg stream gemini"}]}"#;
     let resp = app
@@ -2400,8 +2273,6 @@ async fn messages_streaming_non_native_engine_delivers_content() {
 
 #[tokio::test]
 async fn provider_preset_config_serves_requests() {
-    // providers: two lines of config replace hand-written accounts + wire types;
-    // the injected MockTransport answers the preset's real URLs by path shape.
     let yaml = r#"
 listen: {host: 127.0.0.1, port: 0}
 access_keys:
@@ -2455,7 +2326,6 @@ models:
 
 #[tokio::test]
 async fn metrics_endpoint_exposes_request_counters() {
-    // mirrors the server wiring: global recorder + /metrics on top of the app
     let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .expect("install recorder");
@@ -2492,8 +2362,6 @@ async fn metrics_endpoint_exposes_request_counters() {
 
 #[tokio::test]
 async fn metrics_count_error_statuses_too() {
-    // error paths short-circuit before handlers finish — the router middleware
-    // must still count them (this is what makes error-rate dashboards possible)
     let app = app();
     let resp = app
         .clone()
@@ -2505,8 +2373,6 @@ async fn metrics_count_error_statuses_too() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    // the global recorder is process-wide; the render below sees this 404
-    // regardless of which test installed the recorder first.
 }
 
 #[tokio::test]

@@ -1,14 +1,14 @@
 //! Durable gateway records: billing ledger, uploaded files, batch jobs.
 //!
-//! Two backends behind the [`Store`] trait: [`MemoryStore`] (the default — and
-//! what tests use) and [`SqliteStore`] (sqlx; selected by `storage.sqlite_path`
-//! in the config, survives restarts).
+//! Three backends behind the [`Store`] trait: [`MemoryStore`] (the default),
+//! [`SqliteStore`] (`storage.sqlite_path`, one durable node), and
+//! [`PostgresStore`] (`storage.postgres_url`, shared across a fleet).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
-use gw_models::{GResult, GatewayError};
+use gw_models::GResult;
 use sqlx::Row;
 
 /// One billing entry (recorded locally only; no reporting upstream).
@@ -237,7 +237,7 @@ impl SqliteStore {
             .busy_timeout(std::time::Duration::from_secs(5));
         let pool = sqlx::SqlitePool::connect_with(opts)
             .await
-            .map_err(|e| store_err("open sqlite store", e))?;
+            .map_err(|e| crate::sqlx_err("open sqlite store", e))?;
         for ddl in [
             "CREATE TABLE IF NOT EXISTS billing (
                 n INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,7 +262,7 @@ impl SqliteStore {
             sqlx::query(ddl)
                 .execute(&pool)
                 .await
-                .map_err(|e| store_err("create schema", e))?;
+                .map_err(|e| crate::sqlx_err("create schema", e))?;
         }
         // Pre-existing databases lack these columns; the ALTER fails with
         // "duplicate column name" on every later boot, so that error is ignored.
@@ -273,16 +273,15 @@ impl SqliteStore {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
                 && !e.to_string().contains("duplicate column name")
             {
-                return Err(store_err("migrate billing schema", e));
+                return Err(crate::sqlx_err("migrate billing schema", e));
             }
         }
-        // Jobs left pending/running by a dead process can never progress
-        // (single-instance store) — surface them as failed instead of letting
-        // clients poll a job that will never finish.
+        // a dead process's pending/running jobs can never progress on a
+        // single-instance store — fail them instead of letting clients poll forever
         sqlx::query("UPDATE batches SET status = 'failed' WHERE status IN ('pending', 'running')")
             .execute(&pool)
             .await
-            .map_err(|e| store_err("sweep orphaned batches", e))?;
+            .map_err(|e| crate::sqlx_err("sweep orphaned batches", e))?;
         Ok(Self {
             pool,
             ledger_max_rows,
@@ -312,13 +311,13 @@ impl Store for SqliteStore {
         .bind(r.ptu_spillover)
         .execute(&self.pool)
         .await
-        .map_err(|e| store_err("insert billing record", e))?;
+        .map_err(|e| crate::sqlx_err("insert billing record", e))?;
         if self.ledger_max_rows > 0 {
             sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?")
                 .bind(self.ledger_max_rows as i64)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| store_err("prune billing records", e))?;
+                .map_err(|e| crate::sqlx_err("prune billing records", e))?;
         }
         Ok(())
     }
@@ -327,7 +326,7 @@ impl Store for SqliteStore {
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| store_err("count billing records", e))?;
+            .map_err(|e| crate::sqlx_err("count billing records", e))?;
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover
@@ -336,7 +335,7 @@ impl Store for SqliteStore {
         .bind(limit.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| store_err("read billing records", e))?;
+        .map_err(|e| crate::sqlx_err("read billing records", e))?;
         rows.reverse();
         Ok((
             total as usize,
@@ -361,8 +360,7 @@ impl Store for SqliteStore {
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
-        // id computed inside the single INSERT: SQLite serializes writers, so the
-        // subselect is atomic with the insert (no placeholder row, no second step).
+        // SQLite serializes writers, so the MAX(n)+1 subselect is atomic with the insert
         let id: String = sqlx::query_scalar(
             "INSERT INTO files (id, purpose, bytes, content)
              VALUES ('file-' || (SELECT COALESCE(MAX(n), 0) + 1 FROM files), ?, ?, ?)
@@ -373,7 +371,7 @@ impl Store for SqliteStore {
         .bind(&content)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| store_err("insert file", e))?;
+        .map_err(|e| crate::sqlx_err("insert file", e))?;
         Ok(StoredFile {
             id,
             bytes,
@@ -387,7 +385,7 @@ impl Store for SqliteStore {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| store_err("read file", e))?;
+            .map_err(|e| crate::sqlx_err("read file", e))?;
         Ok(row.map(|row| StoredFile {
             id: row.get(0),
             purpose: row.get(1),
@@ -408,7 +406,7 @@ impl Store for SqliteStore {
         .bind(total as i64)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| store_err("insert batch", e))?;
+        .map_err(|e| crate::sqlx_err("insert batch", e))?;
         Ok(BatchJob {
             id,
             ak: ak.to_owned(),
@@ -424,7 +422,7 @@ impl Store for SqliteStore {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| store_err("read batch", e))?;
+            .map_err(|e| crate::sqlx_err("read batch", e))?;
         let Some(row) = row else { return Ok(None) };
         let results = sqlx::query(
             "SELECT idx, ok, message, total_tokens FROM batch_results
@@ -433,7 +431,7 @@ impl Store for SqliteStore {
         .bind(id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| store_err("read batch results", e))?;
+        .map_err(|e| crate::sqlx_err("read batch results", e))?;
         let status_text: String = row.get(3);
         Ok(Some(BatchJob {
             id: row.get(0),
@@ -459,7 +457,7 @@ impl Store for SqliteStore {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| store_err("update batch status", e))?;
+            .map_err(|e| crate::sqlx_err("update batch status", e))?;
         Ok(())
     }
 
@@ -475,7 +473,7 @@ impl Store for SqliteStore {
         .bind(result.total_tokens)
         .execute(&self.pool)
         .await
-        .map_err(|e| store_err("insert batch result", e))?;
+        .map_err(|e| crate::sqlx_err("insert batch result", e))?;
         Ok(())
     }
 }
@@ -502,7 +500,7 @@ impl PostgresStore {
             .max_connections(10)
             .connect(url)
             .await
-            .map_err(|e| store_err("connect postgres store", e))?;
+            .map_err(|e| crate::sqlx_err("connect postgres store", e))?;
         for ddl in [
             "CREATE TABLE IF NOT EXISTS billing (
                 n BIGSERIAL PRIMARY KEY,
@@ -527,7 +525,7 @@ impl PostgresStore {
             sqlx::query(ddl)
                 .execute(&pool)
                 .await
-                .map_err(|e| store_err("create postgres schema", e))?;
+                .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
         }
         Ok(Self {
             pool,
@@ -558,13 +556,13 @@ impl Store for PostgresStore {
         .bind(r.ptu_spillover)
         .execute(&self.pool)
         .await
-        .map_err(|e| store_err("insert billing record", e))?;
+        .map_err(|e| crate::sqlx_err("insert billing record", e))?;
         if self.ledger_max_rows > 0 {
             sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - $1")
                 .bind(self.ledger_max_rows as i64)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| store_err("prune billing records", e))?;
+                .map_err(|e| crate::sqlx_err("prune billing records", e))?;
         }
         Ok(())
     }
@@ -573,7 +571,7 @@ impl Store for PostgresStore {
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| store_err("count billing records", e))?;
+            .map_err(|e| crate::sqlx_err("count billing records", e))?;
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover
@@ -582,7 +580,7 @@ impl Store for PostgresStore {
         .bind(limit.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| store_err("read billing records", e))?;
+        .map_err(|e| crate::sqlx_err("read billing records", e))?;
         rows.reverse();
         Ok((
             total as usize,
@@ -607,9 +605,8 @@ impl Store for PostgresStore {
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
-        // Unlike SQLite's MAX(n)+1 subselect (safe there because SQLite
-        // serializes writers), concurrent Postgres writers race on MAX(n); the
-        // sequence is consumed explicitly so id and n share one atomic value.
+        // concurrent PG writers race a MAX(n)+1 subselect; consume the
+        // sequence explicitly so id and n share one atomic value
         let id: String = sqlx::query_scalar(
             "INSERT INTO files (n, id, purpose, bytes, content)
              SELECT v, 'file-' || v, $1, $2, $3
@@ -621,7 +618,7 @@ impl Store for PostgresStore {
         .bind(&content)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| store_err("insert file", e))?;
+        .map_err(|e| crate::sqlx_err("insert file", e))?;
         Ok(StoredFile {
             id,
             bytes,
@@ -635,7 +632,7 @@ impl Store for PostgresStore {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| store_err("read file", e))?;
+            .map_err(|e| crate::sqlx_err("read file", e))?;
         Ok(row.map(|row| StoredFile {
             id: row.get(0),
             purpose: row.get(1),
@@ -657,7 +654,7 @@ impl Store for PostgresStore {
         .bind(total as i64)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| store_err("insert batch", e))?;
+        .map_err(|e| crate::sqlx_err("insert batch", e))?;
         Ok(BatchJob {
             id,
             ak: ak.to_owned(),
@@ -673,7 +670,7 @@ impl Store for PostgresStore {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| store_err("read batch", e))?;
+            .map_err(|e| crate::sqlx_err("read batch", e))?;
         let Some(row) = row else { return Ok(None) };
         let results = sqlx::query(
             "SELECT idx, ok, message, total_tokens FROM batch_results
@@ -682,7 +679,7 @@ impl Store for PostgresStore {
         .bind(id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| store_err("read batch results", e))?;
+        .map_err(|e| crate::sqlx_err("read batch results", e))?;
         let status_text: String = row.get(3);
         Ok(Some(BatchJob {
             id: row.get(0),
@@ -708,7 +705,7 @@ impl Store for PostgresStore {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| store_err("update batch status", e))?;
+            .map_err(|e| crate::sqlx_err("update batch status", e))?;
         Ok(())
     }
 
@@ -724,13 +721,9 @@ impl Store for PostgresStore {
         .bind(result.total_tokens)
         .execute(&self.pool)
         .await
-        .map_err(|e| store_err("insert batch result", e))?;
+        .map_err(|e| crate::sqlx_err("insert batch result", e))?;
         Ok(())
     }
-}
-
-fn store_err(what: &str, e: sqlx::Error) -> GatewayError {
-    GatewayError::internal(what).with_source(e)
 }
 
 #[cfg(test)]
@@ -761,7 +754,6 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(snap[0].model, "m1");
         assert_eq!(snap[1].total_tokens, 8);
-        // pagination: latest record only, total still reports everything
         let (total, page) = store.ledger_snapshot(1).await.unwrap();
         assert_eq!(total, 2);
         assert_eq!(page.len(), 1);
@@ -875,7 +867,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // a new process can never resume the dead process's job
         let store = SqliteStore::open(path).await.unwrap();
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
         assert_eq!(job.status, BatchStatus::Failed);
@@ -890,7 +881,6 @@ mod tests {
             let store = SqliteStore::open(path).await.unwrap();
             exercise(&store).await;
         }
-        // reopen: records survive the process (unlike MemoryStore)
         let store = SqliteStore::open(path).await.unwrap();
         assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 2);
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
@@ -937,7 +927,6 @@ mod tests {
         assert_eq!(got.status, BatchStatus::Running);
         assert_eq!(got.results.len(), 1);
 
-        // concurrent creates race the id path; every id must be unique
         let store = std::sync::Arc::new(store);
         let mut handles = Vec::new();
         for _ in 0..8 {

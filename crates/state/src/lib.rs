@@ -1,7 +1,7 @@
-//! Gateway state: AK table, account pool, account health, response cache, and
-//! two pluggable seams — the durable [`Store`] and rate/quota [`Governance`].
-//! Both default to in-process; the store can be SQLite and governance can be
-//! Redis for multi-replica deployments. Layer L2.
+//! Gateway state: AK table, account pool, account health, response cache,
+//! behind pluggable seams ([`KeyStore`], [`Store`], [`Governance`],
+//! [`HealthStore`], the config store). Everything defaults to in-process;
+//! Postgres/Redis back them for multi-replica deployments. Layer L2.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -43,7 +43,8 @@ pub struct AkInfo {
     /// A banned key stays in the table but fails auth with a distinct 403.
     pub banned: bool,
     /// Per-model daily token caps overriding the tenant defaults; empty = none.
-    pub model_quotas: std::collections::HashMap<String, i64>,
+    /// Arc'd: `AkInfo` is cloned per request and the map is write-rare.
+    pub model_quotas: Arc<std::collections::HashMap<String, i64>>,
 }
 
 impl AkInfo {
@@ -70,7 +71,7 @@ impl From<&gw_config::AkConf> for AkInfo {
             tokens_per_minute: k.tokens_per_minute,
             expires_at_epoch_secs: k.expires_at_epoch_secs,
             banned: k.banned,
-            model_quotas: k.model_quotas.clone(),
+            model_quotas: Arc::new(k.model_quotas.clone()),
         }
     }
 }
@@ -81,6 +82,11 @@ pub enum KeyStatus {
     Active,
     Banned,
     Expired,
+}
+
+/// Wrap a sqlx error as an internal gateway error with context.
+pub(crate) fn sqlx_err(what: &str, e: sqlx::Error) -> gw_models::GatewayError {
+    gw_models::GatewayError::internal(what).with_source(e)
 }
 
 /// Current unix seconds (0 if the clock reads before the epoch).
@@ -357,12 +363,19 @@ impl AccountPool {
         excluded: &[String],
         health: &dyn HealthStore,
     ) -> Option<Account> {
-        let mut unhealthy: Vec<String> = Vec::new();
-        for a in self.accounts.iter().filter(|a| a.protocols.contains(&p)) {
-            if !health.available(&a.name).await {
-                unhealthy.push(a.name.clone());
-            }
-        }
+        let candidates: Vec<&Account> = self
+            .accounts
+            .iter()
+            .filter(|a| a.protocols.contains(&p))
+            .collect();
+        let checks =
+            futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
+        let unhealthy: Vec<String> = candidates
+            .iter()
+            .zip(checks)
+            .filter(|(_, ok)| !ok)
+            .map(|(a, _)| a.name.clone())
+            .collect();
         let mut all_excluded = excluded.to_vec();
         all_excluded.extend(unhealthy);
         self.select_excluding(p, provider, &all_excluded)
@@ -498,8 +511,7 @@ impl AccountHealth {
     ) -> bool {
         let mut e = self.entries.entry(name.to_owned()).or_default();
         e.consecutive_failures += 1;
-        // An expired cooldown re-arms the breaker: a still-failing account must
-        // re-enter cooldown after its recovery probe fails, not latch open forever.
+        // an expired cooldown re-arms: a still-failing account re-trips, not latches open
         let armed = e.cooldown_until.is_none_or(|until| Instant::now() >= until);
         if e.consecutive_failures >= threshold && armed {
             e.cooldown_until = Some(Instant::now() + cooldown);
@@ -576,8 +588,7 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
         Some(value.1)
     }
 
-    // Re-putting a key resets its TTL (the pre-moka behavior); the default
-    // would keep the original deadline.
+    // re-putting resets the TTL; moka's default would keep the original deadline
     fn expire_after_update(
         &self,
         _key: &String,
@@ -728,10 +739,8 @@ mod tests {
     #[test]
     fn fractional_and_zero_qps() {
         let rl = RateLimiter::default();
-        // qps < 1: burst 1, second immediate call denied
         assert!(rl.allow("frac", 0.5));
         assert!(!rl.allow("frac", 0.5));
-        // qps <= 0: always denied
         assert!(!rl.allow("zero", 0.0));
         assert!(!rl.allow("neg", -1.0));
     }
@@ -740,7 +749,6 @@ mod tests {
     async fn reload_swaps_keys_but_preserves_seams() {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let boot = Arc::new(GatewayState::from_config(&cfg));
-        // write a durable record through the seam so we can prove it survives
         let file_id = boot
             .store
             .file_put("batch", "keep me".into())
@@ -751,12 +759,10 @@ mod tests {
         let health_ptr = Arc::as_ptr(&boot.health);
         let shared = SharedConfig::new(cfg, boot);
 
-        // the boot config has ak-demo-123 but not ak-new
         let snap = shared.load();
         assert!(snap.state.auth.authenticate("ak-demo-123").await.is_some());
         assert!(snap.state.auth.authenticate("ak-new").await.is_none());
 
-        // reload with a config carrying a different key set
         let new_cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-new, product: p, qps: 5, daily_token_quota: 100}]",
         )
@@ -764,10 +770,8 @@ mod tests {
         shared.reload(new_cfg).await.unwrap();
 
         let snap = shared.load();
-        // config-derived state rebuilt: new key present, old gone
         assert!(snap.state.auth.authenticate("ak-new").await.is_some());
         assert!(snap.state.auth.authenticate("ak-demo-123").await.is_none());
-        // seams preserved: same store/health instances, durable record intact
         assert_eq!(Arc::as_ptr(&snap.state.store), store_ptr);
         assert_eq!(Arc::as_ptr(&snap.state.health), health_ptr);
         assert!(
@@ -807,7 +811,6 @@ mod tests {
             },
             KeySource::Admin,
         );
-        // reload with a config that has a different config key
         let new = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-config2, product: p, qps: 2, daily_token_quota: 20}]",
         )
@@ -825,7 +828,6 @@ mod tests {
             auth.authenticate("ak-admin").is_some(),
             "admin key preserved"
         );
-        // patch + revoke
         let patched = auth
             .patch("ak-admin", Some(9.0), None, Some(Some(5)), None, Some(true))
             .unwrap();
@@ -854,8 +856,6 @@ mod tests {
             },
             KeySource::Config,
         );
-        // reload with a config that still contains ak-keep (plus a new key): a
-        // surviving key must never be observed absent (upsert, not remove+add)
         let cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-keep, product: p, qps: 2, daily_token_quota: 20}, {ak: ak-add, product: p, qps: 1, daily_token_quota: 5}]",
         )
@@ -863,7 +863,6 @@ mod tests {
         auth.reload_config_keys(&cfg.access_keys);
         assert!(auth.authenticate("ak-keep").is_some());
         assert!(auth.authenticate("ak-add").is_some());
-        // the surviving key picked up its new quota
         assert_eq!(auth.authenticate("ak-keep").unwrap().daily_token_quota, 20);
     }
 
@@ -882,9 +881,7 @@ mod tests {
             model_quotas: Default::default(),
         };
         auth.put(info("ak-x"), KeySource::Config);
-        // an admin write to a config key updates values but keeps Config ownership
         auth.put(info("ak-x"), KeySource::Admin);
-        // reload with a config that no longer declares ak-x → it must be revoked
         let cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-other, product: p, qps: 1, daily_token_quota: 5}]",
         )
@@ -894,7 +891,6 @@ mod tests {
             auth.authenticate("ak-x").is_none(),
             "config revocation must not be defeated by a prior admin overwrite"
         );
-        // config can still claim a genuinely admin-only key by declaring it
         auth.put(info("ak-adm"), KeySource::Admin);
         let cfg2 = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-adm, product: p, qps: 1, daily_token_quota: 5}]",
@@ -953,7 +949,6 @@ mod tests {
     #[test]
     fn pool_prefers_priority_then_round_robins() {
         let s = state();
-        // openai-chat has priority-1 mock-openai-1 and priority-2 mock-openai-2
         let a = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
         let b = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
         assert_eq!(a.name, "mock-openai-1");
@@ -965,7 +960,6 @@ mod tests {
                 .name,
             "mock-anthropic-1"
         );
-        // no account in the embedded config serves this provider binding
         assert!(
             s.pool
                 .select(Protocol::Video, Some("nonexistent"))
@@ -982,7 +976,6 @@ mod tests {
         assert!(!h.available("acc"));
         std::thread::sleep(Duration::from_millis(15));
         assert!(h.available("acc"), "cooldown auto-recovers");
-        // recovery probe fails again: the breaker must re-trip, not latch open
         assert!(h.record_failure("acc", 2, cd), "expired cooldown re-arms");
         assert!(!h.available("acc"));
         h.record_success("acc");
@@ -992,14 +985,12 @@ mod tests {
     #[test]
     fn pool_prefers_ptu_then_excludes_failed() {
         let s = state();
-        // hunyuan: the ptu account (named "down") is preferred over paygo
         let first = s
             .pool
             .select(Protocol::OpenaiChat, Some("tencent"))
             .unwrap();
         assert_eq!(first.name, "mock-hunyuan-ptu-down");
         assert!(first.is_ptu());
-        // after failover exclusion it falls back to paygo
         let next = s
             .pool
             .select_excluding(

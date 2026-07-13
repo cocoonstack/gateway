@@ -93,8 +93,8 @@ impl HealthStore for RedisHealth {
              return 0",
         );
         let tripped: i64 = match script
-            .key(format!("gw:health:fails:{name}"))
-            .key(format!("gw:health:cd:{name}"))
+            .key(fails_key(name))
+            .key(cd_key(name))
             .arg(threshold as i64)
             .arg(cooldown.as_millis() as i64)
             .arg(FAILS_TTL_MS)
@@ -114,8 +114,8 @@ impl HealthStore for RedisHealth {
     async fn record_success(&self, name: &str) {
         let mut conn = self.conn.clone();
         let _ = redis::cmd("DEL")
-            .arg(format!("gw:health:fails:{name}"))
-            .arg(format!("gw:health:cd:{name}"))
+            .arg(fails_key(name))
+            .arg(cd_key(name))
             .query_async::<i64>(&mut conn)
             .await;
         self.cache.invalidate(name);
@@ -127,7 +127,7 @@ impl HealthStore for RedisHealth {
         }
         let mut conn = self.conn.clone();
         let avail = match redis::cmd("EXISTS")
-            .arg(format!("gw:health:cd:{name}"))
+            .arg(cd_key(name))
             .query_async::<i64>(&mut conn)
             .await
         {
@@ -140,6 +140,14 @@ impl HealthStore for RedisHealth {
         self.cache.insert(name.to_owned(), avail);
         avail
     }
+}
+
+fn fails_key(name: &str) -> String {
+    format!("gw:health:fails:{name}")
+}
+
+fn cd_key(name: &str) -> String {
+    format!("gw:health:cd:{name}")
 }
 
 #[cfg(test)]

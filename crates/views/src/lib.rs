@@ -200,7 +200,7 @@ async fn realtime_ws(
 ) -> Response {
     // one consistent snapshot for the whole accept decision (cfg + state)
     let snap = s.handler.config.load();
-    // Auth: header, or the gw-api-key.<ak> subprotocol for browser clients
+    // browsers can't set ws headers; the key may ride the subprotocol
     let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => {
@@ -220,7 +220,6 @@ async fn realtime_ws(
     let Some(model) = q.get("model").cloned() else {
         return error_response(400, "model query param is required");
     };
-    // Resolve: public name or wire name, must be the Realtime family
     let model_conf = snap.cfg.find_model(&model);
     let mt = model_conf
         .and_then(|m| m.protocol())
@@ -246,7 +245,6 @@ async fn realtime_ws(
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
-    // an account with a real endpoint bridges to the vendor; else the local mock
     if account.endpoint.is_empty() {
         ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
     } else {
@@ -421,7 +419,6 @@ async fn realtime_bridge(
 
     let send_err = |m: String| json!({"type":"error","error":{"type":"gateway_error","message":m}});
 
-    // wss URL from the account's https endpoint
     let base = account.endpoint.trim_end_matches('/');
     let ws_base = base
         .replacen("https://", "wss://", 1)
@@ -674,15 +671,6 @@ async fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16,
     Ok(info)
 }
 
-/// The caller's original model name when a quota fallback swapped the served
-/// one; the response echoes it instead of the vendor-reported name.
-fn fallback_echo(ctx: &DagContext) -> Option<String> {
-    ctx.request
-        .model_param_v2
-        .as_ref()
-        .and_then(|p| p.fallback_from.clone())
-}
-
 /// Lifecycle gate shared by every auth path: banned and expired keys stay in
 /// the table but fail with distinct 403s (unlike a revoked key's 401).
 fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
@@ -724,18 +712,19 @@ impl AdminScope {
 /// each tenant's scoped token. Disabled (404) while no admin token of any kind
 /// is configured, so probing the surface can't tell it apart from a
 /// nonexistent route.
-fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, (u16, &'static str)> {
+#[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
+fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, Response> {
     let cfg = s.handler.cfg();
     let global = cfg.admin.token();
     if global.is_none() && !cfg.tenants.iter().any(|t| t.admin_token().is_some()) {
-        return Err((404, "not found"));
+        return Err(error_response(404, "not found"));
     }
     let presented = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     let Some(presented) = presented else {
-        return Err((401, "invalid admin token"));
+        return Err(error_response(401, "invalid admin token"));
     };
     if global.is_some_and(|g| ct_eq(&g, presented)) {
         return Ok(AdminScope::Global);
@@ -747,7 +736,31 @@ fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, (u16, &'s
     {
         return Ok(AdminScope::Tenant(t.name.clone()));
     }
-    Err((401, "invalid admin token"))
+    Err(error_response(401, "invalid admin token"))
+}
+
+/// Global-token gate for fleet-wide operations (reload, config publish).
+#[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
+fn require_global_admin(s: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    match admin_auth(s, headers)? {
+        AdminScope::Global => Ok(()),
+        AdminScope::Tenant(_) => Err(error_response(403, "requires the global admin token")),
+    }
+}
+
+/// Key lookup under an admin scope: another tenant's key answers 404 (not
+/// 403), so a tenant admin can't probe which keys exist outside its scope.
+async fn scoped_key(
+    s: &AppState,
+    scope: &AdminScope,
+    ak: &str,
+) -> Result<Option<AkInfo>, Response> {
+    match s.handler.state().auth.authenticate(ak).await {
+        Some(existing) if !scope.covers(&existing.tenant) => {
+            Err(error_response(404, format!("key {ak} not found")))
+        }
+        found => Ok(found),
+    }
 }
 
 /// Constant-time string equality for bearer-token checks.
@@ -764,12 +777,8 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// account health, and cache preserved). Storage-backend URL changes need a
 /// restart.
 async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    match admin_auth(&s, &headers) {
-        Ok(AdminScope::Global) => {}
-        Ok(AdminScope::Tenant(_)) => {
-            return error_response(403, "reload requires the global admin token");
-        }
-        Err((st, msg)) => return error_response(st, msg),
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
     }
     match s.reload().await {
         Ok(()) => {
@@ -804,14 +813,12 @@ async fn admin_key_create(
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
-        Err((st, msg)) => return error_response(st, msg),
+        Err(r) => return r,
     };
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
-    // A tenant admin creates keys in its own tenant only (and that's the
-    // default when the body omits one); overwriting another tenant's key is
-    // rejected before the write.
+    // a tenant admin defaults into, and may only write, its own tenant
     let default_tenant = match &scope {
         AdminScope::Global => gw_config::DEFAULT_TENANT,
         AdminScope::Tenant(t) => t.as_str(),
@@ -823,16 +830,12 @@ async fn admin_key_create(
     if !scope.covers(tenant) {
         return error_response(403, "tenant admin may only create keys in its own tenant");
     }
-    // A typo'd tenant would silently produce an unrestricted key (no tenant
-    // entry = no entitlement/pooled limits), so reject undeclared tenants here
-    // exactly like config-file validation does.
-    if tenant != gw_config::DEFAULT_TENANT && s.handler.cfg().find_tenant(tenant).is_none() {
+    // a typo'd tenant would silently create an unrestricted key
+    if !s.handler.cfg().is_known_tenant(tenant) {
         return error_response(400, format!("unknown tenant `{tenant}`"));
     }
-    if let Some(existing) = s.handler.state().auth.authenticate(ak).await
-        && !scope.covers(&existing.tenant)
-    {
-        return error_response(404, "not found");
+    if let Err(r) = scoped_key(&s, &scope, ak).await {
+        return r;
     }
     let info = AkInfo {
         ak: ak.to_owned(),
@@ -843,14 +846,16 @@ async fn admin_key_create(
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
         expires_at_epoch_secs: body["expires_at_epoch_secs"].as_i64(),
         banned: body["banned"].as_bool().unwrap_or(false),
-        model_quotas: body["model_quotas"]
-            .as_object()
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(m, v)| Some((m.clone(), v.as_i64()?)))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        model_quotas: std::sync::Arc::new(
+            body["model_quotas"]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(m, v)| Some((m.clone(), v.as_i64()?)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
     };
     if let Err(e) = s
         .handler
@@ -879,23 +884,16 @@ async fn admin_key_patch(
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
-        Err((st, msg)) => return error_response(st, msg),
+        Err(r) => return r,
     };
-    // Another tenant's key answers 404 (not 403) so a tenant admin can't
-    // probe which keys exist outside its scope.
-    match s.handler.state().auth.authenticate(&ak).await {
-        Some(existing) if !scope.covers(&existing.tenant) => {
-            return error_response(404, format!("key {ak} not found"));
-        }
-        _ => {}
+    // 404, not 403: don't leak other tenants' key existence
+    if let Err(r) = scoped_key(&s, &scope, &ak).await {
+        return r;
     }
-    // tokens_per_minute / expires_at_epoch_secs are Option<Option<i64>>:
-    // absent = leave, null = clear, a number = set. A malformed value leaves
-    // the field unchanged (never silently drops a cap or an expiry), matching
-    // how qps/daily_token_quota ignore malformed input.
+    // absent = leave, null = clear, number = set; malformed (incl. u64
+    // overflow) leaves the field unchanged rather than clearing a cap
     let tri = |field: &str| match body.get(field) {
         Some(Value::Null) => Some(None),
-        // out-of-range u64 falls through to "leave unchanged", never "clear"
         Some(v) if v.is_i64() || v.is_u64() => v.as_i64().map(Some),
         _ => None,
     };
@@ -939,13 +937,10 @@ async fn admin_key_delete(
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
-        Err((st, msg)) => return error_response(st, msg),
+        Err(r) => return r,
     };
-    match s.handler.state().auth.authenticate(&ak).await {
-        Some(existing) if !scope.covers(&existing.tenant) => {
-            return error_response(404, format!("key {ak} not found"));
-        }
-        _ => {}
+    if let Err(r) = scoped_key(&s, &scope, &ak).await {
+        return r;
     }
     match s.handler.state().auth.revoke(&ak).await {
         Err(e) => gateway_error(e),
@@ -963,12 +958,8 @@ async fn admin_key_delete(
 /// via the store's change feed). Global admin only; requires the Postgres
 /// config store.
 async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: String) -> Response {
-    match admin_auth(&s, &headers) {
-        Ok(AdminScope::Global) => {}
-        Ok(AdminScope::Tenant(_)) => {
-            return error_response(403, "config publish requires the global admin token");
-        }
-        Err((st, msg)) => return error_response(st, msg),
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
     }
     let Some(store) = &s.config_store else {
         return error_response(
@@ -1001,7 +992,7 @@ async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: S
 async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
-        Err((st, msg)) => return error_response(st, msg),
+        Err(r) => return r,
     };
     let listed = match s.handler.state().auth.list().await {
         Ok(v) => v,
@@ -1032,7 +1023,7 @@ async fn admin_usage(
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
-        Err((st, msg)) => return error_response(st, msg),
+        Err(r) => return r,
     };
     let filter = match &scope {
         AdminScope::Tenant(t) => Some(t.clone()),
@@ -1169,7 +1160,7 @@ async fn chat_completions(
         return error_response(400, "messages must not be empty");
     }
 
-    // Full field passthrough: multimodal parts + tool message fields + sampling/tools params + unrecognized fields
+    // full passthrough, including unrecognized fields
     let messages: Vec<ChatMsg> = body
         .messages
         .iter()
@@ -1228,7 +1219,6 @@ async fn chat_completions(
         Err(e) => return gateway_error(e),
     };
     log_access("chat_completions", &ctx, started);
-    let echo = fallback_echo(&ctx);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -1240,7 +1230,7 @@ async fn chat_completions(
         completion_tokens: outcome.response.completion_tokens,
         total_tokens: outcome.response.total_tokens,
     };
-    let model_out = echo.unwrap_or_else(|| outcome.response.model.clone());
+    let model_out = outcome.response.model.clone();
 
     // tool_calls response: content=null + finish_reason=tool_calls (OpenAI semantics)
     if let Some(tc) = &outcome.response.tool_calls {
@@ -1495,8 +1485,7 @@ async fn messages(
         ..Default::default()
     };
 
-    // Streaming: the standard anthropic event sequence, emitted incrementally
-    // as pipeline chunks arrive.
+    // standard anthropic event sequence, emitted incrementally
     if body.stream {
         let model = body.model.clone();
         return messages_stream_response(s, request, ak, model, started).into_response();
@@ -1507,12 +1496,10 @@ async fn messages(
         Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
-    let echo = fallback_echo(&ctx);
     let Some(outcome) = ctx.outcome else {
         return anthropic_error(500, "pipeline produced no outcome");
     };
 
-    // Non-streaming: text + tool_use blocks
     let tool_use = anthropic_tool_blocks(&outcome.response.tool_calls);
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
@@ -1529,7 +1516,7 @@ async fn messages(
     }
     let resp = MessagesResponse::new(
         next_id("msg"),
-        echo.unwrap_or_else(|| outcome.response.model.clone()),
+        outcome.response.model.clone(),
         content,
         finish_anthropic(&outcome.response.finish_reason),
         AnthUsage {
@@ -1875,8 +1862,7 @@ async fn responses(
         return error_response(400, "input is required");
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
-    // native passthrough: the whole Responses-shaped body rides in `raw`;
-    // resolve_model maps `model` → Protocol::Responses → ResponsesEngine.
+    // native passthrough: the whole Responses-shaped body rides in `raw`
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model);
     param.raw = body;
     let request = GatewayRequest {
@@ -1917,7 +1903,6 @@ fn responses_sse(
         json!({"type": "response.created", "response": {"model": r.model, "status": "in_progress"}})
             .to_string(),
     ));
-    // deltas: use engine chunks, or synthesize one from the full message.
     let deltas: Vec<String> = if outcome.chunks.is_empty() && !r.message.is_empty() {
         vec![r.message.clone()]
     } else {
@@ -1993,7 +1978,6 @@ async fn embeddings(
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
-    // Engine passes through the full openai-shaped response body
     match outcome.response.response_v2 {
         Some(v) => (StatusCode::OK, Json(v)).into_response(),
         None => error_response(500, "embeddings engine returned no payload"),
@@ -2180,8 +2164,7 @@ async fn batches_submit(
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
 
-    // Two input modes: inline `items`, or an uploaded JSONL `input_file_id`
-    // (the OpenAI batch pattern — each line is {custom_id,method,url,body}).
+    // inline `items`, or an uploaded JSONL `input_file_id` (OpenAI batch pattern)
     if let Some(file_id) = body["input_file_id"].as_str() {
         let file = match s.handler.state().store.file_get(file_id).await {
             Ok(Some(f)) => f,
@@ -2410,23 +2393,19 @@ mod tests {
 
     #[test]
     fn finish_reason_mapping_both_directions() {
-        // anthropic stop_reason → openai finish_reason
         assert_eq!(finish_openai("end_turn"), "stop");
         assert_eq!(finish_openai("stop_sequence"), "stop");
         assert_eq!(finish_openai(""), "stop"); // absent → stop
         assert_eq!(finish_openai("max_tokens"), "length");
         assert_eq!(finish_openai("tool_use"), "tool_calls");
-        // unknown values pass through unchanged (e.g. content-policy signals)
         assert_eq!(finish_openai("refusal"), "refusal");
 
-        // openai finish_reason → anthropic stop_reason
         assert_eq!(finish_anthropic("stop"), "end_turn");
         assert_eq!(finish_anthropic(""), "end_turn");
         assert_eq!(finish_anthropic("length"), "max_tokens");
         assert_eq!(finish_anthropic("tool_calls"), "tool_use");
         assert_eq!(finish_anthropic("content_filter"), "content_filter");
 
-        // round-trip on the canonical trio is stable
         for (o, a) in [
             ("stop", "end_turn"),
             ("length", "max_tokens"),

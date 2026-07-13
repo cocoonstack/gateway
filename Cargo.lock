@@ -896,6 +896,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "dashmap",
+ "futures",
  "governor",
  "gw-config",
  "gw-consts",

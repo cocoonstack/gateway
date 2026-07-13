@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gw_models::{GResult, GatewayError};
+use gw_models::GResult;
 use sqlx::Row;
 
 use crate::{AkInfo, KeySource};
@@ -65,7 +65,7 @@ impl PostgresKeyStore {
             .max_connections(5)
             .connect(url)
             .await
-            .map_err(|e| key_err("connect postgres key store", e))?;
+            .map_err(|e| crate::sqlx_err("connect postgres key store", e))?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS access_keys (
                 ak TEXT PRIMARY KEY,
@@ -81,7 +81,7 @@ impl PostgresKeyStore {
         )
         .execute(&pool)
         .await
-        .map_err(|e| key_err("create access_keys schema", e))?;
+        .map_err(|e| crate::sqlx_err("create access_keys schema", e))?;
         Ok(Self {
             pool,
             cache: moka::sync::Cache::builder()
@@ -134,33 +134,9 @@ impl KeyStore for PostgresKeyStore {
     }
 
     async fn put(&self, info: AkInfo, source: KeySource) -> GResult<()> {
-        let quotas = serde_json::to_string(&info.model_quotas).unwrap_or_else(|_| "{}".into());
-        sqlx::query(
-            "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
-             tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, source)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT (ak) DO UPDATE SET
-               product = EXCLUDED.product, tenant = EXCLUDED.tenant,
-               qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
-               tokens_per_minute = EXCLUDED.tokens_per_minute,
-               expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
-               banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
-               source = CASE WHEN access_keys.source = 'config' AND EXCLUDED.source = 'admin'
-                             THEN 'config' ELSE EXCLUDED.source END",
-        )
-        .bind(&info.ak)
-        .bind(&info.product)
-        .bind(&info.tenant)
-        .bind(info.qps)
-        .bind(info.daily_token_quota)
-        .bind(info.tokens_per_minute)
-        .bind(info.expires_at_epoch_secs)
-        .bind(info.banned)
-        .bind(&quotas)
-        .bind(source_str(source))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| key_err("upsert access key", e))?;
+        upsert(&self.pool, &info, source)
+            .await
+            .map_err(|e| crate::sqlx_err("upsert access key", e))?;
         self.note_write(&info.ak);
         Ok(())
     }
@@ -179,7 +155,7 @@ impl KeyStore for PostgresKeyStore {
             .pool
             .begin()
             .await
-            .map_err(|e| key_err("begin patch", e))?;
+            .map_err(|e| crate::sqlx_err("begin patch", e))?;
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
              expires_at_epoch_secs, banned, model_quotas FROM access_keys
@@ -188,7 +164,7 @@ impl KeyStore for PostgresKeyStore {
         .bind(ak)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| key_err("read key for patch", e))?;
+        .map_err(|e| crate::sqlx_err("read key for patch", e))?;
         let Some(row) = row else { return Ok(None) };
         let mut info = row_to_info(&row);
         if let Some(v) = qps {
@@ -219,8 +195,10 @@ impl KeyStore for PostgresKeyStore {
         .bind(info.banned)
         .execute(&mut *tx)
         .await
-        .map_err(|e| key_err("apply patch", e))?;
-        tx.commit().await.map_err(|e| key_err("commit patch", e))?;
+        .map_err(|e| crate::sqlx_err("apply patch", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit patch", e))?;
         self.note_write(ak);
         Ok(Some(info))
     }
@@ -230,7 +208,7 @@ impl KeyStore for PostgresKeyStore {
             .bind(ak)
             .execute(&self.pool)
             .await
-            .map_err(|e| key_err("revoke key", e))?
+            .map_err(|e| crate::sqlx_err("revoke key", e))?
             .rows_affected();
         self.note_write(ak);
         Ok(n > 0)
@@ -243,7 +221,7 @@ impl KeyStore for PostgresKeyStore {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| key_err("list keys", e))?;
+        .map_err(|e| crate::sqlx_err("list keys", e))?;
         Ok(rows.iter().map(row_to_info).collect())
     }
 
@@ -253,46 +231,61 @@ impl KeyStore for PostgresKeyStore {
             .pool
             .begin()
             .await
-            .map_err(|e| key_err("begin reload", e))?;
+            .map_err(|e| crate::sqlx_err("begin reload", e))?;
         sqlx::query("DELETE FROM access_keys WHERE source = 'config' AND NOT (ak = ANY($1))")
             .bind(&wanted)
             .execute(&mut *tx)
             .await
-            .map_err(|e| key_err("drop stale config keys", e))?;
+            .map_err(|e| crate::sqlx_err("drop stale config keys", e))?;
         for k in keys {
-            let info = AkInfo::from(k);
-            let quotas = serde_json::to_string(&info.model_quotas).unwrap_or_else(|_| "{}".into());
-            sqlx::query(
-                "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
-                 tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, source)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'config')
-                 ON CONFLICT (ak) DO UPDATE SET
-                   product = EXCLUDED.product, tenant = EXCLUDED.tenant,
-                   qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
-                   tokens_per_minute = EXCLUDED.tokens_per_minute,
-                   expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
-                   banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
-                   source = 'config'",
-            )
-            .bind(&info.ak)
-            .bind(&info.product)
-            .bind(&info.tenant)
-            .bind(info.qps)
-            .bind(info.daily_token_quota)
-            .bind(info.tokens_per_minute)
-            .bind(info.expires_at_epoch_secs)
-            .bind(info.banned)
-            .bind(&quotas)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| key_err("re-apply config key", e))?;
+            upsert(&mut *tx, &AkInfo::from(k), KeySource::Config)
+                .await
+                .map_err(|e| crate::sqlx_err("re-apply config key", e))?;
         }
-        tx.commit().await.map_err(|e| key_err("commit reload", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit reload", e))?;
         self.write_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.cache.invalidate_all();
         Ok(())
     }
+}
+
+/// The one INSERT..ON CONFLICT for the key table. The sticky-source CASE is a
+/// no-op when `source` is Config, so the reload path shares it unchanged.
+async fn upsert(
+    exec: impl sqlx::PgExecutor<'_>,
+    info: &AkInfo,
+    source: KeySource,
+) -> Result<(), sqlx::Error> {
+    let quotas = serde_json::to_string(&*info.model_quotas).unwrap_or_else(|_| "{}".into());
+    sqlx::query(
+        "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
+         tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (ak) DO UPDATE SET
+           product = EXCLUDED.product, tenant = EXCLUDED.tenant,
+           qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
+           tokens_per_minute = EXCLUDED.tokens_per_minute,
+           expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
+           banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
+           source = CASE WHEN access_keys.source = 'config' AND EXCLUDED.source = 'admin'
+                         THEN 'config' ELSE EXCLUDED.source END",
+    )
+    .bind(&info.ak)
+    .bind(&info.product)
+    .bind(&info.tenant)
+    .bind(info.qps)
+    .bind(info.daily_token_quota)
+    .bind(info.tokens_per_minute)
+    .bind(info.expires_at_epoch_secs)
+    .bind(info.banned)
+    .bind(&quotas)
+    .bind(source_str(source))
+    .execute(exec)
+    .await
+    .map(|_| ())
 }
 
 fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
@@ -305,7 +298,9 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
         tokens_per_minute: row.get(5),
         expires_at_epoch_secs: row.get(6),
         banned: row.get(7),
-        model_quotas: serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default(),
+        model_quotas: std::sync::Arc::new(
+            serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default(),
+        ),
     }
 }
 
@@ -314,10 +309,6 @@ fn source_str(s: KeySource) -> &'static str {
         KeySource::Config => "config",
         KeySource::Admin => "admin",
     }
-}
-
-fn key_err(what: &str, e: sqlx::Error) -> GatewayError {
-    GatewayError::internal(what).with_source(e)
 }
 
 #[cfg(test)]

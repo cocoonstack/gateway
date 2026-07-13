@@ -1,7 +1,6 @@
-//! Local file configuration.
-//!
-//! There is no config center: everything comes from a local YAML file. Layer L1 —
-//! depends only on gw-consts.
+//! Gateway configuration: parsing and validation of the YAML document. The
+//! document may come from a local file or the Postgres config store (gw-state);
+//! this crate only defines its shape. Layer L1 — depends only on gw-consts.
 
 use gw_consts::Protocol;
 use serde::Deserialize;
@@ -528,7 +527,7 @@ impl GatewayConfig {
         // A typo'd tenant on a key would otherwise silently fall back to the
         // unrestricted default tenant — reject undeclared references at load.
         for k in &self.access_keys {
-            if k.tenant != DEFAULT_TENANT && !self.tenants.iter().any(|t| t.name == k.tenant) {
+            if !self.is_known_tenant(&k.tenant) {
                 return Err(ConfigError::UnknownTenant {
                     ak: k.ak.clone(),
                     tenant: k.tenant.clone(),
@@ -537,7 +536,7 @@ impl GatewayConfig {
         }
         for t in &self.tenants {
             for m in t.models.iter().flatten() {
-                if !self.models.iter().any(|c| &c.name == m) {
+                if !self.model_exists(m) {
                     return Err(ConfigError::UnknownEntitledModel {
                         tenant: t.name.clone(),
                         model: m.clone(),
@@ -545,7 +544,7 @@ impl GatewayConfig {
                 }
             }
             for m in t.model_quotas.keys() {
-                if !self.models.iter().any(|c| &c.name == m) {
+                if !self.model_exists(m) {
                     return Err(ConfigError::UnknownQuotaModel {
                         owner: format!("tenant {}", t.name),
                         model: m.clone(),
@@ -553,7 +552,7 @@ impl GatewayConfig {
                 }
             }
             if let Some(fb) = &t.fallback_model
-                && (!self.models.iter().any(|c| &c.name == fb)
+                && (!self.model_exists(fb)
                     || !t.models.as_ref().is_none_or(|allow| allow.contains(fb)))
             {
                 return Err(ConfigError::BadFallbackModel {
@@ -564,7 +563,7 @@ impl GatewayConfig {
         }
         for k in &self.access_keys {
             for m in k.model_quotas.keys() {
-                if !self.models.iter().any(|c| &c.name == m) {
+                if !self.model_exists(m) {
                     return Err(ConfigError::UnknownQuotaModel {
                         owner: format!("access key {}", k.ak),
                         model: m.clone(),
@@ -584,6 +583,16 @@ impl GatewayConfig {
 
     pub fn find_tenant(&self, name: &str) -> Option<&TenantConf> {
         self.tenants.get(*self.tenant_idx.get(name)?)
+    }
+
+    /// Whether keys may reference `name` as their tenant. A linear scan so it
+    /// also works during `validate()`, before the indices are built.
+    pub fn is_known_tenant(&self, name: &str) -> bool {
+        name == DEFAULT_TENANT || self.tenants.iter().any(|t| t.name == name)
+    }
+
+    fn model_exists(&self, name: &str) -> bool {
+        self.models.iter().any(|c| c.name == name)
     }
 
     /// Whether `tenant` may call `model`: no tenant entry or no allowlist =
@@ -669,7 +678,6 @@ models:
         assert_eq!(acc.endpoint, "https://api.openai.com");
         assert_eq!(acc.api_key_env, "OPENAI_API_KEY");
         assert!(acc.protocols.iter().any(|w| w == "embeddings"));
-        // endpoint override wins over the preset default
         let gem = cfg.accounts.iter().find(|a| a.name == "gemini").unwrap();
         assert_eq!(gem.endpoint, "https://gw.example.com");
     }
@@ -753,7 +761,6 @@ accounts:
         let slow = cfg.accounts.iter().find(|a| a.name == "slow").unwrap();
         assert_eq!(slow.timeout_seconds, Some(120));
         assert_eq!(slow.connect_retries, None);
-        // the synthesized preset account inherits the provider's policy
         let preset = cfg.accounts.iter().find(|a| a.name == "openai").unwrap();
         assert_eq!(preset.timeout_seconds, Some(30));
         assert_eq!(preset.connect_retries, Some(3));
@@ -839,7 +846,6 @@ tenants: [{name: t1, model_quotas: {ghost: 10}}]
             Err(ConfigError::UnknownQuotaModel { .. })
         ));
 
-        // fallback outside the tenant's own allowlist is a config error
         let bad_fallback = r#"
 listen: {host: h, port: 1}
 models: [{name: m1, protocol: openai-chat}, {name: m2, protocol: openai-chat}]
