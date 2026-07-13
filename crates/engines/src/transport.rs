@@ -285,8 +285,6 @@ impl MockTransport {
         }))
     }
 
-    // --- bespoke vendor wire shapes ---
-
     fn dashscope_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "dashscope")?;
         let user = Self::last_user_text(body["input"]["messages"].as_array().unwrap_or(&vec![]));

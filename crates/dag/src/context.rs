@@ -11,16 +11,13 @@ use gw_models::GatewayRequest;
 use gw_state::{AkInfo, GatewayState};
 
 pub struct DagContext {
-    // --- environment (read-only) ---
     pub cfg: Arc<GatewayConfig>,
     pub state: Arc<GatewayState>,
     pub transport: SharedTransport,
 
-    // --- the request being served ---
     pub request: GatewayRequest,
     pub ak: AkInfo,
 
-    // --- produced along the way ---
     /// engine result, set by the model_access layer.
     pub outcome: Option<EngineOutcome>,
     /// decision trail as (stage, detail); joined only when read, so the hot

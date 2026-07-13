@@ -94,12 +94,12 @@ fn common_usage_matches_go_struct_semantics() {
         "prompt_tokens_details":{"cached_tokens":4},
         "completion_tokens_details":{"reasoning_tokens":2}}"#;
     let u = extract_common_usage(raw, false).unwrap();
-    assert_eq!(u.platform_input, 6); // 10 prompt − 4 cache: PlatformInput excludes cache
+    assert_eq!(u.platform_input, 6);
     assert_eq!(u.read_cache, 4);
     assert_eq!(u.write_cache, 0);
-    assert_eq!(u.completion, 3); // 5 − 2 reasoning: Completion excludes Reasoning
+    assert_eq!(u.completion, 3);
     assert_eq!(u.reason, 2);
-    assert_eq!(u.platform_total, 15); // sum of all tokens
+    assert_eq!(u.platform_total, 15);
 }
 
 /// Anthropic usage shape → CommonUsage (messages protocol field map).
@@ -141,9 +141,9 @@ async fn anthropic_valid_matches_go_recorded_response() {
     let out = run_claude(GO_ANTHROPIC_VALID).await.unwrap();
     assert_eq!(out.response.message, "Hello!");
     assert_eq!(out.response.model, "claude-4-sonnet-20250514");
-    assert_eq!(out.response.finish_reason, "end_turn"); // stop_reason → finish_reason
-    assert_eq!(out.response.prompt_tokens, 25); // input_tokens → prompt_tokens
-    assert_eq!(out.response.completion_tokens, 150); // output_tokens → completion_tokens
+    assert_eq!(out.response.finish_reason, "end_turn");
+    assert_eq!(out.response.prompt_tokens, 25);
+    assert_eq!(out.response.completion_tokens, 150);
     assert!(out.response.is_messages_protocol);
 }
 
@@ -155,7 +155,7 @@ async fn anthropic_no_usage_matches_go() {
     let out = run_claude(GO_ANTHROPIC_NO_USAGE).await.unwrap();
     assert_eq!(out.response.model, "test");
     assert_eq!(out.response.finish_reason, "end_turn");
-    assert_eq!(out.response.prompt_tokens, 0); // usage absent → tokens default to 0
+    assert_eq!(out.response.prompt_tokens, 0);
     assert_eq!(out.response.completion_tokens, 0);
 }
 
@@ -166,7 +166,7 @@ const GO_ANTHROPIC_NO_STOP: &str =
 #[tokio::test]
 async fn anthropic_no_stop_reason_matches_go() {
     let out = run_claude(GO_ANTHROPIC_NO_STOP).await.unwrap();
-    assert_eq!(out.response.finish_reason, ""); // stop_reason absent → empty finish_reason
+    assert_eq!(out.response.finish_reason, "");
     assert_eq!(out.response.prompt_tokens, 10);
     assert_eq!(out.response.completion_tokens, 5);
 }
@@ -177,10 +177,10 @@ fn anthropic_cache_usage_matches_go_recorded() {
     let raw = br#"{"input_tokens":12,"cache_creation_input_tokens":3,"cache_read_input_tokens":2}"#;
     let u = extract_common_usage(raw, true).unwrap();
     assert_eq!(u.platform_input, 12);
-    assert_eq!(u.read_cache, 2); // cache_read_input_tokens
-    assert_eq!(u.write_cache, 3); // cache_creation_input_tokens
-    assert_eq!(u.completion, 0); // no output_tokens in message_start
-    assert_eq!(u.platform_total, 17); // 12 + 0 + 2 + 3
+    assert_eq!(u.read_cache, 2);
+    assert_eq!(u.write_cache, 3);
+    assert_eq!(u.completion, 0);
+    assert_eq!(u.platform_total, 17);
 }
 
 /// Family + bespoke engines must ALSO surface vendor error envelopes (same gap
@@ -298,7 +298,7 @@ fn openai_req_stream() -> GatewayRequest {
 async fn openai_error_envelope_surfaces() {
     let fixture = r#"{"error":{"type":"rate_limit","code":"429","message":"too many requests"}}"#;
     let transport = Arc::new(FixtureTransport {
-        status: 200, // vendor 200 body but error envelope → status from error.code
+        status: 200,
         sse: false,
         bytes: fixture.as_bytes().to_vec(),
     });
@@ -367,8 +367,8 @@ async fn gemini_usage_metadata_matches_go_recorded() {
     };
     let out = VertexEngine::new(req, transport).run().await.unwrap();
     assert_eq!(out.response.message, "Hi from gemini");
-    assert_eq!(out.response.finish_reason, "stop"); // STOP → lowercased
-    assert_eq!(out.response.prompt_tokens, 15); // promptTokenCount
-    assert_eq!(out.response.completion_tokens, 10); // candidatesTokenCount
+    assert_eq!(out.response.finish_reason, "stop");
+    assert_eq!(out.response.prompt_tokens, 15);
+    assert_eq!(out.response.completion_tokens, 10);
     assert_eq!(out.response.total_tokens, 25);
 }

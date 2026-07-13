@@ -171,7 +171,7 @@ async fn engine_through_real_http_transport_end_to_end() {
         name: "real-local".into(),
         provider: "local".into(),
         priority: 1,
-        endpoint: base, // the one config field that makes it "real"
+        endpoint: base,
         ..Default::default()
     };
     let request = GatewayRequest {

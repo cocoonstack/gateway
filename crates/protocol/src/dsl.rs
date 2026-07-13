@@ -252,7 +252,6 @@ pub fn transform(input: &Value, spec: &MappingSpec) -> Value {
 mod tests {
     use super::*;
 
-    /// Asserts the scalar-op outputs: type=message, stop_reason=end_turn, usage renamed.
     #[test]
     fn transform_applies_scalar_and_collect_ops() {
         let input: Value = serde_json::from_str(
@@ -287,8 +286,8 @@ mod tests {
         assert_eq!(out["stop_reason"], "end_turn");
         assert_eq!(out["content"][0]["type"], "text");
         assert_eq!(out["content"][0]["text"], "Hello!");
-        assert_eq!(out["usage"]["input_tokens"], 10); // renamed from prompt_tokens
-        assert_eq!(out["usage"]["output_tokens"], 5); // renamed from completion_tokens
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["output_tokens"], 5);
     }
 
     #[test]
@@ -309,8 +308,6 @@ mod tests {
         assert_eq!(out["content"][0]["input"]["city"], "sf");
     }
 
-    /// Full OpenAI chat.completion → Anthropic message, via the built-in mapping,
-    /// on a recorded OpenAI response fixture.
     #[test]
     fn builtin_openai_to_anthropic_full_conversion() {
         let openai: Value = serde_json::from_str(

@@ -19,10 +19,8 @@ use std::fmt;
 pub struct ErrCode(pub i64);
 
 impl ErrCode {
-    // --- metrics ---
     pub const SUCCESS: ErrCode = ErrCode(200); // used for metrics tracking
 
-    // --- system / infra (1000, 2000-2012) ---
     pub const SYSTEM_ERROR: ErrCode = ErrCode(1000);
     pub const DB_WRITE: ErrCode = ErrCode(2000);
     pub const DB_READ: ErrCode = ErrCode(2001);
@@ -37,13 +35,11 @@ impl ErrCode {
     pub const PARSE_FED_RESP: ErrCode = ErrCode(2009);
     pub const GEN_RES_NOT_NULL: ErrCode = ErrCode(2010);
 
-    // --- request validation (3001-3007) ---
     pub const REQ_JSON: ErrCode = ErrCode(3001);
     pub const REQ_PARAM: ErrCode = ErrCode(3002);
     pub const REQ_NON_CHAT: ErrCode = ErrCode(3003);
     pub const PERMISSION_CHECK: ErrCode = ErrCode(3007);
 
-    // --- response / content (4003-4004) ---
     pub const EMPTY_RESP: ErrCode = ErrCode(4003);
     pub const STOP_LIMIT_MSG: ErrCode = ErrCode(4004);
 

@@ -16,18 +16,15 @@ use crate::usage::CommonUsage;
 /// Clone-able so the request-level cache can replay it.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayResponse {
-    /// generated chat content.
     pub message: String,
     /// model-requested tool calls (shape varies by protocol: openai tool_calls array /
     /// anthropic tool_use blocks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
-    /// embedding vector.
     pub embeddings: Vec<f32>,
     /// model name reported by the vendor.
     pub model: String,
 
-    // --- token accounting ---
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub read_cached_prompt_tokens: i64,
@@ -37,24 +34,19 @@ pub struct GatewayResponse {
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
 
-    /// vendor timestamp.
     pub upstream_latency_ms: i64,
     /// upstream HTTP status.
     pub http_code: i64,
-    /// vendor error type.
     pub err_type: String,
-    /// vendor error code.
     pub err_code: String,
 
     /// v2 typed response payload (dynamic for now).
     pub response_v2: Option<Value>,
-    /// proxy instance used.
     pub proxy_url: String,
     /// actually-requested model when auto-routing.
     pub request_model: String,
     /// tokens to deduct post-request.
     pub post_consume_tokens: i64,
-    /// finish reason.
     pub finish_reason: String,
 
     /// arbitrary key-value info to record in session.
@@ -76,7 +68,6 @@ pub struct GatewayResponse {
     /// normalized usage view, filled by the CommonUsage post-processor.
     pub common_usage: Option<CommonUsage>,
 
-    // --- runtime-only, not part of the serialized model ---
     /// the stream was committed to the client and then broke off; `message`
     /// holds what was delivered (billing estimates from it when usage is absent).
     #[serde(skip)]

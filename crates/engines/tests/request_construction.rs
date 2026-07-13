@@ -142,7 +142,7 @@ async fn anthropic_request_shape() {
     assert_eq!(b["stop_sequences"][1], "END");
     assert!(b.get("stop").is_none());
     assert_eq!(b["system"], "be brief");
-    assert_eq!(b["messages"].as_array().unwrap().len(), 1); // only the user turn remains
+    assert_eq!(b["messages"].as_array().unwrap().len(), 1);
     assert_eq!(b["messages"][0]["role"], "user");
     assert_eq!(b["max_tokens"], 512);
     assert!(t.url().ends_with("/v1/messages"));
@@ -463,7 +463,7 @@ async fn cohere_request_shape_with_sigv4() {
         .await
         .unwrap();
     let b = t.body_json();
-    assert_eq!(b["message"], "hello"); // last user turn becomes `message`
+    assert_eq!(b["message"], "hello");
     assert!(b["chat_history"].is_array());
     let auth = t.header("authorization").expect("SigV4 auth header");
     assert!(
@@ -540,7 +540,7 @@ async fn embeddings_request_shape() {
     assert_eq!(b["model"], "text-embedding-3");
     assert_eq!(b["input"][0], "a");
     assert_eq!(b["input"][1], "b");
-    assert_eq!(b["dimensions"], 256); // not silently dropped
+    assert_eq!(b["dimensions"], 256);
     assert!(t.url().contains("/embeddings"), "url: {}", t.url());
     assert_eq!(
         t.header("content-type").as_deref(),
@@ -612,7 +612,7 @@ async fn tts_request_shape() {
     assert_eq!(b["model"], "tts-1");
     assert_eq!(b["input"], "read this");
     assert_eq!(b["voice"], "alloy");
-    assert_eq!(b["response_format"], "mp3"); // not silently dropped
+    assert_eq!(b["response_format"], "mp3");
     assert!(t.url().ends_with("/audio/speech"), "url: {}", t.url());
 }
 
@@ -659,7 +659,7 @@ async fn video_request_shape() {
     let b = t.body_json();
     assert_eq!(b["model"], "kling-video");
     assert_eq!(b["prompt"], "a dog surfing");
-    assert_eq!(b["duration_seconds"], 5); // not silently dropped
+    assert_eq!(b["duration_seconds"], 5);
     assert_eq!(b["resolution"], "1080p");
     assert!(t.url().contains("/videos"), "url: {}", t.url());
 }
