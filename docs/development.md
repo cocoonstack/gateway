@@ -9,6 +9,7 @@ make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make fmt         # cargo fmt --all
 make deny        # cargo deny check (advisories + licenses)
 make release     # optimized ap-server binary (--locked)
+make dist        # cross-platform release artifacts (mirrors CI)
 make docker      # build the container image
 make run         # cargo run -p ap-server
 ```

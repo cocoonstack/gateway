@@ -1,6 +1,6 @@
 BIN := ap
 
-.PHONY: all build release test lint fmt fmt-check deny clean docker run
+.PHONY: all build release test lint fmt fmt-check deny dist dist-plan docker run clean
 
 all: fmt lint test build
 
@@ -24,6 +24,13 @@ fmt-check:
 
 deny:
 	cargo deny check
+
+# dist owns releases (v* tags in CI); these mirror it locally.
+dist-plan:
+	dist plan
+
+dist:
+	dist build
 
 docker:
 	docker build -t gateway .
