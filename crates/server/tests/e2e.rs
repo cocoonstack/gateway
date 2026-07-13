@@ -2636,7 +2636,6 @@ models:
         )
     };
 
-    // turn 1: admitted, streams and bills 13 tokens
     ws.send(append()).await.unwrap();
     let mut done1 = None;
     while let Some(Ok(msg)) = ws.next().await {
@@ -2646,11 +2645,13 @@ models:
             break;
         }
     }
-    assert_eq!(done1.unwrap()["response"]["usage"]["total_tokens"], 13);
+    assert_eq!(
+        done1.unwrap()["response"]["usage"]["total_tokens"],
+        13,
+        "first turn admitted and billed"
+    );
 
-    // turn 2: over quota — the gateway must deny it (error frame), suppress its
-    // output entirely (no delta/done relayed before OR after the error), and not
-    // bill it. Read until a brief idle gap so a late leak would be caught too.
+    // read to a brief idle gap so a leaked frame after the error is caught too
     ws.send(append()).await.unwrap();
     let mut saw_error = false;
     let mut leaked_output = false;

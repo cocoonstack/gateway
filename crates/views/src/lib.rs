@@ -310,6 +310,18 @@ struct RealtimeAdmit {
     at: i64,
 }
 
+impl RealtimeAdmit {
+    /// Refund this turn's unsettled reserves (daily quota + any TPM window) — for
+    /// a turn dropped before its boundary frame arrived.
+    async fn refund(&self, gov: &dyn gw_state::Governance) {
+        gov.quota_settle(&self.ak.ak, -self.reserved, self.at).await;
+        if let Some(tpm) = self.tpm_reserved {
+            gov.token_window_settle(&self.ak.ak, -tpm, gw_consts::MINUTE)
+                .await;
+        }
+    }
+}
+
 /// The full governance chain the REST path runs (tenant + AK QPS, product/model
 /// QPM, per-(AK, model) quota, AK daily quota, AK TPM), applied per realtime
 /// generation. Re-fetches the key each turn (the handshake snapshot is stale),
@@ -564,6 +576,18 @@ fn is_response_create(payload: &[u8]) -> bool {
 /// several dialects (see `realtime_usage`); a vendor with
 /// a different wire shape needs its own adapter before it can be metered (the
 /// unmetered-session warning below is the operator's misconfiguration signal).
+/// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate:
+/// OpenAI's `response.created`, sent with no client `response.create`. Non-OpenAI
+/// dialects have no such gated auto-start, so `false` — keeping turn-start dialect
+/// knowledge here alongside the turn-boundary detector rather than as a bare
+/// literal in the bridge.
+fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
+    match provider {
+        "google" | "gemini" | "vertex" => false,
+        _ => frame["type"] == "response.created",
+    }
+}
+
 /// Per-dialect realtime turn boundary → the turn's (input, output) tokens.
 /// `Some` for a per-turn TERMINAL frame — including `Some((0, 0))` for a
 /// cancelled/empty turn, so its admission reservation is settled/refunded rather
@@ -741,7 +765,7 @@ async fn realtime_bridge(
                         // the same admission + fresh-key attribution as manual ones;
                         // a denied turn is cancelled upstream, error'd downstream, and
                         // its output frames are suppressed so nothing leaks.
-                        else if v["type"] == "response.created" && pending.is_empty() {
+                        else if realtime_turn_started(&account.provider, &v) && pending.is_empty() {
                             match realtime_gate(&s, &ak, &model).await {
                                 Ok(admit) => pending.push_back(admit),
                                 Err(denied) => {
@@ -819,13 +843,9 @@ async fn realtime_bridge(
     // refund reserves for turns that never reached a boundary frame (session
     // dropped mid-generation)
     if !pending.is_empty() {
-        let gov = &s.handler.state().governance;
+        let state = s.handler.state();
         for a in pending {
-            gov.quota_settle(&a.ak.ak, -a.reserved, a.at).await;
-            if let Some(tpm_res) = a.tpm_reserved {
-                gov.token_window_settle(&a.ak.ak, -tpm_res, gw_consts::MINUTE)
-                    .await;
-            }
+            a.refund(state.governance.as_ref()).await;
         }
     }
     if generations > 0 && recognized == 0 {
@@ -2801,12 +2821,9 @@ mod tests {
         let gov = || s.handler.state().governance.clone();
         let used = || async { gov().quota_used(&ak.ak).await };
 
-        // admission reserves a fixed per-turn estimate up front, so a concurrent
-        // turn admitted before this one bills already counts against the budget
         let a1 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
-        assert_eq!(used().await, REALTIME_TURN_RESERVE);
+        assert_eq!(used().await, REALTIME_TURN_RESERVE, "reserved up front");
 
-        // billing settles the reserve to the turn's actual total (30 + 70)
         bill_realtime_turn(
             &s,
             &a1,
@@ -2817,18 +2834,13 @@ mod tests {
             70,
         )
         .await;
-        assert_eq!(used().await, 100);
+        assert_eq!(used().await, 100, "settled to actual (30 + 70)");
 
-        // a turn that admits but never produces a usage frame is refunded whole
-        // by the bridge's close path, leaving only the settled turn's total
         let a2 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         gov().quota_settle(&a2.ak.ak, -a2.reserved, a2.at).await;
-        assert_eq!(used().await, 100);
+        assert_eq!(used().await, 100, "dropped turn refunded whole");
 
-        // a zero-usage terminal turn (cancelled/errored) settles to a full refund
-        // and writes no ledger row — the fix for reservations orphaned at the
-        // FIFO head when a turn ends without billable usage
         let a3 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         let ledger_before = s.handler.state().store.ledger_snapshot(1).await.unwrap().0;
@@ -2855,7 +2867,7 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
-        // ak-tpm-tiny has tokens_per_minute: 10 (< the 1000-token reserve)
+        // ak-tpm-tiny: tokens_per_minute 10, below the 1000-token turn reserve
         let ak = s
             .handler
             .state()
@@ -2865,16 +2877,12 @@ mod tests {
             .unwrap();
         let gov = s.handler.state().governance.clone();
 
-        // first turn admits (the TPM window was empty) and reserves both windows
         let a1 = realtime_gate(&s, &ak, "gpt-4o")
             .await
             .expect("first admits");
         assert_eq!(a1.tpm_reserved, Some(REALTIME_TURN_RESERVE));
         let daily_before = gov.quota_used(&ak.ak).await;
 
-        // second turn: the in-flight TPM reserve now exceeds the tiny cap, so the
-        // gate denies — and the daily reserve it took first must be rolled back,
-        // not leaked
         assert!(
             realtime_gate(&s, &ak, "gpt-4o").await.is_err(),
             "second turn denied by the TPM reserve"

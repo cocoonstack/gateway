@@ -90,9 +90,9 @@ impl ModelEngine for ErnieEngine {
             } else {
                 "stop".into()
             },
-            prompt_tokens: usage["prompt_tokens"].as_i64().unwrap_or(0).max(0),
-            completion_tokens: usage["completion_tokens"].as_i64().unwrap_or(0).max(0),
-            total_tokens: usage["total_tokens"].as_i64().unwrap_or(0).max(0),
+            prompt_tokens: crate::engine::tok(&usage["prompt_tokens"]),
+            completion_tokens: crate::engine::tok(&usage["completion_tokens"]),
+            total_tokens: crate::engine::tok(&usage["total_tokens"]),
             raw_usage_json: usage.to_string().into_bytes(),
             ..Default::default()
         };
@@ -142,7 +142,7 @@ impl ModelEngine for MinimaxV1Engine {
                 format!("minimax base_resp {code}: {}", v["base_resp"]["status_msg"]),
             ));
         }
-        let total = v["usage"]["total_tokens"].as_i64().unwrap_or(0).max(0);
+        let total = crate::engine::tok(&v["usage"]["total_tokens"]);
         let resp = GatewayResponse {
             message: v["reply"].as_str().unwrap_or_default().to_owned(),
             model,
@@ -213,8 +213,8 @@ impl ModelEngine for CohereEngine {
         let (status, v) = self.base.post_json(&url, headers, body).await?;
         let tokens = &v["meta"]["tokens"];
         let (input, output) = (
-            tokens["input_tokens"].as_i64().unwrap_or(0).max(0),
-            tokens["output_tokens"].as_i64().unwrap_or(0).max(0),
+            crate::engine::tok(&tokens["input_tokens"]),
+            crate::engine::tok(&tokens["output_tokens"]),
         );
         let resp = GatewayResponse {
             message: v["text"].as_str().unwrap_or_default().to_owned(),
@@ -285,8 +285,8 @@ impl ModelEngine for LlamaEngine {
         let url = format!("{base}{uri}");
         let (status, v) = self.base.post_json(&url, headers, body).await?;
         let (pt, ct) = (
-            v["prompt_token_count"].as_i64().unwrap_or(0).max(0),
-            v["generation_token_count"].as_i64().unwrap_or(0).max(0),
+            crate::engine::tok(&v["prompt_token_count"]),
+            crate::engine::tok(&v["generation_token_count"]),
         );
         let total = pt.saturating_add(ct);
         let resp = GatewayResponse {

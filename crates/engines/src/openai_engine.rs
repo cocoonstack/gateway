@@ -299,9 +299,9 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
         return;
     }
     // floor upstream counts so a negative can't refund quota or bill negative
-    resp.prompt_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0).max(0);
-    resp.completion_tokens = usage["completion_tokens"].as_i64().unwrap_or(0).max(0);
-    resp.total_tokens = usage["total_tokens"].as_i64().unwrap_or(0).max(0);
+    resp.prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);
+    resp.completion_tokens = crate::engine::tok(&usage["completion_tokens"]);
+    resp.total_tokens = crate::engine::tok(&usage["total_tokens"]);
     resp.raw_usage_json = usage.to_string().into_bytes();
 }
 

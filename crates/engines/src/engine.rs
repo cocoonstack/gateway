@@ -10,6 +10,13 @@ use serde_json::Value;
 
 pub use gw_models::StreamChunk;
 
+/// One upstream usage count, floored at 0 — a vendor must never drive a negative
+/// into billing/quota. The overflow ceiling is applied later at the metering
+/// sinks (see `gw_state::clamp_tokens`).
+pub fn tok(v: &Value) -> i64 {
+    v.as_i64().unwrap_or(0).max(0)
+}
+
 /// Detect a vendor error envelope and turn it into a `GatewayError`.
 /// Covers OpenAI-style `{"error":{message,type,code}}` and MiniMax-style
 /// `{"type":"error","error":{http_code,message}}`, normalized from each engine's

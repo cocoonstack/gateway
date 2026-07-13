@@ -415,17 +415,14 @@ mod tests {
 
     #[tokio::test]
     async fn dlp_buffers_stream_and_drops_raw_chunks() {
-        // #9: the handler is the DLP boundary — a caller that sets stream_tx
-        // under DLP still gets buffered redaction, and the raw pre-redaction
-        // chunks are cleared so nothing downstream can replay unmasked text.
         let h = OnlineHandler::new(handler().config.clone(), Arc::new(PiiStream));
         assert!(h.cfg().security.dlp_redact, "default config has DLP on");
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut req = chat_req("gpt-4o", "hello");
         req.stream = true;
         req.stream_tx = Some(tx);
-        // run() consumes the request; under DLP it clears stream_tx before the
-        // engine runs, so the sender is dropped and the live channel stays empty
+        // under DLP, run() clears stream_tx before the engine runs, so the sender
+        // drops and the live channel stays empty
         let ctx = h.run(req, ak(&h).await).await.unwrap();
         let mut live: Vec<String> = Vec::new();
         while let Ok(chunk) = rx.try_recv() {

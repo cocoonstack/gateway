@@ -254,7 +254,7 @@ fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if let Some(pt) = um["promptTokenCount"].as_i64() {
         resp.prompt_tokens = pt.max(0);
     }
-    let thoughts = um["thoughtsTokenCount"].as_i64().unwrap_or(0).max(0);
+    let thoughts = crate::engine::tok(&um["thoughtsTokenCount"]);
     if let Some(cand) = um["candidatesTokenCount"].as_i64() {
         resp.completion_tokens = cand.max(0).saturating_add(thoughts);
         resp.reasoning_tokens = thoughts;
@@ -325,7 +325,7 @@ impl ModelEngine for EmbeddingsEngine {
                     .collect()
             })
             .unwrap_or_default();
-        let pt = v["usage"]["prompt_tokens"].as_i64().unwrap_or(0).max(0);
+        let pt = crate::engine::tok(&v["usage"]["prompt_tokens"]);
         let resp = GatewayResponse {
             embeddings: first,
             model: param.model_name.clone(),
@@ -694,8 +694,8 @@ impl ModelEngine for CompletionsEngine {
             .to_owned();
         let usage = &v["usage"];
         let (pt, ct) = (
-            usage["prompt_tokens"].as_i64().unwrap_or(0).max(0),
-            usage["completion_tokens"].as_i64().unwrap_or(0).max(0),
+            crate::engine::tok(&usage["prompt_tokens"]),
+            crate::engine::tok(&usage["completion_tokens"]),
         );
         let resp = GatewayResponse {
             message: text,
@@ -763,8 +763,8 @@ fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
         return (0, 0, vec![]);
     }
     // floor upstream counts so a negative can't refund quota or bill a negative
-    let input = usage["input_tokens"].as_i64().unwrap_or(0).max(0);
-    let output = usage["output_tokens"].as_i64().unwrap_or(0).max(0);
+    let input = crate::engine::tok(&usage["input_tokens"]);
+    let output = crate::engine::tok(&usage["output_tokens"]);
     let cached = usage["input_tokens_details"]["cached_tokens"]
         .as_i64()
         .unwrap_or(0)

@@ -18,6 +18,13 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
      FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
      RETURNING id";
 
+/// Per-call token ceiling. Usage is floored at 0 upstream but not capped, so a
+/// hostile/buggy upstream can report i64::MAX; clamping each metered count keeps
+/// every downstream accumulator (Redis INCRBY reservations, SQL `SUM` rollups,
+/// in-memory counters) far from overflow. Far above any real response (largest
+/// model context is ~2M tokens), so real traffic is never clamped.
+pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
+
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BillingRecord {
@@ -128,13 +135,6 @@ pub struct BillingInput<'a> {
     pub total: i64,
     pub ptu_spillover: bool,
 }
-
-/// Per-call token ceiling. Usage is floored at 0 upstream but not capped, so a
-/// hostile/buggy upstream can report i64::MAX; clamping each metered count here
-/// keeps every downstream accumulator (Redis INCRBY reservations, SQL `SUM`
-/// rollups, in-memory counters) far from overflow. Far above any real response
-/// (largest model context is ~2M tokens), so real traffic is never clamped.
-pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
 /// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
 pub fn clamp_tokens(n: i64) -> i64 {
@@ -256,9 +256,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     }
     /// Claim one pending batch (requeuing any running batch whose executor went
     /// stale first). `None` = nothing to run. Only the distributed backend claims.
-    /// The returned `i64` is a fence token bumped on each claim; the executor
-    /// passes it to [`Store::batch_touch`] so a stalled instance whose batch was
-    /// reclaimed detects that it lost ownership.
+    /// The returned `i64` is a fence token, always `>= 1` (it is bumped from 0 on
+    /// each claim); the executor passes it to [`Store::batch_touch`] /
+    /// [`Store::batch_set_status_owned`] so a stalled instance whose batch was
+    /// reclaimed detects it lost ownership. The executor uses `0` as the sentinel
+    /// for the in-process path, which has no fence and no reclaim.
     async fn batch_claim_pending(&self, _stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
         Ok(None)
     }

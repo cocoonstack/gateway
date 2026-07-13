@@ -116,8 +116,8 @@ impl ClaudeEngine {
             }
         }
         let usage = &v["usage"];
-        let input = usage["input_tokens"].as_i64().unwrap_or(0).max(0);
-        let output = usage["output_tokens"].as_i64().unwrap_or(0).max(0);
+        let input = crate::engine::tok(&usage["input_tokens"]);
+        let output = crate::engine::tok(&usage["output_tokens"]);
         let resp = GatewayResponse {
             message: text,
             tool_calls: if tool_use.is_empty() {
