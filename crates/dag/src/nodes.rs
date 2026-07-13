@@ -8,6 +8,13 @@ use gw_state::BillingRecord;
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
 
+/// Completion tokens reserved when the caller sets no max_tokens; settle
+/// corrects to actuals, so the estimate only needs to be monotone.
+const DEFAULT_COMPLETION_RESERVE: i64 = 256;
+/// Cap on the reservation regardless of a caller's `max_tokens`, so a hostile
+/// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
+const MAX_RESERVE: i64 = 1_000_000;
+
 /// preprocess/model_quota: per-(AK, model) daily token cap — AK override, else
 /// tenant default, else unmetered (no counter is ever touched). Over-quota
 /// degrades to the tenant's fallback model when one is configured; otherwise
@@ -140,26 +147,6 @@ impl DagNode for TenantEntitlement {
 /// engine/billing nodes all short-circuit.
 pub struct CacheLookup;
 
-/// Cache key: sha256 of model name + messages + typed params + passthrough
-/// params. Not keyed by tenant: entitlement gates before the cache, and a
-/// per-tenant split would only shrink the hit rate.
-fn cache_key_of(ctx: &DagContext) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let param = ctx.request.model_param_v2.as_ref()?;
-    let mut h = Sha256::new();
-    h.update(param.model_name.as_bytes());
-    h.update(serde_json::to_vec(&ctx.request.message).ok()?);
-    if let Some(t) = &param.typed {
-        h.update(serde_json::to_vec(t).ok()?);
-    }
-    // `raw` params (seed, response_format, vendor extras) change the output;
-    // omitting them would collide distinct requests onto one entry
-    if !param.raw.is_null() {
-        h.update(serde_json::to_vec(&param.raw).ok()?);
-    }
-    Some(hex::encode(h.finalize()))
-}
-
 #[async_trait::async_trait]
 impl DagNode for CacheLookup {
     fn name(&self) -> &'static str {
@@ -199,12 +186,25 @@ impl DagNode for CacheLookup {
     }
 }
 
-/// Completion tokens reserved when the caller sets no max_tokens; settle
-/// corrects to actuals, so the estimate only needs to be monotone.
-const DEFAULT_COMPLETION_RESERVE: i64 = 256;
-/// Cap on the reservation regardless of a caller's `max_tokens`, so a hostile
-/// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
-const MAX_RESERVE: i64 = 1_000_000;
+/// Cache key: sha256 of model name + messages + typed params + passthrough
+/// params. Not keyed by tenant: entitlement gates before the cache, and a
+/// per-tenant split would only shrink the hit rate.
+fn cache_key_of(ctx: &DagContext) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let param = ctx.request.model_param_v2.as_ref()?;
+    let mut h = Sha256::new();
+    h.update(param.model_name.as_bytes());
+    h.update(serde_json::to_vec(&ctx.request.message).ok()?);
+    if let Some(t) = &param.typed {
+        h.update(serde_json::to_vec(t).ok()?);
+    }
+    // `raw` params (seed, response_format, vendor extras) change the output;
+    // omitting them would collide distinct requests onto one entry
+    if !param.raw.is_null() {
+        h.update(serde_json::to_vec(&param.raw).ok()?);
+    }
+    Some(hex::encode(h.finalize()))
+}
 
 /// Cheap admission estimate: ~chars/4 prompt heuristic + requested max_tokens,
 /// saturating and capped so caller-controlled input can't wrap the counters.

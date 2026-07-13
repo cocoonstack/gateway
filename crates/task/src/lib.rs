@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use gw_state::GatewayState;
 
+/// The production period: once a day.
+pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Spawn the daily quota reset loop. Returns the join handle (abort to stop).
 /// `period` is configurable so tests don't wait 24h.
 pub fn spawn_quota_reset(
@@ -25,9 +28,6 @@ pub fn spawn_quota_reset(
         }
     })
 }
-
-/// The production period: once a day.
-pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[cfg(test)]
 mod tests {

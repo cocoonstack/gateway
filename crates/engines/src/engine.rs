@@ -8,6 +8,8 @@ use gw_consts::ErrCode;
 use gw_models::{Block, GResult, GatewayError, GatewayResponse, Recorder};
 use serde_json::Value;
 
+pub use gw_models::StreamChunk;
+
 /// Detect a vendor error envelope and turn it into a `GatewayError`.
 /// Covers OpenAI-style `{"error":{message,type,code}}` and MiniMax-style
 /// `{"type":"error","error":{http_code,message}}`, normalized from each engine's
@@ -79,5 +81,3 @@ pub trait ModelEngine: Send + Sync {
     /// The per-request latency recorder.
     fn recorder(&self) -> &dyn Recorder;
 }
-
-pub use gw_models::StreamChunk;

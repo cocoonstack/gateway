@@ -47,37 +47,6 @@ pub enum ConfigError {
     SharedCacheNeedsRedis,
 }
 
-/// Build a name → slot-index map for O(1) lookups.
-fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashMap<String, usize> {
-    items
-        .iter()
-        .enumerate()
-        .map(|(i, x)| (key(x).to_owned(), i))
-        .collect()
-}
-
-/// Reject duplicate and empty names — name lookups are last-wins, so a
-/// duplicate is ambiguous, and an empty name is unreachable (e.g. a tenant
-/// named "" can never be referenced: empty key tenants coerce to `default`).
-fn check_unique<'a>(
-    kind: &'static str,
-    names: impl Iterator<Item = &'a str>,
-) -> Result<(), ConfigError> {
-    let mut seen = std::collections::HashSet::new();
-    for name in names {
-        if name.is_empty() {
-            return Err(ConfigError::EmptyName { kind });
-        }
-        if !seen.insert(name) {
-            return Err(ConfigError::DuplicateName {
-                kind,
-                name: name.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Listen {
     pub host: String,
@@ -668,6 +637,37 @@ impl GatewayConfig {
         }
         self.prices_for(model)
     }
+}
+
+/// Build a name → slot-index map for O(1) lookups.
+fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashMap<String, usize> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (key(x).to_owned(), i))
+        .collect()
+}
+
+/// Reject duplicate and empty names — name lookups are last-wins, so a
+/// duplicate is ambiguous, and an empty name is unreachable (e.g. a tenant
+/// named "" can never be referenced: empty key tenants coerce to `default`).
+fn check_unique<'a>(
+    kind: &'static str,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.is_empty() {
+            return Err(ConfigError::EmptyName { kind });
+        }
+        if !seen.insert(name) {
+            return Err(ConfigError::DuplicateName {
+                kind,
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
