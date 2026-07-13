@@ -619,24 +619,24 @@ async fn chat_completions(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-/// Streaming chat: the pipeline runs on its own task and forwards chunks
-/// through a bounded channel — the backpressure seam — while this response
-/// re-emits them as OpenAI SSE. Engines without live streaming yield their
-/// buffered chunks after the run; billing stays in the pipeline tail either way.
-fn chat_stream_response(
-    s: AppState,
+/// Run the pipeline on its own task, forwarding stream chunks through a
+/// bounded channel — the backpressure seam. Engines without live streaming
+/// yield their buffered chunks after the run; a final chunk carries the usage
+/// totals; billing stays in the pipeline tail either way.
+fn spawn_stream_pipeline(
+    s: &AppState,
     mut request: GatewayRequest,
     ak: AkInfo,
-    model: String,
+    surface: &'static str,
     started: Instant,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
+) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
     request.stream_tx = Some(tx.clone());
     let handler = s.handler.clone();
     tokio::spawn(async move {
         match handler.run(request, ak).await {
             Ok(ctx) => {
-                log_access("chat_completions", &ctx, started);
+                log_access(surface, &ctx, started);
                 if let Some(outcome) = &ctx.outcome {
                     let mut tail = if outcome.streamed_live {
                         Vec::new()
@@ -668,6 +668,18 @@ fn chat_stream_response(
             }
         }
     });
+    rx
+}
+
+/// Streaming chat: pipeline chunks re-emitted as OpenAI SSE.
+fn chat_stream_response(
+    s: AppState,
+    request: GatewayRequest,
+    ak: AkInfo,
+    model: String,
+    started: Instant,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
+    let rx = spawn_stream_pipeline(&s, request, ak, "chat_completions", started);
 
     struct St {
         rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
@@ -844,6 +856,13 @@ async fn messages(
         ..Default::default()
     };
 
+    // Streaming: the standard anthropic event sequence, emitted incrementally
+    // as pipeline chunks arrive.
+    if body.stream {
+        let model = body.model.clone();
+        return messages_stream_response(s, request, ak, model, started).into_response();
+    }
+
     let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return anthropic_gateway_error(e),
@@ -853,51 +872,8 @@ async fn messages(
         return anthropic_error(500, "pipeline produced no outcome");
     };
 
-    // tool_use blocks the engine produced (anthropic wire shape).
-    let tool_use: Vec<Value> = match &outcome.response.tool_calls {
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|b| b["type"] == "tool_use")
-            .cloned()
-            .collect(),
-        _ => Vec::new(),
-    };
-
-    // Streaming: standard anthropic event sequence (message_start → ... → message_stop)
-    if body.stream {
-        let id = next_id("msg");
-        let mut deltas: Vec<String> = outcome
-            .chunks
-            .iter()
-            .filter(|c| c.finish_reason.is_none() && !c.delta.is_empty())
-            .map(|c| c.delta.clone())
-            .collect();
-        // non-native-streaming engine (empty chunks) → deliver the full message as
-        // one delta so the client doesn't get an empty stream (same handling as chat completions).
-        if deltas.is_empty() && !outcome.response.message.is_empty() {
-            deltas.push(outcome.response.message.clone());
-        }
-        let usage = gw_protocol::anthropic::AnthUsage {
-            input_tokens: outcome.response.prompt_tokens,
-            output_tokens: outcome.response.completion_tokens,
-        };
-        let stop = finish_anthropic(&outcome.response.finish_reason);
-        let events: Vec<Event> = gw_protocol::anthropic::stream_events(
-            &id,
-            &outcome.response.model,
-            &deltas,
-            &tool_use,
-            &stop,
-            &usage,
-        )
-        .into_iter()
-        .map(|(name, payload)| Event::default().event(name).data(payload.to_string()))
-        .collect();
-        let stream = futures::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
-        return Sse::new(stream).into_response();
-    }
-
     // Non-streaming: text + tool_use blocks
+    let tool_use = anthropic_tool_blocks(&outcome.response.tool_calls);
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
         content.push(gw_protocol::anthropic::ContentBlock::Text {
@@ -922,6 +898,188 @@ async fn messages(
         },
     );
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// The anthropic-shaped tool_use blocks inside an engine's tool_calls value.
+fn anthropic_tool_blocks(tool_calls: &Option<Value>) -> Vec<Value> {
+    match tool_calls {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Streaming /v1/messages: pipeline chunks re-emitted incrementally as the
+/// anthropic event sequence. message_start goes out before upstream usage is
+/// known, so its input_tokens is 0; the final message_delta carries the real
+/// counts (SDKs accumulate usage from message_delta).
+fn messages_stream_response(
+    s: AppState,
+    request: GatewayRequest,
+    ak: AkInfo,
+    model: String,
+    started: Instant,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
+    let rx = spawn_stream_pipeline(&s, request, ak, "messages", started);
+
+    struct St {
+        rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
+        queue: std::collections::VecDeque<Event>,
+        id: String,
+        model: String,
+        started_msg: bool,
+        /// index of the open text content block, if any.
+        text_idx: Option<usize>,
+        next_idx: usize,
+        pending_finish: Option<String>,
+        ended: bool,
+    }
+
+    impl St {
+        fn ev(name: &str, payload: Value) -> Event {
+            Event::default().event(name).data(payload.to_string())
+        }
+
+        fn ensure_message_start(&mut self) {
+            if self.started_msg {
+                return;
+            }
+            self.started_msg = true;
+            self.queue.push_back(Self::ev(
+                "message_start",
+                json!({"type":"message_start","message":{
+                    "id": self.id, "type":"message","role":"assistant","model": self.model,
+                    "content":[], "stop_reason": null,
+                    "usage":{"input_tokens":0,"output_tokens":0}}}),
+            ));
+        }
+
+        fn open_text(&mut self) -> usize {
+            if let Some(idx) = self.text_idx {
+                return idx;
+            }
+            let idx = self.next_idx;
+            self.next_idx += 1;
+            self.text_idx = Some(idx);
+            self.queue.push_back(Self::ev(
+                "content_block_start",
+                json!({"type":"content_block_start","index":idx,
+                       "content_block":{"type":"text","text":""}}),
+            ));
+            idx
+        }
+
+        fn close_text(&mut self) {
+            if let Some(idx) = self.text_idx.take() {
+                self.queue.push_back(Self::ev(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":idx}),
+                ));
+            }
+        }
+
+        /// The wire pattern clients expect for a tool_use block: empty `input`
+        /// in the start frame, the arguments as one input_json_delta, stop.
+        fn emit_tool_block(&mut self, block: &Value) {
+            self.close_text();
+            let idx = self.next_idx;
+            self.next_idx += 1;
+            self.queue.push_back(Self::ev(
+                "content_block_start",
+                json!({"type":"content_block_start","index":idx,
+                       "content_block":{"type":"tool_use","id":block["id"],"name":block["name"],"input":{}}}),
+            ));
+            self.queue.push_back(Self::ev(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":idx,
+                       "delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}}),
+            ));
+            self.queue.push_back(Self::ev(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":idx}),
+            ));
+        }
+
+        fn finish(&mut self, input_tokens: i64, output_tokens: i64) {
+            self.ensure_message_start();
+            self.close_text();
+            let stop = self
+                .pending_finish
+                .take()
+                .unwrap_or_else(|| "end_turn".to_owned());
+            self.queue.push_back(Self::ev(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":stop},
+                       "usage":{"input_tokens":input_tokens,"output_tokens":output_tokens}}),
+            ));
+            self.queue
+                .push_back(Self::ev("message_stop", json!({"type":"message_stop"})));
+            self.ended = true;
+        }
+    }
+
+    let st = St {
+        rx,
+        queue: std::collections::VecDeque::new(),
+        id: next_id("msg"),
+        model,
+        started_msg: false,
+        text_idx: None,
+        next_idx: 0,
+        pending_finish: None,
+        ended: false,
+    };
+    let stream = futures::stream::unfold(st, |mut st| async move {
+        loop {
+            if let Some(ev) = st.queue.pop_front() {
+                return Some((Ok::<_, Infallible>(ev), st));
+            }
+            if st.ended {
+                return None;
+            }
+            match st.rx.recv().await {
+                Some(c) if c.error.is_some() => {
+                    let msg = c.error.unwrap_or_default();
+                    st.queue.push_back(St::ev(
+                        "error",
+                        json!({"type":"error","error":{"type":"api_error","message":msg}}),
+                    ));
+                    st.ended = true;
+                }
+                Some(c) => {
+                    if !c.delta.is_empty() {
+                        st.ensure_message_start();
+                        let idx = st.open_text();
+                        st.queue.push_back(St::ev(
+                            "content_block_delta",
+                            json!({"type":"content_block_delta","index":idx,
+                                   "delta":{"type":"text_delta","text":c.delta}}),
+                        ));
+                    }
+                    if let Some(tc) = &c.tool_calls {
+                        st.ensure_message_start();
+                        for block in anthropic_tool_blocks(&Some(tc.clone())) {
+                            st.emit_tool_block(&block);
+                        }
+                    }
+                    if let Some(fr) = c.finish_reason {
+                        st.pending_finish = Some(finish_anthropic(&fr));
+                    }
+                    if let Some((pt, ct, _)) = c.usage_totals {
+                        st.finish(pt, ct);
+                    }
+                }
+                None => {
+                    // producer gone without a usage chunk — close out cleanly
+                    st.finish(0, 0);
+                }
+            }
+        }
+    });
+    Sse::new(stream)
 }
 
 /// Shared: run a non-chat family request through the pipeline.

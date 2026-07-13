@@ -176,7 +176,7 @@ impl ClaudeEngine {
         })
     }
 
-    /// Decode the standard anthropic streaming event sequence.
+    /// Decode a fully buffered anthropic streaming event sequence.
     fn parse_sse(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
         let (events, _done) = SseDecoder::decode_all(bytes);
         let mut resp = GatewayResponse {
@@ -184,88 +184,76 @@ impl ClaudeEngine {
             http_code: status as i64,
             ..Default::default()
         };
+        let mut st = SseState::default();
         let mut chunks = Vec::new();
-        let mut full = String::new();
-        let (mut input, mut output) = (0i64, 0i64);
-        let mut tool_blocks: Vec<Value> = Vec::new();
-        // in-flight tool_use block: (skeleton from content_block_start,
-        // accumulated input_json_delta fragments)
-        let mut open_tool: Option<(Value, String)> = None;
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse anthropic sse frame").with_source(e))?;
-            // mid-stream error frame → surface it
-            if let Some(err) = crate::engine::vendor_error(status, &v) {
-                return Err(err);
-            }
-            match v["type"].as_str().unwrap_or_default() {
-                "message_start" => {
-                    resp.model = v["message"]["model"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned();
-                    input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
-                }
-                "content_block_start" => {
-                    if v["content_block"]["type"] == "tool_use" {
-                        open_tool = Some((v["content_block"].clone(), String::new()));
-                    }
-                }
-                "content_block_delta" => {
-                    if let Some(t) = v["delta"]["text"].as_str() {
-                        full.push_str(t);
-                        chunks.push(StreamChunk {
-                            delta: t.to_owned(),
-                            finish_reason: None,
-                            ..Default::default()
-                        });
-                    }
-                    if let Some(pj) = v["delta"]["partial_json"].as_str()
-                        && let Some((_, buf)) = open_tool.as_mut()
-                    {
-                        buf.push_str(pj);
-                    }
-                }
-                "content_block_stop" => {
-                    if let Some((mut block, buf)) = open_tool.take() {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
-                            block["input"] = parsed;
-                        }
-                        chunks.push(StreamChunk {
-                            tool_calls: Some(json!([block.clone()])),
-                            ..Default::default()
-                        });
-                        tool_blocks.push(block);
-                    }
-                }
-                "message_delta" => {
-                    if let Some(sr) = v["delta"]["stop_reason"].as_str() {
-                        resp.finish_reason = sr.to_owned();
-                        chunks.push(StreamChunk {
-                            delta: String::new(),
-                            finish_reason: Some(sr.to_owned()),
-                            ..Default::default()
-                        });
-                    }
-                    output = v["usage"]["output_tokens"].as_i64().unwrap_or(output);
-                }
-                _ => {} // message_stop
-            }
+            chunks.extend(st.apply(&v, status, &mut resp)?);
         }
-        if !tool_blocks.is_empty() {
-            resp.tool_calls = Some(Value::Array(tool_blocks));
-        }
-        resp.message = full;
-        resp.prompt_tokens = input;
-        resp.completion_tokens = output;
-        resp.total_tokens = input + output;
-        resp.raw_usage_json = json!({"input_tokens": input, "output_tokens": output})
-            .to_string()
-            .into_bytes();
+        st.finish(&mut resp);
         Ok(EngineOutcome {
             response: resp,
             http_code: status,
             chunks,
+            ..Default::default()
+        })
+    }
+
+    /// Incremental variant of `parse_sse`: frames are decoded as vendor bytes
+    /// arrive and forwarded through `stream_tx` when the request carries one
+    /// (same live-pump contract as the OpenAI engine).
+    async fn pump_sse(
+        &self,
+        status: u16,
+        mut s: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
+    ) -> GResult<EngineOutcome> {
+        use futures::StreamExt;
+        let tx = self.request.stream_tx.clone();
+        let mut dec = SseDecoder::default();
+        let mut st = SseState::default();
+        let mut chunks = Vec::new();
+        let mut resp = GatewayResponse {
+            is_messages_protocol: true,
+            http_code: status as i64,
+            ..Default::default()
+        };
+        let mut sent_any = false;
+        while let Some(item) = s.next().await {
+            let bytes = item.map_err(|e| {
+                if sent_any {
+                    GatewayError::client_closed(format!("upstream stream failed mid-response: {e}"))
+                } else {
+                    GatewayError::new(
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        502,
+                        format!("upstream stream failed: {e}"),
+                    )
+                }
+            })?;
+            for data in dec.feed(&bytes) {
+                let v: Value = serde_json::from_str(&data).map_err(|e| {
+                    GatewayError::internal("parse anthropic sse frame").with_source(e)
+                })?;
+                for chunk in st.apply(&v, status, &mut resp)? {
+                    match &tx {
+                        Some(tx) => {
+                            tx.send(chunk)
+                                .await
+                                .map_err(|_| GatewayError::client_closed("client stream closed"))?;
+                            sent_any = true;
+                        }
+                        None => chunks.push(chunk),
+                    }
+                }
+            }
+        }
+        st.finish(&mut resp);
+        Ok(EngineOutcome {
+            response: resp,
+            http_code: status,
+            chunks,
+            streamed_live: sent_any,
             ..Default::default()
         })
     }
@@ -275,19 +263,112 @@ impl ClaudeEngine {
 impl ModelEngine for ClaudeEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
-        let reply = self.transport.send(up).await?.buffered().await?;
-        match &reply.body {
-            UpstreamBody::Json(b) => self.parse_json(reply.status, b),
-            UpstreamBody::Sse(b) => self.parse_sse(reply.status, b),
-            // buffered() above drained any live stream
-            UpstreamBody::SseStream(_) => Err(GatewayError::internal(
-                "unbuffered stream reached claude engine",
-            )),
+        let reply = self.transport.send(up).await?;
+        match reply.body {
+            UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
+            UpstreamBody::Sse(b) => self.parse_sse(reply.status, &b),
+            UpstreamBody::SseStream(s) => self.pump_sse(reply.status, s).await,
         }
     }
 
     fn recorder(&self) -> &dyn Recorder {
         &self.recorder
+    }
+}
+
+/// Accumulating state for the anthropic streaming event sequence, shared by
+/// the buffered and live decode paths.
+#[derive(Default)]
+struct SseState {
+    full: String,
+    input: i64,
+    output: i64,
+    tool_blocks: Vec<Value>,
+    /// in-flight tool_use block: (skeleton from content_block_start,
+    /// accumulated input_json_delta fragments)
+    open_tool: Option<(Value, String)>,
+}
+
+impl SseState {
+    /// Apply one decoded event; returns the chunks it yields.
+    fn apply(
+        &mut self,
+        v: &Value,
+        status: u16,
+        resp: &mut GatewayResponse,
+    ) -> GResult<Vec<StreamChunk>> {
+        // mid-stream error frame → surface it
+        if let Some(err) = crate::engine::vendor_error(status, v) {
+            return Err(err);
+        }
+        let mut chunks = Vec::new();
+        match v["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                resp.model = v["message"]["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
+            }
+            "content_block_start" => {
+                if v["content_block"]["type"] == "tool_use" {
+                    self.open_tool = Some((v["content_block"].clone(), String::new()));
+                }
+            }
+            "content_block_delta" => {
+                if let Some(t) = v["delta"]["text"].as_str() {
+                    self.full.push_str(t);
+                    chunks.push(StreamChunk {
+                        delta: t.to_owned(),
+                        finish_reason: None,
+                        ..Default::default()
+                    });
+                }
+                if let Some(pj) = v["delta"]["partial_json"].as_str()
+                    && let Some((_, buf)) = self.open_tool.as_mut()
+                {
+                    buf.push_str(pj);
+                }
+            }
+            "content_block_stop" => {
+                if let Some((mut block, buf)) = self.open_tool.take() {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
+                        block["input"] = parsed;
+                    }
+                    chunks.push(StreamChunk {
+                        tool_calls: Some(json!([block.clone()])),
+                        ..Default::default()
+                    });
+                    self.tool_blocks.push(block);
+                }
+            }
+            "message_delta" => {
+                if let Some(sr) = v["delta"]["stop_reason"].as_str() {
+                    resp.finish_reason = sr.to_owned();
+                    chunks.push(StreamChunk {
+                        delta: String::new(),
+                        finish_reason: Some(sr.to_owned()),
+                        ..Default::default()
+                    });
+                }
+                self.output = v["usage"]["output_tokens"].as_i64().unwrap_or(self.output);
+            }
+            _ => {} // message_stop
+        }
+        Ok(chunks)
+    }
+
+    fn finish(self, resp: &mut GatewayResponse) {
+        if !self.tool_blocks.is_empty() {
+            resp.tool_calls = Some(Value::Array(self.tool_blocks));
+        }
+        resp.message = self.full;
+        resp.prompt_tokens = self.input;
+        resp.completion_tokens = self.output;
+        resp.total_tokens = self.input + self.output;
+        resp.raw_usage_json = json!({"input_tokens": self.input, "output_tokens": self.output})
+            .to_string()
+            .into_bytes();
     }
 }
 
