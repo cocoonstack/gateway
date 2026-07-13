@@ -26,7 +26,8 @@ impl OfflineHandler {
     }
 
     /// Submit a batch: registers the job and processes it on a background task.
-    /// Items run through the SAME online DAG (billing/quota/limits apply per item).
+    /// Items run through the SAME online DAG (billing/quota/limits apply per
+    /// item; the request cache is bypassed so that stays true).
     pub async fn submit(
         &self,
         ak: AkInfo,

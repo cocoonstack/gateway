@@ -204,6 +204,88 @@ mod tests {
         assert!(ctx.decisions.iter().any(|(_, w)| w.contains("failover")));
     }
 
+    #[derive(Debug)]
+    struct BreakingStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for BreakingStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+                )),
+                Err("connection reset".to_owned()),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_stream_bills_estimated_delivered_tokens() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(cfg, state, Arc::new(BreakingStream));
+        // client that consumes chunks (stays connected) — the upstream breaks
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut req = chat_req("gpt-4o", "please stream something long");
+        req.stream = true;
+        req.stream_tx = Some(tx);
+        let ctx = h.run(req, ak(&h)).await.unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert!(out.response.aborted, "mid-stream break must mark aborted");
+        assert_eq!(out.response.message, "partial answer");
+        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger.len(), 1, "aborted stream must still bill");
+        assert!(
+            ledger[0].prompt_tokens > 0 && ledger[0].completion_tokens > 0,
+            "estimated tokens, not zero: {:?}",
+            ledger[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_items_bypass_the_cache_and_bill_each() {
+        let h = handler();
+        let off = OfflineHandler::new(h.clone());
+        // two byte-identical items on the cached model: without the bypass the
+        // second would be a free cache hit and the ledger would miss a row
+        let items = vec![
+            BatchItem {
+                messages: vec![ChatMsg::text("user", "same prompt")],
+            },
+            BatchItem {
+                messages: vec![ChatMsg::text("user", "same prompt")],
+            },
+        ];
+        let job = off
+            .submit(ak(&h), "cached-mini".into(), items)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if let Some(j) = h.state.store.batch_get(&job.id).await.unwrap()
+                && matches!(
+                    j.status,
+                    gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
+                )
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (count, _) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(count, 2, "every batch item bills, cache hits or not");
+    }
+
     #[tokio::test]
     async fn batch_runs_all_items() {
         let h = handler();

@@ -19,6 +19,9 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true
