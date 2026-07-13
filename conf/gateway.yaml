@@ -84,6 +84,8 @@ tenants:
     model_quotas:
       gpt-4o: 20
     fallback_model: gpt-4o-mini
+    model_prices: # e2e: tenant pays a premium over the list price
+      gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
 
 # Public model name → wire protocol, optional provider binding (only that
 # provider's accounts serve the model), plus demo prices (micros per 1k tokens).
@@ -168,6 +170,8 @@ accounts:
   - name: mock-openai-1
     provider: openai
     priority: 1
+    cost_input_price_per_1k_micros: 100 # e2e: margin accounting (vendor cost)
+    cost_output_price_per_1k_micros: 400
     protocols: ["openai-chat", "completions"]
   - name: mock-openai-2
     provider: openai

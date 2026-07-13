@@ -691,8 +691,17 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
-    let (p_in, p_out) = ctx.cfg.prices_for(served);
+    let (p_in, p_out) = ctx.cfg.prices_for_tenant(&ctx.ak.tenant, served);
     let cost = prompt * p_in / 1000 + completion * p_out / 1000;
+    let vendor_cost = ctx
+        .request
+        .account
+        .as_ref()
+        .map(|a| {
+            prompt * a.cost_input_price_per_1k_micros / 1000
+                + completion * a.cost_output_price_per_1k_micros / 1000
+        })
+        .unwrap_or(0);
     // settle reservations to actuals (the model-quota counter stays soft
     // post-hoc by design); independent keys run as one concurrent round-trip
     let quota_delta = total - ctx.quota_reserved.take().unwrap_or(0);
@@ -744,6 +753,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         completion_tokens: completion,
         total_tokens: total,
         cost_micros: cost,
+        vendor_cost_micros: vendor_cost,
         ptu_spillover,
     };
     // a ledger write failure must not fail an already-served response

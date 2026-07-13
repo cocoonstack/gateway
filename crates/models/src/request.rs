@@ -150,6 +150,10 @@ pub mod domain {
         /// AWS SigV4 accounts only: env var holding the secret access key (paired
         /// with `api_key_env` = the access key id). Empty for non-AWS vendors.
         pub secret_key_env: String,
+        /// What this account's vendor charges us per 1k tokens (micros);
+        /// zero = untracked. Feeds the ledger's vendor-cost column.
+        pub cost_input_price_per_1k_micros: i64,
+        pub cost_output_price_per_1k_micros: i64,
         pub protocols: Vec<gw_consts::Protocol>,
     }
 

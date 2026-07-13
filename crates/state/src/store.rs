@@ -27,6 +27,10 @@ pub struct BillingRecord {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cost_micros: i64,
+    /// What the serving account's vendor charged us (zero = untracked);
+    /// margin = cost_micros - vendor_cost_micros.
+    #[serde(default)]
+    pub vendor_cost_micros: i64,
     /// PTU spilled over to a paygo account (a failover occurred).
     #[serde(default)]
     pub ptu_spillover: bool,
@@ -235,7 +239,8 @@ where
         completion_tokens: row.get(8),
         total_tokens: row.get(9),
         cost_micros: row.get(10),
-        ptu_spillover: row.get(11),
+        vendor_cost_micros: row.get(11),
+        ptu_spillover: row.get(12),
     }
 }
 
@@ -273,6 +278,7 @@ impl SqliteStore {
                 protocol TEXT NOT NULL, account TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
+                vendor_cost_micros INTEGER NOT NULL DEFAULT 0,
                 ptu_spillover INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
@@ -295,6 +301,7 @@ impl SqliteStore {
         for ddl in [
             "ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE billing ADD COLUMN served_model TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE billing ADD COLUMN vendor_cost_micros INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
                 && !e.to_string().contains("duplicate column name")
@@ -320,8 +327,9 @@ impl Store for SqliteStore {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             prompt_tokens, completion_tokens, total_tokens, cost_micros,
+             vendor_cost_micros, ptu_spillover)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.ak)
         .bind(&r.product)
@@ -334,6 +342,7 @@ impl Store for SqliteStore {
         .bind(r.completion_tokens)
         .bind(r.total_tokens)
         .bind(r.cost_micros)
+        .bind(r.vendor_cost_micros)
         .bind(r.ptu_spillover)
         .execute(&self.pool)
         .await
@@ -355,7 +364,8 @@ impl Store for SqliteStore {
             .map_err(|e| crate::sqlx_err("count billing records", e))?;
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover
+             prompt_tokens, completion_tokens, total_tokens, cost_micros,
+             vendor_cost_micros, ptu_spillover
              FROM billing ORDER BY n DESC LIMIT ?",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -518,6 +528,7 @@ impl PostgresStore {
                 protocol TEXT NOT NULL, account TEXT NOT NULL,
                 prompt_tokens BIGINT NOT NULL, completion_tokens BIGINT NOT NULL,
                 total_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL,
+                vendor_cost_micros BIGINT NOT NULL DEFAULT 0,
                 ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE)",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
@@ -535,6 +546,13 @@ impl PostgresStore {
                 .await
                 .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
         }
+        sqlx::query(
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS
+             vendor_cost_micros BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| crate::sqlx_err("migrate postgres billing schema", e))?;
         Ok(Self {
             pool,
             ledger_max_rows,
@@ -547,8 +565,9 @@ impl Store for PostgresStore {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             prompt_tokens, completion_tokens, total_tokens, cost_micros,
+             vendor_cost_micros, ptu_spillover)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&r.ak)
         .bind(&r.product)
@@ -561,6 +580,7 @@ impl Store for PostgresStore {
         .bind(r.completion_tokens)
         .bind(r.total_tokens)
         .bind(r.cost_micros)
+        .bind(r.vendor_cost_micros)
         .bind(r.ptu_spillover)
         .execute(&self.pool)
         .await
@@ -582,7 +602,8 @@ impl Store for PostgresStore {
             .map_err(|e| crate::sqlx_err("count billing records", e))?;
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover
+             prompt_tokens, completion_tokens, total_tokens, cost_micros,
+             vendor_cost_micros, ptu_spillover
              FROM billing ORDER BY n DESC LIMIT $1",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -733,6 +754,7 @@ mod tests {
             completion_tokens: 5,
             total_tokens: 8,
             cost_micros: 42,
+            vendor_cost_micros: 7,
             ptu_spillover: false,
         }
     }

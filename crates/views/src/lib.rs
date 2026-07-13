@@ -288,7 +288,19 @@ async fn bill_realtime_turn(
     it: i64,
     ot: i64,
 ) {
-    let (p_in, p_out) = s.handler.cfg().prices_for(model);
+    let cfg = s.handler.cfg();
+    let (p_in, p_out) = cfg.prices_for_tenant(&ak.tenant, model);
+    let (c_in, c_out) = cfg
+        .accounts
+        .iter()
+        .find(|a| a.name == account)
+        .map(|a| {
+            (
+                a.cost_input_price_per_1k_micros,
+                a.cost_output_price_per_1k_micros,
+            )
+        })
+        .unwrap_or((0, 0));
     let gov = &s.handler.state().governance;
     gov.quota_consume(&ak.ak, it + ot).await;
     gov.token_window_add(&ak.ak, it + ot, std::time::Duration::from_secs(60))
@@ -305,6 +317,7 @@ async fn bill_realtime_turn(
         completion_tokens: ot,
         total_tokens: it + ot,
         cost_micros: it * p_in / 1000 + ot * p_out / 1000,
+        vendor_cost_micros: it * c_in / 1000 + ot * c_out / 1000,
         ptu_spillover: false,
     };
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it.max(0) as u64);
@@ -1040,6 +1053,7 @@ async fn admin_usage(
         completion: i64,
         total: i64,
         cost_micros: i64,
+        vendor_cost_micros: i64,
     }
     let mut rollup: std::collections::BTreeMap<(String, String), Agg> =
         std::collections::BTreeMap::new();
@@ -1053,6 +1067,7 @@ async fn admin_usage(
         e.completion += r.completion_tokens;
         e.total += r.total_tokens;
         e.cost_micros += r.cost_micros;
+        e.vendor_cost_micros += r.vendor_cost_micros;
     }
     let usage: Vec<Value> = rollup
         .into_iter()
@@ -1061,6 +1076,7 @@ async fn admin_usage(
                 "tenant": tenant, "model": model, "requests": a.requests,
                 "prompt_tokens": a.prompt, "completion_tokens": a.completion,
                 "total_tokens": a.total, "cost_micros": a.cost_micros,
+                "vendor_cost_micros": a.vendor_cost_micros,
             })
         })
         .collect();

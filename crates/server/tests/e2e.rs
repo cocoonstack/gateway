@@ -382,6 +382,38 @@ async fn tenant_entitlement_gates_models_and_catalog() {
 }
 
 #[tokio::test]
+async fn tenant_price_override_and_vendor_cost_reach_the_ledger() {
+    let app = app();
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-beta-1"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = app.oneshot(get_authed("/internal/ledger")).await.unwrap();
+    let j = body_json(r).await;
+    let rec = j["records"]
+        .as_array()
+        .and_then(|a| a.iter().rev().find(|x| x["ak"] == "ak-beta-1"))
+        .cloned()
+        .expect("beta record");
+    let (p, c) = (
+        rec["prompt_tokens"].as_i64().unwrap(),
+        rec["completion_tokens"].as_i64().unwrap(),
+    );
+    assert_eq!(
+        rec["cost_micros"].as_i64().unwrap(),
+        p * 5000 / 1000 + c * 20000 / 1000,
+        "tenant override price charged, not the list price"
+    );
+    assert_eq!(
+        rec["vendor_cost_micros"].as_i64().unwrap(),
+        p * 100 / 1000 + c * 400 / 1000,
+        "serving account's vendor cost recorded"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_requests_cannot_blow_past_quota() {
     let app = app();
     let mut handles = Vec::new();

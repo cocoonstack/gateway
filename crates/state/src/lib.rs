@@ -354,6 +354,8 @@ impl AccountPool {
                 endpoint: a.endpoint.clone(),
                 api_key_env: a.api_key_env.clone(),
                 secret_key_env: a.secret_key_env.clone(),
+                cost_input_price_per_1k_micros: a.cost_input_price_per_1k_micros,
+                cost_output_price_per_1k_micros: a.cost_output_price_per_1k_micros,
                 protocols: a
                     .protocols
                     .iter()

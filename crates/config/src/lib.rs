@@ -167,6 +167,11 @@ pub struct AccountConf {
     /// api_key_env = access key). Leave empty for non-AWS providers.
     #[serde(default)]
     pub secret_key_env: String,
+    /// What this account's vendor charges us (margin accounting); zero = untracked.
+    #[serde(default)]
+    pub cost_input_price_per_1k_micros: i64,
+    #[serde(default)]
+    pub cost_output_price_per_1k_micros: i64,
     pub protocols: Vec<String>,
 }
 
@@ -262,6 +267,15 @@ pub struct ProductConfEntry {
     pub qpm: Option<i64>,
 }
 
+/// A per-1k-token price pair (micro-dollars).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct PriceConf {
+    #[serde(default)]
+    pub input_price_per_1k_micros: i64,
+    #[serde(default)]
+    pub output_price_per_1k_micros: i64,
+}
+
 /// Tenant-level pooled governance and model entitlement. All of a tenant's
 /// keys share one rate bucket; the entitlement gates which models they may call.
 #[derive(Debug, Clone, Deserialize)]
@@ -285,6 +299,10 @@ pub struct TenantConf {
     /// tenant's keys/usage on `/admin/*`. Empty = no tenant-scoped admin.
     #[serde(default)]
     pub admin_token_env: String,
+    /// Per-model charged-price overrides for this tenant (else the model's
+    /// list price applies).
+    #[serde(default)]
+    pub model_prices: std::collections::HashMap<String, PriceConf>,
 }
 
 impl TenantConf {
@@ -471,6 +489,8 @@ impl GatewayConfig {
                 provider: p.name.clone(),
                 priority: 1,
                 tier: String::new(),
+                cost_input_price_per_1k_micros: 0,
+                cost_output_price_per_1k_micros: 0,
                 timeout_seconds: p.timeout_seconds,
                 connect_retries: p.connect_retries,
                 endpoint: if p.endpoint.is_empty() {
@@ -551,6 +571,14 @@ impl GatewayConfig {
                     });
                 }
             }
+            for m in t.model_prices.keys() {
+                if !self.model_exists(m) {
+                    return Err(ConfigError::UnknownQuotaModel {
+                        owner: format!("tenant {} (model_prices)", t.name),
+                        model: m.clone(),
+                    });
+                }
+            }
             if let Some(fb) = &t.fallback_model
                 && (!self.model_exists(fb)
                     || !t.models.as_ref().is_none_or(|allow| allow.contains(fb)))
@@ -618,6 +646,18 @@ impl GatewayConfig {
         self.find_model(name)
             .map(|m| (m.input_price_per_1k_micros, m.output_price_per_1k_micros))
             .unwrap_or((0, 0))
+    }
+
+    /// Charged pricing for `tenant` on `model`: the tenant's override when one
+    /// is configured, else the model's list price.
+    pub fn prices_for_tenant(&self, tenant: &str, model: &str) -> (i64, i64) {
+        if let Some(p) = self
+            .find_tenant(tenant)
+            .and_then(|t| t.model_prices.get(model))
+        {
+            return (p.input_price_per_1k_micros, p.output_price_per_1k_micros);
+        }
+        self.prices_for(model)
     }
 }
 
@@ -854,6 +894,28 @@ tenants: [{name: t1, models: [m1], fallback_model: m2}]
         assert!(matches!(
             GatewayConfig::from_yaml(bad_fallback),
             Err(ConfigError::BadFallbackModel { .. })
+        ));
+    }
+
+    #[test]
+    fn tenant_price_override_resolution() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: 10, output_price_per_1k_micros: 20}]
+tenants: [{name: t1, model_prices: {m1: {input_price_per_1k_micros: 30, output_price_per_1k_micros: 60}}}]
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        assert_eq!(cfg.prices_for_tenant("t1", "m1"), (30, 60));
+        assert_eq!(cfg.prices_for_tenant("default", "m1"), (10, 20));
+
+        let bad = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat}]
+tenants: [{name: t1, model_prices: {ghost: {input_price_per_1k_micros: 1}}}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(bad),
+            Err(ConfigError::UnknownQuotaModel { .. })
         ));
     }
 
