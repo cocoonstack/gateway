@@ -11,6 +11,7 @@ gw-consts = { workspace = true }
 gw-models = { workspace = true }
 gw-config = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
 moka = { workspace = true }
 governor = { workspace = true }
 redis = { workspace = true }

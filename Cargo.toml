@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- misc ---
 bytes = "1"
 dashmap = "6"
+arc-swap = "1" # lock-free live-config swap (M7 dynamic config)
 moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }

@@ -36,14 +36,15 @@ impl OfflineHandler {
     ) -> gw_models::GResult<BatchJob> {
         let job = self
             .online
-            .state
+            .state()
             .store
             .batch_create(&ak.ak, &model, items.len())
             .await?;
         let id = job.id.clone();
         let this = self.clone();
         tokio::spawn(async move {
-            let store = &this.online.state.store;
+            let state = this.online.state();
+            let store = &state.store;
             if let Err(e) = store.batch_set_status(&id, BatchStatus::Running).await {
                 tracing::error!(error = %e, batch = %id, "batch status write failed");
             }

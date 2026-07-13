@@ -28,6 +28,105 @@ fn app() -> Router {
     ))
 }
 
+#[tokio::test]
+async fn admin_reload_is_gated_and_swaps_keys_live() {
+    // admin disabled by default (embedded config has no admin token) → 404, so a
+    // probe can't distinguish the surface from a missing route
+    let r = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+    // an app with admin enabled + a loader that returns the v2 key set on reload
+    const V1: &str = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_TEST_ADMIN_TOKEN_E2E}
+access_keys: [{ak: ak-v1, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-4o, protocol: openai-chat}]
+accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    // SAFETY: unique var name for this test; no concurrent reader of it.
+    unsafe { std::env::set_var("GW_TEST_ADMIN_TOKEN_E2E", "s3cret") };
+    let v1 = GatewayConfig::from_yaml(V1).unwrap();
+    let v2_yaml = V1.replace("ak-v1", "ak-v2");
+    let loader: gw_views::ConfigLoader =
+        Arc::new(move || GatewayConfig::from_yaml(&v2_yaml).map_err(|e| e.to_string()));
+    let state = Arc::new(GatewayState::from_config(&v1));
+    let shared = gw_state::SharedConfig::new(Arc::new(v1), state);
+    let app = gw_views::app(gw_views::AppState::with_config(
+        shared,
+        Arc::new(gw_engines::MockTransport),
+        Some(loader),
+    ));
+
+    let chat = |ak: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {ak}"))
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap()
+    };
+    let reload = |token: Option<&str>| {
+        let mut b = Request::builder().method("POST").uri("/admin/reload");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    };
+
+    // before reload: v1 key works, v2 key unknown
+    assert_eq!(
+        app.clone().oneshot(chat("ak-v1")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(chat("ak-v2")).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // reload gated: no/wrong token rejected
+    assert_eq!(
+        app.clone().oneshot(reload(None)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(reload(Some("wrong")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // correct token reloads
+    assert_eq!(
+        app.clone()
+            .oneshot(reload(Some("s3cret")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // after reload: the swap is live — v2 works, v1 gone, no restart
+    assert_eq!(
+        app.clone().oneshot(chat("ak-v2")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.oneshot(chat("ak-v1")).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 async fn body_bytes(resp: Response) -> Vec<u8> {
     axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await

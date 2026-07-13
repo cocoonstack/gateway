@@ -366,30 +366,31 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
     }
 }
 
-/// All gateway state, built once from config at startup.
+/// All gateway state. `auth` and `pool` are config-derived and rebuilt on a
+/// live reload; the other four are runtime seams preserved across reloads.
 #[derive(Debug)]
 pub struct GatewayState {
     pub auth: AkAuth,
-    pub governance: Arc<dyn Governance>,
     pub pool: AccountPool,
+    pub governance: Arc<dyn Governance>,
     /// Durable records (ledger/files/batches): memory by default, sqlite when
     /// `storage.sqlite_path` is configured (swapped in by the server at boot).
     pub store: Arc<dyn Store>,
     /// Account health (cooldown/recovery).
-    pub health: AccountHealth,
+    pub health: Arc<AccountHealth>,
     /// Request-level response cache.
-    pub cache: ResponseCache,
+    pub cache: Arc<ResponseCache>,
 }
 
 impl Default for GatewayState {
     fn default() -> Self {
         Self {
             auth: AkAuth::default(),
-            governance: Arc::new(MemoryGovernance::default()),
             pool: AccountPool::default(),
+            governance: Arc::new(MemoryGovernance::default()),
             store: Arc::new(MemoryStore::default()),
-            health: AccountHealth::default(),
-            cache: ResponseCache::default(),
+            health: Arc::new(AccountHealth::default()),
+            cache: Arc::new(ResponseCache::default()),
         }
     }
 }
@@ -437,6 +438,67 @@ impl GatewayState {
             ..Default::default()
         }
     }
+
+    /// Rebuild the config-derived state (AK table, account pool) from `cfg`
+    /// while preserving the runtime seams — governance, store, account health,
+    /// and the response cache — from `prev`. In-flight requests keep running on
+    /// their own snapshot; new requests see this one.
+    pub fn reload_from(cfg: &GatewayConfig, prev: &GatewayState) -> Self {
+        let fresh = Self::from_config(cfg);
+        Self {
+            auth: fresh.auth,
+            pool: fresh.pool,
+            governance: prev.governance.clone(),
+            store: prev.store.clone(),
+            health: prev.health.clone(),
+            cache: prev.cache.clone(),
+        }
+    }
+}
+
+/// A consistent (config, derived-state) pair. A request loads one snapshot and
+/// runs to completion on it, so a mid-flight reload never splits its view.
+#[derive(Debug)]
+pub struct Snapshot {
+    pub cfg: Arc<GatewayConfig>,
+    pub state: Arc<GatewayState>,
+}
+
+/// Lock-free live configuration: `load()` on the hot path is a pointer read;
+/// `reload()` atomically swaps in a fresh snapshot (config-derived state
+/// rebuilt, seams preserved).
+#[derive(Clone)]
+pub struct SharedConfig {
+    inner: Arc<arc_swap::ArcSwap<Snapshot>>,
+}
+
+impl SharedConfig {
+    pub fn new(cfg: Arc<GatewayConfig>, state: Arc<GatewayState>) -> Self {
+        Self {
+            inner: Arc::new(arc_swap::ArcSwap::from_pointee(Snapshot { cfg, state })),
+        }
+    }
+
+    /// The current snapshot — a cheap atomic load; hold it for the whole request.
+    pub fn load(&self) -> Arc<Snapshot> {
+        self.inner.load_full()
+    }
+
+    /// Swap in a new config, rebuilding derived state and preserving seams.
+    pub fn reload(&self, cfg: GatewayConfig) {
+        let prev = self.inner.load();
+        let state = GatewayState::reload_from(&cfg, &prev.state);
+        self.inner.store(Arc::new(Snapshot {
+            cfg: Arc::new(cfg),
+            state: Arc::new(state),
+        }));
+    }
+}
+
+impl std::fmt::Debug for SharedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedConfig")
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +518,46 @@ mod tests {
         // qps <= 0: always denied
         assert!(!rl.allow("zero", 0.0));
         assert!(!rl.allow("neg", -1.0));
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_keys_but_preserves_seams() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let boot = Arc::new(GatewayState::from_config(&cfg));
+        // write a durable record through the seam so we can prove it survives
+        let file_id = boot
+            .store
+            .file_put("batch", "keep me".into())
+            .await
+            .unwrap()
+            .id;
+        let store_ptr = Arc::as_ptr(&boot.store);
+        let health_ptr = Arc::as_ptr(&boot.health);
+        let shared = SharedConfig::new(cfg, boot);
+
+        // the boot config has ak-demo-123 but not ak-new
+        let snap = shared.load();
+        assert!(snap.state.auth.authenticate("ak-demo-123").is_some());
+        assert!(snap.state.auth.authenticate("ak-new").is_none());
+
+        // reload with a config carrying a different key set
+        let new_cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-new, product: p, qps: 5, daily_token_quota: 100}]",
+        )
+        .unwrap();
+        shared.reload(new_cfg);
+
+        let snap = shared.load();
+        // config-derived state rebuilt: new key present, old gone
+        assert!(snap.state.auth.authenticate("ak-new").is_some());
+        assert!(snap.state.auth.authenticate("ak-demo-123").is_none());
+        // seams preserved: same store/health instances, durable record intact
+        assert_eq!(Arc::as_ptr(&snap.state.store), store_ptr);
+        assert_eq!(Arc::as_ptr(&snap.state.health), health_ptr);
+        assert!(
+            snap.state.store.file_get(&file_id).await.unwrap().is_some(),
+            "durable file survived the reload"
+        );
     }
 
     #[test]

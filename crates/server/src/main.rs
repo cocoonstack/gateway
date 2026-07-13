@@ -25,16 +25,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = match env::var("GW_CONFIG") {
-        Ok(path) => {
-            tracing::info!("loading config from {path}");
-            GatewayConfig::load(&path)?
-        }
-        Err(_) => {
-            tracing::info!("using embedded default config (set GW_CONFIG to override)");
-            GatewayConfig::embedded_default()?
+    // The config source (file path or the embedded default) is captured so a
+    // runtime reload — SIGHUP or POST /admin/reload — re-reads the same source.
+    let config_source = env::var("GW_CONFIG").ok();
+    let load_from_source = {
+        let src = config_source.clone();
+        move || -> Result<GatewayConfig, String> {
+            match &src {
+                Some(path) => GatewayConfig::load(path).map_err(|e| e.to_string()),
+                None => GatewayConfig::embedded_default().map_err(|e| e.to_string()),
+            }
         }
     };
+    match &config_source {
+        Some(path) => tracing::info!("loading config from {path}"),
+        None => tracing::info!("using embedded default config (set GW_CONFIG to override)"),
+    }
+    let cfg = load_from_source().map_err(|e| anyhow::anyhow!(e))?;
 
     // GW_HOST / GW_PORT win over the config file (GW_HOST=0.0.0.0 for containers).
     let host = env::var("GW_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
@@ -75,11 +82,34 @@ async fn main() -> anyhow::Result<()> {
         "gateway state built"
     );
 
-    // Local background task: AK daily quota reset
+    // Local background task: AK daily quota reset (governance is a preserved
+    // seam, so this keeps resetting the live counters across reloads).
     let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
 
     let transport = select_transport(&cfg)?;
-    let app_state = AppState::new(cfg, state, transport);
+    let shared = gw_state::SharedConfig::new(cfg, state);
+    let loader: gw_views::ConfigLoader = Arc::new(load_from_source);
+    let app_state = AppState::with_config(shared, transport, Some(loader));
+
+    // SIGHUP → live reload (rebuild AK table / models / providers / accounts;
+    // keep governance / store / health / cache; storage-backend changes need a restart).
+    #[cfg(unix)]
+    {
+        let app = app_state.clone();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(mut sighup) => {
+                    while sighup.recv().await.is_some() {
+                        match app.reload() {
+                            Ok(()) => tracing::info!("SIGHUP: config reloaded"),
+                            Err(e) => tracing::error!(error = %e, "SIGHUP: reload failed"),
+                        }
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "install SIGHUP handler failed"),
+            }
+        });
+    }
 
     let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
     let router = gw_views::app(app_state).route(

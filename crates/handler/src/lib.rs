@@ -14,15 +14,14 @@ use gw_config::GatewayConfig;
 use gw_dag::DagContext;
 use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{GResult, GatewayRequest, GatewayResponse};
-use gw_state::{AkInfo, GatewayState};
+use gw_state::{AkInfo, GatewayState, SharedConfig};
 
 pub use offline::{BatchItem, OfflineHandler};
 
 /// Runs one request through the plugin pre-stage, the DAG, and the plugin post-stage.
 #[derive(Clone)]
 pub struct OnlineHandler {
-    pub cfg: Arc<GatewayConfig>,
-    pub state: Arc<GatewayState>,
+    pub config: SharedConfig,
     pub transport: SharedTransport,
     plan: Arc<gw_dag::Plan>,
 }
@@ -30,32 +29,39 @@ pub struct OnlineHandler {
 impl OnlineHandler {
     /// Panics only if the static DAG topology has a cycle — a build-time bug,
     /// caught by tests.
-    pub fn new(
-        cfg: Arc<GatewayConfig>,
-        state: Arc<GatewayState>,
-        transport: SharedTransport,
-    ) -> Self {
+    pub fn new(config: SharedConfig, transport: SharedTransport) -> Self {
         #[allow(clippy::expect_used)]
         let plan =
             Arc::new(gw_dag::Plan::build(gw_dag::default_layers()).expect("static dag topology"));
         Self {
-            cfg,
-            state,
+            config,
             transport,
             plan,
         }
     }
 
+    /// The live config snapshot (cheap atomic load). Introspection surfaces read
+    /// through this so a runtime reload takes effect immediately.
+    pub fn cfg(&self) -> Arc<GatewayConfig> {
+        self.config.load().cfg.clone()
+    }
+
+    pub fn state(&self) -> Arc<GatewayState> {
+        self.config.load().state.clone()
+    }
+
     /// Run one request: plugin pre → DAG (4 layers) → plugin post.
     /// The returned context carries the outcome, decision log, billing effects.
     pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
+        // one consistent snapshot for the whole request
+        let snap = self.config.load();
         // --- plugin pre-stage ---
-        let redacted = plugins::dlp_redact_request(&self.cfg.security, &mut request);
-        if let Some(block) = plugins::security_check(&self.cfg.security, &request) {
+        let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
+        if let Some(block) = plugins::security_check(&snap.cfg.security, &request) {
             // security block hit: skips the engine and billing, returns the block message
             let mut ctx = DagContext::new(
-                self.cfg.clone(),
-                self.state.clone(),
+                snap.cfg.clone(),
+                snap.state.clone(),
                 self.transport.clone(),
                 request,
                 ak,
@@ -80,8 +86,8 @@ impl OnlineHandler {
         }
 
         let mut ctx = DagContext::new(
-            self.cfg.clone(),
-            self.state.clone(),
+            snap.cfg.clone(),
+            snap.state.clone(),
             self.transport.clone(),
             request,
             ak,
@@ -94,7 +100,7 @@ impl OnlineHandler {
 
         // --- plugin post-stage: outbound redaction ---
         if let Some(outcome) = ctx.outcome.as_mut() {
-            let n = plugins::dlp_redact_response(&self.cfg.security, &mut outcome.response);
+            let n = plugins::dlp_redact_response(&snap.cfg.security, &mut outcome.response);
             if n > 0 {
                 ctx.decide("dlp", format!("redacted {n} span(s) outbound"));
             }
@@ -112,11 +118,14 @@ mod tests {
     fn handler() -> OnlineHandler {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
-        OnlineHandler::new(cfg, state, Arc::new(gw_engines::MockTransport))
+        OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
     }
 
     fn ak(h: &OnlineHandler) -> AkInfo {
-        h.state.auth.authenticate("ak-demo-123").unwrap()
+        h.state().auth.authenticate("ak-demo-123").unwrap()
     }
 
     fn chat_req(name: &str, content: &str) -> GatewayRequest {
@@ -135,7 +144,7 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.message.contains("you said: hi there"));
         assert!(out.response.common_usage.is_some());
-        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 1);
         assert!(ledger[0].cost_micros > 0);
         assert_eq!(ledger[0].account, "mock-openai-1");
@@ -161,7 +170,7 @@ mod tests {
         assert!(out.block.block);
         assert_eq!(out.response.finish_reason, "content_filter");
         assert!(
-            h.state
+            h.state()
                 .store
                 .ledger_snapshot(usize::MAX)
                 .await
@@ -198,7 +207,7 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.ptu_spillover);
         assert!(out.response.message.contains("you said: failover please"));
-        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.last().unwrap().account, "mock-hunyuan-paygo");
         assert!(ledger.last().unwrap().ptu_spillover);
         assert!(ctx.decisions.iter().any(|(_, w)| w.contains("failover")));
@@ -233,7 +242,10 @@ mod tests {
     async fn aborted_stream_bills_estimated_delivered_tokens() {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
-        let h = OnlineHandler::new(cfg, state, Arc::new(BreakingStream));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(BreakingStream),
+        );
         // client that consumes chunks (stays connected) — the upstream breaks
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -244,7 +256,7 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted, "mid-stream break must mark aborted");
         assert_eq!(out.response.message, "partial answer");
-        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 1, "aborted stream must still bill");
         assert!(
             ledger[0].prompt_tokens > 0 && ledger[0].completion_tokens > 0,
@@ -288,7 +300,10 @@ mod tests {
     async fn aborted_anthropic_stream_bills_delivered_completion() {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
-        let h = OnlineHandler::new(cfg, state, Arc::new(BreakingAnthropicStream));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(BreakingAnthropicStream),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let mut req = chat_req("claude-sonnet", "please stream something");
@@ -298,7 +313,7 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted);
         assert_eq!(out.response.message, "delivered words here");
-        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 1);
         // the real prompt count is kept (100), completion is estimated from the
         // delivered text — NOT billed as zero
@@ -329,7 +344,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..100 {
-            if let Some(j) = h.state.store.batch_get(&job.id).await.unwrap()
+            if let Some(j) = h.state().store.batch_get(&job.id).await.unwrap()
                 && matches!(
                     j.status,
                     gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
@@ -339,7 +354,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let (count, _) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let (count, _) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 2, "every batch item bills, cache hits or not");
     }
 
@@ -364,7 +379,7 @@ mod tests {
             .unwrap();
         // poll until the background task finishes
         for _ in 0..100 {
-            if let Some(j) = h.state.store.batch_get(&job.id).await.unwrap()
+            if let Some(j) = h.state().store.batch_get(&job.id).await.unwrap()
                 && matches!(
                     j.status,
                     gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
@@ -374,12 +389,12 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let j = h.state.store.batch_get(&job.id).await.unwrap().unwrap();
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
         assert_eq!(j.status, gw_state::BatchStatus::Completed);
         assert_eq!(j.results.len(), 2);
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
         assert_eq!(
-            h.state.store.ledger_snapshot(usize::MAX).await.unwrap().0,
+            h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
             2
         );
     }

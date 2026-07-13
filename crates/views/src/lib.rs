@@ -56,10 +56,16 @@ const STREAM_CHANNEL_CAP: usize = 64;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Produces a fresh `GatewayConfig` from the config source (file or embedded),
+/// so a reload re-reads what's on disk. Errors are returned as a message.
+pub type ConfigLoader = Arc<dyn Fn() -> Result<GatewayConfig, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub handler: OnlineHandler,
     pub offline: OfflineHandler,
+    /// Reloads config from its source; `None` = reload not wired (tests).
+    pub loader: Option<ConfigLoader>,
 }
 
 impl AppState {
@@ -68,9 +74,31 @@ impl AppState {
         state: Arc<GatewayState>,
         transport: SharedTransport,
     ) -> Self {
-        let handler = OnlineHandler::new(cfg, state, transport);
+        Self::with_config(gw_state::SharedConfig::new(cfg, state), transport, None)
+    }
+
+    pub fn with_config(
+        config: gw_state::SharedConfig,
+        transport: SharedTransport,
+        loader: Option<ConfigLoader>,
+    ) -> Self {
+        let handler = OnlineHandler::new(config, transport);
         let offline = OfflineHandler::new(handler.clone());
-        Self { handler, offline }
+        Self {
+            handler,
+            offline,
+            loader,
+        }
+    }
+
+    /// Reload config from source and atomically swap it in (derived state
+    /// rebuilt, runtime seams preserved). Storage-backend changes (redis/sqlite
+    /// URLs) need a restart and are ignored here.
+    pub fn reload(&self) -> Result<(), String> {
+        let loader = self.loader.as_ref().ok_or("reload not configured")?;
+        let cfg = loader()?;
+        self.handler.config.reload(cfg);
+        Ok(())
     }
 }
 
@@ -96,6 +124,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/realtime", get(realtime_ws))
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
+        .route("/admin/reload", post(admin_reload))
         .layer(axum::middleware::from_fn(track_requests))
         .with_state(state)
 }
@@ -150,7 +179,8 @@ async fn realtime_ws(
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
         Err((st, msg)) => {
-            match ws_subprotocol_ak(&headers).and_then(|k| s.handler.state.auth.authenticate(&k)) {
+            match ws_subprotocol_ak(&headers).and_then(|k| s.handler.state().auth.authenticate(&k))
+            {
                 Some(ak) => ak,
                 None => return error_response(st, msg),
             }
@@ -162,7 +192,7 @@ async fn realtime_ws(
     // Resolve: public name or wire name, must be the Realtime family
     let mt = s
         .handler
-        .cfg
+        .cfg()
         .find_model(&model)
         .and_then(|m| m.protocol())
         .or_else(|| gw_consts::Protocol::from_wire(&model));
@@ -172,14 +202,14 @@ async fn realtime_ws(
     if mt != gw_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
-    let Some(account) = s.handler.state.pool.select_healthy(
+    let Some(account) = s.handler.state().pool.select_healthy(
         mt,
         s.handler
-            .cfg
+            .cfg()
             .find_model(&model)
             .and_then(|m| m.provider.as_deref()),
         &[],
-        &s.handler.state.health,
+        &s.handler.state().health,
     ) else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
@@ -196,7 +226,7 @@ async fn realtime_ws(
 /// Same governance gates as the REST surfaces — the realtime surface bills,
 /// so it must also be rate/quota limited. `None` = admitted.
 async fn realtime_gate(s: &AppState, ak: &AkInfo) -> Option<String> {
-    let gov = &s.handler.state.governance;
+    let gov = &s.handler.state().governance;
     if !gov.rate_allow(&ak.ak, ak.qps).await {
         return Some(format!(
             "rate limit exceeded for ak {} (qps {})",
@@ -229,8 +259,8 @@ async fn bill_realtime_turn(
     it: i64,
     ot: i64,
 ) {
-    let (p_in, p_out) = s.handler.cfg.prices_for(model);
-    let gov = &s.handler.state.governance;
+    let (p_in, p_out) = s.handler.cfg().prices_for(model);
+    let gov = &s.handler.state().governance;
     gov.quota_consume(&ak.ak, it + ot).await;
     gov.token_window_add(&ak.ak, it + ot, std::time::Duration::from_secs(60))
         .await;
@@ -248,7 +278,7 @@ async fn bill_realtime_turn(
     };
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot.max(0) as u64);
-    if let Err(e) = s.handler.state.store.ledger_add(record).await {
+    if let Err(e) = s.handler.state().store.ledger_add(record).await {
         metrics::counter!("gateway_ledger_write_failures_total").increment(1);
         tracing::error!(error = %e, "realtime billing write failed");
     }
@@ -530,7 +560,7 @@ async fn health() -> Json<Value> {
 async fn list_models(State(s): State<AppState>) -> Json<Value> {
     let data: Vec<Value> = s
         .handler
-        .cfg
+        .cfg()
         .models
         .iter()
         .map(|m| {
@@ -555,7 +585,7 @@ async fn ledger(
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(LEDGER_PAGE_DEFAULT);
-    match s.handler.state.store.ledger_snapshot(limit).await {
+    match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
         Err(e) => gateway_error(e),
     }
@@ -565,7 +595,7 @@ async fn ledger(
 async fn accounts(State(s): State<AppState>) -> Json<Value> {
     let data: Vec<Value> = s
         .handler
-        .cfg
+        .cfg()
         .accounts
         .iter()
         .map(|a| {
@@ -574,7 +604,7 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
                 "provider": a.provider,
                 "priority": a.priority,
                 "tier": if a.tier.is_empty() { "paygo" } else { a.tier.as_str() },
-                "health": s.handler.state.health.status(&a.name),
+                "health": s.handler.state().health.status(&a.name),
                 "protocols": a.protocols,
             })
         })
@@ -597,7 +627,7 @@ fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'sta
         ));
     };
     s.handler
-        .state
+        .state()
         .auth
         .authenticate(ak)
         .ok_or((401, "invalid api key"))
@@ -610,6 +640,56 @@ fn error_response(status: u16, message: impl Into<String>) -> Response {
         Json(json!({ "error": { "message": message.into(), "type": "gateway_error" } })),
     )
         .into_response()
+}
+
+/// Admin surface gate: a bearer check against the configured admin token.
+/// Disabled (404) when no token is configured, so probing the surface can't
+/// tell it apart from a nonexistent route.
+fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<(), (u16, &'static str)> {
+    let Some(token) = s.handler.cfg().admin.token() else {
+        return Err((404, "not found"));
+    };
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if presented == Some(token.as_str()) {
+        Ok(())
+    } else {
+        Err((401, "invalid admin token"))
+    }
+}
+
+/// POST /admin/reload — re-read config from source and swap it in atomically
+/// (AK table / models / providers / accounts rebuilt; governance, store,
+/// account health, and cache preserved). Storage-backend URL changes need a
+/// restart.
+async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err((st, msg)) = admin_auth(&s, &headers) {
+        return error_response(st, msg);
+    }
+    match s.reload() {
+        Ok(()) => {
+            let cfg = s.handler.cfg();
+            tracing::info!(
+                access_keys = cfg.access_keys.len(),
+                models = cfg.models.len(),
+                accounts = cfg.accounts.len(),
+                "config reloaded"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "reloaded",
+                    "access_keys": cfg.access_keys.len(),
+                    "models": cfg.models.len(),
+                    "accounts": cfg.accounts.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => error_response(500, format!("reload failed: {e}")),
+    }
 }
 
 fn gateway_error(e: GatewayError) -> Response {
@@ -1722,7 +1802,7 @@ async fn batches_submit(
     // Two input modes: inline `items`, or an uploaded JSONL `input_file_id`
     // (the OpenAI batch pattern — each line is {custom_id,method,url,body}).
     if let Some(file_id) = body["input_file_id"].as_str() {
-        let file = match s.handler.state.store.file_get(file_id).await {
+        let file = match s.handler.state().store.file_get(file_id).await {
             Ok(Some(f)) => f,
             Ok(None) => return error_response(404, format!("input file {file_id} not found")),
             Err(e) => return gateway_error(e),
@@ -1789,7 +1869,7 @@ async fn files_upload(
     }
     let f = match s
         .handler
-        .state
+        .state()
         .store
         .file_put(&purpose, content.to_owned())
         .await
@@ -1817,7 +1897,7 @@ async fn files_get(
     if let Err((st, msg)) = authenticate(&s, &headers) {
         return error_response(st, msg);
     }
-    match s.handler.state.store.file_get(&id).await {
+    match s.handler.state().store.file_get(&id).await {
         Ok(Some(f)) => (
             StatusCode::OK,
             Json(json!({"id": f.id, "object": "file", "bytes": f.bytes, "purpose": f.purpose})),
@@ -1837,7 +1917,7 @@ async fn files_content(
     if let Err((st, msg)) = authenticate(&s, &headers) {
         return error_response(st, msg);
     }
-    match s.handler.state.store.file_get(&id).await {
+    match s.handler.state().store.file_get(&id).await {
         Ok(Some(f)) => (StatusCode::OK, f.content).into_response(),
         Ok(None) => error_response(404, format!("file {id} not found")),
         Err(e) => gateway_error(e),
@@ -1853,7 +1933,7 @@ async fn batches_get(
     if let Err((st, msg)) = authenticate(&s, &headers) {
         return error_response(st, msg);
     }
-    match s.handler.state.store.batch_get(&id).await {
+    match s.handler.state().store.batch_get(&id).await {
         Ok(Some(job)) => (StatusCode::OK, Json(json!(job))).into_response(),
         Ok(None) => error_response(404, format!("batch {id} not found")),
         Err(e) => gateway_error(e),

@@ -197,6 +197,29 @@ pub struct StorageConf {
     pub ledger_max_rows: u64,
 }
 
+/// Admin surface gate. `/admin/*` is disabled unless `token_env` names an env
+/// var holding a bearer token; requests must present it. Keep the admin surface
+/// off the public load balancer regardless (bind it to a private network).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdminConf {
+    /// Env var holding the admin bearer token; empty = admin surface disabled.
+    #[serde(default)]
+    pub token_env: String,
+}
+
+impl AdminConf {
+    /// The configured admin token, read from its env var at call time. `None`
+    /// (unset var or no `token_env`) means the admin surface is disabled.
+    pub fn token(&self) -> Option<String> {
+        if self.token_env.is_empty() {
+            return None;
+        }
+        std::env::var(&self.token_env)
+            .ok()
+            .filter(|t| !t.is_empty())
+    }
+}
+
 /// Product-level governance.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProductConfEntry {
@@ -295,6 +318,9 @@ pub struct GatewayConfig {
     /// First-class provider presets; each expands into an upstream account.
     #[serde(default)]
     pub providers: Vec<ProviderConf>,
+    /// Admin surface gate (dynamic config reload / key management).
+    #[serde(default)]
+    pub admin: AdminConf,
     /// name → index lookups, built once after parse to avoid per-request scans.
     #[serde(skip)]
     model_idx: std::collections::HashMap<String, usize>,
