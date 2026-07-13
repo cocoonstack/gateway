@@ -35,6 +35,11 @@ pub struct DagContext {
     /// only when a cap is configured, consumed at billing time (unconfigured
     /// pairs never touch a counter).
     pub model_quota_key: Option<String>,
+    /// Tokens reserved against the AK daily quota at admission; settled to
+    /// actual usage at billing, refunded whole if the pipeline fails.
+    pub quota_reserved: Option<i64>,
+    /// Tokens reserved in the AK TPM window at admission (same lifecycle).
+    pub tpm_reserved: Option<i64>,
 }
 
 impl DagContext {
@@ -56,6 +61,8 @@ impl DagContext {
             cache_hit: false,
             cache_key: None,
             model_quota_key: None,
+            quota_reserved: None,
+            tpm_reserved: None,
         }
     }
 

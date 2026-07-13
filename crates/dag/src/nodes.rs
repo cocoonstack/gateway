@@ -199,7 +199,28 @@ impl DagNode for CacheLookup {
     }
 }
 
-/// preprocess/quota_check: AK daily token pre-check.
+/// Completion tokens reserved when the caller sets no max_tokens; settle
+/// corrects to actuals, so the estimate only needs to be monotone.
+const DEFAULT_COMPLETION_RESERVE: i64 = 256;
+
+/// Cheap admission estimate: ~chars/4 prompt heuristic + requested max_tokens.
+fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
+    let prompt: usize = req.message.iter().map(|m| m.content.len()).sum();
+    let max_out = req
+        .model_param_v2
+        .as_ref()
+        .and_then(|p| p.typed.as_ref())
+        .and_then(|t| match t {
+            gw_models::TypedParams::Chat(c) => c.max_tokens,
+            _ => None,
+        });
+    (prompt as i64 / 4).max(1) + max_out.unwrap_or(DEFAULT_COMPLETION_RESERVE)
+}
+
+/// preprocess/quota_check: AK daily-quota admission. Reserves the estimate
+/// atomically (admitted while spent-before < limit), so concurrent in-flight
+/// requests count against the budget instead of all passing a stale check;
+/// billing settles to actuals and a failed pipeline refunds in the handler.
 pub struct QuotaCheck;
 
 #[async_trait::async_trait]
@@ -214,10 +235,11 @@ impl DagNode for QuotaCheck {
         if ctx.cache_hit {
             return Ok(()); // cache hit doesn't consume quota
         }
+        let est = reserve_estimate(&ctx.request);
         if !ctx
             .state
             .governance
-            .quota_check(&ctx.ak.ak, ctx.ak.daily_token_quota)
+            .quota_reserve(&ctx.ak.ak, est, ctx.ak.daily_token_quota)
             .await
         {
             return Err(GatewayError::new(
@@ -226,9 +248,8 @@ impl DagNode for QuotaCheck {
                 format!("daily token quota exhausted for ak {}", ctx.ak.ak),
             ));
         }
-        let used = ctx.state.governance.quota_used(&ctx.ak.ak).await;
-        let quota = ctx.ak.daily_token_quota;
-        ctx.decide("quota_check", format!("used {used}/{quota}"));
+        ctx.quota_reserved = Some(est);
+        ctx.decide("quota_check", format!("reserved {est}"));
         Ok(())
     }
 }
@@ -435,10 +456,13 @@ impl DagNode for AkTpmLimit {
             return Ok(());
         };
         let window = std::time::Duration::from_secs(60);
+        let est = ctx
+            .quota_reserved
+            .unwrap_or_else(|| reserve_estimate(&ctx.request));
         if !ctx
             .state
             .governance
-            .token_window_check(&ctx.ak.ak, tpm, window)
+            .token_window_reserve(&ctx.ak.ak, est, tpm, window)
             .await
         {
             return Err(GatewayError::new(
@@ -450,6 +474,7 @@ impl DagNode for AkTpmLimit {
                 ),
             ));
         }
+        ctx.tpm_reserved = Some(est);
         Ok(())
     }
 }
@@ -668,20 +693,38 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         .unwrap_or(served);
     let (p_in, p_out) = ctx.cfg.prices_for(served);
     let cost = prompt * p_in / 1000 + completion * p_out / 1000;
+    // settle reservations to actuals (the model-quota counter stays soft
+    // post-hoc by design); independent keys run as one concurrent round-trip
+    let quota_delta = total - ctx.quota_reserved.take().unwrap_or(0);
     match &ctx.model_quota_key {
-        // independent keys — one concurrent round-trip instead of two
         Some(key) => {
             tokio::join!(
-                ctx.state.governance.quota_consume(&ctx.ak.ak, total),
+                ctx.state.governance.quota_settle(&ctx.ak.ak, quota_delta),
                 ctx.state.governance.quota_consume(key, total)
             );
         }
-        None => ctx.state.governance.quota_consume(&ctx.ak.ak, total).await,
+        None => {
+            ctx.state
+                .governance
+                .quota_settle(&ctx.ak.ak, quota_delta)
+                .await
+        }
     }
-    ctx.state
-        .governance
-        .token_window_add(&ctx.ak.ak, total, std::time::Duration::from_secs(60))
-        .await;
+    let window = std::time::Duration::from_secs(60);
+    match ctx.tpm_reserved.take() {
+        Some(est) => {
+            ctx.state
+                .governance
+                .token_window_settle(&ctx.ak.ak, total - est, window)
+                .await
+        }
+        None => {
+            ctx.state
+                .governance
+                .token_window_add(&ctx.ak.ak, total, window)
+                .await
+        }
+    }
     let record = BillingRecord {
         ak: ctx.ak.ak.clone(),
         product: ctx.ak.product.clone(),

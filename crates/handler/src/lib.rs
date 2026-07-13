@@ -94,7 +94,19 @@ impl OnlineHandler {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
         }
 
-        gw_dag::run(&self.plan, &mut ctx).await?;
+        if let Err(e) = gw_dag::run(&self.plan, &mut ctx).await {
+            // a failed pipeline refunds its admission reservations whole
+            if let Some(est) = ctx.quota_reserved.take() {
+                ctx.state.governance.quota_settle(&ctx.ak.ak, -est).await;
+            }
+            if let Some(est) = ctx.tpm_reserved.take() {
+                ctx.state
+                    .governance
+                    .token_window_settle(&ctx.ak.ak, -est, std::time::Duration::from_secs(60))
+                    .await;
+            }
+            return Err(e);
+        }
 
         // a quota fallback served a different model; every surface echoes the
         // requested name (the ledger keeps both)

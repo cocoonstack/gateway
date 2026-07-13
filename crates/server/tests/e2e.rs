@@ -382,6 +382,67 @@ async fn tenant_entitlement_gates_models_and_catalog() {
 }
 
 #[tokio::test]
+async fn concurrent_requests_cannot_blow_past_quota() {
+    let app = app();
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            app.oneshot(post(
+                "/v1/chat/completions",
+                Some("ak-tiny-quota"),
+                CHAT_BODY,
+            ))
+            .await
+            .unwrap()
+            .status()
+        }));
+    }
+    let mut ok = 0;
+    let mut limited = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            StatusCode::OK => ok += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        (ok, limited),
+        (1, 9),
+        "reservation admits exactly one in-flight request on a quota of 1"
+    );
+}
+
+#[tokio::test]
+async fn failed_request_refunds_its_reservation() {
+    let app = app();
+    let r = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-tiny-quota"),
+            r#"{"model":"erroring-model","messages":[{"role":"user","content":"x"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "vendor error surfaces");
+    let r = app
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-tiny-quota"),
+            CHAT_BODY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "the failed call's reservation was refunded, budget intact"
+    );
+}
+
+#[tokio::test]
 async fn tenant_scoped_admin() {
     const YAML: &str = r#"
 listen: {host: 127.0.0.1, port: 0}

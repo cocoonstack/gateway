@@ -19,6 +19,12 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
 
     /// Daily quota: is `ak` under `limit`?
     async fn quota_check(&self, ak: &str, limit: i64) -> bool;
+    /// Admission with reservation: admit while spent-before < `limit`, and
+    /// atomically add `amount` so concurrent in-flight requests count against
+    /// the budget. False = rejected (nothing reserved).
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool;
+    /// Apply the settle delta (actual - reserved; negative refunds).
+    async fn quota_settle(&self, key: &str, delta: i64);
     /// Tokens spent today by `ak`.
     async fn quota_used(&self, ak: &str) -> i64;
     /// Add to `ak`'s spent tokens.
@@ -31,6 +37,16 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
 
     /// Fixed-window token limit (TPM): are spent tokens under `limit`?
     async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool;
+    /// Windowed admission with reservation (see [`Governance::quota_reserve`]).
+    async fn token_window_reserve(
+        &self,
+        key: &str,
+        amount: i64,
+        limit: i64,
+        window: Duration,
+    ) -> bool;
+    /// Apply the settle delta to the current window (negative refunds).
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration);
     /// Add to the current TPM window.
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration);
 }
@@ -52,6 +68,12 @@ impl Governance for MemoryGovernance {
     async fn quota_check(&self, ak: &str, limit: i64) -> bool {
         self.quota.check(ak, limit)
     }
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
+        self.quota.reserve(key, amount, limit)
+    }
+    async fn quota_settle(&self, key: &str, delta: i64) {
+        self.quota.settle(key, delta);
+    }
     async fn quota_used(&self, ak: &str) -> i64 {
         self.quota.used(ak)
     }
@@ -66,6 +88,18 @@ impl Governance for MemoryGovernance {
     }
     async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.tpm.check(key, limit, window)
+    }
+    async fn token_window_reserve(
+        &self,
+        key: &str,
+        amount: i64,
+        limit: i64,
+        window: Duration,
+    ) -> bool {
+        self.tpm.reserve(key, amount, limit, window)
+    }
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
+        self.tpm.settle(key, delta, window);
     }
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
         self.tpm.add(key, tokens, window);
@@ -154,6 +188,43 @@ impl Governance for RedisGovernance {
             }
         }
     }
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
+        let mut conn = self.conn.clone();
+        // admit while spent-before < limit; the reservation itself may cross
+        // the limit (same one-request overshoot the settle corrects)
+        let script = redis::Script::new(
+            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
+               redis.call('DECRBY', KEYS[1], ARGV[1])
+               return 0
+             end
+             return 1",
+        );
+        match script
+            .key(format!("gw:quota:{key}"))
+            .arg(amount)
+            .arg(limit)
+            .invoke_async::<i64>(&mut conn)
+            .await
+        {
+            Ok(v) => v == 1,
+            Err(e) => {
+                tracing::warn!(error = %e, key, "redis quota reserve failed; admitting");
+                true
+            }
+        }
+    }
+    async fn quota_settle(&self, key: &str, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut conn = self.conn.clone();
+        let _ = redis::cmd("INCRBY")
+            .arg(format!("gw:quota:{key}"))
+            .arg(delta)
+            .query_async::<i64>(&mut conn)
+            .await;
+    }
     async fn quota_consume(&self, ak: &str, tokens: i64) {
         let mut conn = self.conn.clone();
         let _ = redis::cmd("INCRBY")
@@ -204,6 +275,45 @@ impl Governance for RedisGovernance {
         let _ = window;
         used < limit
     }
+    async fn token_window_reserve(
+        &self,
+        key: &str,
+        amount: i64,
+        limit: i64,
+        window: Duration,
+    ) -> bool {
+        let mut conn = self.conn.clone();
+        let script = redis::Script::new(
+            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
+               redis.call('DECRBY', KEYS[1], ARGV[1])
+               return 0
+             end
+             return 1",
+        );
+        match script
+            .key(format!("gw:tpm:{key}"))
+            .arg(amount)
+            .arg(limit)
+            .arg(window.as_millis() as i64)
+            .invoke_async::<i64>(&mut conn)
+            .await
+        {
+            Ok(v) => v == 1,
+            Err(e) => {
+                tracing::warn!(error = %e, key, "redis tpm reserve failed; admitting");
+                true
+            }
+        }
+    }
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
+        if delta == 0 {
+            return;
+        }
+        self.incr_window(&format!("gw:tpm:{key}"), delta, window)
+            .await;
+    }
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
         self.incr_window(&format!("gw:tpm:{key}"), tokens, window)
             .await;
@@ -228,6 +338,26 @@ mod tests {
         assert_eq!(g.quota_used(&ak).await, 10);
         assert!(!g.quota_check(&ak, 10).await);
 
+        let rkey = format!("r{}", std::process::id());
+        assert!(g.quota_reserve(&rkey, 300, 100).await);
+        assert!(!g.quota_reserve(&rkey, 300, 100).await);
+        g.quota_settle(&rkey, 15 - 300).await;
+        assert_eq!(g.quota_used(&rkey).await, 15);
+        assert!(
+            g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
+                .await
+        );
+        assert!(
+            !g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
+                .await
+        );
+        g.token_window_settle(&rkey, -300, Duration::from_secs(60))
+            .await;
+        assert!(
+            g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
+                .await
+        );
+
         let mkey = format!("m{}", std::process::id());
         assert!(g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
@@ -236,6 +366,27 @@ mod tests {
         g.token_window_add(&ak, 10, Duration::from_secs(60)).await;
         assert!(!g.token_window_check(&ak, 10, Duration::from_secs(60)).await);
         g.quota_reset_all().await;
+    }
+
+    #[tokio::test]
+    async fn reserve_then_settle_semantics() {
+        let g = MemoryGovernance::default();
+        assert!(g.quota_reserve("k", 300, 100).await, "admit while under");
+        assert!(!g.quota_reserve("k", 300, 100).await, "in-flight counts");
+        g.quota_settle("k", 15 - 300).await;
+        assert_eq!(g.quota_used("k").await, 15);
+        assert!(
+            g.quota_reserve("k", 300, 100).await,
+            "back under after settle"
+        );
+        g.quota_settle("k", -300).await;
+        assert_eq!(g.quota_used("k").await, 15, "refund restores");
+
+        let w = Duration::from_secs(60);
+        assert!(g.token_window_reserve("t", 300, 100, w).await);
+        assert!(!g.token_window_reserve("t", 300, 100, w).await);
+        g.token_window_settle("t", -300, w).await;
+        assert!(g.token_window_reserve("t", 300, 100, w).await);
     }
 
     #[tokio::test]

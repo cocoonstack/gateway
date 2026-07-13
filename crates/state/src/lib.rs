@@ -307,6 +307,23 @@ impl QuotaStore {
         *self.used.entry(ak.to_owned()).or_insert(0) += tokens;
     }
 
+    /// Admission with reservation, atomic under the entry guard: admit while
+    /// spent-before < `limit`, adding `amount` so in-flight requests count.
+    pub fn reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
+        let mut e = self.used.entry(key.to_owned()).or_insert(0);
+        if *e >= limit {
+            return false;
+        }
+        *e += amount;
+        true
+    }
+
+    /// Apply the settle delta (actual - reserved); never below zero.
+    pub fn settle(&self, key: &str, delta: i64) {
+        let mut e = self.used.entry(key.to_owned()).or_insert(0);
+        *e = (*e + delta).max(0);
+    }
+
     /// Daily reset. Driven by the gw-task background job as an in-process
     /// periodic task.
     pub fn reset_all(&self) {
@@ -471,6 +488,34 @@ impl TokenWindow {
     /// Pre-check: tokens already spent in this window are under the limit.
     pub fn check(&self, key: &str, limit: i64, window: std::time::Duration) -> bool {
         self.rotate(key, window) < limit
+    }
+
+    /// Windowed admission with reservation, atomic under the entry guard.
+    pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: std::time::Duration) -> bool {
+        let mut e = self
+            .entries
+            .entry(key.to_owned())
+            .or_insert_with(|| (Instant::now(), 0));
+        if e.0.elapsed() >= window {
+            *e = (Instant::now(), 0);
+        }
+        if e.1 >= limit {
+            return false;
+        }
+        e.1 += amount;
+        true
+    }
+
+    /// Apply the settle delta to the current window; never below zero.
+    pub fn settle(&self, key: &str, delta: i64, window: std::time::Duration) {
+        let mut e = self
+            .entries
+            .entry(key.to_owned())
+            .or_insert_with(|| (Instant::now(), 0));
+        if e.0.elapsed() >= window {
+            *e = (Instant::now(), 0);
+        }
+        e.1 = (e.1 + delta).max(0);
     }
 
     /// Post-add actual token usage. Rotation and increment happen under one
