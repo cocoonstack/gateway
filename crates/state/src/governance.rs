@@ -454,4 +454,14 @@ mod tests {
                 .await
         );
     }
+
+    #[test]
+    fn quota_key_pins_the_admission_day() {
+        // the last second of a UTC day and the first of the next map to distinct
+        // buckets — so a settle replaying the reserve's timestamp lands on the
+        // reserve's day even after "now" has rolled past midnight
+        assert_ne!(quota_key_at("k", 86_400 - 1), quota_key_at("k", 86_400));
+        // any two timestamps within one UTC day share a bucket
+        assert_eq!(quota_key_at("k", 60), quota_key_at("k", 86_400 - 1));
+    }
 }

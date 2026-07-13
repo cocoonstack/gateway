@@ -90,9 +90,9 @@ impl ModelEngine for ErnieEngine {
             } else {
                 "stop".into()
             },
-            prompt_tokens: usage["prompt_tokens"].as_i64().unwrap_or(0),
-            completion_tokens: usage["completion_tokens"].as_i64().unwrap_or(0),
-            total_tokens: usage["total_tokens"].as_i64().unwrap_or(0),
+            prompt_tokens: usage["prompt_tokens"].as_i64().unwrap_or(0).max(0),
+            completion_tokens: usage["completion_tokens"].as_i64().unwrap_or(0).max(0),
+            total_tokens: usage["total_tokens"].as_i64().unwrap_or(0).max(0),
             raw_usage_json: usage.to_string().into_bytes(),
             ..Default::default()
         };
@@ -142,7 +142,7 @@ impl ModelEngine for MinimaxV1Engine {
                 format!("minimax base_resp {code}: {}", v["base_resp"]["status_msg"]),
             ));
         }
-        let total = v["usage"]["total_tokens"].as_i64().unwrap_or(0);
+        let total = v["usage"]["total_tokens"].as_i64().unwrap_or(0).max(0);
         let resp = GatewayResponse {
             message: v["reply"].as_str().unwrap_or_default().to_owned(),
             model,
@@ -213,8 +213,8 @@ impl ModelEngine for CohereEngine {
         let (status, v) = self.base.post_json(&url, headers, body).await?;
         let tokens = &v["meta"]["tokens"];
         let (input, output) = (
-            tokens["input_tokens"].as_i64().unwrap_or(0),
-            tokens["output_tokens"].as_i64().unwrap_or(0),
+            tokens["input_tokens"].as_i64().unwrap_or(0).max(0),
+            tokens["output_tokens"].as_i64().unwrap_or(0).max(0),
         );
         let resp = GatewayResponse {
             message: v["text"].as_str().unwrap_or_default().to_owned(),
@@ -222,7 +222,7 @@ impl ModelEngine for CohereEngine {
             finish_reason: v["finish_reason"].as_str().unwrap_or("stop").to_lowercase(),
             prompt_tokens: input,
             completion_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
             raw_usage_json: json!({"input_tokens": input, "output_tokens": output})
                 .to_string()
                 .into_bytes(),
@@ -285,18 +285,19 @@ impl ModelEngine for LlamaEngine {
         let url = format!("{base}{uri}");
         let (status, v) = self.base.post_json(&url, headers, body).await?;
         let (pt, ct) = (
-            v["prompt_token_count"].as_i64().unwrap_or(0),
-            v["generation_token_count"].as_i64().unwrap_or(0),
+            v["prompt_token_count"].as_i64().unwrap_or(0).max(0),
+            v["generation_token_count"].as_i64().unwrap_or(0).max(0),
         );
+        let total = pt.saturating_add(ct);
         let resp = GatewayResponse {
             message: v["generation"].as_str().unwrap_or_default().to_owned(),
             model,
             finish_reason: v["stop_reason"].as_str().unwrap_or("stop").to_owned(),
             prompt_tokens: pt,
             completion_tokens: ct,
-            total_tokens: pt + ct,
+            total_tokens: total,
             raw_usage_json:
-                json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct})
+                json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total})
                     .to_string()
                     .into_bytes(),
             ..Default::default()
@@ -398,7 +399,7 @@ impl DashScopeEngine {
         resp.message = full;
         resp.aborted = r.aborted;
         if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
         }
         resp.raw_usage_json = dashscope_raw_usage(&resp);
         Ok(EngineOutcome {
@@ -441,7 +442,7 @@ impl ModelEngine for DashScopeEngine {
         };
         dashscope_apply_usage(&v["usage"], &mut resp);
         if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
         }
         resp.raw_usage_json = dashscope_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
@@ -494,16 +495,16 @@ fn dashscope_apply_usage(usage: &Value, resp: &mut GatewayResponse) {
         return;
     }
     if let Some(it) = usage["input_tokens"].as_i64() {
-        resp.prompt_tokens = it;
+        resp.prompt_tokens = it.max(0);
     }
     if let Some(ot) = usage["output_tokens"].as_i64() {
-        resp.completion_tokens = ot;
+        resp.completion_tokens = ot.max(0);
     }
     if let Some(tt) = usage["total_tokens"].as_i64() {
-        resp.total_tokens = tt;
+        resp.total_tokens = tt.max(0);
     }
     if let Some(cached) = usage["prompt_tokens_details"]["cached_tokens"].as_i64() {
-        resp.read_cached_prompt_tokens = cached;
+        resp.read_cached_prompt_tokens = cached.max(0);
     }
 }
 

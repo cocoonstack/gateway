@@ -116,8 +116,8 @@ impl ClaudeEngine {
             }
         }
         let usage = &v["usage"];
-        let input = usage["input_tokens"].as_i64().unwrap_or(0);
-        let output = usage["output_tokens"].as_i64().unwrap_or(0);
+        let input = usage["input_tokens"].as_i64().unwrap_or(0).max(0);
+        let output = usage["output_tokens"].as_i64().unwrap_or(0).max(0);
         let resp = GatewayResponse {
             message: text,
             tool_calls: if tool_use.is_empty() {
@@ -130,7 +130,7 @@ impl ClaudeEngine {
             is_messages_protocol: true,
             prompt_tokens: input,
             completion_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
             raw_usage_json: if usage.is_null() {
                 vec![]
             } else {
@@ -299,10 +299,11 @@ impl SseState {
             resp.tool_calls = Some(Value::Array(self.tool_blocks));
         }
         resp.message = self.full;
-        resp.prompt_tokens = self.input;
-        resp.completion_tokens = self.output;
-        resp.total_tokens = self.input + self.output;
-        resp.raw_usage_json = json!({"input_tokens": self.input, "output_tokens": self.output})
+        let (input, output) = (self.input.max(0), self.output.max(0));
+        resp.prompt_tokens = input;
+        resp.completion_tokens = output;
+        resp.total_tokens = input.saturating_add(output);
+        resp.raw_usage_json = json!({"input_tokens": input, "output_tokens": output})
             .to_string()
             .into_bytes();
     }

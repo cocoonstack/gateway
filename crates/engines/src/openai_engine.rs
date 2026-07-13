@@ -298,9 +298,10 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
     if usage.is_null() {
         return;
     }
-    resp.prompt_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0);
-    resp.completion_tokens = usage["completion_tokens"].as_i64().unwrap_or(0);
-    resp.total_tokens = usage["total_tokens"].as_i64().unwrap_or(0);
+    // floor upstream counts so a negative can't refund quota or bill negative
+    resp.prompt_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0).max(0);
+    resp.completion_tokens = usage["completion_tokens"].as_i64().unwrap_or(0).max(0);
+    resp.total_tokens = usage["total_tokens"].as_i64().unwrap_or(0).max(0);
     resp.raw_usage_json = usage.to_string().into_bytes();
 }
 

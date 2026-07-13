@@ -421,11 +421,20 @@ mod tests {
         let h = OnlineHandler::new(handler().config.clone(), Arc::new(PiiStream));
         assert!(h.cfg().security.dlp_redact, "default config has DLP on");
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let mut req = chat_req("gpt-4o", "hello");
         req.stream = true;
         req.stream_tx = Some(tx);
+        // run() consumes the request; under DLP it clears stream_tx before the
+        // engine runs, so the sender is dropped and the live channel stays empty
         let ctx = h.run(req, ak(&h).await).await.unwrap();
+        let mut live: Vec<String> = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            live.push(chunk.delta);
+        }
+        assert!(
+            live.iter().all(|d| !d.contains("jane@corp.com")),
+            "no raw delta may reach the live channel under DLP: {live:?}"
+        );
         let out = ctx.outcome.expect("outcome");
         assert!(
             out.chunks.is_empty(),

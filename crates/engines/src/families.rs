@@ -149,7 +149,7 @@ impl VertexEngine {
         resp.message = full;
         resp.aborted = r.aborted;
         if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
         }
         resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome {
@@ -195,7 +195,7 @@ impl ModelEngine for VertexEngine {
         };
         vertex_apply_usage(&v["usageMetadata"], &mut resp);
         if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
         }
         resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
@@ -325,7 +325,7 @@ impl ModelEngine for EmbeddingsEngine {
                     .collect()
             })
             .unwrap_or_default();
-        let pt = v["usage"]["prompt_tokens"].as_i64().unwrap_or(0);
+        let pt = v["usage"]["prompt_tokens"].as_i64().unwrap_or(0).max(0);
         let resp = GatewayResponse {
             embeddings: first,
             model: param.model_name.clone(),
@@ -694,8 +694,8 @@ impl ModelEngine for CompletionsEngine {
             .to_owned();
         let usage = &v["usage"];
         let (pt, ct) = (
-            usage["prompt_tokens"].as_i64().unwrap_or(0),
-            usage["completion_tokens"].as_i64().unwrap_or(0),
+            usage["prompt_tokens"].as_i64().unwrap_or(0).max(0),
+            usage["completion_tokens"].as_i64().unwrap_or(0).max(0),
         );
         let resp = GatewayResponse {
             message: text,
@@ -706,7 +706,9 @@ impl ModelEngine for CompletionsEngine {
                 .to_owned(),
             prompt_tokens: pt,
             completion_tokens: ct,
-            total_tokens: usage["total_tokens"].as_i64().unwrap_or(pt + ct),
+            total_tokens: usage["total_tokens"]
+                .as_i64()
+                .unwrap_or(pt.saturating_add(ct)),
             raw_usage_json: if usage.is_null() {
                 vec![]
             } else {
@@ -758,18 +760,21 @@ fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
     if usage.is_null() {
         return (0, 0, vec![]);
     }
-    let input = usage["input_tokens"].as_i64().unwrap_or(0);
-    let output = usage["output_tokens"].as_i64().unwrap_or(0);
+    // floor upstream counts so a negative can't refund quota or bill a negative
+    let input = usage["input_tokens"].as_i64().unwrap_or(0).max(0);
+    let output = usage["output_tokens"].as_i64().unwrap_or(0).max(0);
     let cached = usage["input_tokens_details"]["cached_tokens"]
         .as_i64()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let reasoning = usage["output_tokens_details"]["reasoning_tokens"]
         .as_i64()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
     let raw = json!({
         "prompt_tokens": input,
         "completion_tokens": output,
-        "total_tokens": input + output,
+        "total_tokens": input.saturating_add(output),
         "prompt_tokens_details": {"cached_tokens": cached},
         "completion_tokens_details": {"reasoning_tokens": reasoning},
     })
@@ -812,7 +817,7 @@ fn responses_apply_frame(
             let (input, output, raw) = responses_usage(&r["usage"]);
             resp.prompt_tokens = input;
             resp.completion_tokens = output;
-            resp.total_tokens = input + output;
+            resp.total_tokens = input.saturating_add(output);
             resp.raw_usage_json = raw;
             chunks.push(StreamChunk {
                 finish_reason: Some(resp.finish_reason.clone()),
@@ -922,7 +927,7 @@ impl ResponsesEngine {
             finish_reason: v["status"].as_str().unwrap_or("completed").to_owned(),
             prompt_tokens: input,
             completion_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
             raw_usage_json,
             response_v2: Some(v),
             ..Default::default()
@@ -983,7 +988,7 @@ impl ResponsesEngine {
             finish_reason,
             prompt_tokens: input,
             completion_tokens: output,
-            total_tokens: input + output,
+            total_tokens: input.saturating_add(output),
             raw_usage_json,
             ..Default::default()
         };

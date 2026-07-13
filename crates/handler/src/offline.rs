@@ -94,10 +94,11 @@ impl OfflineHandler {
         // a result that failed to persist leaves the batch incomplete — it must
         // not then be reported Completed
         let mut writes_ok = true;
-        // heartbeat claimed_at while items run so a slow item isn't judged
-        // stale and reclaimed by another instance mid-execution; if a heartbeat
-        // reports the fence token no longer matches, another instance already
-        // reclaimed us — stop so we don't double-run or clobber its status
+        use std::sync::atomic::Ordering::Relaxed;
+        // A background heartbeat refreshes claimed_at so a single slow item isn't
+        // judged stale mid-run; it also flips `lost` if the fence token stops
+        // matching (another instance reclaimed us). Long-item liveness is its job
+        // — the per-item synchronous touch below is what bounds a double-run.
         let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb = {
             let store = store.clone();
@@ -109,18 +110,27 @@ impl OfflineHandler {
                 loop {
                     tick.tick().await;
                     if let Ok(false) = store.batch_touch(&id, claim).await {
-                        lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                        lost.store(true, Relaxed);
                         break;
                     }
                 }
             })
         };
         for (index, messages) in items.into_iter().enumerate() {
-            if lost.load(std::sync::atomic::Ordering::Relaxed) {
+            if lost.load(Relaxed) {
                 break; // reclaimed by another instance; stop running new items
             }
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
+            }
+            // synchronous fence before starting each item: if we were reclaimed
+            // while stalled, learn it here and stop before running/billing the
+            // next item — so at most the one item already in flight double-runs
+            // (the resume/dedup path tolerates exactly that). claim 0 = in-process,
+            // unfenced (the local store's touch is a no-op that returns true).
+            if claim != 0 && matches!(store.batch_touch(id, claim).await, Ok(false)) {
+                lost.store(true, Relaxed);
+                break;
             }
             let request = GatewayRequest {
                 is_online: false,
@@ -172,8 +182,13 @@ impl OfflineHandler {
             }
         }
         hb.abort();
-        if lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if lost.load(Relaxed) {
             return; // the reclaiming instance owns the terminal status now
+        }
+        // final ownership check right before the terminal write, so a reclaim
+        // during the last item can't be clobbered by our stale Completed/Failed
+        if claim != 0 && matches!(store.batch_touch(id, claim).await, Ok(false)) {
+            return;
         }
         // Completed only if every result persisted; a lost write means missing
         // results, so report Failed rather than a Completed-but-incomplete batch.
