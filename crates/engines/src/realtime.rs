@@ -4,12 +4,33 @@
 
 use serde_json::Value;
 
-/// Whether a client frame is the OpenAI-dialect generation trigger; text and
-/// binary are both checked so a binary-encoded event can't slip past the gate.
-pub fn is_response_create(payload: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(payload)
-        .map(|v| v["type"] == "response.create")
-        .unwrap_or(false)
+/// Whether a client frame is the OpenAI-dialect generation trigger. The bridge
+/// parses text and binary frames alike, so a binary-encoded event can't slip
+/// past the gate.
+pub fn is_response_create(frame: &Value) -> bool {
+    frame["type"] == "response.create"
+}
+
+/// The keys that carry human text in realtime frames (both directions); audio
+/// and other base64 payloads never ride under these names, so a rewrite here
+/// cannot corrupt them.
+const TEXT_KEYS: [&str; 4] = ["text", "transcript", "instructions", "delta"];
+
+/// Visit the text-bearing fields of a realtime frame with a visitor that may
+/// rewrite them; returns summed hits. The content-security seam for the
+/// WebSocket surface — which fields are text is dialect knowledge owned here.
+pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
+    match v {
+        Value::Array(a) => a.iter_mut().map(|x| visit_frame_text(x, f)).sum(),
+        Value::Object(o) => o
+            .iter_mut()
+            .map(|(k, x)| match x {
+                Value::String(s) if TEXT_KEYS.contains(&k.as_str()) => f(s),
+                _ => visit_frame_text(x, f),
+            })
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// A non-OpenAI realtime dialect (Gemini Live family): no turn-start signal to
@@ -59,6 +80,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn visit_frame_text_hits_text_fields_not_audio() {
+        let mut frame = json!({
+            "type": "conversation.item.create",
+            "item": {"content": [
+                {"type": "input_text", "text": "hello"},
+                {"type": "input_audio", "audio": "AAAA1381234567890AAA"}
+            ]},
+            "instructions": "be brief"
+        });
+        let mut seen = Vec::new();
+        visit_frame_text(&mut frame, &mut |s| {
+            seen.push(s.clone());
+            *s = "X".into();
+            1
+        });
+        seen.sort();
+        assert_eq!(seen, vec!["be brief".to_owned(), "hello".to_owned()]);
+        assert_eq!(frame["item"]["content"][0]["text"], "X");
+        assert_eq!(
+            frame["item"]["content"][1]["audio"], "AAAA1381234567890AAA",
+            "audio payloads are never rewritten"
+        );
+    }
 
     #[test]
     fn realtime_usage_per_dialect() {

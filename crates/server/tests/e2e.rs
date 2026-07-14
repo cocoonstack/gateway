@@ -2362,6 +2362,60 @@ async fn account_cooldown_and_recovery() {
 }
 
 #[tokio::test]
+async fn realtime_applies_blocklist_and_dlp() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let application = app();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-demo-123".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    let first = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "session.created");
+
+    ws.send(Message::text(
+        serde_json::json!({"type":"input_text","text":"say ForbiddenWord now"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let ev = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(ev.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "error", "blocklisted turn must be refused: {v}");
+
+    ws.send(Message::text(
+        serde_json::json!({"type":"input_text","text":"mail me at jane@corp.com"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut assembled = String::new();
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        match v["type"].as_str().unwrap() {
+            "response.delta" => assembled.push_str(v["delta"].as_str().unwrap()),
+            "response.done" => break,
+            other => panic!("unexpected event {other}"),
+        }
+    }
+    assert!(
+        assembled.contains("[REDACTED_EMAIL]") && !assembled.contains("jane@corp.com"),
+        "PII must be redacted on the realtime surface: {assembled}"
+    );
+}
+
+#[tokio::test]
 async fn realtime_websocket_mock_session() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

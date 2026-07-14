@@ -423,12 +423,21 @@ async fn realtime_session(
             Message::Close(_) => break,
             _ => continue,
         };
-        let Ok(ev) = serde_json::from_str::<Value>(&text) else {
+        let Ok(mut ev) = serde_json::from_str::<Value>(&text) else {
             let _ = socket
                 .send(send(json!({"type":"error","message":"invalid json event"})))
                 .await;
             continue;
         };
+        // same blocklist + inbound DLP every REST surface runs
+        let sec = &s.handler.cfg().security;
+        if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut ev) {
+            let _ = socket
+                .send(send(json!({"type":"error","message": block.message})))
+                .await;
+            continue;
+        }
+        gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut ev);
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
                 let admit = match realtime_gate(&s, &ak, &model).await {
@@ -545,28 +554,48 @@ async fn realtime_bridge(
     loop {
         tokio::select! {
             m = cl_rx.next() => {
-                let (is_trigger, forward) = match m {
-                    Some(Ok(CMsg::Text(t))) => (is_response_create(t.as_bytes()), UMsg::text(t.to_string())),
-                    Some(Ok(CMsg::Binary(b))) => (is_response_create(&b), UMsg::binary(b)),
+                // text and binary frames are parsed alike so neither encoding
+                // bypasses the gate or the content-security pass; a non-JSON
+                // frame (raw audio) carries no scannable text and relays as-is
+                let (frame, mut forward) = match m {
+                    Some(Ok(CMsg::Text(t))) => (serde_json::from_str::<Value>(&t).ok(), UMsg::text(t.to_string())),
+                    Some(Ok(CMsg::Binary(b))) => (serde_json::from_slice::<Value>(&b).ok(), UMsg::binary(b)),
                     Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
-                // gate each generation trigger, not every control frame
-                if is_trigger {
-                    match realtime_gate(&s, &ak, &model).await {
-                        Ok(admit) => {
-                            pending.push_back(admit);
-                            generations += 1;
+                if let Some(mut frame) = frame {
+                    // same blocklist + inbound DLP every REST surface runs
+                    let sec = &s.handler.cfg().security;
+                    if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut frame) {
+                        if cl_tx
+                            .send(CMsg::Text(send_err(block.message).to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
                         }
-                        Err(denied) => {
-                            if cl_tx
-                                .send(CMsg::Text(send_err(denied).to_string().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                        continue;
+                    }
+                    if gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut frame) > 0 {
+                        forward = UMsg::text(frame.to_string());
+                    }
+                    // gate each generation trigger, not every control frame
+                    if is_response_create(&frame) {
+                        match realtime_gate(&s, &ak, &model).await {
+                            Ok(admit) => {
+                                pending.push_back(admit);
+                                generations += 1;
                             }
-                            continue;
+                            Err(denied) => {
+                                if cl_tx
+                                    .send(CMsg::Text(send_err(denied).to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -577,7 +606,8 @@ async fn realtime_bridge(
             m = up_rx.next() => match m {
                 Some(Ok(UMsg::Text(t))) => {
                     let mut relay = true;
-                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    let mut redacted: Option<String> = None;
+                    if let Ok(mut v) = serde_json::from_str::<Value>(&t) {
                         if suppress {
                             relay = false;
                             if realtime_usage(&account.provider, &v).is_some() {
@@ -639,8 +669,19 @@ async fn realtime_bridge(
                             }
                             recognized += 1;
                         }
+                        // outbound DLP, per frame (a span straddling deltas is
+                        // beyond a relay that cannot buffer)
+                        if relay
+                            && gw_handler::plugins::dlp_redact_realtime_frame(
+                                &s.handler.cfg().security,
+                                &mut v,
+                            ) > 0
+                        {
+                            redacted = Some(v.to_string());
+                        }
                     }
-                    if relay && cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
+                    let payload = redacted.unwrap_or_else(|| t.to_string());
+                    if relay && cl_tx.send(CMsg::Text(payload.into())).await.is_err() {
                         break;
                     }
                 }
@@ -888,6 +929,23 @@ async fn scoped_key(
             Err(error_response(404, format!("key {ak} not found")))
         }
         found => Ok(found),
+    }
+}
+
+/// A tenant-owned store lookup: another tenant's resource answers 404 (not
+/// 403), so sequential ids can't be probed for cross-tenant existence.
+#[allow(clippy::result_large_err)] // mirrors the surrounding admin/lookup helpers
+fn tenant_owned<T>(
+    found: GResult<Option<T>>,
+    owner: impl Fn(&T) -> &str,
+    tenant: &str,
+    kind: &str,
+    id: &str,
+) -> Result<T, Response> {
+    match found {
+        Ok(Some(x)) if owner(&x) == tenant => Ok(x),
+        Ok(_) => Err(error_response(404, format!("{kind} {id} not found"))),
+        Err(e) => Err(gateway_error(e)),
     }
 }
 
@@ -2382,10 +2440,10 @@ async fn batches_submit(
 
     if let Some(file_id) = body["input_file_id"].as_str() {
         // another tenant's file answers 404, not 403 — don't leak its existence
-        let file = match s.handler.state().store.file_get(file_id).await {
-            Ok(Some(f)) if f.tenant == ak.tenant => f,
-            Ok(_) => return error_response(404, format!("input file {file_id} not found")),
-            Err(e) => return gateway_error(e),
+        let found = s.handler.state().store.file_get(file_id).await;
+        let file = match tenant_owned(found, |f| &f.tenant, &ak.tenant, "input file", file_id) {
+            Ok(f) => f,
+            Err(resp) => return resp,
         };
         for line in file.content.lines().filter(|l| !l.trim().is_empty()) {
             let Ok(req) = serde_json::from_str::<Value>(line) else {
@@ -2477,14 +2535,14 @@ async fn files_get(
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
-    match s.handler.state().store.file_get(&id).await {
-        Ok(Some(f)) if f.tenant == ak.tenant => (
+    let found = s.handler.state().store.file_get(&id).await;
+    match tenant_owned(found, |f| &f.tenant, &ak.tenant, "file", &id) {
+        Ok(f) => (
             StatusCode::OK,
             Json(json!({"id": f.id, "object": "file", "bytes": f.bytes, "purpose": f.purpose})),
         )
             .into_response(),
-        Ok(_) => error_response(404, format!("file {id} not found")),
-        Err(e) => gateway_error(e),
+        Err(resp) => resp,
     }
 }
 
@@ -2498,10 +2556,10 @@ async fn files_content(
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
-    match s.handler.state().store.file_get(&id).await {
-        Ok(Some(f)) if f.tenant == ak.tenant => (StatusCode::OK, f.content).into_response(),
-        Ok(_) => error_response(404, format!("file {id} not found")),
-        Err(e) => gateway_error(e),
+    let found = s.handler.state().store.file_get(&id).await;
+    match tenant_owned(found, |f| &f.tenant, &ak.tenant, "file", &id) {
+        Ok(f) => (StatusCode::OK, f.content).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -2515,12 +2573,10 @@ async fn batches_get(
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
-    match s.handler.state().store.batch_get(&id).await {
-        Ok(Some(job)) if job.tenant == ak.tenant => {
-            (StatusCode::OK, Json(json!(job))).into_response()
-        }
-        Ok(_) => error_response(404, format!("batch {id} not found")),
-        Err(e) => gateway_error(e),
+    let found = s.handler.state().store.batch_get(&id).await;
+    match tenant_owned(found, |j| &j.tenant, &ak.tenant, "batch", &id) {
+        Ok(job) => (StatusCode::OK, Json(json!(job))).into_response(),
+        Err(resp) => resp,
     }
 }
 

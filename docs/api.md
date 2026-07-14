@@ -89,7 +89,10 @@ A realtime model bound to an account with a real `endpoint` bridges the session
 to that vendor's realtime WebSocket: a transparent relay, with the gateway
 enforcing the same governance chain as the REST path per generation — tenant and
 AK QPS, product/model QPM, per-(key, model) and daily-token quota, TPM — plus
-billing (shared pricing) from the vendor's usage. Each generation re-checks the
+billing (shared pricing) from the vendor's usage. Content security also applies:
+the blocklist gates inbound frames and DLP redacts text fields in both
+directions (per frame — a PII span straddling two deltas is beyond a relay
+that cannot buffer). Each generation re-checks the
 key, so a key banned, expired, or revoked (or a model de-entitled) mid-session
 stops generating. An endpoint-less account serves a local mock session (OpenAI
 Realtime event shape) for offline development.

@@ -97,6 +97,30 @@ fn for_each_typed_text(
     }
 }
 
+/// Blocklist scan over a realtime frame's text-bearing fields — the same terms
+/// every REST surface blocks, so the WebSocket surface is not a bypass.
+pub fn realtime_frame_blocked(sec: &SecurityConf, frame: &mut serde_json::Value) -> Option<Block> {
+    if sec.blocklist.is_empty() {
+        return None;
+    }
+    let hits =
+        gw_engines::realtime::visit_frame_text(frame, &mut |s| usize::from(blocklist_hit(sec, s)));
+    (hits > 0).then(|| {
+        let e = gw_consts::error_code::exceptions::empty_resp_err();
+        Block::blocked(e.msg, e.code as i32)
+    })
+}
+
+/// DLP-redact a realtime frame's text-bearing fields in place; the hit count.
+/// Per-frame best effort: a PII span straddling two deltas is not caught — a
+/// realtime relay cannot buffer the way the REST stream surfaces do.
+pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
+    if !sec.dlp_redact {
+        return 0;
+    }
+    gw_engines::realtime::visit_frame_text(frame, &mut redact_str)
+}
+
 /// DLP inbound redaction: emails and 11-digit phone numbers.
 pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
     if !sec.dlp_redact {
