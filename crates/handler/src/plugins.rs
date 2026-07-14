@@ -18,15 +18,12 @@ pub fn security_check(sec: &SecurityConf, request: &GatewayRequest) -> Option<Bl
     if sec.blocklist.is_empty() {
         return None;
     }
-    let terms: Vec<String> = sec
-        .blocklist
-        .iter()
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_lowercase())
-        .collect();
+    // sec.blocklist is already lower-cased at config load (see SecurityConf)
     let hit = |text: &str| {
         let lower = text.to_lowercase();
-        terms.iter().any(|w| lower.contains(w))
+        sec.blocklist
+            .iter()
+            .any(|w| !w.is_empty() && lower.contains(w))
     };
     let mut blocked = false;
     for msg in &request.message {

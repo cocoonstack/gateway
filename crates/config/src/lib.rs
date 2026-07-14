@@ -153,7 +153,8 @@ fn default_priority() -> i32 {
 /// Local security policy (rule-based; no cloud security service).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConf {
-    /// Blocklist: a hit triggers Block.
+    /// Blocklist: a hit triggers Block. Normalized to lower-case (empties
+    /// dropped) at load, so matching is case-insensitive without per-request work.
     #[serde(default)]
     pub blocklist: Vec<String>,
     /// Whether to DLP-redact inbound/outbound content (emails/phone numbers).
@@ -489,6 +490,15 @@ impl GatewayConfig {
                 protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
             });
         }
+        // blocklist is matched case-insensitively; lower-case (and drop empties)
+        // once here so `security_check` needn't rebuild the term list per request
+        self.security.blocklist = self
+            .security
+            .blocklist
+            .iter()
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_lowercase())
+            .collect();
         Ok(())
     }
 
@@ -874,6 +884,21 @@ accounts:
         let m = cfg.find_model("gpt-4o").unwrap();
         assert_eq!(m.protocol(), Some(Protocol::OpenaiChat));
         assert_eq!(cfg.prices_for("claude-sonnet"), (3000, 15000));
+    }
+
+    #[test]
+    fn blocklist_normalized_lowercase_at_load() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+security: {blocklist: ["Example.COM", "", "  BadWord "]}
+providers: []
+models: []
+accounts: []
+access_keys: []
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        // lower-cased, empties dropped (whitespace preserved — matching is contains)
+        assert_eq!(cfg.security.blocklist, vec!["example.com", "  badword "]);
     }
 
     #[test]
