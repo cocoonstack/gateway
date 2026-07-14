@@ -314,12 +314,15 @@ mod tests {
 
     #[tokio::test]
     async fn stream_survives_non_ascii_reply() {
-        let mut r = req(true);
-        r.message = vec![ChatMsg::text("user", "你好，世界😀")];
-        let e = OpenAiEngine::new(r, Arc::new(MockTransport));
-        let out = e.run().await.unwrap();
-        assert!(out.response.message.contains("你好，世界😀"));
-        assert!(out.chunks.len() >= 3);
+        for n in [40, 41, 42] {
+            let text = "界".repeat(n);
+            let mut r = req(true);
+            r.message = vec![ChatMsg::text("user", text.as_str())];
+            let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+            let out = e.run().await.unwrap();
+            assert!(out.response.message.contains(&text), "n={n}");
+            assert!(out.chunks.len() >= 3, "n={n}");
+        }
     }
 
     #[tokio::test]
