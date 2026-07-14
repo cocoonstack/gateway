@@ -40,9 +40,12 @@ Use the sample [`deploy/nginx.conf`](../deploy/nginx.conf). The essentials:
 - **Batch**: with the Postgres store, submission persists the items and any
   instance's drain loop claims and runs the batch (`FOR UPDATE SKIP LOCKED`),
   so execution survives the submitter restarting and a crashed executor's
-  work is requeued. On a local store (memory/sqlite) the job runs on the
-  receiving instance; polling `GET /v1/batches/{id}` needs the submitting
-  instance (use `ip_hash` on `/v1/batches`).
+  work is requeued. Known behavior: when a stalled executor is reclaimed, its
+  one in-flight item may run twice — two real upstream calls, both billed
+  (results themselves dedup, first writer wins). On a local store
+  (memory/sqlite) the job runs on the receiving instance; polling
+  `GET /v1/batches/{id}` needs the submitting instance (use `ip_hash` on
+  `/v1/batches`).
 
 ## Dynamic config
 
