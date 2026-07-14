@@ -240,6 +240,16 @@ async fn body_bytes(resp: Response) -> Vec<u8> {
         .to_vec()
 }
 
+/// Serve `application` on an ephemeral local port; the bound address.
+async fn serve_app(application: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+    addr
+}
+
 async fn body_json(resp: Response) -> Value {
     serde_json::from_slice(&body_bytes(resp).await).expect("json body")
 }
@@ -1752,12 +1762,7 @@ async fn files_and_batches_are_tenant_isolated() {
 async fn realtime_entitlement_blocks_unentitled_tenant() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let application = app();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(app()).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
@@ -1797,11 +1802,7 @@ models:
         state,
         Arc::new(gw_engines::MockTransport),
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(application).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
         .into_client_request()
@@ -2367,12 +2368,7 @@ async fn realtime_applies_blocklist_and_dlp() {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let application = app();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(app()).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
@@ -2421,12 +2417,7 @@ async fn realtime_websocket_mock_session() {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let application = app();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(app()).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
@@ -2544,11 +2535,7 @@ models:
         state.clone(),
         Arc::new(gw_engines::MockTransport),
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(application).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
         .into_client_request()
@@ -2670,11 +2657,7 @@ models:
         state.clone(),
         Arc::new(gw_engines::MockTransport),
     ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(application).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
         .into_client_request()
@@ -2739,12 +2722,7 @@ async fn realtime_authenticates_via_ws_subprotocol() {
     use futures::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let application = app();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(app()).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
@@ -2785,12 +2763,7 @@ async fn realtime_turns_are_rate_limited() {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let application = app();
-    tokio::spawn(async move {
-        axum::serve(listener, application).await.unwrap();
-    });
+    let addr = serve_app(app()).await;
 
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()

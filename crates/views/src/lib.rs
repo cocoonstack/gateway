@@ -486,6 +486,32 @@ async fn realtime_session(
     }
 }
 
+/// Cross the axum↔tungstenite text-frame boundary without copying: both wrap
+/// `bytes::Bytes`, so the payload stays refcounted and is only re-validated as
+/// UTF-8. The lossy fallback is unreachable in practice (input was validated).
+fn client_text_to_upstream(
+    t: axum::extract::ws::Utf8Bytes,
+) -> tokio_tungstenite::tungstenite::Message {
+    let b = bytes::Bytes::from(t);
+    match tokio_tungstenite::tungstenite::Utf8Bytes::try_from(b.clone()) {
+        Ok(u) => tokio_tungstenite::tungstenite::Message::Text(u),
+        Err(_) => {
+            tokio_tungstenite::tungstenite::Message::text(String::from_utf8_lossy(&b).into_owned())
+        }
+    }
+}
+
+/// The reverse direction of [`client_text_to_upstream`].
+fn upstream_text_to_client(
+    t: tokio_tungstenite::tungstenite::Utf8Bytes,
+) -> axum::extract::ws::Message {
+    let b = bytes::Bytes::from(t);
+    match axum::extract::ws::Utf8Bytes::try_from(b.clone()) {
+        Ok(u) => axum::extract::ws::Message::Text(u),
+        Err(_) => axum::extract::ws::Message::Text(String::from_utf8_lossy(&b).into_owned().into()),
+    }
+}
+
 /// Bridge one realtime session to a real upstream over WebSocket: transparent
 /// relay plus auth, per-generation gates, and per-turn billing. Only the OpenAI
 /// dialect reaches here — [`realtime_ws`] refuses providers it can't gate; the
@@ -558,7 +584,7 @@ async fn realtime_bridge(
                 // bypasses the gate or the content-security pass; a non-JSON
                 // frame (raw audio) carries no scannable text and relays as-is
                 let (frame, mut forward) = match m {
-                    Some(Ok(CMsg::Text(t))) => (serde_json::from_str::<Value>(&t).ok(), UMsg::text(t.to_string())),
+                    Some(Ok(CMsg::Text(t))) => (serde_json::from_str::<Value>(&t).ok(), client_text_to_upstream(t)),
                     Some(Ok(CMsg::Binary(b))) => (serde_json::from_slice::<Value>(&b).ok(), UMsg::binary(b)),
                     Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
@@ -603,11 +629,24 @@ async fn realtime_bridge(
                     break;
                 }
             },
-            m = up_rx.next() => match m {
-                Some(Ok(UMsg::Text(t))) => {
-                    let mut relay = true;
-                    let mut redacted: Option<String> = None;
-                    if let Ok(mut v) = serde_json::from_str::<Value>(&t) {
+            m = up_rx.next() => {
+                // text and binary frames are parsed alike so a vendor encoding
+                // its JSON events as binary can't bypass settlement or DLP;
+                // non-JSON binary (audio) relays unchanged, suppress-gated
+                let (frame, was_text, raw_text, raw_bytes) = match m {
+                    Some(Ok(UMsg::Text(t))) => {
+                        (serde_json::from_str::<Value>(&t).ok(), true, Some(t), None)
+                    }
+                    Some(Ok(UMsg::Binary(b))) => {
+                        (serde_json::from_slice::<Value>(&b).ok(), false, None, Some(b))
+                    }
+                    Some(Ok(UMsg::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
+                };
+                let mut relay = true;
+                let mut redacted: Option<String> = None;
+                match frame {
+                    Some(mut v) => {
                         if suppress {
                             relay = false;
                             if realtime_usage(&account.provider, &v).is_some() {
@@ -680,19 +719,21 @@ async fn realtime_bridge(
                             redacted = Some(v.to_string());
                         }
                     }
-                    let payload = redacted.unwrap_or_else(|| t.to_string());
-                    if relay && cl_tx.send(CMsg::Text(payload.into())).await.is_err() {
+                    // a denied turn's non-JSON output (e.g. audio deltas) is dropped too
+                    None => relay = !suppress,
+                }
+                if relay {
+                    let out = match (redacted, was_text, raw_text, raw_bytes) {
+                        (Some(json), true, _, _) => CMsg::Text(json.into()),
+                        (Some(json), false, _, _) => CMsg::Binary(json.into_bytes().into()),
+                        (None, _, Some(t), _) => upstream_text_to_client(t),
+                        (None, _, _, Some(b)) => CMsg::Binary(b),
+                        (None, _, None, None) => continue,
+                    };
+                    if cl_tx.send(out).await.is_err() {
                         break;
                     }
                 }
-                Some(Ok(UMsg::Binary(b))) => {
-                    // a denied turn's binary output (e.g. audio deltas) is dropped too
-                    if !suppress && cl_tx.send(CMsg::Binary(b)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(UMsg::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {} // ping/pong handled by the ws stacks
             },
         }
     }
@@ -719,7 +760,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         .request
         .model_param_v2
         .as_ref()
-        .map(|p| (p.model_name.clone(), p.protocol.as_str()))
+        .map(|p| (p.model_name.as_str(), p.protocol.as_str()))
         .unwrap_or_default();
     let account = ctx
         .request
@@ -1261,6 +1302,11 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-local-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The wire default when an engine reported no finish reason.
+fn finish_or_stop(fr: &str) -> &str {
+    if fr.is_empty() { "stop" } else { fr }
+}
+
 /// finish_reason mapping, anthropic → openai.
 fn finish_openai(fr: &str) -> String {
     match fr {
@@ -1600,11 +1646,7 @@ fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamCh
     }
     if !chunks.iter().any(|c| c.finish_reason.is_some()) {
         chunks.push(gw_engines::StreamChunk {
-            finish_reason: Some(if outcome.response.finish_reason.is_empty() {
-                "stop".to_owned()
-            } else {
-                outcome.response.finish_reason.clone()
-            }),
+            finish_reason: Some(finish_or_stop(&outcome.response.finish_reason).to_owned()),
             ..Default::default()
         });
     }
@@ -1628,11 +1670,7 @@ fn redacted_stream_tail(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::
         });
     }
     chunks.push(gw_engines::StreamChunk {
-        finish_reason: Some(if outcome.response.finish_reason.is_empty() {
-            "stop".to_owned()
-        } else {
-            outcome.response.finish_reason.clone()
-        }),
+        finish_reason: Some(finish_or_stop(&outcome.response.finish_reason).to_owned()),
         ..Default::default()
     });
     chunks
@@ -2026,11 +2064,7 @@ async fn completions(
         return error_response(500, "pipeline produced no outcome");
     };
     let r = &outcome.response;
-    let finish = if r.finish_reason.is_empty() {
-        "stop"
-    } else {
-        r.finish_reason.as_str()
-    };
+    let finish = finish_or_stop(&r.finish_reason);
     let resp = json!({
         "id": next_id("cmpl"),
         "object": "text_completion",

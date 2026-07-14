@@ -11,22 +11,48 @@ pub fn is_response_create(frame: &Value) -> bool {
     frame["type"] == "response.create"
 }
 
-/// The keys that carry human text in realtime frames (both directions); audio
-/// and other base64 payloads never ride under these names, so a rewrite here
-/// cannot corrupt them.
-const TEXT_KEYS: [&str; 4] = ["text", "transcript", "instructions", "delta"];
+/// The keys that carry human text in realtime frames (both directions):
+/// message content, transcripts, instructions, tool descriptions, and the
+/// function-call output/arguments strings. Audio and other base64 payloads
+/// never ride under these names, so a rewrite here cannot corrupt them.
+const TEXT_KEYS: [&str; 6] = [
+    "text",
+    "transcript",
+    "instructions",
+    "output",
+    "arguments",
+    "description",
+];
+
+/// Whether a frame's top-level `delta` carries text. Audio deltas reuse the
+/// same key for base64 payloads (`response.output_audio.delta`), which a
+/// rewrite would corrupt — only text/transcript/argument deltas are visited.
+fn delta_is_text(frame_type: &str) -> bool {
+    frame_type.contains("text")
+        || frame_type.contains("transcript")
+        || frame_type.contains("arguments")
+}
 
 /// Visit the text-bearing fields of a realtime frame with a visitor that may
 /// rewrite them; returns summed hits. The content-security seam for the
 /// WebSocket surface — which fields are text is dialect knowledge owned here.
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
+    let text_delta = v["type"].as_str().map(delta_is_text).unwrap_or(false);
+    walk(v, text_delta, f)
+}
+
+fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     match v {
-        Value::Array(a) => a.iter_mut().map(|x| visit_frame_text(x, f)).sum(),
+        Value::Array(a) => a.iter_mut().map(|x| walk(x, text_delta, f)).sum(),
         Value::Object(o) => o
             .iter_mut()
             .map(|(k, x)| match x {
-                Value::String(s) if TEXT_KEYS.contains(&k.as_str()) => f(s),
-                _ => visit_frame_text(x, f),
+                Value::String(s)
+                    if TEXT_KEYS.contains(&k.as_str()) || (k == "delta" && text_delta) =>
+                {
+                    f(s)
+                }
+                _ => walk(x, text_delta, f),
             })
             .sum(),
         _ => 0,
@@ -103,6 +129,42 @@ mod tests {
         assert_eq!(
             frame["item"]["content"][1]["audio"], "AAAA1381234567890AAA",
             "audio payloads are never rewritten"
+        );
+    }
+
+    #[test]
+    fn visit_frame_text_covers_tool_output_and_arguments() {
+        let mut frame = json!({
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "output": "call me at 13812345678"}
+        });
+        let hits = visit_frame_text(&mut frame, &mut |s| {
+            *s = "X".into();
+            1
+        });
+        assert_eq!(hits, 1, "function output is scanned");
+        assert_eq!(frame["item"]["output"], "X");
+
+        let mut tools = json!({
+            "type": "session.update",
+            "session": {"tools": [{"name": "t", "description": "desc", "parameters": {}}]}
+        });
+        let hits = visit_frame_text(&mut tools, &mut |_| 1);
+        assert_eq!(hits, 1, "tool descriptions are scanned");
+    }
+
+    #[test]
+    fn delta_visited_only_on_text_frames() {
+        let mut text = json!({"type": "response.output_text.delta", "delta": "hi"});
+        assert_eq!(visit_frame_text(&mut text, &mut |_| 1), 1);
+        let mut transcript = json!({"type": "response.audio_transcript.delta", "delta": "hi"});
+        assert_eq!(visit_frame_text(&mut transcript, &mut |_| 1), 1);
+        let mut audio =
+            json!({"type": "response.output_audio.delta", "delta": "AAAA13812345678A=="});
+        assert_eq!(
+            visit_frame_text(&mut audio, &mut |_| 1),
+            0,
+            "base64 audio deltas are never visited"
         );
     }
 
