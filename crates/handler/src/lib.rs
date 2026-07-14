@@ -9,11 +9,12 @@ pub mod plugins;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use gw_config::GatewayConfig;
 use gw_dag::DagContext;
 use gw_engines::http_transport::UpstreamPolicy;
 use gw_engines::{EngineOutcome, SharedTransport};
-use gw_models::{GResult, GatewayRequest, GatewayResponse};
+use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse};
 use gw_state::{AkInfo, GatewayState, SharedConfig};
 
 pub use offline::{BatchItem, OfflineHandler};
@@ -115,7 +116,14 @@ impl OnlineHandler {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
         }
 
-        if let Err(e) = gw_dag::run(&self.plan, &mut ctx).await {
+        // a panicking node must refund too, not leak the reserves; unwind-safe —
+        // the refund reads only plain ctx fields (ak, state, quota_at, the
+        // reserves), each written whole by its node, so a panic can't tear them
+        let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.plan, &mut ctx))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(GatewayError::internal("pipeline panicked")));
+        if let Err(e) = ran {
             // a failed pipeline refunds its reservations whole, on the reserve's day bucket
             ctx.state
                 .governance
@@ -497,6 +505,90 @@ mod tests {
             out.response.finish_reason, "content_filter",
             "blocklist must catch a term inside a redactable span"
         );
+    }
+
+    #[derive(Debug)]
+    struct PanickingTransport;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PanickingTransport {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            panic!("mock upstream panicked");
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_pipeline_refunds_reserves() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(PanickingTransport),
+        );
+        let ak = ak(&h).await;
+        let err = h
+            .run(chat_req("gpt-4o", "boom"), ak.clone())
+            .await
+            .err()
+            .expect("panic must surface as an error");
+        assert_eq!(err.http_status, 500);
+        assert_eq!(
+            h.state().governance.quota_used(&ak.ak).await,
+            0,
+            "reserves refunded after a panicking pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_key_orphaned_by_tenant_removal_fails_closed() {
+        let with_t1 = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m1]}]",
+        )
+        .unwrap();
+        let cfg = Arc::new(with_t1);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = gw_state::AkInfo {
+            ak: "ak-t1".into(),
+            product: "p".into(),
+            tenant: "t1".into(),
+            qps: 10.0,
+            daily_token_quota: 100_000,
+            tokens_per_minute: None,
+            expires_at_epoch_secs: None,
+            banned: false,
+            model_quotas: Default::default(),
+        };
+        h.state()
+            .auth
+            .put(key.clone(), gw_state::KeySource::Admin)
+            .await
+            .unwrap();
+        assert!(
+            h.run(chat_req("m1", "hi"), key.clone()).await.is_ok(),
+            "entitled while t1 is declared"
+        );
+        let without_t1 = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]",
+        )
+        .unwrap();
+        h.reload(without_t1).await.unwrap();
+        assert!(
+            h.state().auth.authenticate("ak-t1").await.is_some(),
+            "admin key survives the reload"
+        );
+        let err = h
+            .run(chat_req("m1", "hi"), key)
+            .await
+            .err()
+            .expect("orphaned tenant must fail closed, not become unrestricted");
+        assert_eq!(err.http_status, 403);
     }
 
     #[tokio::test]

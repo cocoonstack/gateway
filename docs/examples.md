@@ -33,8 +33,10 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{...}}
 data: [DONE]
 ```
 
-Frames arrive as the upstream produces them; the final data frame carries
-`usage` and `finish_reason`.
+The final data frame carries `usage` and `finish_reason`. Frames arrive
+as the upstream produces them only when `security.dlp_redact` is off;
+the embedded demo config ships with it **on**, so the stream is buffered
+and replayed post-redaction (see [governance.md](governance.md)).
 
 ## Anthropic messages
 

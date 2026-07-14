@@ -1,16 +1,15 @@
 # Architecture
 
-Cargo workspace, 12 crates, strictly layered — lower layers never depend
+Cargo workspace, 11 crates, strictly layered — lower layers never depend
 on higher ones:
 
 ```
-server → views → handler → {dag, engines} → {models, state} → {protocol, config} → {consts, utils}
+server → views → handler → {dag, engines} → {models, state} → {protocol, config} → consts
 ```
 
 | Crate       | Layer | Role |
 |-------------|-------|------|
 | `consts`    | L0    | error codes, the `Protocol` enum |
-| `utils`     | L0    | shared utilities |
 | `models`    | L1    | request/response domain types, typed params, usage, cost |
 | `protocol`  | L1    | OpenAI / Anthropic wire types, DSL response transforms |
 | `config`    | L1    | YAML config loading (`conf/gateway.yaml`) |
@@ -26,7 +25,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 
 ```
 client ──► views (auth, parse, protocol normalize)
-       ──► handler (pre plugins: DLP redact, blocklist)
+       ──► handler (pre plugins: blocklist, then DLP redact)
        ──► dag: preprocess        resolve model, quota check, cache lookup
               account_select      priority / PTU-first / cooldown-aware selection
               model_access        rate limits, engine call, retry-on-5xx failover
@@ -34,9 +33,11 @@ client ──► views (auth, parse, protocol normalize)
        ──► handler (post plugins) ──► views (JSON or SSE re-emit)
 ```
 
-Client disconnects cancel by drop: axum drops the in-flight handler
-future, which aborts the upstream reqwest call. Spawned background work
-(offline batches) deliberately outlives the submitting request.
+A client disconnect does not cancel the pipeline: every request runs on
+its own task (`run_pipeline` / `spawn_stream_pipeline`), so once admitted,
+quota and ledger accounting run to completion even if the caller goes
+away. Spawned background work (offline batches) likewise outlives the
+submitting request.
 
 The DAG executes four fixed layers; nodes within a layer are
 topologically ordered by declared dependencies. `account_select` and

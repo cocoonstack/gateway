@@ -218,10 +218,14 @@ impl MockTransport {
         }
     }
 
-    /// Two stream deltas from one reply (mock text is ASCII, so the byte
-    /// midpoint is a char boundary).
+    /// Two stream deltas, split at a char boundary — the reply embeds user
+    /// text, and a byte-midpoint split would panic the pipeline task.
     fn split_half(s: &str) -> (&str, &str) {
-        s.split_at(s.len() / 2)
+        let mut mid = s.len() / 2;
+        while !s.is_char_boundary(mid) {
+            mid -= 1;
+        }
+        s.split_at(mid)
     }
 
     fn sse_bytes(frames: &[Value], done: bool) -> Vec<u8> {

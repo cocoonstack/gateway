@@ -599,12 +599,17 @@ impl GatewayConfig {
         Ok(())
     }
 
-    /// Whether `tenant` may call `model`: no tenant entry or no allowlist =
-    /// every model; otherwise the allowlist decides.
+    /// Whether `tenant` may call `model`: a declared tenant without an
+    /// allowlist (and the implicit default) allows every model. An undeclared
+    /// non-default tenant fails closed — a runtime key outliving the reload
+    /// that deleted its tenant loses entitlement, not becomes unrestricted.
     pub fn tenant_allows_model(&self, tenant: &str, model: &str) -> bool {
-        match self.find_tenant(tenant).and_then(|t| t.models.as_ref()) {
-            Some(allow) => allow.iter().any(|m| m == model),
-            None => true,
+        match self.find_tenant(tenant) {
+            Some(t) => t
+                .models
+                .as_ref()
+                .is_none_or(|allow| allow.iter().any(|m| m == model)),
+            None => tenant == DEFAULT_TENANT,
         }
     }
 
@@ -892,6 +897,10 @@ access_keys:
         assert!(cfg.tenant_allows_model("t1", "m1"));
         assert!(!cfg.tenant_allows_model("t1", "m2"));
         assert!(cfg.tenant_allows_model(DEFAULT_TENANT, "m2"));
+        assert!(
+            !cfg.tenant_allows_model("ghost", "m1"),
+            "an undeclared (deleted) tenant must fail closed"
+        );
         assert_eq!(cfg.find_tenant("t1").unwrap().qps, Some(5.0));
 
         let undeclared = r#"

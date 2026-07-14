@@ -238,21 +238,26 @@ async fn realtime_ws(
     }
 }
 
-/// A turn admitted by [`realtime_gate`]: the freshly re-authenticated key, the
-/// reserves taken (daily quota + optional TPM window), and the admission day so
-/// the paired settle/refund lands on the same bucket.
+/// A turn admitted by [`realtime_gate`]: the freshly re-authenticated key,
+/// the reserves taken, the admission day (the paired settle/refund lands on
+/// the same bucket), and the admission snapshot (settlement must not drift
+/// from the admission config when a reload lands mid-turn).
 struct RealtimeAdmit {
     ak: AkInfo,
     reserved: i64,
     /// Tokens reserved in the AK TPM window; `None` when the key has no TPM cap.
     tpm_reserved: Option<i64>,
     at: i64,
+    snap: Arc<gw_state::Snapshot>,
 }
 
 impl RealtimeAdmit {
     /// Refund this turn's unsettled reserves — for a turn dropped before its boundary frame.
-    async fn refund(&self, gov: &dyn gw_state::Governance) {
-        gov.refund_reserves(&self.ak.ak, self.reserved, self.tpm_reserved, self.at)
+    async fn refund(&self) {
+        self.snap
+            .state
+            .governance
+            .refund_reserves(&self.ak.ak, self.reserved, self.tpm_reserved, self.at)
             .await;
     }
 }
@@ -305,14 +310,14 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
         reserved: REALTIME_TURN_RESERVE,
         tpm_reserved,
         at,
+        snap,
     })
 }
 
 /// Settle one realtime turn via the shared [`admission::settle_and_bill`]
-/// orchestration; a zero-usage terminal frame (cancelled/empty turn) refunds
-/// the reserves and writes nothing.
+/// orchestration, on the turn's admission snapshot; a zero-usage terminal
+/// frame (cancelled/empty turn) refunds the reserves and writes nothing.
 async fn bill_realtime_turn(
-    s: &AppState,
     admit: &RealtimeAdmit,
     model: &str,
     mt: gw_consts::Protocol,
@@ -324,21 +329,17 @@ async fn bill_realtime_turn(
     // clamp parts and total so a hostile count can't overflow shared counters
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
     let total = gw_state::clamp_tokens(it.saturating_add(ot));
-    let state = s.handler.state();
     if total == 0 {
-        state
-            .governance
-            .refund_reserves(&ak.ak, admit.reserved, admit.tpm_reserved, admit.at)
-            .await;
+        admit.refund().await;
         return;
     }
-    let cfg = s.handler.cfg();
-    let model_quota_key = admission::model_quota_limit(&cfg, ak, model)
+    let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
+    let model_quota_key = admission::model_quota_limit(cfg, ak, model)
         .map(|_| admission::model_quota_key(&ak.ak, model));
     admission::settle_and_bill(
         state.governance.as_ref(),
         state.store.as_ref(),
-        &cfg,
+        cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {
                 ak: &ak.ak,
@@ -434,7 +435,7 @@ async fn realtime_session(
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
                     .await;
-                bill_realtime_turn(&s, &admit, &model, mt, &account, it, ot).await;
+                bill_realtime_turn(&admit, &model, mt, &account, it, ot).await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -638,15 +639,14 @@ async fn realtime_bridge(
                             // a boundary with no gated turn bills unreserved
                             match pending.pop_front() {
                                 Some(a) => {
-                                    bill_realtime_turn(&s, &a, &model, mt, &account.name, it, ot)
-                                        .await
+                                    bill_realtime_turn(&a, &model, mt, &account.name, it, ot).await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
                                     // re-authenticate so billing uses the key's current
                                     // identity, not the stale handshake snapshot
-                                    let billed = s
-                                        .handler
-                                        .state()
+                                    let snap = s.handler.config.load();
+                                    let billed = snap
+                                        .state
                                         .auth
                                         .authenticate(&ak.ak)
                                         .await
@@ -656,9 +656,9 @@ async fn realtime_bridge(
                                         reserved: 0,
                                         tpm_reserved: None,
                                         at: gw_state::epoch_secs(),
+                                        snap,
                                     };
                                     bill_realtime_turn(
-                                        &s,
                                         &unreserved,
                                         &model,
                                         mt,
@@ -701,11 +701,8 @@ async fn realtime_bridge(
             },
         }
     }
-    if !pending.is_empty() {
-        let state = s.handler.state();
-        for a in pending {
-            a.refund(state.governance.as_ref()).await;
-        }
+    for a in pending {
+        a.refund().await;
     }
     if generations > 0 && recognized == 0 {
         tracing::warn!(
@@ -2675,16 +2672,7 @@ mod tests {
         let a1 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
         assert_eq!(used().await, REALTIME_TURN_RESERVE, "reserved up front");
 
-        bill_realtime_turn(
-            &s,
-            &a1,
-            "gpt-4o",
-            gw_consts::Protocol::Realtime,
-            "acc",
-            30,
-            70,
-        )
-        .await;
+        bill_realtime_turn(&a1, "gpt-4o", gw_consts::Protocol::Realtime, "acc", 30, 70).await;
         assert_eq!(used().await, 100, "settled to actual (30 + 70)");
 
         let a2 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
@@ -2695,16 +2683,7 @@ mod tests {
         let a3 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         let ledger_before = s.handler.state().store.ledger_snapshot(1).await.unwrap().0;
-        bill_realtime_turn(
-            &s,
-            &a3,
-            "gpt-4o",
-            gw_consts::Protocol::Realtime,
-            "acc",
-            0,
-            0,
-        )
-        .await;
+        bill_realtime_turn(&a3, "gpt-4o", gw_consts::Protocol::Realtime, "acc", 0, 0).await;
         assert_eq!(used().await, 100, "zero-usage turn refunds its reserve");
         let ledger_after = s.handler.state().store.ledger_snapshot(1).await.unwrap().0;
         assert_eq!(
@@ -2741,6 +2720,32 @@ mod tests {
             gov.quota_used(&ak.ak).await,
             daily_before,
             "a TPM-denied turn rolls back its daily reserve"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_settles_on_the_admission_snapshot() {
+        let price = |per_1k: i64| {
+            format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: rt, protocol: realtime, input_price_per_1k_micros: {per_1k}, output_price_per_1k_micros: {per_1k}}}]\naccess_keys: [{{ak: k-rt, product: p, qps: 10, daily_token_quota: 100000}}]"
+            )
+        };
+        let cfg = Arc::new(GatewayConfig::from_yaml(&price(1_000_000)).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let ak = s.handler.state().auth.authenticate("k-rt").await.unwrap();
+
+        let admit = realtime_gate(&s, &ak, "rt").await.expect("admit");
+        s.handler
+            .reload(GatewayConfig::from_yaml(&price(2_000_000)).unwrap())
+            .await
+            .unwrap();
+        bill_realtime_turn(&admit, "rt", gw_consts::Protocol::Realtime, "acc", 100, 100).await;
+
+        let (_, records) = s.handler.state().store.ledger_snapshot(1).await.unwrap();
+        assert_eq!(
+            records[0].cost_micros, 200_000,
+            "settled at the admission price, not the reloaded one"
         );
     }
 

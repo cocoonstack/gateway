@@ -27,13 +27,12 @@ workspace denies `unwrap`/`expect`/undocumented `unsafe` outside tests.
 Crates are strictly layered — lower layers never depend on higher ones:
 
 ```
-server → views → handler → {dag, engines} → {models, state} → {protocol, config} → {consts, utils}
+server → views → handler → {dag, engines} → {models, state} → {protocol, config} → consts
 ```
 
 | Crate | Role |
 |-------|------|
 | `consts` | error codes, the `Protocol` enum |
-| `utils` | shared helpers |
 | `models` | request/response types, typed params, usage, cost, token estimation |
 | `protocol` | OpenAI/Anthropic wire types, cross-protocol DSL |
 | `config` | YAML config, provider presets, name indices |
