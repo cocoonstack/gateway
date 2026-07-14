@@ -190,7 +190,7 @@ pub async fn settle_and_bill(
         }
     };
     let write_ledger = async {
-        if let Err(e) = store.ledger_add(record.clone()).await {
+        if let Err(e) = store.ledger_add(&record).await {
             metrics::counter!("gateway_ledger_write_failures_total").increment(1);
             tracing::error!(error = %e, "billing ledger write failed");
         }

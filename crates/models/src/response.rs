@@ -13,7 +13,6 @@ pub struct GatewayResponse {
     /// model-requested tool calls (openai tool_calls array / anthropic tool_use blocks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
-    pub embeddings: Vec<f32>,
     /// model name reported by the vendor.
     pub model: String,
 

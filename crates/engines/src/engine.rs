@@ -2,7 +2,7 @@
 //! (response, http_code, block) with the error folded into the `Result`.
 
 use gw_consts::ErrCode;
-use gw_models::{Block, GResult, GatewayError, GatewayResponse, Recorder};
+use gw_models::{Block, GResult, GatewayError, GatewayResponse};
 use serde_json::Value;
 
 pub use gw_models::StreamChunk;
@@ -87,7 +87,4 @@ impl EngineOutcome {
 pub trait ModelEngine: Send + Sync {
     /// Perform the upstream call.
     async fn run(&self) -> GResult<EngineOutcome>;
-
-    /// The per-request latency recorder.
-    fn recorder(&self) -> &dyn Recorder;
 }

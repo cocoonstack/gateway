@@ -55,61 +55,6 @@ impl fmt::Display for ErrCode {
     }
 }
 
-/// An error exception: a numeric code plus a user-facing message.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ErrorException {
-    pub code: i64,
-    pub msg: String,
-}
-
-impl ErrorException {
-    pub fn new(code: i64, msg: impl Into<String>) -> Self {
-        Self {
-            code,
-            msg: msg.into(),
-        }
-    }
-
-    pub fn ml_unknown(code: ErrCode) -> Self {
-        Self::new(
-            code.value(),
-            "an unknown error occurred, please retry later",
-        )
-    }
-}
-
-impl fmt::Display for ErrorException {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.code, self.msg)
-    }
-}
-
-impl std::error::Error for ErrorException {}
-
-/// Well-known `ErrorException` values.
-pub mod exceptions {
-    use super::ErrorException;
-
-    pub fn system_error() -> ErrorException {
-        ErrorException::new(1000, "internal error, please retry later")
-    }
-    pub fn req_json_err() -> ErrorException {
-        ErrorException::new(3001, "invalid request json")
-    }
-    pub fn req_param_err() -> ErrorException {
-        ErrorException::new(3002, "invalid parameter")
-    }
-    pub fn permission_check_err() -> ErrorException {
-        ErrorException::new(3007, "signature verification failed")
-    }
-    pub fn empty_resp_err() -> ErrorException {
-        ErrorException::new(
-            4003,
-            "this content cannot be answered, please try a different request",
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,13 +63,5 @@ mod tests {
     fn numeric_codes_preserved() {
         assert_eq!(ErrCode::REQ_JSON.value(), 3001);
         assert_eq!(ErrCode::SYSTEM_ERROR.value(), 1000);
-    }
-
-    #[test]
-    fn exception_display() {
-        assert_eq!(
-            exceptions::req_json_err().to_string(),
-            "[3001] invalid request json"
-        );
     }
 }

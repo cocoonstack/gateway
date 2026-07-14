@@ -41,16 +41,11 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
             write_cache,
             completion: output,
             reason: 0,
-            platform_total: input
-                .saturating_add(output)
-                .saturating_add(read_cache)
-                .saturating_add(write_cache),
         }
     } else {
         // OpenAI: prompt/completion/total (+ details)
         let prompt = get(&v, &["prompt_tokens"]).max(0);
         let completion = get(&v, &["completion_tokens"]).max(0);
-        let total = get(&v, &["total_tokens"]);
         // cached ⊆ prompt and reasoning ⊆ completion by the vendor contract,
         // but never trust upstream: cap the parts so malformed usage can't go
         // negative or make the parts sum past the vendor's own totals
@@ -64,11 +59,6 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
             write_cache: 0,
             completion: completion - reason,
             reason,
-            platform_total: if total > 0 {
-                total
-            } else {
-                prompt.saturating_add(completion)
-            },
         }
     })
 }
@@ -87,7 +77,6 @@ mod tests {
         assert_eq!(u.read_cache, 4);
         assert_eq!(u.completion, 3);
         assert_eq!(u.reason, 2);
-        assert_eq!(u.platform_total, 15);
     }
 
     #[test]
@@ -114,7 +103,6 @@ mod tests {
         assert_eq!(u.platform_input, 8);
         assert_eq!(u.completion, 6);
         assert_eq!(u.read_cache, 2);
-        assert_eq!(u.platform_total, 16);
     }
 
     #[test]
@@ -124,7 +112,6 @@ mod tests {
         assert_eq!(u.platform_input, 0, "negative floored, no quota refund");
         assert_eq!(u.completion, 0);
         assert_eq!(u.read_cache, 0);
-        assert_eq!(u.platform_total, 0);
     }
 
     #[test]

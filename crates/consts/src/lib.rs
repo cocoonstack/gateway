@@ -6,7 +6,7 @@
 pub mod error_code;
 pub mod protocol;
 
-pub use error_code::{ErrCode, ErrorException};
+pub use error_code::ErrCode;
 pub use protocol::Protocol;
 
 /// The per-minute governance window (QPM/TPM limits).
@@ -18,12 +18,7 @@ pub mod role {
     pub const AI: &str = "assistant";
     pub const MODEL: &str = "model";
     pub const SYSTEM: &str = "system";
-    pub const DEVELOPER: &str = "developer";
-    pub const BOT: &str = "bot"; // google vertex
     pub const STORAGE: &str = "storage";
-    // alternate names for the same roles.
-    pub const QUESTION: &str = USER;
-    pub const ANSWER: &str = AI;
 }
 
 /// Account tiers for PTU (provisioned) vs pay-as-you-go routing.

@@ -52,11 +52,6 @@ fn normalize_prompt(input: &TokenInput, rate: &TokenRate) -> i64 {
     prompt.max(0)
 }
 
-/// Pure input tokens (cache-excluded).
-pub fn platform_input(input: &TokenInput, rate: &TokenRate) -> i64 {
-    normalize_prompt(input, rate)
-}
-
 /// Cost in micro-dollars for one call at per-1k-token prices. Saturating, so a
 /// malformed/hostile token count can't overflow the multiply into a wrong bill.
 pub fn cost_micros(prompt: i64, completion: i64, price_per_1k: (i64, i64)) -> i64 {
@@ -92,7 +87,6 @@ mod tests {
     #[test]
     fn default_rate_is_plain_sum() {
         assert_eq!(platform_total(&sample(), &TokenRate::default()), 20);
-        assert_eq!(platform_input(&sample(), &TokenRate::default()), 10);
     }
 
     #[test]
@@ -102,7 +96,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(platform_total(&sample(), &rate), 17);
-        assert_eq!(platform_input(&sample(), &rate), 7);
     }
 
     #[test]
@@ -127,7 +120,6 @@ mod tests {
             write_cache: 5,
             ..Default::default()
         };
-        assert_eq!(platform_input(&input, &rate), 0);
         assert_eq!(platform_total(&input, &rate), 10);
     }
 }

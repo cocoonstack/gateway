@@ -21,8 +21,7 @@ impl SseDecoder {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(end) = event_boundary(&self.buf) {
-            let event: Vec<u8> = self.buf.drain(..end).collect();
-            let event = String::from_utf8_lossy(&event);
+            let event = String::from_utf8_lossy(&self.buf[..end]);
             for line in event.lines() {
                 let line = line.strip_suffix('\r').unwrap_or(line);
                 if let Some(data) = line.strip_prefix("data:") {
@@ -34,6 +33,7 @@ impl SseDecoder {
                     }
                 }
             }
+            self.buf.drain(..end);
         }
         out
     }

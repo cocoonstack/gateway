@@ -3,7 +3,7 @@
 //! that boundary. The mock protocol flags byte-level vendor differences as
 //! deferred to a later fidelity pass.
 
-use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, TypedParams};
+use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams};
 use serde_json::{Value, json};
 
 use crate::base::{Base, base_engine};
@@ -177,10 +177,6 @@ impl ModelEngine for VertexEngine {
         resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 /// Apply one `streamGenerateContent` frame to the accumulating response;
@@ -289,18 +285,8 @@ impl ModelEngine for EmbeddingsEngine {
                 body,
             )
             .await?;
-        let first: Vec<f32> = v["data"][0]["embedding"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_f64())
-                    .map(|x| x as f32)
-                    .collect()
-            })
-            .unwrap_or_default();
         let pt = crate::engine::tok(&v["usage"]["prompt_tokens"]);
         let resp = GatewayResponse {
-            embeddings: first,
             model: param.model_name.clone(),
             prompt_tokens: pt,
             total_tokens: pt,
@@ -310,10 +296,6 @@ impl ModelEngine for EmbeddingsEngine {
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 
@@ -359,10 +341,6 @@ impl ModelEngine for ImageEngine {
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 
@@ -446,10 +424,6 @@ impl ModelEngine for AudioEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 base_engine!(VideoEngine);
@@ -496,10 +470,6 @@ impl ModelEngine for VideoEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 base_engine!(SearchEngine);
@@ -541,10 +511,6 @@ impl ModelEngine for SearchEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 base_engine!(PassthroughEngine);
@@ -578,10 +544,6 @@ impl ModelEngine for PassthroughEngine {
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 
@@ -652,10 +614,6 @@ impl ModelEngine for CompletionsEngine {
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 
@@ -906,10 +864,6 @@ impl ModelEngine for ResponsesEngine {
             )),
         }
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 #[cfg(test)]
@@ -973,7 +927,11 @@ mod tests {
             t(),
         );
         let out = e.run().await.unwrap();
-        assert_eq!(out.response.embeddings.len(), 8);
+        let dims = out.response.response_v2.as_ref().unwrap()["data"][0]["embedding"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(dims, 8);
         assert!(out.response.prompt_tokens > 0);
     }
 

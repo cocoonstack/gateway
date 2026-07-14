@@ -89,7 +89,6 @@ fn common_usage_matches_go_struct_semantics() {
     assert_eq!(u.write_cache, 0);
     assert_eq!(u.completion, 3);
     assert_eq!(u.reason, 2);
-    assert_eq!(u.platform_total, 15);
 }
 
 #[test]
@@ -99,7 +98,6 @@ fn anthropic_common_usage_matches_semantics() {
     assert_eq!(u.platform_input, 8);
     assert_eq!(u.read_cache, 1);
     assert_eq!(u.completion, 6);
-    assert_eq!(u.platform_total, 15);
 }
 
 fn claude_req() -> GatewayRequest {
@@ -165,7 +163,6 @@ fn anthropic_cache_usage_matches_go_recorded() {
     assert_eq!(u.read_cache, 2);
     assert_eq!(u.write_cache, 3);
     assert_eq!(u.completion, 0);
-    assert_eq!(u.platform_total, 17);
 }
 
 #[tokio::test]

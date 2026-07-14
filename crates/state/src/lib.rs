@@ -228,15 +228,17 @@ impl RateLimiter {
         if qps <= 0.0 {
             return false;
         }
-        let mut e = self
-            .buckets
-            .entry(key.to_owned())
-            .or_insert_with(|| (qps, new_bucket(qps)));
-        if e.0 != qps {
-            *e = (qps, new_bucket(qps));
-        }
-        let limiter = e.1.clone();
-        drop(e);
+        let limiter = loop {
+            if let Some(mut e) = self.buckets.get_mut(key) {
+                if e.0 != qps {
+                    *e = (qps, new_bucket(qps));
+                }
+                break e.1.clone();
+            }
+            self.buckets
+                .entry(key.to_owned())
+                .or_insert_with(|| (qps, new_bucket(qps)));
+        };
         limiter.check().is_ok()
     }
 }
@@ -278,31 +280,53 @@ impl QuotaStore {
 
     /// Post-consume actual usage; saturating against a hostile i64::MAX count.
     pub fn consume(&self, ak: &str, tokens: i64) {
-        let mut e = self.used.entry(ak.to_owned()).or_insert(0);
+        let mut e = counter(&self.used, ak);
         *e = e.saturating_add(tokens);
     }
 
-    /// Admission with reservation, atomic under the entry guard: admit while
-    /// spent-before < `limit`, adding `amount` so in-flight requests count.
+    /// Admission with reservation, atomic under the entry guard.
     pub fn reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
-        let mut e = self.used.entry(key.to_owned()).or_insert(0);
-        if *e >= limit {
-            return false;
-        }
-        *e = e.saturating_add(amount);
-        true
+        reserve_on(&mut counter(&self.used, key), amount, limit)
     }
 
     /// Apply the settle delta (actual - reserved); never below zero.
     pub fn settle(&self, key: &str, delta: i64) {
-        let mut e = self.used.entry(key.to_owned()).or_insert(0);
-        *e = e.saturating_add(delta).max(0);
+        settle_on(&mut counter(&self.used, key), delta);
     }
 
     /// Daily reset.
     pub fn reset_all(&self) {
         self.used.clear();
     }
+}
+
+/// The counter entry for `key`, allocating the key String only on first use.
+fn counter<'a>(
+    map: &'a DashMap<String, i64>,
+    key: &str,
+) -> dashmap::mapref::one::RefMut<'a, String, i64> {
+    loop {
+        if let Some(e) = map.get_mut(key) {
+            return e;
+        }
+        map.entry(key.to_owned()).or_insert(0);
+    }
+}
+
+/// Admit while spent-before < `limit`, adding `amount` so in-flight work
+/// counts — the one in-process reserve semantics (Redis mirrors it in
+/// `reserve_capped`).
+fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
+    if *counter >= limit {
+        return false;
+    }
+    *counter = counter.saturating_add(amount);
+    true
+}
+
+/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
+fn settle_on(counter: &mut i64, delta: i64) {
+    *counter = counter.saturating_add(delta).max(0);
 }
 
 /// Account pool: pick the highest-priority slot serving a model type, round-robin
@@ -427,18 +451,12 @@ impl TokenWindow {
 
     /// Windowed admission with reservation, atomic under the entry guard.
     pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: std::time::Duration) -> bool {
-        let mut e = self.slot(key, window);
-        if e.1 >= limit {
-            return false;
-        }
-        e.1 = e.1.saturating_add(amount);
-        true
+        reserve_on(&mut self.slot(key, window).1, amount, limit)
     }
 
     /// Apply the settle delta to the current window; never below zero.
     pub fn settle(&self, key: &str, delta: i64, window: std::time::Duration) {
-        let mut e = self.slot(key, window);
-        e.1 = e.1.saturating_add(delta).max(0);
+        settle_on(&mut self.slot(key, window).1, delta);
     }
 
     /// Post-add actual token usage (saturating on a hostile i64::MAX count).
@@ -454,14 +472,17 @@ impl TokenWindow {
         key: &str,
         window: std::time::Duration,
     ) -> dashmap::mapref::one::RefMut<'_, String, (Instant, i64)> {
-        let mut e = self
-            .entries
-            .entry(key.to_owned())
-            .or_insert_with(|| (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
+        loop {
+            if let Some(mut e) = self.entries.get_mut(key) {
+                if e.0.elapsed() >= window {
+                    *e = (Instant::now(), 0);
+                }
+                return e;
+            }
+            self.entries
+                .entry(key.to_owned())
+                .or_insert_with(|| (Instant::now(), 0));
         }
-        e
     }
 }
 

@@ -15,5 +15,4 @@ pub struct CommonUsage {
     /// completion tokens, excluding reasoning.
     pub completion: i64,
     pub reason: i64,
-    pub platform_total: i64,
 }

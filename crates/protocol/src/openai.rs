@@ -29,16 +29,6 @@ impl MessageContent {
                 .collect(),
         }
     }
-
-    /// Number of image parts (multimodal probe).
-    pub fn image_count(&self) -> usize {
-        match self {
-            MessageContent::Text(_) => 0,
-            MessageContent::Parts(parts) => {
-                parts.iter().filter(|p| p["type"] == "image_url").count()
-            }
-        }
-    }
 }
 
 impl Default for MessageContent {
@@ -228,7 +218,9 @@ pub struct ChunkChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
-    pub object: String, // "chat.completion.chunk"
+    /// Always "chat.completion.chunk"; borrowed so per-frame construction
+    /// doesn't allocate it.
+    pub object: std::borrow::Cow<'static, str>,
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
@@ -286,7 +278,7 @@ impl ChatCompletionChunk {
     ) -> Self {
         Self {
             id: id.to_owned(),
-            object: "chat.completion.chunk".to_owned(),
+            object: std::borrow::Cow::Borrowed("chat.completion.chunk"),
             created,
             model: model.to_owned(),
             choices: vec![ChunkChoice {
@@ -322,7 +314,6 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
         let c = req.messages[0].content.as_ref().unwrap();
         assert_eq!(c.text(), "look: what is it?");
-        assert_eq!(c.image_count(), 1);
     }
 
     #[test]

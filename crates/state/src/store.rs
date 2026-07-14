@@ -195,7 +195,7 @@ pub struct UsageRow {
 
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + std::fmt::Debug {
-    async fn ledger_add(&self, r: BillingRecord) -> GResult<()>;
+    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()>;
     /// Total count plus the most recent `limit` records in chronological order;
     /// the ledger is append-only, so count/page skew is at most one fresh record.
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
@@ -303,12 +303,12 @@ impl MemoryStore {
 
 #[async_trait::async_trait]
 impl Store for MemoryStore {
-    async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
+    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
         let mut records = self
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        records.push(r);
+        records.push(r.clone());
         if self.ledger_max_rows > 0 && records.len() > self.ledger_max_rows {
             let excess = records.len() - self.ledger_max_rows;
             records.drain(..excess);
@@ -572,7 +572,7 @@ impl SqliteStore {
 
 #[async_trait::async_trait]
 impl Store for SqliteStore {
-    async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
+    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
@@ -865,7 +865,7 @@ impl PostgresStore {
 
 #[async_trait::async_trait]
 impl Store for PostgresStore {
-    async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
+    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
@@ -1306,8 +1306,8 @@ mod tests {
     }
 
     async fn exercise(store: &dyn Store) {
-        store.ledger_add(record("m1")).await.unwrap();
-        store.ledger_add(record("m2")).await.unwrap();
+        store.ledger_add(&record("m1")).await.unwrap();
+        store.ledger_add(&record("m2")).await.unwrap();
         let (total, snap) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 2);
         assert_eq!(snap[0].model, "m1");
@@ -1427,7 +1427,7 @@ mod tests {
     async fn ledger_retention_caps_both_stores() {
         let mem = MemoryStore::with_ledger_cap(2);
         for m in ["a", "b", "c"] {
-            mem.ledger_add(record(m)).await.unwrap();
+            mem.ledger_add(&record(m)).await.unwrap();
         }
         let (total, page) = mem.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 2);
@@ -1440,7 +1440,7 @@ mod tests {
         // the SQL stores prune every LEDGER_PRUNE_EVERY inserts, so the cap is
         // approximate: drive past one full prune cycle and check the bound
         for i in 0..=LEDGER_PRUNE_EVERY {
-            store.ledger_add(record(&format!("m{i}"))).await.unwrap();
+            store.ledger_add(&record(&format!("m{i}"))).await.unwrap();
         }
         let (total, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 2, "prune cycle enforces the cap");
@@ -1522,7 +1522,7 @@ mod tests {
             return;
         };
         let store = PostgresStore::connect(&url).await.expect("pg connect");
-        store.ledger_add(record("gpt-4o")).await.unwrap();
+        store.ledger_add(&record("gpt-4o")).await.unwrap();
         let (total, page) = store.ledger_snapshot(5).await.unwrap();
         assert!(total >= 1);
         assert_eq!(page.last().unwrap().model, "gpt-4o");

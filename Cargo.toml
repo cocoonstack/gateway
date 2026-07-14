@@ -3,8 +3,7 @@
 resolver = "2"
 members = [
     "crates/consts",
-    "crates/utils",
-    "crates/models",
+        "crates/models",
     "crates/protocol",
     "crates/config",
     "crates/state",
@@ -66,7 +65,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # --- internal crates (path deps) ---
 gw-consts = { path = "crates/consts" }
-gw-utils = { path = "crates/utils" }
 gw-models = { path = "crates/models" }
 gw-protocol = { path = "crates/protocol" }
 gw-config = { path = "crates/config" }

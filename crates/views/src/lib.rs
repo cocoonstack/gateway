@@ -932,6 +932,17 @@ async fn scoped_key(
     }
 }
 
+/// The admin surfaces' public view of a key — one shape for PATCH and GET.
+fn ak_public_json(k: &AkInfo) -> Value {
+    json!({
+        "ak": k.ak, "product": k.product, "tenant": k.tenant,
+        "qps": k.qps, "daily_token_quota": k.daily_token_quota,
+        "tokens_per_minute": k.tokens_per_minute,
+        "expires_at_epoch_secs": k.expires_at_epoch_secs,
+        "banned": k.banned,
+    })
+}
+
 /// A tenant-owned store lookup: another tenant's resource answers 404 (not
 /// 403), so sequential ids can't be probed for cross-tenant existence.
 #[allow(clippy::result_large_err)] // mirrors the surrounding admin/lookup helpers
@@ -1087,18 +1098,7 @@ async fn admin_key_patch(
     let patched = s.handler.state().auth.patch(&ak, &patch).await;
     match patched {
         Err(e) => gateway_error(e),
-        Ok(Some(info)) => (
-            StatusCode::OK,
-            Json(json!({
-                "ak": info.ak, "product": info.product, "tenant": info.tenant,
-                "qps": info.qps,
-                "daily_token_quota": info.daily_token_quota,
-                "tokens_per_minute": info.tokens_per_minute,
-                "expires_at_epoch_secs": info.expires_at_epoch_secs,
-                "banned": info.banned,
-            })),
-        )
-            .into_response(),
+        Ok(Some(info)) => (StatusCode::OK, Json(ak_public_json(&info))).into_response(),
         Ok(None) => error_response(404, format!("key {ak} not found")),
     }
 }
@@ -1172,15 +1172,7 @@ async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Respon
     let keys: Vec<Value> = listed
         .into_iter()
         .filter(|k| scope.covers(&k.tenant))
-        .map(|k| {
-            json!({
-                "ak": k.ak, "product": k.product, "tenant": k.tenant,
-                "qps": k.qps, "daily_token_quota": k.daily_token_quota,
-                "tokens_per_minute": k.tokens_per_minute,
-                "expires_at_epoch_secs": k.expires_at_epoch_secs,
-                "banned": k.banned,
-            })
-        })
+        .map(|k| ak_public_json(&k))
         .collect();
     Json(json!({ "count": keys.len(), "keys": keys })).into_response()
 }
@@ -1512,20 +1504,23 @@ fn chat_stream_response(
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
-                Some(c) => {
+                Some(mut c) => {
                     if !c.delta.is_empty() {
                         let chunk = ChatCompletionChunk::content(
                             &self.id,
                             self.created,
                             &self.model,
-                            c.delta,
+                            std::mem::take(&mut c.delta),
                         );
                         if let Ok(payload) = serde_json::to_string(&chunk) {
                             self.queue.push_back(Event::default().data(payload));
                         }
                     }
-                    if let Some(tc) = &c.tool_calls {
-                        let calls = tc.as_array().cloned().unwrap_or_default();
+                    if let Some(tc) = c.tool_calls.take() {
+                        let calls = match tc {
+                            Value::Array(a) => a,
+                            _ => Vec::new(),
+                        };
                         let chunk = ChatCompletionChunk::tool_calls(
                             &self.id,
                             self.created,
@@ -1710,7 +1705,7 @@ async fn messages(
         return anthropic_error(500, "pipeline produced no outcome");
     };
 
-    let tool_use = anthropic_tool_blocks(&outcome.response.tool_calls);
+    let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.as_ref());
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
         content.push(gw_protocol::anthropic::ContentBlock::Text {
@@ -1739,7 +1734,7 @@ async fn messages(
 
 /// tool_use blocks for an engine's tool_calls: native blocks pass through;
 /// OpenAI-shaped calls run through the dsl's openai→anthropic mapping.
-fn anthropic_tool_blocks(tool_calls: &Option<Value>) -> Vec<Value> {
+fn anthropic_tool_blocks(tool_calls: Option<&Value>) -> Vec<Value> {
     let Some(Value::Array(blocks)) = tool_calls else {
         return Vec::new();
     };
@@ -1859,7 +1854,7 @@ fn messages_stream_response(
         fn finish(&mut self, input_tokens: i64, output_tokens: i64) {
             self.ensure_message_start();
             if let Some(frags) = self.tool_frags.take() {
-                for block in anthropic_tool_blocks(&Some(frags)) {
+                for block in anthropic_tool_blocks(Some(&frags)) {
                     self.emit_tool_block(&block);
                 }
             }
@@ -1909,7 +1904,7 @@ fn messages_stream_response(
                             .map(|a| a.iter().any(|b| b["type"] == "tool_use"))
                             .unwrap_or(false);
                         if native {
-                            for block in anthropic_tool_blocks(&Some(tc.clone())) {
+                            for block in anthropic_tool_blocks(Some(tc)) {
                                 self.emit_tool_block(&block);
                             }
                         } else {

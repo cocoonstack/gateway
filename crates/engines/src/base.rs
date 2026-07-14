@@ -1,9 +1,8 @@
-//! Shared engine scaffolding: request + transport + recorder, the account
-//! go-live seam (endpoint/key resolution), and the JSON round-trip helpers the
-//! family and bespoke engines build on.
+//! Shared engine scaffolding: request + transport, the account go-live seam
+//! (endpoint/key resolution), and the JSON round-trip helpers the family and
+//! bespoke engines build on.
 
-use chrono::Utc;
-use gw_models::{GResult, GatewayError, SimpleRecorder};
+use gw_models::{GResult, GatewayError};
 use serde_json::Value;
 
 use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
@@ -11,20 +10,15 @@ use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamR
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
     pub transport: SharedTransport,
-    pub recorder: SimpleRecorder,
 }
 
 impl Base {
     pub fn new(request: gw_models::GatewayRequest, transport: SharedTransport) -> Self {
-        Self {
-            request,
-            transport,
-            recorder: SimpleRecorder::new(Utc::now()),
-        }
+        Self { request, transport }
     }
 
     pub fn account(&self) -> String {
-        self.request.account_name()
+        self.request.account_name().to_owned()
     }
 
     /// The go-live seam: the account's configured endpoint when set, else the

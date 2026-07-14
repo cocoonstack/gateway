@@ -3,7 +3,7 @@
 //! `GatewayResponse` + stream chunks, and slices the raw usage subtree into
 //! `raw_usage_json` for the CommonUsage DAG node.
 
-use gw_models::{GResult, GatewayError, GatewayResponse, Recorder, TypedParams};
+use gw_models::{GResult, GatewayError, GatewayResponse, TypedParams};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -163,10 +163,6 @@ impl ModelEngine for OpenAiEngine {
             body => self.run_sse(reply.status, body).await,
         }
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 /// Apply one decoded SSE event to the accumulating response; returns the
@@ -249,11 +245,12 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
             call["function"]["name"] = json!(name);
         }
         if let Some(args) = f["function"]["arguments"].as_str() {
-            let joined = format!(
-                "{}{args}",
-                call["function"]["arguments"].as_str().unwrap_or("")
-            );
-            call["function"]["arguments"] = json!(joined);
+            // append in place — rebuilding the string per fragment is quadratic
+            if let Value::String(acc) = &mut call["function"]["arguments"] {
+                acc.push_str(args);
+            } else {
+                call["function"]["arguments"] = json!(args);
+            }
         }
     }
 }

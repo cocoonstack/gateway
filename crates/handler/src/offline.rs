@@ -138,6 +138,12 @@ impl OfflineHandler {
             let online = self.online.clone();
             let item_ak = ak.clone();
             let ran = tokio::spawn(async move { online.run(request, item_ak).await }).await;
+            let fail = |message: String| BatchItemResult {
+                index,
+                ok: false,
+                message,
+                total_tokens: 0,
+            };
             let result = match ran {
                 Ok(Ok(ctx)) => match ctx.outcome {
                     Some(out) => BatchItemResult {
@@ -146,25 +152,10 @@ impl OfflineHandler {
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
                     },
-                    None => BatchItemResult {
-                        index,
-                        ok: false,
-                        message: "pipeline produced no outcome".into(),
-                        total_tokens: 0,
-                    },
+                    None => fail("pipeline produced no outcome".into()),
                 },
-                Ok(Err(e)) => BatchItemResult {
-                    index,
-                    ok: false,
-                    message: e.to_string(),
-                    total_tokens: 0,
-                },
-                Err(join_err) => BatchItemResult {
-                    index,
-                    ok: false,
-                    message: format!("item task failed: {join_err}"),
-                    total_tokens: 0,
-                },
+                Ok(Err(e)) => fail(e.to_string()),
+                Err(join_err) => fail(format!("item task failed: {join_err}")),
             };
             // if we lost the claim mid-run, don't persist — the new owner is authoritative
             if lost.load(Relaxed) {

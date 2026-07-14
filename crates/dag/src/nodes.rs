@@ -32,12 +32,19 @@ impl DagNode for ModelQuotaGate {
         "model_quota"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let requested = match ctx.request.model_param_v2.as_ref() {
-            Some(p) if !p.model_name.is_empty() => p.model_name.clone(),
+        let limit = match ctx.request.model_param_v2.as_ref() {
+            Some(p) if !p.model_name.is_empty() => {
+                admission::model_quota_limit(&ctx.cfg, &ctx.ak, &p.model_name)
+            }
             _ => return Ok(()),
         };
-        let Some(limit) = admission::model_quota_limit(&ctx.cfg, &ctx.ak, &requested) else {
+        let Some(limit) = limit else {
             return Ok(());
+        };
+        // clone only on the metered path — the common unmetered case stays allocation-free
+        let requested = match ctx.request.model_param_v2.as_ref() {
+            Some(p) => p.model_name.clone(),
+            None => return Ok(()),
         };
         let key = admission::model_quota_key(&ctx.ak.ak, &requested);
         let under = ctx.state.governance.quota_check(&key, limit).await;
@@ -87,12 +94,12 @@ impl DagNode for ResolveModel {
             .model_param_v2
             .as_mut()
             .ok_or_else(|| GatewayError::bad_request("request missing model param"))?;
-        let name = param.model_name.clone();
-        let mt = if let Some(conf) = ctx.cfg.find_model(&name) {
+        let name = &param.model_name;
+        let mt = if let Some(conf) = ctx.cfg.find_model(name) {
             conf.protocol().ok_or_else(|| {
                 GatewayError::internal(format!("config maps `{name}` to unknown type"))
             })?
-        } else if let Some(direct) = Protocol::from_wire(&name) {
+        } else if let Some(direct) = Protocol::from_wire(name) {
             direct // callers may address a wire model type directly
         } else {
             return Err(GatewayError::new(
@@ -101,8 +108,9 @@ impl DagNode for ResolveModel {
                 format!("unknown model: {name}"),
             ));
         };
+        let decision = format!("{name} -> {mt}");
         param.protocol = mt;
-        ctx.decide("resolve_model", format!("{name} -> {mt}"));
+        ctx.decide("resolve_model", decision);
         Ok(())
     }
 }
@@ -193,13 +201,14 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     // generation: a reload may have remapped the model — a pre-reload entry must not match
     h.update(ctx.cfg.generation().to_le_bytes());
     h.update(param.model_name.as_bytes());
-    h.update(serde_json::to_vec(&ctx.request.message).ok()?);
+    // serialize straight into the hasher — no throwaway buffers for a multi-KB history
+    serde_json::to_writer(&mut h, &ctx.request.message).ok()?;
     if let Some(t) = &param.typed {
-        h.update(serde_json::to_vec(t).ok()?);
+        serde_json::to_writer(&mut h, t).ok()?;
     }
     // raw params (seed, vendor extras) change the output — omitting them would collide entries
     if !param.raw.is_null() {
-        h.update(serde_json::to_vec(&param.raw).ok()?);
+        serde_json::to_writer(&mut h, &param.raw).ok()?;
     }
     Some(hex::encode(h.finalize()))
 }
@@ -266,7 +275,7 @@ impl DagNode for SelectAccount {
         let account = ctx
             .state
             .pool
-            .select_healthy(mt, provider.as_deref(), &[], ctx.state.health.as_ref())
+            .select_healthy(mt, provider, &[], ctx.state.health.as_ref())
             .await
             .ok_or_else(|| {
                 GatewayError::new(
@@ -437,7 +446,7 @@ impl DagNode for CallEngine {
                     .pool
                     .select_healthy(
                         mt,
-                        provider.as_deref(),
+                        provider,
                         std::slice::from_ref(&failed.name),
                         ctx.state.health.as_ref(),
                     )
@@ -580,7 +589,6 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
-    let account = ctx.request.account_name();
     let record = admission::settle_and_bill(
         ctx.state.governance.as_ref(),
         ctx.state.store.as_ref(),
@@ -593,7 +601,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 requested_model: requested,
                 served_model: served,
                 protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
-                account: &account,
+                account: ctx.request.account_name(),
                 prompt,
                 completion,
                 total,
@@ -602,7 +610,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
             reserved: ctx.quota_reserved.take().unwrap_or(0),
             tpm_reserved: ctx.tpm_reserved.take(),
             reserved_at: ctx.quota_at,
-            model_quota_key: ctx.model_quota_key.clone(),
+            model_quota_key: ctx.model_quota_key.take(),
         },
     )
     .await;
@@ -699,9 +707,9 @@ pub fn default_layers() -> Vec<Layer> {
 }
 
 /// The provider a model is bound to in config, if any.
-fn model_provider(ctx: &DagContext) -> Option<String> {
+fn model_provider(ctx: &DagContext) -> Option<&str> {
     let name = &ctx.request.model_param_v2.as_ref()?.model_name;
-    ctx.cfg.find_model(name).and_then(|m| m.provider.clone())
+    ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())
 }
 
 #[cfg(test)]

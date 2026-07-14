@@ -7,6 +7,8 @@
 use gw_config::SecurityConf;
 use gw_models::{Block, GatewayRequest, GatewayResponse};
 
+const BLOCKED_MSG: &str = "this content cannot be answered, please try a different request";
+
 /// Blocklist check. Returns Block on a hit (block=true implies hit=true).
 /// Scans the same inbound text DLP covers, so no surface is a bypass; takes
 /// `&mut` only to share the one traversal with the redaction pass.
@@ -30,8 +32,10 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> Optio
         }
     }
     if blocked > 0 {
-        let e = gw_consts::error_code::exceptions::empty_resp_err();
-        return Some(Block::blocked(e.msg, e.code as i32));
+        return Some(Block::blocked(
+            BLOCKED_MSG,
+            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+        ));
     }
     None
 }
@@ -105,10 +109,7 @@ pub fn realtime_frame_blocked(sec: &SecurityConf, frame: &mut serde_json::Value)
     }
     let hits =
         gw_engines::realtime::visit_frame_text(frame, &mut |s| usize::from(blocklist_hit(sec, s)));
-    (hits > 0).then(|| {
-        let e = gw_consts::error_code::exceptions::empty_resp_err();
-        Block::blocked(e.msg, e.code as i32)
-    })
+    (hits > 0).then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32))
 }
 
 /// DLP-redact a realtime frame's text-bearing fields in place; the hit count.

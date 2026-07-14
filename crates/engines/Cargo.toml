@@ -10,7 +10,6 @@ description = "Model engines: ModelEngine trait + factory + implementations."
 gw-consts = { workspace = true }
 gw-models = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

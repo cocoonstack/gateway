@@ -2,7 +2,7 @@
 //! blocks, and streaming (the standard anthropic SSE event sequence). Marks
 //! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
-use gw_models::{GResult, GatewayError, GatewayResponse, Recorder, TypedParams};
+use gw_models::{GResult, GatewayError, GatewayResponse, TypedParams};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -167,10 +167,6 @@ impl ModelEngine for ClaudeEngine {
             UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
             body => self.run_sse(reply.status, body).await,
         }
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 

@@ -3,7 +3,7 @@
 //! response shape (the mock answers in the same shapes). AWS engines compute a
 //! real SigV4 Authorization header.
 
-use gw_models::{GResult, GatewayError, GatewayResponse, Recorder};
+use gw_models::{GResult, GatewayError, GatewayResponse};
 use serde_json::{Value, json};
 
 use crate::base::{Base, base_engine};
@@ -117,10 +117,6 @@ impl ModelEngine for ErnieEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 base_engine!(MinimaxV1Engine);
@@ -171,10 +167,6 @@ impl ModelEngine for MinimaxV1Engine {
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 
@@ -230,10 +222,6 @@ impl ModelEngine for CohereEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
-    }
 }
 
 base_engine!(LlamaEngine);
@@ -287,10 +275,6 @@ impl ModelEngine for LlamaEngine {
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 
@@ -418,10 +402,6 @@ impl ModelEngine for DashScopeEngine {
         crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = dashscope_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.base.recorder
     }
 }
 

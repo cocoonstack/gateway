@@ -5,23 +5,18 @@
 //! It is the concrete pattern new engines should follow:
 //! hold the request + a recorder, implement `run()` and `recorder()`.
 
-use chrono::Utc;
-use gw_models::{GResult, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder};
+use gw_models::{GResult, GatewayRequest, GatewayResponse};
 
 use crate::engine::{EngineOutcome, ModelEngine};
 
 /// Placeholder engine that echoes the dispatched model type and request flags.
 pub struct EchoEngine {
     request: GatewayRequest,
-    recorder: SimpleRecorder,
 }
 
 impl EchoEngine {
     pub fn new(request: GatewayRequest) -> Self {
-        Self {
-            request,
-            recorder: SimpleRecorder::new(Utc::now()),
-        }
+        Self { request }
     }
 }
 
@@ -48,10 +43,6 @@ impl ModelEngine for EchoEngine {
             ..Default::default()
         };
         Ok(EngineOutcome::ok(response))
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.recorder
     }
 }
 

@@ -24,11 +24,8 @@ impl GatewayRequest {
     }
 
     /// The serving account's name; empty when none is selected.
-    pub fn account_name(&self) -> String {
-        self.account
-            .as_ref()
-            .map(|a| a.name.clone())
-            .unwrap_or_default()
+    pub fn account_name(&self) -> &str {
+        self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")
     }
 }
 

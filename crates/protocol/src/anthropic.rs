@@ -120,22 +120,6 @@ impl MessagesResponse {
             usage,
         }
     }
-
-    pub fn text(
-        id: impl Into<String>,
-        model: impl Into<String>,
-        text: impl Into<String>,
-        stop_reason: impl Into<String>,
-        usage: AnthUsage,
-    ) -> Self {
-        Self::new(
-            id,
-            model,
-            vec![ContentBlock::Text { text: text.into() }],
-            stop_reason,
-            usage,
-        )
-    }
 }
 
 #[cfg(test)]
