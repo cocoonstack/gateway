@@ -21,7 +21,16 @@ pub fn is_response_create(frame: &Value) -> bool {
 fn skip_scalar(k: &str, text_delta: bool) -> bool {
     matches!(
         k,
-        "audio" | "data" | "type" | "object" | "status" | "role" | "voice" | "model" | "format"
+        "audio"
+            | "data"
+            | "image_url"
+            | "type"
+            | "object"
+            | "status"
+            | "role"
+            | "voice"
+            | "model"
+            | "format"
     ) || (k == "delta" && !text_delta)
         || k == "id"
         || k.ends_with("_id")
@@ -54,8 +63,8 @@ fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usiz
             .iter_mut()
             .map(|(k, x)| match x {
                 Value::String(_) if skip_scalar(k, text_delta) => 0,
-                // identifier list, never prose
-                _ if k == "modalities" => 0,
+                // identifier lists, never prose
+                _ if k == "modalities" || k == "output_modalities" => 0,
                 _ => walk(x, text_delta, f),
             })
             .sum(),
@@ -174,6 +183,27 @@ mod tests {
                 "t".to_owned(),
             ],
             "every text leaf of a tool schema is scanned; `type` identifiers are not"
+        );
+
+        let mut modal = json!({
+            "type": "session.update",
+            "session": {"output_modalities": ["audio"],
+                         "instructions": "x"}
+        });
+        assert_eq!(
+            visit_frame_text(&mut modal, &mut |_| 1),
+            1,
+            "modality identifier lists are never scanned"
+        );
+        let mut img = json!({
+            "type": "conversation.item.create",
+            "item": {"content": [{"type": "input_image",
+                                   "image_url": "data:image/png;base64,AAAA13812345678A=="}]}
+        });
+        assert_eq!(
+            visit_frame_text(&mut img, &mut |_| 1),
+            0,
+            "image data URIs are never rewritten"
         );
 
         let mut err = json!({"type": "error", "error": {"message": "boom jane@corp.com"}});
