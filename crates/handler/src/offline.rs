@@ -195,21 +195,12 @@ impl OfflineHandler {
         if lost.load(Relaxed) {
             return; // the reclaiming instance owns the terminal status now
         }
-        // Re-derive the terminal status from the PERSISTED result set (the union
-        // of our first-writer results and any racing/prior executor's), not our
-        // in-memory view — so the status can't contradict what's stored. Complete
-        // only when every item has a result and all succeeded; any failure or
-        // missing (unpersisted) result → Failed.
-        let done = match store.batch_get(id).await {
-            Ok(Some(job)) if job.results.len() == job.total && job.results.iter().all(|r| r.ok) => {
-                BatchStatus::Completed
-            }
-            _ => BatchStatus::Failed,
-        };
-        // fenced terminal write: applies only if we still hold the claim, so a
-        // reclaim during the last item can't be clobbered by a stale status
-        if let Err(e) = store.batch_set_status_owned(id, done, claim).await {
-            tracing::error!(error = %e, batch = %id, "batch status write failed");
+        // Finalize: derive the terminal status from the PERSISTED result set and
+        // set it atomically, fenced on the claim. On the distributed backend this
+        // is serialized with result writes, so no late result can land after the
+        // decision and contradict it.
+        if let Err(e) = store.batch_finalize(id, claim).await {
+            tracing::error!(error = %e, batch = %id, "batch finalize failed");
         }
     }
 

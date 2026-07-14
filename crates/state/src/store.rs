@@ -219,6 +219,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<BatchJob>;
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>>;
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()>;
+    /// Record one item's result. First-writer-wins (a reclaimed stale executor
+    /// can't overwrite the owner's result) and rejected once the batch is
+    /// terminal (so a late insert can't land after the finalize decision).
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()>;
     /// Set status only if `claim` still matches the batch's fence token (see
     /// [`Store::batch_claim_pending`]); returns whether the write applied. So a
@@ -231,6 +234,27 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         _claim: i64,
     ) -> GResult<bool> {
         self.batch_set_status(id, status).await.map(|()| true)
+    }
+    /// Transition a running batch to its terminal status DERIVED from the
+    /// persisted result set (Completed iff every item has a result and all
+    /// succeeded), only if `claim` still owns it. On the fenced backend this is
+    /// serialized with result writes via the batch row lock, so a late result
+    /// insert can't land after the terminal decision. Returns `None` if the batch
+    /// is no longer owned or already terminal. The default is the single-executor
+    /// read → derive → fenced-set (no concurrent writer to race).
+    async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
+        let Some(job) = self.batch_get(id).await? else {
+            return Ok(None);
+        };
+        let done = if job.results.len() == job.total && job.results.iter().all(|r| r.ok) {
+            BatchStatus::Completed
+        } else {
+            BatchStatus::Failed
+        };
+        Ok(self
+            .batch_set_status_owned(id, done, claim)
+            .await?
+            .then_some(done))
     }
 
     /// Whether this backend runs a fleet work queue (any instance drains
@@ -411,9 +435,11 @@ impl Store for MemoryStore {
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         if let Some(mut j) = self.jobs.get_mut(id)
+            && !matches!(j.status, BatchStatus::Completed | BatchStatus::Failed)
             && !j.results.iter().any(|r| r.index == result.index)
         {
-            j.results.push(result); // first-writer-wins (matches the SQL backends)
+            // first-writer-wins, and never into a terminal batch
+            j.results.push(result);
         }
         Ok(())
     }
@@ -754,15 +780,19 @@ impl Store for SqliteStore {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
+        // reject inserts into a terminal batch (single-node, so no writer race)
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
-             VALUES (?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?
+             WHERE EXISTS (SELECT 1 FROM batches
+                           WHERE id = ? AND status NOT IN ('completed', 'failed'))",
         )
         .bind(id)
         .bind(result.index as i64)
         .bind(result.ok)
         .bind(&result.message)
         .bind(result.total_tokens)
+        .bind(id)
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert batch result", e))?;
@@ -1062,12 +1092,16 @@ impl Store for PostgresStore {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
-        // first-writer-wins: a reclaimed stale executor must not overwrite the
-        // new owner's result (which would let a terminal batch's output mutate,
-        // or leave a completed batch holding a failed item result)
+        // first-writer-wins (DO NOTHING) so a reclaimed stale executor can't
+        // overwrite the owner's result; and only while the batch is non-terminal.
+        // The `FOR UPDATE` takes the batch row lock, serializing this insert with
+        // batch_finalize's terminal UPDATE — so a missing-index insert can't land
+        // after the finalize decided the batch was Failed.
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
-             VALUES ($1, $2, $3, $4, $5)
+             SELECT $1, $2, $3, $4, $5
+             WHERE EXISTS (SELECT 1 FROM batches
+                           WHERE id = $1 AND status NOT IN ('completed', 'failed') FOR UPDATE)
              ON CONFLICT (batch_id, idx) DO NOTHING",
         )
         .bind(id)
@@ -1079,6 +1113,27 @@ impl Store for PostgresStore {
         .await
         .map_err(|e| crate::sqlx_err("insert batch result", e))?;
         Ok(())
+    }
+
+    async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
+        // Derive the terminal status from the result set IN the same UPDATE that
+        // sets it (atomic snapshot), gated on ownership + still-running. The
+        // batch row lock this takes serializes with batch_push_result's FOR
+        // UPDATE, so no result can be inserted between the derive and the write.
+        let row = sqlx::query(
+            "UPDATE batches SET status = CASE
+                 WHEN (SELECT count(*) FROM batch_results WHERE batch_id = $1) = total
+                      AND NOT EXISTS (SELECT 1 FROM batch_results WHERE batch_id = $1 AND ok = false)
+                 THEN 'completed' ELSE 'failed' END
+             WHERE id = $1 AND claim_seq = $2 AND status = 'running'
+             RETURNING status",
+        )
+        .bind(id)
+        .bind(claim)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("finalize batch", e))?;
+        Ok(row.and_then(|r| BatchStatus::parse(r.get::<String, _>(0).as_str())))
     }
 
     fn distributed_batches(&self) -> bool {
@@ -1326,6 +1381,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_result_rejected_after_terminal_and_finalize_derives() {
+        let store = MemoryStore::default();
+        let res = |index, ok| BatchItemResult {
+            index,
+            ok,
+            message: String::new(),
+            total_tokens: 0,
+        };
+        let job = store.batch_create("ak", "default", "m", 2).await.unwrap();
+        store
+            .batch_push_result(&job.id, res(0, true))
+            .await
+            .unwrap();
+
+        // one item's result is missing → finalize derives Failed
+        assert_eq!(
+            store.batch_finalize(&job.id, 0).await.unwrap(),
+            Some(BatchStatus::Failed)
+        );
+        // a stale executor's late result for the missing item must NOT land on the
+        // now-terminal batch (which would flip it to complete-and-successful while
+        // status stays Failed)
+        store
+            .batch_push_result(&job.id, res(1, true))
+            .await
+            .unwrap();
+        let got = store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(got.results.len(), 1, "no result added to a terminal batch");
+        assert_eq!(got.status, BatchStatus::Failed);
+
+        // a fully-resulted batch finalizes Completed
+        let ok = store.batch_create("ak", "default", "m", 1).await.unwrap();
+        store.batch_push_result(&ok.id, res(0, true)).await.unwrap();
+        assert_eq!(
+            store.batch_finalize(&ok.id, 0).await.unwrap(),
+            Some(BatchStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
     async fn ledger_retention_caps_both_stores() {
         let mem = MemoryStore::with_ledger_cap(2);
         for m in ["a", "b", "c"] {
@@ -1479,6 +1574,33 @@ mod tests {
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
         assert_eq!(got.results.len(), 1);
         assert!(got.results[0].ok && got.results[0].message == "ok");
+        // finalize derives Failed (item 1 missing from a total-2 batch), then a
+        // late insert of the missing item into the now-terminal batch is rejected
+        // by the atomic status gate — so it can't flip a Failed batch to
+        // complete-and-successful after the fact
+        assert_eq!(
+            store.batch_finalize(&b.id, 0).await.unwrap(),
+            Some(BatchStatus::Failed)
+        );
+        store
+            .batch_push_result(
+                &b.id,
+                BatchItemResult {
+                    index: 1,
+                    ok: true,
+                    message: "late".into(),
+                    total_tokens: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let got = store.batch_get(&b.id).await.unwrap().unwrap();
+        assert_eq!(
+            got.results.len(),
+            1,
+            "no result added to a terminal PG batch"
+        );
+        assert_eq!(got.status, BatchStatus::Failed);
 
         assert!(store.distributed_batches());
         let qmsgs = vec![
