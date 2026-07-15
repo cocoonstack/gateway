@@ -236,13 +236,16 @@ pub fn realtime_frame_scan(sec: &SecurityConf, frame: &mut serde_json::Value) ->
 }
 
 /// DLP-redact a realtime frame's text-bearing fields in place; the hit count.
+/// Honors both `dlp_redact` (PII) and `detect_secrets` (credentials), the same
+/// as the REST path — a realtime frame must not be a secret-redaction bypass.
 /// Per-frame best effort: a PII span straddling two deltas is not caught — a
 /// realtime relay cannot buffer the way the REST stream surfaces do.
 pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
-    if !sec.dlp_redact {
+    if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
     }
-    gw_engines::realtime::visit_frame_text(frame, &mut redact_str)
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    gw_engines::realtime::visit_frame_text(frame, &mut |s| redact_in_place(s, pii, secrets))
 }
 
 /// DLP inbound redaction: emails, 11-digit phone numbers, and — when
@@ -274,6 +277,16 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     hits
 }
 
+/// A privacy-safe copy of `text` for content retention: PII and secrets are
+/// ALWAYS stripped, independent of the tenant's forwarding DLP flags. Retention
+/// owns its own redaction so a `redacted` row — or a keyless `full` downgrade —
+/// can never persist raw secrets/PII even when inline DLP is disabled.
+pub fn redact_retained(text: &str) -> String {
+    let mut s = text.to_owned();
+    redact_in_place(&mut s, true, true);
+    s
+}
+
 /// Redact one string in place (email/phone via `pii`, secrets via `secrets`);
 /// the hit count.
 fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
@@ -289,7 +302,7 @@ fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     hits
 }
 
-/// Redact one string in place; email/phone only (the outbound/realtime path).
+/// Redact one string in place; email/phone only (the outbound response path).
 fn redact_str(s: &mut String) -> usize {
     redact_in_place(s, true, false)
 }
@@ -542,6 +555,46 @@ mod tests {
         let out = realtime_frame_scan(&s2, &mut frame);
         assert!(out.block.is_none(), "flag does not block realtime");
         assert_eq!(out.hits.len(), 1);
+    }
+
+    #[test]
+    fn realtime_frame_redacts_secrets_when_detect_secrets_on() {
+        // detect_secrets on, dlp_redact OFF: a credential in a realtime frame is
+        // still masked before it reaches the model (the frame is not a bypass)
+        let s = SecurityConf {
+            detect_secrets: true,
+            dlp_redact: false,
+            ..Default::default()
+        };
+        let mut frame = serde_json::json!({
+            "type":"input_text","text":"here is sk-abcdefghijklmnopqrstuvwxyz012345"
+        });
+        let n = dlp_redact_realtime_frame(&s, &mut frame);
+        assert_eq!(n, 1, "secret masked even with dlp_redact off");
+        let text = frame["text"].as_str().unwrap();
+        assert!(
+            text.contains("[REDACTED_SECRET]") && !text.contains("sk-abc"),
+            "{text}"
+        );
+
+        // both flags off: realtime frame untouched
+        let none = SecurityConf::default();
+        let mut frame =
+            serde_json::json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
+        assert_eq!(dlp_redact_realtime_frame(&none, &mut frame), 0);
+    }
+
+    #[test]
+    fn redact_retained_strips_pii_and_secrets_unconditionally() {
+        let out =
+            redact_retained("mail john.doe@example.com key sk-abcdefghijklmnopqrstuvwxyz012345");
+        assert!(out.contains("[REDACTED_EMAIL]"), "{out}");
+        assert!(out.contains("[REDACTED_SECRET]"), "{out}");
+        assert!(
+            !out.contains("example.com") && !out.contains("sk-abc"),
+            "{out}"
+        );
+        assert_eq!(redact_retained("clean text"), "clean text");
     }
 
     #[test]

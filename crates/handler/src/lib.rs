@@ -80,12 +80,17 @@ async fn persist_content(
     } else {
         0
     };
-    let redacted_prompt = || plugins::inbound_text(&ctx.request);
+    // retention owns its redaction: the stored non-full text is always stripped
+    // of PII/secrets even if the tenant forwards traffic with DLP off, so a
+    // keyless `full` downgrade or a `redacted` row can't hold raw content
+    let redacted_prompt = || plugins::redact_retained(&plugins::inbound_text(&ctx.request));
     let redacted_response = || {
-        ctx.outcome
-            .as_ref()
-            .map(|o| o.response.message.clone())
-            .unwrap_or_default()
+        plugins::redact_retained(
+            ctx.outcome
+                .as_ref()
+                .map(|o| o.response.message.as_str())
+                .unwrap_or_default(),
+        )
     };
 
     let items = [

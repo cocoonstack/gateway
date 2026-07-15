@@ -1327,23 +1327,29 @@ async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: S
         Ok(v) => v,
         Err(e) => return gateway_error(e),
     };
-    match s.reload().await {
-        Ok(()) => {
-            audit_admin(
-                &s,
-                &AdminScope::Global,
-                &headers,
-                "config_publish",
-                &version.to_string(),
-                String::new(),
-            )
-            .await;
-            (
-                StatusCode::OK,
-                Json(json!({ "status": "published", "version": version })),
-            )
-                .into_response()
-        }
+    // publish already made this version the fleet source of truth and notified
+    // peers; audit it before the local reload can fail, or a failed apply would
+    // leave the fleet on a config with no publish record
+    let reload = s.reload().await;
+    let detail = match &reload {
+        Ok(()) => String::new(),
+        Err(e) => format!("local reload failed: {e}"),
+    };
+    audit_admin(
+        &s,
+        &AdminScope::Global,
+        &headers,
+        "config_publish",
+        &version.to_string(),
+        detail,
+    )
+    .await;
+    match reload {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "status": "published", "version": version })),
+        )
+            .into_response(),
         Err(e) => error_response(
             500,
             format!("published v{version} but local reload failed: {e}"),
@@ -3032,6 +3038,52 @@ mod tests {
             events.iter().any(|e| e.rule == "dlp"),
             "an inbound PII redaction was recorded, no prompt text stored"
         );
+    }
+
+    #[tokio::test]
+    async fn full_retention_without_key_never_stores_raw_even_with_dlp_off() {
+        // full retention + no GW_CONTENT_KEY + tenant DLP fully off: the keyless
+        // downgrade must still strip secrets, not persist the raw prompt
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, retention: {content: full, days: 1}, security: {dlp_redact: false, detect_secrets: false}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        assert!(
+            !gw_state::sealing_available(),
+            "test env has no content key"
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer k1")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"here is sk-abcdefghijklmnopqrstuvwxyz012345"}]}"#,
+            ))
+            .unwrap();
+        let resp = app(app_state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (_, rows) = store.ledger_snapshot(1).await.unwrap();
+        let stored = store.content_for(&rows[0].request_id).await.unwrap();
+        let prompt = stored
+            .iter()
+            .find(|c| c.kind == "prompt")
+            .expect("prompt stored");
+        assert!(!prompt.sealed, "no key → unsealed");
+        assert!(
+            prompt.content.contains("[REDACTED_SECRET]"),
+            "secret masked: {}",
+            prompt.content
+        );
+        for c in &stored {
+            assert!(
+                !c.content.contains("sk-abc"),
+                "raw secret never persisted: {}",
+                c.content
+            );
+        }
     }
 
     #[tokio::test]
