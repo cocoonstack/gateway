@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     // daily quota reset; governance is a preserved seam, so this survives reloads
     let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
+    let purge_task = gw_task::spawn_content_purge(state.clone(), gw_task::PURGE_PERIOD);
     let distributed_batches = state.store.distributed_batches();
 
     let transport = select_transport()?;
@@ -190,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     quota_task.abort();
+    purge_task.abort();
     tracing::info!("gw drained and exiting");
     Ok(())
 }

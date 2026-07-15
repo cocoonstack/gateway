@@ -362,6 +362,7 @@ async fn bill_realtime_turn(
                 completion: ot,
                 total,
                 ptu_spillover: false,
+                estimated: false,
             },
             reserved: admit.reserved,
             tpm_reserved: admit.tpm_reserved,
@@ -1390,7 +1391,35 @@ async fn admin_usage_users(
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
+    if q.get("format").map(String::as_str) == Some("csv") {
+        let mut csv = String::from(
+            "user_id,model,requests,prompt_tokens,completion_tokens,total_tokens,cost_micros,vendor_cost_micros\n",
+        );
+        for u in &usage {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{}\n",
+                csv_field(&u.user_id),
+                csv_field(&u.model),
+                u.requests,
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.total_tokens,
+                u.cost_micros,
+                u.vendor_cost_micros,
+            ));
+        }
+        return ([("content-type", "text/csv")], csv).into_response();
+    }
     Json(json!({ "usage": usage })).into_response()
+}
+
+/// Quote a CSV field that may contain a comma, quote, or newline (RFC 4180).
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
 }
 
 /// GET /admin/audit/events?limit= — content-safety hits (no prompt text), newest

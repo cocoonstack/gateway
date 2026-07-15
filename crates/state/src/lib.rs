@@ -15,12 +15,14 @@ use gw_models::Account;
 
 pub mod admission;
 pub mod configstore;
+pub mod content;
 pub mod governance;
 pub mod health;
 pub mod keystore;
 pub mod store;
 
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
+pub use content::{ContentRecord, sealing_available};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
 pub use health::{HealthStore, RedisHealth};
 pub use keystore::{KeyStore, PostgresKeyStore};

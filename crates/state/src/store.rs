@@ -59,6 +59,10 @@ pub struct BillingRecord {
     /// PTU spilled over to a paygo account (a failover occurred).
     #[serde(default)]
     pub ptu_spillover: bool,
+    /// Token counts were estimated (an aborted stream billed from delivered
+    /// text), not read from a vendor usage payload.
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 /// Offline batch job status.
@@ -149,6 +153,8 @@ pub struct BillingInput<'a> {
     pub completion: i64,
     pub total: i64,
     pub ptu_spillover: bool,
+    /// Counts are estimated (aborted stream), not vendor-reported.
+    pub estimated: bool,
 }
 
 /// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
@@ -194,6 +200,7 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         cost_micros: gw_models::cost_micros(prompt, completion, charged),
         vendor_cost_micros: gw_models::cost_micros(prompt, completion, vendor),
         ptu_spillover: b.ptu_spillover,
+        estimated: b.estimated,
     }
 }
 
@@ -290,6 +297,14 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// The most recent `limit` admin-audit entries, newest first.
     async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>>;
 
+    /// Store one retained prompt/response record (per-tenant retention policy).
+    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()>;
+    /// Delete content whose `expires_at_epoch_secs` is in `(0, now]`; returns the
+    /// number deleted. Rows with `expires_at = 0` are kept until manual purge.
+    async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
+    /// The retained content for one request (both prompt and response rows).
+    async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>>;
+
     /// Store `content` under a fresh id owned by `tenant`; returns the metadata.
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile>;
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>>;
@@ -375,6 +390,7 @@ pub struct MemoryStore {
     records: Mutex<Vec<BillingRecord>>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
+    content: Mutex<Vec<crate::ContentRecord>>,
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
     seq: AtomicUsize,
@@ -537,6 +553,36 @@ impl Store for MemoryStore {
         Ok(audit.iter().rev().take(limit).cloned().collect())
     }
 
+    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
+        self.content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(r.clone());
+        Ok(())
+    }
+
+    async fn content_purge(&self, now: i64) -> GResult<u64> {
+        let mut content = self
+            .content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = content.len();
+        content.retain(|r| r.expires_at_epoch_secs == 0 || r.expires_at_epoch_secs > now);
+        Ok((before - content.len()) as u64)
+    }
+
+    async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
+        let content = self
+            .content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(content
+            .iter()
+            .filter(|r| r.request_id == request_id)
+            .cloned()
+            .collect())
+    }
+
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let id = format!(
             "file-local-{}",
@@ -629,6 +675,7 @@ where
         user_id: row.get(13),
         request_id: row.get(14),
         created_at_epoch_secs: row.get(15),
+        estimated: row.get(16),
     }
 }
 
@@ -724,6 +771,27 @@ where
     }
 }
 
+fn content_row<'r, R>(row: &'r R) -> crate::ContentRecord
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    crate::ContentRecord {
+        created_at_epoch_secs: row.get(0),
+        request_id: row.get(1),
+        ak: row.get(2),
+        user_id: row.get(3),
+        tenant: row.get(4),
+        kind: row.get(5),
+        content: row.get(6),
+        sealed: row.get(7),
+        expires_at_epoch_secs: row.get(8),
+    }
+}
+
 /// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
 /// file; ids derive from rowids so they stay unique across restarts.
 #[derive(Debug)]
@@ -761,7 +829,8 @@ impl SqliteStore {
                 vendor_cost_micros INTEGER NOT NULL DEFAULT 0,
                 ptu_spillover INTEGER NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
-                created_at_epoch_secs INTEGER NOT NULL DEFAULT 0)",
+                created_at_epoch_secs INTEGER NOT NULL DEFAULT 0,
+                estimated INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
@@ -785,6 +854,14 @@ impl SqliteStore {
                 actor TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
                 action TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '', source_ip TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE IF NOT EXISTS request_content (
+                n INTEGER PRIMARY KEY AUTOINCREMENT, created_at_epoch_secs INTEGER NOT NULL,
+                request_id TEXT NOT NULL DEFAULT '', ak TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '', tenant TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '',
+                sealed INTEGER NOT NULL DEFAULT 0, expires_at_epoch_secs INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
+            "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -799,6 +876,7 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN created_at_epoch_secs INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE billing ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0",
             // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
@@ -828,8 +906,9 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
+             estimated)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.ak)
         .bind(&r.product)
@@ -847,6 +926,7 @@ impl Store for SqliteStore {
         .bind(&r.user_id)
         .bind(&r.request_id)
         .bind(r.created_at_epoch_secs)
+        .bind(r.estimated)
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert billing record", e))?;
@@ -873,7 +953,8 @@ impl Store for SqliteStore {
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
+             estimated
              FROM billing ORDER BY n DESC LIMIT ?",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -1001,6 +1082,51 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| crate::sqlx_err("read admin audit", e))?;
         Ok(rows.iter().map(admin_audit_row).collect())
+    }
+
+    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
+             tenant, kind, content, sealed, expires_at_epoch_secs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(r.created_at_epoch_secs)
+        .bind(&r.request_id)
+        .bind(&r.ak)
+        .bind(&r.user_id)
+        .bind(&r.tenant)
+        .bind(&r.kind)
+        .bind(&r.content)
+        .bind(r.sealed)
+        .bind(r.expires_at_epoch_secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("insert content", e))?;
+        Ok(())
+    }
+
+    async fn content_purge(&self, now: i64) -> GResult<u64> {
+        let r = sqlx::query(
+            "DELETE FROM request_content
+             WHERE expires_at_epoch_secs > 0 AND expires_at_epoch_secs <= ?",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("purge content", e))?;
+        Ok(r.rows_affected())
+    }
+
+    async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
+             sealed, expires_at_epoch_secs FROM request_content WHERE request_id = ? ORDER BY n",
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read content", e))?;
+        Ok(rows.iter().map(content_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -1166,7 +1292,8 @@ impl PostgresStore {
                 vendor_cost_micros BIGINT NOT NULL DEFAULT 0,
                 ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE,
                 user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
-                created_at_epoch_secs BIGINT NOT NULL DEFAULT 0)",
+                created_at_epoch_secs BIGINT NOT NULL DEFAULT 0,
+                estimated BOOLEAN NOT NULL DEFAULT FALSE)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS security_events (
                 n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
@@ -1179,6 +1306,14 @@ impl PostgresStore {
                 actor TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
                 action TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '', source_ip TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE IF NOT EXISTS request_content (
+                n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
+                request_id TEXT NOT NULL DEFAULT '', ak TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '', tenant TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '',
+                sealed BOOLEAN NOT NULL DEFAULT FALSE, expires_at_epoch_secs BIGINT NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
+            "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -1215,6 +1350,7 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -1235,8 +1371,9 @@ impl Store for PostgresStore {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
+             estimated)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
         .bind(&r.ak)
         .bind(&r.product)
@@ -1254,6 +1391,7 @@ impl Store for PostgresStore {
         .bind(&r.user_id)
         .bind(&r.request_id)
         .bind(r.created_at_epoch_secs)
+        .bind(r.estimated)
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert billing record", e))?;
@@ -1280,7 +1418,8 @@ impl Store for PostgresStore {
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
+             estimated
              FROM billing ORDER BY n DESC LIMIT $1",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -1417,6 +1556,51 @@ impl Store for PostgresStore {
         .await
         .map_err(|e| crate::sqlx_err("read admin audit", e))?;
         Ok(rows.iter().map(admin_audit_row).collect())
+    }
+
+    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
+             tenant, kind, content, sealed, expires_at_epoch_secs)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(r.created_at_epoch_secs)
+        .bind(&r.request_id)
+        .bind(&r.ak)
+        .bind(&r.user_id)
+        .bind(&r.tenant)
+        .bind(&r.kind)
+        .bind(&r.content)
+        .bind(r.sealed)
+        .bind(r.expires_at_epoch_secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("insert content", e))?;
+        Ok(())
+    }
+
+    async fn content_purge(&self, now: i64) -> GResult<u64> {
+        let r = sqlx::query(
+            "DELETE FROM request_content
+             WHERE expires_at_epoch_secs > 0 AND expires_at_epoch_secs <= $1",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("purge content", e))?;
+        Ok(r.rows_affected())
+    }
+
+    async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
+             sealed, expires_at_epoch_secs FROM request_content WHERE request_id = $1 ORDER BY n",
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read content", e))?;
+        Ok(rows.iter().map(content_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -1745,6 +1929,7 @@ mod tests {
                 completion: i64::MAX,
                 total: i64::MAX,
                 ptu_spillover: false,
+                estimated: false,
             },
         );
         assert_eq!(rec.prompt_tokens, MAX_METERED_TOKENS);
@@ -1771,6 +1956,7 @@ mod tests {
             cost_micros: 42,
             vendor_cost_micros: 7,
             ptu_spillover: false,
+            estimated: false,
         }
     }
 
@@ -1906,6 +2092,36 @@ mod tests {
     #[tokio::test]
     async fn memory_audit_roundtrip() {
         exercise_audit(&MemoryStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn content_retention_stores_and_purges() {
+        let store = MemoryStore::default();
+        let rec = |kind: &str, expires: i64| crate::ContentRecord {
+            created_at_epoch_secs: 100,
+            request_id: "req-1".into(),
+            ak: "ak".into(),
+            user_id: "u".into(),
+            tenant: "default".into(),
+            kind: kind.into(),
+            content: "hello".into(),
+            sealed: false,
+            expires_at_epoch_secs: expires,
+        };
+        store.content_add(&rec("prompt", 200)).await.unwrap();
+        store.content_add(&rec("response", 0)).await.unwrap();
+        let got = store.content_for("req-1").await.unwrap();
+        assert_eq!(got.len(), 2);
+
+        assert_eq!(
+            store.content_purge(150).await.unwrap(),
+            0,
+            "not yet expired"
+        );
+        assert_eq!(store.content_purge(250).await.unwrap(), 1, "prompt expired");
+        let kept = store.content_for("req-1").await.unwrap();
+        assert_eq!(kept.len(), 1, "the keep-forever response survives");
+        assert_eq!(kept[0].kind, "response");
     }
 
     #[tokio::test]

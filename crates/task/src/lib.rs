@@ -1,8 +1,6 @@
-//! Local background tasks.
-//!
-//! Currently just one pure in-process task: periodic AK daily quota reset.
-//! Batch job execution lives in gw-handler::offline (spawned on submit) and
-//! needs no separate poller.
+//! Local background tasks: periodic AK daily quota reset and retained-content
+//! purge. Batch job execution lives in gw-handler::offline (spawned on submit)
+//! and needs no separate poller.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +9,8 @@ use gw_state::GatewayState;
 
 /// The production period: once a day.
 pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Retained content is swept for expiry this often.
+pub const PURGE_PERIOD: Duration = Duration::from_secs(60 * 60);
 
 /// Spawn the daily quota reset loop. Returns the join handle (abort to stop).
 /// `period` is configurable so tests don't wait 24h.
@@ -25,6 +25,28 @@ pub fn spawn_quota_reset(
             tick.tick().await;
             state.governance.quota_reset_all().await;
             tracing::info!(target: "task", "quota_reset: all AK daily counters cleared");
+        }
+    })
+}
+
+/// Spawn the retained-content purge loop: deletes content rows whose retention
+/// window has elapsed. Returns the join handle (abort to stop).
+pub fn spawn_content_purge(
+    state: Arc<GatewayState>,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            match state.store.content_purge(gw_state::epoch_secs()).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(target: "task", purged = n, "content purge")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "content purge failed"),
+            }
         }
     })
 }

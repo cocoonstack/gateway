@@ -536,7 +536,7 @@ impl DagNode for CostCalc {
             };
             let ct = enc.encode_len(&resp.message) as i64;
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, pt, ct, pt.saturating_add(ct)).await;
+            return bill(ctx, pt, ct, pt.saturating_add(ct), true).await;
         }
         // default rate is 1:1; the formula carries future weighted rates.
         // saturating sums so a malformed usage subtree can't overflow the totals
@@ -564,13 +564,20 @@ impl DagNode for CostCalc {
                 resp.prompt_tokens.saturating_add(resp.completion_tokens),
             ),
         };
-        bill(ctx, prompt, completion, total).await
+        bill(ctx, prompt, completion, total, false).await
     }
 }
 
 /// Settle reserves and write the ledger for one served request via the shared
-/// [`admission::settle_and_bill`] orchestration.
-async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) -> GResult<()> {
+/// [`admission::settle_and_bill`] orchestration. `estimated` marks a bill from
+/// an aborted stream's estimated counts rather than a vendor usage payload.
+async fn bill(
+    ctx: &mut DagContext,
+    prompt: i64,
+    completion: i64,
+    total: i64,
+    estimated: bool,
+) -> GResult<()> {
     let ptu_spillover = ctx
         .outcome
         .as_ref()
@@ -609,6 +616,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 completion,
                 total,
                 ptu_spillover,
+                estimated,
             },
             reserved,
             tpm_reserved,

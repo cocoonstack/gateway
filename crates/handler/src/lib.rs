@@ -54,6 +54,89 @@ async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i
     }
 }
 
+/// Persist this request's prompt and response per the tenant's retention policy.
+/// `full` content is sealed at rest (and refuses to store raw without a key,
+/// downgrading to the redacted text); `redacted` stores the post-DLP text,
+/// sealed too when a key is present. Best-effort — a store failure is logged.
+async fn persist_content(
+    ctx: &DagContext,
+    retention: gw_config::RetentionConf,
+    raw_prompt: Option<String>,
+    raw_response: Option<String>,
+) {
+    use gw_config::ContentLevel;
+    let want_full = retention.content == ContentLevel::Full;
+    let sealed_ok = gw_state::sealing_available();
+    // full without a key must NOT land raw — fall back to the redacted text
+    let store_full = want_full && sealed_ok;
+    if want_full && !sealed_ok {
+        tracing::warn!("full retention configured but GW_CONTENT_KEY unset; storing redacted text");
+    }
+
+    let now = gw_state::epoch_secs();
+    let expires = if retention.days > 0 {
+        now + retention.days as i64 * 86_400
+    } else {
+        0
+    };
+    let redacted_prompt = || {
+        ctx.request
+            .message
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let redacted_response = ctx
+        .outcome
+        .as_ref()
+        .map(|o| o.response.message.clone())
+        .unwrap_or_default();
+
+    let items = [
+        (
+            "prompt",
+            if store_full {
+                raw_prompt.unwrap_or_else(redacted_prompt)
+            } else {
+                redacted_prompt()
+            },
+        ),
+        (
+            "response",
+            if store_full {
+                raw_response.unwrap_or_else(|| redacted_response.clone())
+            } else {
+                redacted_response.clone()
+            },
+        ),
+    ];
+    for (kind, text) in items {
+        if text.is_empty() {
+            continue;
+        }
+        // seal whenever a key exists (defense in depth even for redacted text)
+        let (content, sealed) = match gw_state::content::seal(&text) {
+            Some(ct) => (ct, true),
+            None => (text, false),
+        };
+        let record = gw_state::ContentRecord {
+            created_at_epoch_secs: now,
+            request_id: ctx.request.request_id.clone(),
+            ak: ctx.ak.ak.clone(),
+            user_id: ctx.effective_user_id().to_owned(),
+            tenant: ctx.ak.tenant.clone(),
+            kind: kind.to_owned(),
+            content,
+            sealed,
+            expires_at_epoch_secs: expires,
+        };
+        if let Err(e) = ctx.state.store.content_add(&record).await {
+            tracing::warn!(error = %e, kind, "content retention write failed");
+        }
+    }
+}
+
 /// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
 /// unique within the process (the seq disambiguates same-millisecond requests).
 pub fn new_request_id() -> String {
@@ -160,6 +243,21 @@ impl OnlineHandler {
             });
             return Ok(ctx);
         }
+        // capture raw prompt before DLP when the tenant retains full content
+        let retention = snap.cfg.retention_for(&ctx.ak.tenant).copied();
+        let full = matches!(
+            retention,
+            Some(r) if r.content == gw_config::ContentLevel::Full
+        );
+        let raw_prompt = full.then(|| {
+            ctx.request
+                .message
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
@@ -198,6 +296,11 @@ impl OnlineHandler {
             outcome.response.model = requested;
         }
 
+        // capture raw response before outbound DLP for full retention
+        let raw_response = full
+            .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
+            .flatten();
+
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
             // raw decoded deltas are pre-redaction; drop them so no downstream
@@ -209,6 +312,9 @@ impl OnlineHandler {
         } else {
             0
         };
+        if let Some(r) = retention.filter(|r| r.content != gw_config::ContentLevel::None) {
+            persist_content(&ctx, r, raw_prompt, raw_response).await;
+        }
         if redacted_out > 0 {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
             emit_security_event(&ctx, "dlp", "redact_out", redacted_out as i64).await;
