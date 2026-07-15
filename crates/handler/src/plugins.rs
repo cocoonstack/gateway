@@ -32,15 +32,8 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
     if sec.blocklist.is_empty() && sec.regexes.is_empty() {
         return ScanOutcome::default();
     }
-    let mut blocklist_count = 0i64;
-    let mut regex_counts = vec![0i64; sec.regexes.len()];
-    let mut visit = |s: &mut String| {
-        blocklist_count += i64::from(blocklist_hit(sec, s));
-        for (i, r) in sec.regexes.iter().enumerate() {
-            regex_counts[i] += r.re.find_iter(s).count() as i64;
-        }
-        0
-    };
+    let mut counts = ScanCounts::new(sec);
+    let mut visit = |s: &mut String| counts.visit(s);
     for msg in &mut request.message {
         visit(&mut msg.content);
         if let Some(parts) = &mut msg.parts {
@@ -53,61 +46,83 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
             for_each_typed_text(typed, &mut visit);
         }
     }
-
-    tally_scan(sec, blocklist_count, regex_counts)
+    counts.outcome()
 }
 
-/// Build a [`ScanOutcome`] from per-rule hit counts: a rule with count > 0 is a
-/// hit at its action; any block-action hit denies. Shared by the REST scan and
-/// the realtime frame scan so the two apply identical action semantics.
-fn tally_scan(sec: &SecurityConf, blocklist_count: i64, regex_counts: Vec<i64>) -> ScanOutcome {
-    let mut hits = Vec::new();
-    if blocklist_count > 0 {
-        hits.push(RuleHit {
-            rule: "blocklist".to_owned(),
-            action: sec.blocklist_action,
-            count: blocklist_count,
-        });
-    }
-    for (r, count) in sec.regexes.iter().zip(regex_counts) {
-        if count > 0 {
-            hits.push(RuleHit {
-                rule: r.name.clone(),
-                action: r.action,
-                count,
-            });
+/// Per-rule hit counters for one scan, shared by the REST request scan and the
+/// realtime frame scan so the two apply identical action semantics.
+struct ScanCounts<'a> {
+    sec: &'a SecurityConf,
+    blocklist: i64,
+    regex: Vec<i64>,
+}
+
+impl<'a> ScanCounts<'a> {
+    fn new(sec: &'a SecurityConf) -> Self {
+        Self {
+            sec,
+            blocklist: 0,
+            regex: vec![0; sec.regexes.len()],
         }
     }
-    let block = hits
-        .iter()
-        .any(|h| h.action == Action::Block)
-        .then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32));
-    ScanOutcome { block, hits }
+
+    fn visit(&mut self, s: &str) -> usize {
+        self.blocklist += i64::from(blocklist_hit(self.sec, s));
+        for (i, r) in self.sec.regexes.iter().enumerate() {
+            self.regex[i] += r.re.find_iter(s).count() as i64;
+        }
+        0
+    }
+
+    /// Fold the counts into a [`ScanOutcome`]: a rule with count > 0 is a hit
+    /// at its action; any block-action hit denies.
+    fn outcome(self) -> ScanOutcome {
+        let mut hits = Vec::new();
+        if self.blocklist > 0 {
+            hits.push(RuleHit {
+                rule: "blocklist".to_owned(),
+                action: self.sec.blocklist_action,
+                count: self.blocklist,
+            });
+        }
+        for (r, count) in self.sec.regexes.iter().zip(self.regex) {
+            if count > 0 {
+                hits.push(RuleHit {
+                    rule: r.name.clone(),
+                    action: r.action,
+                    count,
+                });
+            }
+        }
+        let block = hits
+            .iter()
+            .any(|h| h.action == Action::Block)
+            .then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32));
+        ScanOutcome { block, hits }
+    }
 }
 
 /// All inbound text a request carries — message content, multimodal text
-/// parts, the Responses raw body, and the family typed params. The one text
-/// view moderation and content retention operate on, so a non-chat surface
-/// (input in `raw`/typed with an empty `message`) is not a bypass. The
-/// typed-field list mirrors [`for_each_typed_text`].
-pub fn inbound_text(request: &GatewayRequest) -> String {
+/// parts, the Responses raw body, and the family typed params — collected via
+/// the same traversals the blocklist scan and DLP run, so the field lists
+/// cannot drift apart. The one text view moderation and content retention
+/// operate on. `&mut` only to share those traversals; nothing is rewritten.
+pub fn inbound_text(request: &mut GatewayRequest) -> String {
     let mut out = String::new();
-    for m in &request.message {
-        push_text(&mut out, &m.content);
-        if let Some(serde_json::Value::Array(parts)) = &m.parts {
-            for p in parts {
-                if p["type"] == "text"
-                    && let Some(t) = p["text"].as_str()
-                {
-                    push_text(&mut out, t);
-                }
-            }
+    let mut collect = |s: &mut String| {
+        push_text(&mut out, s);
+        0
+    };
+    for m in &mut request.message {
+        collect(&mut m.content);
+        if let Some(parts) = &mut m.parts {
+            for_each_part_text(parts, &mut collect);
         }
     }
-    if let Some(param) = &request.model_param_v2 {
-        collect_json_text(&param.raw, &mut out);
-        if let Some(typed) = &param.typed {
-            collect_typed_text(typed, &mut out);
+    if let Some(param) = request.model_param_v2.as_mut() {
+        walk_json_strings(&mut param.raw, &mut collect);
+        if let Some(typed) = param.typed.as_mut() {
+            for_each_typed_text(typed, &mut collect);
         }
     }
     out
@@ -119,38 +134,6 @@ fn push_text(out: &mut String, s: &str) {
             out.push('\n');
         }
         out.push_str(s);
-    }
-}
-
-fn collect_json_text(v: &serde_json::Value, out: &mut String) {
-    match v {
-        serde_json::Value::String(s) => push_text(out, s),
-        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_json_text(x, out)),
-        serde_json::Value::Object(o) => o.values().for_each(|x| collect_json_text(x, out)),
-        _ => {}
-    }
-}
-
-fn collect_typed_text(typed: &gw_models::TypedParams, out: &mut String) {
-    use gw_models::TypedParams as T;
-    match typed {
-        T::Chat(p) => {
-            if let Some(s) = &p.system {
-                push_text(out, s);
-            }
-            if let Some(t) = &p.tools {
-                collect_json_text(t, out);
-            }
-            if let Some(t) = &p.tool_choice {
-                collect_json_text(t, out);
-            }
-        }
-        T::Embeddings(p) => p.input.iter().for_each(|s| push_text(out, s)),
-        T::AudioTts(p) => push_text(out, &p.input),
-        T::Image(p) => push_text(out, &p.prompt),
-        T::Video(p) => push_text(out, &p.prompt),
-        T::Search(p) => push_text(out, &p.query),
-        T::AudioStt(_) => {}
     }
 }
 
@@ -215,24 +198,53 @@ fn for_each_typed_text(
     }
 }
 
+/// Visit a multimodal `parts` array's text blocks; returns summed hits.
+/// Deliberately narrower than the blocklist scan: non-text parts (image URLs,
+/// base64 data) are never visited, so a rewrite can't corrupt them.
+fn for_each_part_text(
+    parts: &mut serde_json::Value,
+    f: &mut impl FnMut(&mut String) -> usize,
+) -> usize {
+    let Some(arr) = parts.as_array_mut() else {
+        return 0;
+    };
+    let mut hits = 0;
+    for p in arr {
+        if p["type"] == "text"
+            && let Some(serde_json::Value::String(s)) = p.get_mut("text")
+        {
+            hits += f(s);
+        }
+    }
+    hits
+}
+
 /// Scan a realtime frame's text-bearing fields against the blocklist AND the
 /// regex recognizers, honoring their actions — the same policy every REST
-/// surface runs, so the WebSocket surface is not a bypass. Returns the same
-/// [`ScanOutcome`] as [`security_check`]: a block-action hit denies the frame.
-pub fn realtime_frame_scan(sec: &SecurityConf, frame: &mut serde_json::Value) -> ScanOutcome {
-    if sec.blocklist.is_empty() && sec.regexes.is_empty() {
-        return ScanOutcome::default();
+/// surface runs, so the WebSocket surface is not a bypass. A block-action hit
+/// denies the frame. `collect_text` also gathers the frame's text (for
+/// moderation) in the same traversal, so a moderated tenant pays one walk per
+/// frame, not two.
+pub fn realtime_frame_scan(
+    sec: &SecurityConf,
+    frame: &mut serde_json::Value,
+    collect_text: bool,
+) -> (ScanOutcome, String) {
+    let scan_rules = !sec.blocklist.is_empty() || !sec.regexes.is_empty();
+    let mut counts = ScanCounts::new(sec);
+    let mut text = String::new();
+    if scan_rules || collect_text {
+        gw_engines::realtime::visit_frame_text(frame, &mut |s| {
+            if scan_rules {
+                counts.visit(s);
+            }
+            if collect_text {
+                push_text(&mut text, s);
+            }
+            0
+        });
     }
-    let mut blocklist_count = 0i64;
-    let mut regex_counts = vec![0i64; sec.regexes.len()];
-    gw_engines::realtime::visit_frame_text(frame, &mut |s| {
-        blocklist_count += i64::from(blocklist_hit(sec, s));
-        for (i, r) in sec.regexes.iter().enumerate() {
-            regex_counts[i] += r.re.find_iter(s).count() as i64;
-        }
-        0
-    });
-    tally_scan(sec, blocklist_count, regex_counts)
+    (counts.outcome(), text)
 }
 
 /// DLP-redact a realtime frame's text-bearing fields in place; the hit count.
@@ -263,7 +275,7 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
         // engines forward `parts` (not `content`) when present, so PII must be
         // scrubbed inside the parts' text blocks too
         if let Some(parts) = &mut msg.parts {
-            hits += redact_parts_text(parts, pii, secrets);
+            hits += for_each_part_text(parts, &mut redact_field);
         }
     }
     // non-chat surfaces carry user text outside `message` (Responses raw body,
@@ -305,24 +317,6 @@ fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
 /// Redact one string in place; email/phone only (the outbound response path).
 fn redact_str(s: &mut String) -> usize {
     redact_in_place(s, true, false)
-}
-
-/// Redact PII inside a multimodal `parts` array's text blocks, in place.
-/// Deliberately narrower than the blocklist scan: non-text parts (image URLs,
-/// base64 data) are never rewritten, so a redaction can't corrupt them.
-fn redact_parts_text(parts: &mut serde_json::Value, pii: bool, secrets: bool) -> usize {
-    let Some(arr) = parts.as_array_mut() else {
-        return 0;
-    };
-    let mut hits = 0;
-    for p in arr {
-        if p["type"] == "text"
-            && let Some(serde_json::Value::String(s)) = p.get_mut("text")
-        {
-            hits += redact_in_place(s, pii, secrets);
-        }
-    }
-    hits
 }
 
 /// Mask credential shapes (API keys, tokens, private-key headers) with
@@ -504,63 +498,68 @@ mod tests {
     #[test]
     fn inbound_text_covers_non_chat_raw_and_typed() {
         use gw_models::{ModelParamV2, TypedParams};
-        // Responses-style: input rides in raw, message is empty
         let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
         param.raw = serde_json::json!({"input": "secret responses text", "model": "m"});
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             model_param_v2: Some(param),
             ..Default::default()
         };
-        assert!(inbound_text(&req).contains("secret responses text"));
+        assert!(
+            inbound_text(&mut req).contains("secret responses text"),
+            "Responses input rides in raw with an empty message"
+        );
 
-        // embeddings-style: input rides in typed, message is empty
         let mut param = ModelParamV2::with_name(gw_consts::Protocol::Embeddings, "m");
         param.typed = Some(TypedParams::Embeddings(gw_models::EmbeddingParams {
             input: vec!["typed embed text".into()],
             dimensions: None,
         }));
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             model_param_v2: Some(param),
             ..Default::default()
         };
-        assert!(inbound_text(&req).contains("typed embed text"));
+        assert!(
+            inbound_text(&mut req).contains("typed embed text"),
+            "embeddings input rides in typed with an empty message"
+        );
+    }
+
+    fn ssn_block() -> SecurityConf {
+        SecurityConf {
+            regexes: vec![gw_config::CompiledRule {
+                name: "ssn".into(),
+                action: Action::Block,
+                re: regex::Regex::new(r"\d{3}-\d{2}-\d{4}").unwrap(),
+            }],
+            ..Default::default()
+        }
     }
 
     #[test]
     fn realtime_frame_scan_honors_regex_and_actions() {
-        let mut s = SecurityConf {
-            regex_rules: vec![gw_config::RegexRule {
-                name: "ssn".into(),
-                pattern: r"\d{3}-\d{2}-\d{4}".into(),
-                action: Action::Block,
-            }],
-            ..Default::default()
-        };
-        s.regexes = vec![gw_config::CompiledRule {
-            name: "ssn".into(),
-            action: Action::Block,
-            re: regex::Regex::new(r"\d{3}-\d{2}-\d{4}").unwrap(),
-        }];
+        let s = ssn_block();
         let mut frame = serde_json::json!({"type":"input_text","text":"my ssn is 123-45-6789"});
-        let out = realtime_frame_scan(&s, &mut frame);
+        let (out, text) = realtime_frame_scan(&s, &mut frame, true);
         assert!(out.block.is_some(), "regex Block denies on realtime too");
+        assert!(
+            text.contains("123-45-6789"),
+            "collect_text gathers the frame text in the same walk"
+        );
 
-        // flag blocklist: hit recorded, not blocked
         let s2 = SecurityConf {
             blocklist: vec!["watch".into()],
             blocklist_action: Action::Flag,
             ..Default::default()
         };
         let mut frame = serde_json::json!({"type":"input_text","text":"please watch this"});
-        let out = realtime_frame_scan(&s2, &mut frame);
+        let (out, text) = realtime_frame_scan(&s2, &mut frame, false);
         assert!(out.block.is_none(), "flag does not block realtime");
         assert_eq!(out.hits.len(), 1);
+        assert!(text.is_empty(), "no text collected unless asked");
     }
 
     #[test]
     fn realtime_frame_redacts_secrets_when_detect_secrets_on() {
-        // detect_secrets on, dlp_redact OFF: a credential in a realtime frame is
-        // still masked before it reaches the model (the frame is not a bypass)
         let s = SecurityConf {
             detect_secrets: true,
             dlp_redact: false,
@@ -577,11 +576,14 @@ mod tests {
             "{text}"
         );
 
-        // both flags off: realtime frame untouched
         let none = SecurityConf::default();
         let mut frame =
             serde_json::json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
-        assert_eq!(dlp_redact_realtime_frame(&none, &mut frame), 0);
+        assert_eq!(
+            dlp_redact_realtime_frame(&none, &mut frame),
+            0,
+            "both flags off leaves the frame untouched"
+        );
     }
 
     #[test]
@@ -616,20 +618,7 @@ mod tests {
 
     #[test]
     fn regex_rule_blocks_and_redact_secrets_masks() {
-        let mut s = SecurityConf {
-            regex_rules: vec![gw_config::RegexRule {
-                name: "ssn".into(),
-                pattern: r"\d{3}-\d{2}-\d{4}".into(),
-                action: Action::Block,
-            }],
-            ..Default::default()
-        };
-        // compile_security runs at config load; replicate it for the unit test
-        s.regexes = vec![gw_config::CompiledRule {
-            name: "ssn".into(),
-            action: Action::Block,
-            re: regex::Regex::new(r"\d{3}-\d{2}-\d{4}").unwrap(),
-        }];
+        let s = ssn_block();
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "my ssn is 123-45-6789")],
             ..Default::default()

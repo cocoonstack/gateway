@@ -115,8 +115,6 @@ impl OfflineHandler {
                 is_online: false,
                 ak: ak.ak.clone(),
                 message: item.messages,
-                // per-item attribution so effective_user_id (owner else this)
-                // bills and budgets each item to its end user
                 user_id: (!item.user.is_empty()).then_some(item.user),
                 model_param_v2: Some(ModelParamV2::with_name(
                     gw_consts::Protocol::OpenaiChat,

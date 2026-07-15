@@ -249,6 +249,16 @@ pub struct SecurityEvent {
     pub hits: i64,
 }
 
+impl SecurityEvent {
+    /// Append to `store`. Best-effort: a write failure is logged, never fails
+    /// the request being audited.
+    pub async fn record(&self, store: &dyn Store) {
+        if let Err(e) = store.security_event_add(self).await {
+            tracing::warn!(error = %e, rule = %self.rule, "security event write failed");
+        }
+    }
+}
+
 /// One admin-plane mutation, recorded with who/what/when for compliance.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AdminAudit {
@@ -649,54 +659,62 @@ impl Store for MemoryStore {
     }
 }
 
-/// Positional row → record shared by the SQL backends (identical SELECT order).
-fn row_to_billing<'r, R>(row: &'r R) -> BillingRecord
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    BillingRecord {
-        ak: row.get(0),
-        product: row.get(1),
-        tenant: row.get(2),
-        model: row.get(3),
-        served_model: row.get(4),
-        protocol: row.get(5),
-        account: row.get(6),
-        prompt_tokens: row.get(7),
-        completion_tokens: row.get(8),
-        total_tokens: row.get(9),
-        cost_micros: row.get(10),
-        vendor_cost_micros: row.get(11),
-        ptu_spillover: row.get(12),
-        user_id: row.get(13),
-        request_id: row.get(14),
-        created_at_epoch_secs: row.get(15),
-        estimated: row.get(16),
-    }
+/// Positional row → record mappers shared by the SQL backends: fields decode
+/// in the SELECT's column order. One macro so the sqlx trait-bound boilerplate
+/// lives once.
+macro_rules! row_mapper {
+    ($name:ident -> $ty:path { $($field:ident),+ $(,)? }) => {
+        fn $name<'r, R>(row: &'r R) -> $ty
+        where
+            R: sqlx::Row,
+            usize: sqlx::ColumnIndex<R>,
+            String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+            i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+            bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+        {
+            let mut col = 0usize;
+            $(let $field = row.get(next_col(&mut col));)+
+            $ty { $($field),+ }
+        }
+    };
 }
 
-fn usage_row<'r, R>(row: &'r R) -> UsageRow
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    UsageRow {
-        tenant: row.get(0),
-        model: row.get(1),
-        requests: row.get(2),
-        prompt_tokens: row.get(3),
-        completion_tokens: row.get(4),
-        total_tokens: row.get(5),
-        cost_micros: row.get(6),
-        vendor_cost_micros: row.get(7),
-    }
+fn next_col(col: &mut usize) -> usize {
+    let i = *col;
+    *col += 1;
+    i
 }
+
+row_mapper!(row_to_billing -> BillingRecord {
+    ak, product, tenant, model, served_model, protocol, account,
+    prompt_tokens, completion_tokens, total_tokens, cost_micros,
+    vendor_cost_micros, ptu_spillover, user_id, request_id,
+    created_at_epoch_secs, estimated,
+});
+
+row_mapper!(usage_row -> UsageRow {
+    tenant, model, requests, prompt_tokens, completion_tokens, total_tokens,
+    cost_micros, vendor_cost_micros,
+});
+
+row_mapper!(user_usage_row -> UserUsageRow {
+    user_id, model, requests, prompt_tokens, completion_tokens, total_tokens,
+    cost_micros, vendor_cost_micros,
+});
+
+row_mapper!(security_event_row -> SecurityEvent {
+    created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule,
+    action, hits,
+});
+
+row_mapper!(admin_audit_row -> AdminAudit {
+    created_at_epoch_secs, actor, scope, action, target, summary, source_ip,
+});
+
+row_mapper!(content_row -> crate::ContentRecord {
+    created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
+    sealed, expires_at_epoch_secs,
+});
 
 fn batch_item_row<'r, R>(row: &'r R) -> BatchItemResult
 where
@@ -711,84 +729,6 @@ where
         ok: row.get(1),
         message: row.get(2),
         total_tokens: row.get(3),
-    }
-}
-
-fn user_usage_row<'r, R>(row: &'r R) -> UserUsageRow
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    UserUsageRow {
-        user_id: row.get(0),
-        model: row.get(1),
-        requests: row.get(2),
-        prompt_tokens: row.get(3),
-        completion_tokens: row.get(4),
-        total_tokens: row.get(5),
-        cost_micros: row.get(6),
-        vendor_cost_micros: row.get(7),
-    }
-}
-
-fn security_event_row<'r, R>(row: &'r R) -> SecurityEvent
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    SecurityEvent {
-        created_at_epoch_secs: row.get(0),
-        request_id: row.get(1),
-        ak: row.get(2),
-        user_id: row.get(3),
-        tenant: row.get(4),
-        surface: row.get(5),
-        rule: row.get(6),
-        action: row.get(7),
-        hits: row.get(8),
-    }
-}
-
-fn admin_audit_row<'r, R>(row: &'r R) -> AdminAudit
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    AdminAudit {
-        created_at_epoch_secs: row.get(0),
-        actor: row.get(1),
-        scope: row.get(2),
-        action: row.get(3),
-        target: row.get(4),
-        summary: row.get(5),
-        source_ip: row.get(6),
-    }
-}
-
-fn content_row<'r, R>(row: &'r R) -> crate::ContentRecord
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    crate::ContentRecord {
-        created_at_epoch_secs: row.get(0),
-        request_id: row.get(1),
-        ak: row.get(2),
-        user_id: row.get(3),
-        tenant: row.get(4),
-        kind: row.get(5),
-        content: row.get(6),
-        sealed: row.get(7),
-        expires_at_epoch_secs: row.get(8),
     }
 }
 

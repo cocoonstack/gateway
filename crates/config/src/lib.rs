@@ -198,8 +198,7 @@ pub struct SecurityConf {
     /// Whether to DLP-redact inbound/outbound content (emails/phone numbers).
     #[serde(default)]
     pub dlp_redact: bool,
-    /// Detect API keys / secrets in inbound text and redact them (a top
-    /// enterprise ask: stop staff pasting credentials to a model).
+    /// Detect API keys / credentials in inbound text and redact them.
     #[serde(default)]
     pub detect_secrets: bool,
     /// Route inbound text through the wired external moderator; needs a
@@ -616,8 +615,7 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
-        // ':' separates the per-user budget counter key `ub:{tenant}:{user}`, so a
-        // colon in a tenant name could alias another tenant's budget counter
+        // a colon in a tenant name would alias another tenant's `ub:{tenant}:{user}` budget key
         for t in &self.tenants {
             if t.name.contains(':') {
                 return Err(ConfigError::DuplicateName {

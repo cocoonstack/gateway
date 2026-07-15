@@ -9,6 +9,7 @@ pub mod plugins;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::FutureExt;
 use gw_config::GatewayConfig;
@@ -21,132 +22,9 @@ use gw_state::{AkInfo, GatewayState, SharedConfig};
 pub use gw_models::BatchItem;
 pub use offline::OfflineHandler;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Record a content-safety outcome (no prompt text) against this request's
-/// key/user/tenant. Best-effort: a store failure is logged, never fails the
-/// request. Surface = the request protocol, or "batch" for offline items.
-async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
-    let user_id = ctx.effective_user_id().to_owned();
-    let surface = if ctx.request.is_online {
-        ctx.request
-            .model_param_v2
-            .as_ref()
-            .map(|p| p.protocol.as_str())
-            .unwrap_or_default()
-            .to_owned()
-    } else {
-        "batch".to_owned()
-    };
-    let event = gw_state::SecurityEvent {
-        created_at_epoch_secs: gw_state::epoch_secs(),
-        request_id: ctx.request.request_id.clone(),
-        ak: ctx.ak.ak.clone(),
-        user_id,
-        tenant: ctx.ak.tenant.clone(),
-        surface,
-        rule: rule.to_owned(),
-        action: action.to_owned(),
-        hits,
-    };
-    if let Err(e) = ctx.state.store.security_event_add(&event).await {
-        tracing::warn!(error = %e, "security event write failed");
-    }
-}
-
-/// Persist this request's prompt and response per the tenant's retention policy.
-/// `full` content is sealed at rest (and refuses to store raw without a key,
-/// downgrading to the redacted text); `redacted` stores the post-DLP text,
-/// sealed too when a key is present. Best-effort — a store failure is logged.
-async fn persist_content(
-    ctx: &DagContext,
-    retention: gw_config::RetentionConf,
-    raw_prompt: Option<String>,
-    raw_response: Option<String>,
-) {
-    use gw_config::ContentLevel;
-    let want_full = retention.content == ContentLevel::Full;
-    let sealed_ok = gw_state::sealing_available();
-    // full without a key must NOT land raw — fall back to the redacted text
-    let store_full = want_full && sealed_ok;
-    if want_full && !sealed_ok {
-        tracing::warn!("full retention configured but GW_CONTENT_KEY unset; storing redacted text");
-    }
-
-    let now = gw_state::epoch_secs();
-    let expires = if retention.days > 0 {
-        now + retention.days as i64 * 86_400
-    } else {
-        0
-    };
-    // retention owns its redaction: the stored non-full text is always stripped
-    // of PII/secrets even if the tenant forwards traffic with DLP off, so a
-    // keyless `full` downgrade or a `redacted` row can't hold raw content
-    let redacted_prompt = || plugins::redact_retained(&plugins::inbound_text(&ctx.request));
-    let redacted_response = || {
-        plugins::redact_retained(
-            ctx.outcome
-                .as_ref()
-                .map(|o| o.response.message.as_str())
-                .unwrap_or_default(),
-        )
-    };
-
-    let items = [
-        (
-            "prompt",
-            if store_full {
-                raw_prompt.unwrap_or_else(redacted_prompt)
-            } else {
-                redacted_prompt()
-            },
-        ),
-        (
-            "response",
-            if store_full {
-                raw_response.unwrap_or_else(redacted_response)
-            } else {
-                redacted_response()
-            },
-        ),
-    ];
-    for (kind, text) in items {
-        if text.is_empty() {
-            continue;
-        }
-        // seal whenever a key exists (defense in depth even for redacted text)
-        let (content, sealed) = match gw_state::content::seal(&text) {
-            Some(ct) => (ct, true),
-            None => (text, false),
-        };
-        let record = gw_state::ContentRecord {
-            created_at_epoch_secs: now,
-            request_id: ctx.request.request_id.clone(),
-            ak: ctx.ak.ak.clone(),
-            user_id: ctx.effective_user_id().to_owned(),
-            tenant: ctx.ak.tenant.clone(),
-            kind: kind.to_owned(),
-            content,
-            sealed,
-            expires_at_epoch_secs: expires,
-        };
-        if let Err(e) = ctx.state.store.content_add(&record).await {
-            tracing::warn!(error = %e, kind, "content retention write failed");
-        }
-    }
-}
-
-/// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
-/// unique within the process (the seq disambiguates same-millisecond requests).
-pub fn new_request_id() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
-}
 
 /// Runs one request through the plugin pre-stage, the DAG, and the plugin post-stage.
 #[derive(Clone)]
@@ -208,8 +86,7 @@ impl OnlineHandler {
         if request.request_id.is_empty() {
             request.request_id = new_request_id();
         }
-        // one consistent snapshot for the whole request; the tenant's own
-        // security policy wins over the global one when it sets one
+        // one consistent snapshot for the whole request
         let snap = self.config.load();
         let sec = snap.cfg.security_for(&ak.tenant);
         // outbound DLP is a response-buffering boundary: a masked span can
@@ -219,8 +96,7 @@ impl OnlineHandler {
         if dlp {
             request.stream_tx = None;
         }
-        // scan the ORIGINAL content, before DLP — else a blocklisted term inside
-        // a redacted span (a domain in an email) is masked out and slips
+        // scan the ORIGINAL content pre-DLP: a blocklisted term inside a redacted span would slip
         let scan = plugins::security_check(sec, &mut request);
 
         let mut ctx = DagContext::new(
@@ -230,8 +106,7 @@ impl OnlineHandler {
             request,
             ak,
         );
-        // every rule that fired is recorded (block/flag/shadow alike); only a
-        // block-action hit denies the request
+        // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
         for hit in &scan.hits {
             emit_security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count).await;
         }
@@ -240,45 +115,28 @@ impl OnlineHandler {
                 "security_check",
                 format!("blocked (code {})", block.err_code),
             );
-            let response = GatewayResponse {
-                message: block.message.clone(),
-                finish_reason: "content_filter".to_owned(),
-                ..Default::default()
-            };
-            ctx.outcome = Some(EngineOutcome {
-                response,
-                http_code: 200,
-                block,
-                ..Default::default()
-            });
-            return Ok(ctx);
-        }
-        // external moderation, on the ORIGINAL text (before DLP), when the tenant
-        // opted in; a real moderator is wired via with_moderator
-        if sec.moderate
-            && let Some(block) = self.moderate(&ctx, sec).await
-        {
-            ctx.decide("moderation", "denied");
-            let response = GatewayResponse {
-                message: block.message.clone(),
-                finish_reason: "content_filter".to_owned(),
-                ..Default::default()
-            };
-            ctx.outcome = Some(EngineOutcome {
-                response,
-                http_code: 200,
-                block,
-                ..Default::default()
-            });
+            ctx.outcome = Some(content_filter_outcome(block));
             return Ok(ctx);
         }
 
-        // capture raw prompt before DLP when the tenant retains full content —
-        // only worth it if a key exists (full without one downgrades to redacted)
-        let retention = snap.cfg.retention_for(&ctx.ak.tenant).copied();
-        let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
-            && gw_state::sealing_available();
-        let raw_prompt = capture_raw.then(|| plugins::inbound_text(&ctx.request));
+        // pre-DLP text, computed once for moderation and the retained prompt
+        let retention = snap
+            .cfg
+            .retention_for(&ctx.ak.tenant)
+            .copied()
+            .filter(|r| r.content != gw_config::ContentLevel::None);
+        let inbound =
+            (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
+
+        if sec.moderate
+            && let Some(block) = self
+                .moderate(&ctx, sec, inbound.as_deref().unwrap_or_default())
+                .await
+        {
+            ctx.decide("moderation", "denied");
+            ctx.outcome = Some(content_filter_outcome(block));
+            return Ok(ctx);
+        }
 
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
@@ -318,7 +176,9 @@ impl OnlineHandler {
             outcome.response.model = requested;
         }
 
-        // capture raw response before outbound DLP for full retention
+        // raw response pre-outbound-DLP, only when full retention can store it (key present)
+        let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
+            && gw_state::sealing_available();
         let raw_response = capture_raw
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
@@ -334,8 +194,15 @@ impl OnlineHandler {
         } else {
             0
         };
-        if let Some(r) = retention.filter(|r| r.content != gw_config::ContentLevel::None) {
-            persist_content(&ctx, r, raw_prompt, raw_response).await;
+        if let Some(r) = retention {
+            persist_content(
+                &ctx,
+                r,
+                capture_raw,
+                inbound.unwrap_or_default(),
+                raw_response,
+            )
+            .await;
         }
         if redacted_out > 0 {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
@@ -345,42 +212,53 @@ impl OnlineHandler {
     }
 
     /// Run the wired moderator over raw text; `Some(reason)` to deny, `None` to
-    /// allow. A moderator error resolves per `moderation_fail_open`. The seam
-    /// the realtime surface uses (it has no `DagContext`); the caller records
-    /// the security event on its own surface.
+    /// allow. The seam the realtime surface uses (it has no `DagContext`); the
+    /// caller records the security event on its own surface.
     pub async fn moderate_text(&self, sec: &gw_config::SecurityConf, text: &str) -> Option<String> {
-        match self.moderator.review(text).await {
-            Ok(moderation::Verdict::Allow) => None,
-            Ok(moderation::Verdict::Deny(reason)) => Some(reason),
-            Err(e) => {
-                tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
-                (!sec.moderation_fail_open).then(|| "content moderation is unavailable".to_owned())
-            }
+        match self.moderation(sec, text).await {
+            Moderation::Allow => None,
+            Moderation::Deny(reason) => Some(reason),
+            Moderation::Unavailable => Some(MODERATION_UNAVAILABLE.to_owned()),
         }
     }
 
-    /// Run the wired moderator over the request's inbound text; `Some(Block)` to
-    /// deny. A moderator error resolves per `moderation_fail_open`. Records a
-    /// security event on a deny.
-    async fn moderate(&self, ctx: &DagContext, sec: &gw_config::SecurityConf) -> Option<Block> {
-        let text = plugins::inbound_text(&ctx.request);
-        match self.moderator.review(&text).await {
-            Ok(moderation::Verdict::Allow) => None,
-            Ok(moderation::Verdict::Deny(reason)) => {
+    /// Run the wired moderator over the request's pre-DLP inbound `text`;
+    /// `Some(Block)` to deny. Records a security event on a moderator deny.
+    async fn moderate(
+        &self,
+        ctx: &DagContext,
+        sec: &gw_config::SecurityConf,
+        text: &str,
+    ) -> Option<Block> {
+        match self.moderation(sec, text).await {
+            Moderation::Allow => None,
+            Moderation::Deny(reason) => {
                 emit_security_event(ctx, "moderation", "block", 1).await;
                 Some(Block::blocked(
                     reason,
                     gw_consts::ErrCode::EMPTY_RESP.value() as i32,
                 ))
             }
+            Moderation::Unavailable => Some(Block::blocked(
+                MODERATION_UNAVAILABLE,
+                gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
+            )),
+        }
+    }
+
+    /// The one moderator-verdict resolution every surface shares, so the
+    /// fail-open posture can't drift between REST and realtime.
+    async fn moderation(&self, sec: &gw_config::SecurityConf, text: &str) -> Moderation {
+        match self.moderator.review(text).await {
+            Ok(moderation::Verdict::Allow) => Moderation::Allow,
+            Ok(moderation::Verdict::Deny(reason)) => Moderation::Deny(reason),
             Err(e) => {
                 tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
-                (!sec.moderation_fail_open).then(|| {
-                    Block::blocked(
-                        "content moderation is unavailable",
-                        gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
-                    )
-                })
+                if sec.moderation_fail_open {
+                    Moderation::Allow
+                } else {
+                    Moderation::Unavailable
+                }
             }
         }
     }
@@ -408,6 +286,137 @@ impl OnlineHandler {
             .collect();
         self.transport.reload_policies(default, per_account);
     }
+}
+
+/// One resolved moderator verdict: `Unavailable` is a moderator error under a
+/// fail-closed posture (fail-open resolves to `Allow`).
+enum Moderation {
+    Allow,
+    Deny(String),
+    Unavailable,
+}
+
+/// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
+/// unique within the process (the seq disambiguates same-millisecond requests).
+pub fn new_request_id() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The 200-with-`content_filter` outcome every pre-stage denial returns.
+fn content_filter_outcome(block: Block) -> EngineOutcome {
+    EngineOutcome {
+        response: GatewayResponse {
+            message: block.message.clone(),
+            finish_reason: "content_filter".to_owned(),
+            ..Default::default()
+        },
+        http_code: 200,
+        block,
+        ..Default::default()
+    }
+}
+
+/// Record a content-safety outcome (no prompt text) against this request's
+/// key/user/tenant. Best-effort. Surface = the request protocol, or "batch"
+/// for offline items.
+async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
+    let surface = if ctx.request.is_online {
+        ctx.request
+            .model_param_v2
+            .as_ref()
+            .map(|p| p.protocol.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        "batch".to_owned()
+    };
+    gw_state::SecurityEvent {
+        created_at_epoch_secs: gw_state::epoch_secs(),
+        request_id: ctx.request.request_id.clone(),
+        ak: ctx.ak.ak.clone(),
+        user_id: ctx.effective_user_id().to_owned(),
+        tenant: ctx.ak.tenant.clone(),
+        surface,
+        rule: rule.to_owned(),
+        action: action.to_owned(),
+        hits,
+    }
+    .record(ctx.state.store.as_ref())
+    .await;
+}
+
+/// Persist this request's prompt and response per the tenant's retention policy.
+/// `inbound` is the pre-DLP prompt text; `store_full` (resolved once by the
+/// caller: full level AND a content key) stores it sealed, else it is stored
+/// PII/secret-stripped — retention owns that redaction, so a row can't hold
+/// raw content even with DLP off. Best-effort — a store failure is logged.
+async fn persist_content(
+    ctx: &DagContext,
+    retention: gw_config::RetentionConf,
+    store_full: bool,
+    inbound: String,
+    raw_response: Option<String>,
+) {
+    if retention.content == gw_config::ContentLevel::Full && !store_full {
+        tracing::warn!("full retention configured but GW_CONTENT_KEY unset; storing redacted text");
+    }
+
+    let now = gw_state::epoch_secs();
+    let expires = if retention.days > 0 {
+        now + retention.days as i64 * 86_400
+    } else {
+        0
+    };
+    let redacted_response = || {
+        plugins::redact_retained(
+            ctx.outcome
+                .as_ref()
+                .map(|o| o.response.message.as_str())
+                .unwrap_or_default(),
+        )
+    };
+    let prompt = if store_full {
+        inbound
+    } else {
+        plugins::redact_retained(&inbound)
+    };
+    let response = if store_full {
+        raw_response.unwrap_or_else(redacted_response)
+    } else {
+        redacted_response()
+    };
+
+    let writes = [("prompt", prompt), ("response", response)]
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(kind, text)| {
+            // seal whenever a key exists (defense in depth even for redacted text)
+            let (content, sealed) = match gw_state::content::seal(&text) {
+                Some(ct) => (ct, true),
+                None => (text, false),
+            };
+            let record = gw_state::ContentRecord {
+                created_at_epoch_secs: now,
+                request_id: ctx.request.request_id.clone(),
+                ak: ctx.ak.ak.clone(),
+                user_id: ctx.effective_user_id().to_owned(),
+                tenant: ctx.ak.tenant.clone(),
+                kind: kind.to_owned(),
+                content,
+                sealed,
+                expires_at_epoch_secs: expires,
+            };
+            async move {
+                if let Err(e) = ctx.state.store.content_add(&record).await {
+                    tracing::warn!(error = %e, kind, "content retention write failed");
+                }
+            }
+        });
+    futures::future::join_all(writes).await;
 }
 
 #[cfg(test)]
@@ -1070,7 +1079,6 @@ mod tests {
         let j = completed.expect("drain completed the batch");
         assert_eq!(j.results.len(), 2, "both items executed exactly once");
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
-        // per-item attribution survived the enqueue → drain → reconstruct round-trip
         let (_, ledger) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
         let users: std::collections::HashSet<&str> =
             ledger.iter().map(|r| r.user_id.as_str()).collect();

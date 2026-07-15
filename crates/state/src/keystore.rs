@@ -31,10 +31,9 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>>;
     /// Remove a key regardless of source; whether it existed.
     async fn revoke(&self, ak: &str) -> GResult<bool>;
-    /// A page of keys, sorted by ak (stable), optionally confined to one tenant
-    /// (a tenant admin's scope). `offset`/`limit` bound the scan so a fleet key
-    /// table with millions of rows never loads whole — and the tenant filter
-    /// applies BEFORE paging, so a scoped page isn't emptied by a later filter.
+    /// A page of keys, sorted by ak, optionally confined to one tenant. The
+    /// tenant filter applies before paging, so a scoped page is never emptied
+    /// by a later filter; `offset`/`limit` bound the scan.
     async fn list(&self, tenant: Option<&str>, offset: usize, limit: usize)
     -> GResult<Vec<AkInfo>>;
     /// Re-apply the config file's key set, leaving admin-created keys untouched.

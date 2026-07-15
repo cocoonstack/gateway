@@ -3,6 +3,7 @@
 //! structured access-log line per request.
 
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -427,35 +428,11 @@ async fn realtime_session(
                 .await;
             continue;
         };
-        // same policy (blocklist + regex + actions) + inbound DLP every REST
-        // surface runs, tenant policy first
-        let cfg = s.handler.cfg();
-        let sec = cfg.security_for(&ak.tenant);
-        let scan = gw_handler::plugins::realtime_frame_scan(sec, &mut ev);
-        emit_rt_hits(&s, &ak, &scan.hits, &hint).await;
-        if let Some(block) = scan.block {
-            let _ = socket
-                .send(send(json!({"type":"error","message": block.message})))
-                .await;
-            continue;
-        }
-        if let Some(reason) = realtime_moderate(&s, sec, &ak, &hint, &mut ev).await {
+        if let Err(reason) = rt_inbound_policy(&s, &ak, &hint, &mut ev).await {
             let _ = socket
                 .send(send(json!({"type":"error","message": reason})))
                 .await;
             continue;
-        }
-        let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut ev);
-        if redacted > 0 {
-            write_rt_event(
-                &s,
-                &ak,
-                ak.attributed_user(&hint),
-                "dlp",
-                "redact",
-                redacted as i64,
-            )
-            .await;
         }
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
@@ -612,37 +589,22 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 if let Some(mut frame) = frame {
-                    // same policy (blocklist + regex + actions) + inbound DLP every
-                    // REST surface runs, tenant policy first
-                    let cfg = s.handler.cfg();
-                    let sec = cfg.security_for(&ak.tenant);
-                    let scan = gw_handler::plugins::realtime_frame_scan(sec, &mut frame);
-                    emit_rt_hits(&s, &ak, &scan.hits, &hint).await;
-                    if let Some(block) = scan.block {
-                        if cl_tx
-                            .send(CMsg::Text(send_err(block.message).to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                    match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
+                        Err(reason) => {
+                            if cl_tx
+                                .send(CMsg::Text(send_err(reason).to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if let Some(reason) = realtime_moderate(&s, sec, &ak, &hint, &mut frame).await {
-                        if cl_tx
-                            .send(CMsg::Text(send_err(reason).to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        Ok(redacted) => {
+                            if redacted > 0 {
+                                forward = UMsg::text(frame.to_string());
+                            }
                         }
-                        continue;
-                    }
-                    let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut frame);
-                    if redacted > 0 {
-                        write_rt_event(&s, &ak, ak.attributed_user(&hint), "dlp", "redact", redacted as i64)
-                            .await;
-                        forward = UMsg::text(frame.to_string());
                     }
                     // gate each generation trigger, not every control frame
                     if is_response_create(&frame) {
@@ -765,14 +727,10 @@ async fn realtime_bridge(
                         if n > 0 {
                             redacted = Some(v.to_string());
                         }
-                        // a per-token event stream would be too hot: sum the turn's
-                        // outbound redactions and record one event at its boundary
+                        // per-token events would be too hot: sum the turn, record once at its boundary
                         out_redacted += n as i64;
                         if turn_ended {
-                            if out_redacted > 0 {
-                                write_rt_event(&s, &ak, ak.attributed_user(&hint), "dlp", "redact", out_redacted)
-                                    .await;
-                            }
+                            flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
                             out_redacted = 0;
                         }
                     }
@@ -799,17 +757,7 @@ async fn realtime_bridge(
     }
     // a turn aborted before its boundary (upstream drop) still applied its
     // redactions per frame — flush the pending count so the audit isn't lost
-    if out_redacted > 0 {
-        write_rt_event(
-            &s,
-            &ak,
-            ak.attributed_user(&hint),
-            "dlp",
-            "redact",
-            out_redacted,
-        )
-        .await;
-    }
+    flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
     if generations > 0 && recognized == 0 {
         tracing::warn!(
             account = %account.name,
@@ -901,10 +849,7 @@ async fn ledger(
     State(s): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
         Err(e) => gateway_error(e),
@@ -939,6 +884,14 @@ fn user_header(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
         .filter(|s| !s.is_empty())
+}
+
+/// The one request-metadata attribution precedence the REST surfaces apply:
+/// `x-gw-user` header, else the dialect's own user field (OpenAI `user`,
+/// Anthropic `metadata.user_id`). Batch items invert it — per-item `user`
+/// first — so shared-key batches keep per-item attribution.
+fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
+    user_header(headers).or_else(|| field.as_str().map(str::to_owned))
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -1037,7 +990,7 @@ async fn write_rt_event(
     action: &str,
     hits: i64,
 ) {
-    let event = gw_state::SecurityEvent {
+    gw_state::SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: String::new(),
         ak: ak.ak.clone(),
@@ -1047,10 +1000,51 @@ async fn write_rt_event(
         rule: rule.to_owned(),
         action: action.to_owned(),
         hits,
-    };
-    if let Err(e) = s.handler.state().store.security_event_add(&event).await {
-        tracing::warn!(error = %e, "realtime security event write failed");
     }
+    .record(s.handler.state().store.as_ref())
+    .await;
+}
+
+/// Record a turn's summed outbound DLP redactions as one event; no-op at zero.
+async fn flush_rt_out_dlp(s: &AppState, ak: &AkInfo, hint: &str, count: i64) {
+    if count > 0 {
+        write_rt_event(s, ak, ak.attributed_user(hint), "dlp", "redact", count).await;
+    }
+}
+
+/// The full inbound content policy for one realtime frame — the same chain
+/// every REST surface runs (scan + hit events, moderation, DLP + event),
+/// shared by both WebSocket paths. `Err(reason)` denies the frame; `Ok(n)` is
+/// the DLP redaction count (n > 0 means the frame was rewritten).
+async fn rt_inbound_policy(
+    s: &AppState,
+    ak: &AkInfo,
+    hint: &str,
+    frame: &mut Value,
+) -> Result<usize, String> {
+    let cfg = s.handler.cfg();
+    let sec = cfg.security_for(&ak.tenant);
+    let (scan, text) = gw_handler::plugins::realtime_frame_scan(sec, frame, sec.moderate);
+    emit_rt_hits(s, ak, &scan.hits, hint).await;
+    if let Some(block) = scan.block {
+        return Err(block.message);
+    }
+    if let Some(reason) = realtime_moderate(s, sec, ak, hint, &text).await {
+        return Err(reason);
+    }
+    let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, frame);
+    if redacted > 0 {
+        write_rt_event(
+            s,
+            ak,
+            ak.attributed_user(hint),
+            "dlp",
+            "redact",
+            redacted as i64,
+        )
+        .await;
+    }
+    Ok(redacted)
 }
 
 /// Record a realtime frame's content-safety hits to the security-event stream
@@ -1061,67 +1055,54 @@ async fn emit_rt_hits(
     hits: &[gw_handler::plugins::RuleHit],
     hint: &str,
 ) {
-    let user = ak.attributed_user(hint).to_owned();
+    let user = ak.attributed_user(hint);
     for hit in hits {
-        write_rt_event(s, ak, &user, &hit.rule, hit.action.as_str(), hit.count).await;
+        write_rt_event(s, ak, user, &hit.rule, hit.action.as_str(), hit.count).await;
     }
 }
 
-/// All inbound text a realtime frame carries, for moderation.
-fn realtime_frame_text(frame: &mut Value) -> String {
-    let mut text = String::new();
-    gw_engines::realtime::visit_frame_text(frame, &mut |s| {
-        if !s.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(s);
-        }
-        0
-    });
-    text
-}
-
-/// Moderate a realtime frame's inbound text via the wired moderator — parity
-/// with the REST surface, so a moderated tenant can't be bypassed over the
-/// WebSocket. `Some(reason)` denies the frame; records a moderation event.
+/// Moderate a realtime frame's inbound `text` (collected by the frame scan)
+/// via the wired moderator — parity with the REST surface, so a moderated
+/// tenant can't be bypassed over the WebSocket. `Some(reason)` denies the
+/// frame; records a moderation event.
 async fn realtime_moderate(
     s: &AppState,
     sec: &gw_config::SecurityConf,
     ak: &AkInfo,
     hint: &str,
-    frame: &mut Value,
+    text: &str,
 ) -> Option<String> {
-    if !sec.moderate {
+    if !sec.moderate || text.is_empty() {
         return None;
     }
-    let text = realtime_frame_text(frame);
-    if text.is_empty() {
-        return None;
-    }
-    let reason = s.handler.moderate_text(sec, &text).await?;
+    let reason = s.handler.moderate_text(sec, text).await?;
     write_rt_event(s, ak, ak.attributed_user(hint), "moderation", "block", 1).await;
     Some(reason)
 }
 
-/// The connecting peer's socket address, read from the connect-info extension.
-/// An infallible extractor: `None` when the router is driven without connect
-/// info (the test harness), `Some` when served over a real listener.
-struct ClientPeer(Option<std::net::SocketAddr>);
+/// The caller IP for the admin audit trail, resolved at request entry — before
+/// any config mutation the handler performs — so the op that flips
+/// `trust_proxy_headers` is audited under the policy in effect when it
+/// arrived, not the one it just installed. Empty when the router is driven
+/// without connect info (the test harness).
+struct AuditSourceIp(String);
 
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientPeer {
+impl axum::extract::FromRequestParts<AppState> for AuditSourceIp {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        _state: &S,
+        s: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(ClientPeer(
-            parts
-                .extensions
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0),
-        ))
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0);
+        Ok(AuditSourceIp(source_ip(
+            peer,
+            &parts.headers,
+            s.handler.cfg().trust_proxy_headers,
+        )))
     }
 }
 
@@ -1146,9 +1127,6 @@ fn source_ip(peer: Option<std::net::SocketAddr>, headers: &HeaderMap, trust_prox
 }
 
 /// Record one admin-plane mutation to the audit trail (who/what/when/where).
-/// `source` is resolved by the caller at request entry — before any config
-/// mutation — so the op that flips `trust_proxy_headers` is audited under the
-/// policy in effect when it arrived, not the one it just installed.
 /// Best-effort: a store failure is logged, never fails the operation.
 async fn audit_admin(
     s: &AppState,
@@ -1270,13 +1248,11 @@ fn ct_eq(a: &str, b: &str) -> bool {
 async fn admin_reload(
     State(s): State<AppState>,
     headers: HeaderMap,
-    ClientPeer(peer): ClientPeer,
+    AuditSourceIp(source): AuditSourceIp,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    // freeze the source IP under the pre-reload policy
-    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     match s.reload().await {
         Ok(()) => {
             let cfg = s.handler.cfg();
@@ -1307,14 +1283,13 @@ async fn admin_reload(
 async fn admin_key_create(
     State(s): State<AppState>,
     headers: HeaderMap,
-    ClientPeer(peer): ClientPeer,
+    AuditSourceIp(source): AuditSourceIp,
     Json(body): Json<Value>,
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
@@ -1386,7 +1361,7 @@ async fn admin_key_create(
 async fn admin_key_patch(
     State(s): State<AppState>,
     headers: HeaderMap,
-    ClientPeer(peer): ClientPeer,
+    AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
@@ -1394,7 +1369,6 @@ async fn admin_key_patch(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
@@ -1426,14 +1400,13 @@ async fn admin_key_patch(
 async fn admin_key_delete(
     State(s): State<AppState>,
     headers: HeaderMap,
-    ClientPeer(peer): ClientPeer,
+    AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
@@ -1456,15 +1429,12 @@ async fn admin_key_delete(
 async fn admin_config_put(
     State(s): State<AppState>,
     headers: HeaderMap,
-    ClientPeer(peer): ClientPeer,
+    AuditSourceIp(source): AuditSourceIp,
     body: String,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    // freeze the source IP under the pre-publish policy: this very op may be the
-    // one enabling trust_proxy_headers, and must not be audited under it
-    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     let Some(store) = &s.config_store else {
         return error_response(
             400,
@@ -1478,9 +1448,7 @@ async fn admin_config_put(
         Ok(v) => v,
         Err(e) => return gateway_error(e),
     };
-    // publish already made this version the fleet source of truth and notified
-    // peers; audit it before the local reload can fail, or a failed apply would
-    // leave the fleet on a config with no publish record
+    // audit before the local reload can fail — the published version already leads the fleet
     let reload = s.reload().await;
     let detail = match &reload {
         Ok(()) => String::new(),
@@ -1521,8 +1489,7 @@ async fn admin_key_list(
     };
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
-    // filter by the caller's scope IN the store, before paging, so a tenant
-    // admin's page isn't emptied by a post-hoc filter over the global table
+    // the scope filters in the store before paging, or a tenant admin's page could come back empty
     let tenant = scope.tenant_filter(&q);
     let listed = match s
         .handler
@@ -1604,8 +1571,9 @@ async fn admin_usage_users(
             "user_id,model,requests,prompt_tokens,completion_tokens,total_tokens,cost_micros,vendor_cost_micros\n",
         );
         for u in &usage {
-            csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{}\n",
+            let _ = writeln!(
+                csv,
+                "{},{},{},{},{},{},{},{}",
                 csv_field(&u.user_id),
                 csv_field(&u.model),
                 u.requests,
@@ -1614,7 +1582,7 @@ async fn admin_usage_users(
                 u.total_tokens,
                 u.cost_micros,
                 u.vendor_cost_micros,
-            ));
+            );
         }
         return ([("content-type", "text/csv")], csv).into_response();
     }
@@ -1818,7 +1786,7 @@ async fn chat_completions(
     );
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra);
-    let user_id = user_header(&headers).or_else(|| param.raw["user"].as_str().map(str::to_owned));
+    let user_id = user_hint(&headers, &param.raw["user"]);
 
     let request = GatewayRequest {
         is_online: true,
@@ -2150,8 +2118,7 @@ async fn messages(
         ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, body.model.clone());
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra);
-    let user_id = user_header(&headers)
-        .or_else(|| param.raw["metadata"]["user_id"].as_str().map(str::to_owned));
+    let user_id = user_hint(&headers, &param.raw["metadata"]["user_id"]);
 
     let request = GatewayRequest {
         is_online: true,
@@ -2499,7 +2466,7 @@ async fn completions(
         gw_consts::Protocol::Completions,
         typed,
         vec![ChatMsg::text("user", prompt)],
-        user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned)),
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2547,7 +2514,7 @@ async fn responses(
         return error_response(400, "input is required");
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let user_id = user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned));
+    let user_id = user_hint(&headers, &body["user"]);
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model.clone());
     param.raw = body;
     let request = GatewayRequest {
@@ -2699,7 +2666,7 @@ async fn embeddings(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
-        user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned)),
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2739,7 +2706,7 @@ async fn images_generations(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
-        user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned)),
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2782,7 +2749,7 @@ async fn images_edits(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
-        user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned)),
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2822,7 +2789,7 @@ async fn audio_speech(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
-        user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned)),
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2878,7 +2845,7 @@ async fn audio_transcriptions(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
-        user_header(&headers).or_else(|| body["user"].as_str().map(str::to_owned)),
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2922,6 +2889,13 @@ async fn batches_submit(
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
     let hint = user_header(&headers);
+    let item_user = |v: &Value| {
+        v["user"]
+            .as_str()
+            .or(hint.as_deref())
+            .unwrap_or_default()
+            .to_owned()
+    };
 
     if let Some(file_id) = body["input_file_id"].as_str() {
         let found = s.handler.state().store.file_get(file_id).await;
@@ -2943,14 +2917,9 @@ async fn batches_submit(
             if msgs.is_empty() {
                 return error_response(400, "input file line missing a messages array");
             }
-            let user = reqbody["user"]
-                .as_str()
-                .or(hint.as_deref())
-                .unwrap_or_default()
-                .to_owned();
             batch_items.push(BatchItem {
                 messages: msgs,
-                user,
+                user: item_user(reqbody),
             });
         }
     } else if let Some(items) = body["items"].as_array() {
@@ -2959,14 +2928,9 @@ async fn batches_submit(
             if msgs.is_empty() {
                 return error_response(400, "each item needs a non-empty messages array");
             }
-            let user = it["user"]
-                .as_str()
-                .or(hint.as_deref())
-                .unwrap_or_default()
-                .to_owned();
             batch_items.push(BatchItem {
                 messages: msgs,
-                user,
+                user: item_user(it),
             });
         }
     } else {
@@ -3165,15 +3129,21 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-real-ip", "10.0.0.5".parse().unwrap());
         h.insert("x-forwarded-for", "1.2.3.4, 10.0.0.9".parse().unwrap());
-        // default (untrusted): the client's headers are ignored, the TCP peer wins
-        assert_eq!(source_ip(Some(peer), &h, false), "203.0.113.7");
+        assert_eq!(
+            source_ip(Some(peer), &h, false),
+            "203.0.113.7",
+            "untrusted: forgeable headers ignored, the TCP peer wins"
+        );
         assert_eq!(
             source_ip(None, &h, false),
             "",
             "no peer, no forgeable header"
         );
-        // trusted proxy: x-real-ip, then the rightmost (proxy-appended) XFF hop
-        assert_eq!(source_ip(Some(peer), &h, true), "10.0.0.5");
+        assert_eq!(
+            source_ip(Some(peer), &h, true),
+            "10.0.0.5",
+            "trusted proxy: x-real-ip wins"
+        );
         h.remove("x-real-ip");
         assert_eq!(source_ip(Some(peer), &h, true), "10.0.0.9", "rightmost hop");
     }
@@ -3221,8 +3191,6 @@ mod tests {
 
     #[tokio::test]
     async fn full_retention_without_key_never_stores_raw_even_with_dlp_off() {
-        // full retention + no GW_CONTENT_KEY + tenant DLP fully off: the keyless
-        // downgrade must still strip secrets, not persist the raw prompt
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, retention: {content: full, days: 1}, security: {dlp_redact: false, detect_secrets: false}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         assert!(
             !gw_state::sealing_available(),
@@ -3298,15 +3266,12 @@ mod tests {
         let cfg = app.handler.cfg();
         let sec = cfg.security_for(&ak.tenant);
 
-        // moderation denies over realtime, not just REST
-        let mut frame = json!({"type":"input_text","text":"hello there"});
         assert_eq!(
-            realtime_moderate(&app, sec, &ak, "", &mut frame)
+            realtime_moderate(&app, sec, &ak, "", "hello there")
                 .await
                 .as_deref(),
             Some("blocked by moderator")
         );
-        // inbound realtime DLP redaction is recorded (the sink both WS paths use)
         let mut secret = json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
         let n = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut secret);
         assert!(n > 0);

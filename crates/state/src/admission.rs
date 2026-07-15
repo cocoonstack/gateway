@@ -31,6 +31,12 @@ pub fn user_budget_key(tenant: &str, user: &str) -> String {
     format!("ub:{tenant}:{user}")
 }
 
+/// The tenant's per-user daily token budget, if it configured one.
+pub fn user_budget_limit(cfg: &GatewayConfig, tenant: &str) -> Option<i64> {
+    cfg.find_tenant(tenant)
+        .and_then(|t| t.user_daily_token_quota)
+}
+
 /// Per-user daily token budget (a soft cap): admit while the user is under the
 /// tenant's limit. Skipped when the tenant sets no limit or the request carries
 /// no user attribution. Consumed at billing via [`consume_user_budget`].
@@ -43,10 +49,7 @@ pub async fn check_user_budget(
     if user.is_empty() {
         return Ok(());
     }
-    let Some(limit) = cfg
-        .find_tenant(tenant)
-        .and_then(|t| t.user_daily_token_quota)
-    else {
+    let Some(limit) = user_budget_limit(cfg, tenant) else {
         return Ok(());
     };
     if gov.quota_check(&user_budget_key(tenant, user), limit).await {
@@ -68,11 +71,7 @@ pub async fn consume_user_budget(
     if user.is_empty() || total <= 0 {
         return;
     }
-    if cfg
-        .find_tenant(tenant)
-        .and_then(|t| t.user_daily_token_quota)
-        .is_some()
-    {
+    if user_budget_limit(cfg, tenant).is_some() {
         gov.quota_consume(&user_budget_key(tenant, user), total)
             .await;
     }

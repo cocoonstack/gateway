@@ -397,12 +397,11 @@ impl DagNode for UserBudgetGate {
         &["ak_tpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let user = ctx.effective_user_id().to_owned();
         admission::check_user_budget(
             ctx.state.governance.as_ref(),
             &ctx.cfg,
             &ctx.ak.tenant,
-            &user,
+            ctx.effective_user_id(),
         )
         .await
         .map_err(limit_denied)
@@ -615,8 +614,7 @@ async fn bill(
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
-    // take the reserves into locals first so the whole-ctx borrow that
-    // `effective_user_id` needs can't clash with these mutable field takes
+    // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
     let (reserved, tpm_reserved, model_quota_key) = (
         ctx.quota_reserved.take().unwrap_or(0),
         ctx.tpm_reserved.take(),

@@ -64,11 +64,9 @@ impl AkInfo {
         }
     }
 
-    /// The attributed end user: this key's `owner` when set to a non-empty value
-    /// (authoritative), else the caller-supplied `fallback` — request metadata
-    /// on REST surfaces, the `x-gw-user` connect hint on realtime. Empty when
-    /// neither is present. The one resolution every surface shares so an empty
-    /// owner can't fall back on one surface and swallow attribution on another.
+    /// The attributed end user: this key's non-empty `owner` (authoritative),
+    /// else the caller-supplied `fallback` (request metadata / the realtime
+    /// `x-gw-user` hint). The one resolution every surface shares.
     pub fn attributed_user<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.owner
             .as_deref()

@@ -54,8 +54,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         Some(loader),
     ));
 
-    // this reload FLIPS trust_proxy_headers on, while forging x-real-ip on the
-    // very same request — the op must be audited under the pre-reload policy
     let r = app
         .clone()
         .oneshot(

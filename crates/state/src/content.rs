@@ -9,8 +9,19 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, XChaCha20Poly1305};
 
-/// One stored prompt or response, priced out of the ledger's blast radius:
-/// content may be ciphertext (sealed) or plaintext (redacted level).
+/// The process-wide content key, loaded once from `GW_CONTENT_KEY`.
+static CIPHER: LazyLock<Option<XChaCha20Poly1305>> = LazyLock::new(|| {
+    let raw = std::env::var("GW_CONTENT_KEY").ok()?;
+    match hex::decode(raw.trim()) {
+        Ok(bytes) if bytes.len() == 32 => Some(XChaCha20Poly1305::new(bytes.as_slice().into())),
+        _ => {
+            tracing::error!("GW_CONTENT_KEY is not 64 hex chars (32 bytes); content sealing off");
+            None
+        }
+    }
+});
+
+/// One stored prompt or response.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ContentRecord {
     pub created_at_epoch_secs: i64,
@@ -27,18 +38,6 @@ pub struct ContentRecord {
     /// Unix seconds after which the purge job deletes this row; 0 = keep.
     pub expires_at_epoch_secs: i64,
 }
-
-/// The process-wide content key, loaded once from `GW_CONTENT_KEY`.
-static CIPHER: LazyLock<Option<XChaCha20Poly1305>> = LazyLock::new(|| {
-    let raw = std::env::var("GW_CONTENT_KEY").ok()?;
-    match hex::decode(raw.trim()) {
-        Ok(bytes) if bytes.len() == 32 => Some(XChaCha20Poly1305::new(bytes.as_slice().into())),
-        _ => {
-            tracing::error!("GW_CONTENT_KEY is not 64 hex chars (32 bytes); content sealing off");
-            None
-        }
-    }
-});
 
 /// Whether a deployment key is configured (so `full` retention may store raw).
 pub fn sealing_available() -> bool {
