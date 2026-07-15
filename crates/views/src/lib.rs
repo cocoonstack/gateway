@@ -797,6 +797,19 @@ async fn realtime_bridge(
     for a in pending {
         a.refund().await;
     }
+    // a turn aborted before its boundary (upstream drop) still applied its
+    // redactions per frame — flush the pending count so the audit isn't lost
+    if out_redacted > 0 {
+        write_rt_event(
+            &s,
+            &ak,
+            ak.attributed_user(&hint),
+            "dlp",
+            "redact",
+            out_redacted,
+        )
+        .await;
+    }
     if generations > 0 && recognized == 0 {
         tracing::warn!(
             account = %account.name,
