@@ -125,6 +125,7 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/usage/users", get(admin_usage_users))
         .route("/admin/audit/events", get(admin_security_events))
         .route("/admin/audit/ops", get(admin_audit_ops))
+        .route("/admin/audit/content/{request_id}", get(admin_content_get))
         .route(
             "/admin/keys/{ak}",
             axum::routing::patch(admin_key_patch).delete(admin_key_delete),
@@ -1650,6 +1651,48 @@ async fn admin_audit_ops(
         Ok(entries) => Json(json!({ "entries": entries })).into_response(),
         Err(e) => gateway_error(e),
     }
+}
+
+/// GET /admin/audit/content/{request_id} — the retained prompt/response rows
+/// for one request, unsealed when the content key is present (a sealed row
+/// without it returns `content: null`). Tenant-scoped like the other reads.
+async fn admin_content_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err(r) => return r,
+    };
+    let rows = match s.handler.state().store.content_for(&request_id).await {
+        Ok(rows) => rows,
+        Err(e) => return gateway_error(e),
+    };
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| scope.covers(&r.tenant))
+        .map(|r| {
+            let content = if r.sealed {
+                gw_state::content::open(&r.content)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::String(r.content)
+            };
+            json!({
+                "created_at_epoch_secs": r.created_at_epoch_secs,
+                "kind": r.kind,
+                "ak": r.ak,
+                "user_id": r.user_id,
+                "tenant": r.tenant,
+                "sealed": r.sealed,
+                "expires_at_epoch_secs": r.expires_at_epoch_secs,
+                "content": content,
+            })
+        })
+        .collect();
+    Json(json!({ "request_id": request_id, "entries": entries })).into_response()
 }
 
 fn gateway_error(e: GatewayError) -> Response {
@@ -3191,7 +3234,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_retention_without_key_never_stores_raw_even_with_dlp_off() {
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, retention: {content: full, days: 1}, security: {dlp_redact: false, detect_secrets: false}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_CONTENT_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, retention: {content: full, days: 1}, security: {dlp_redact: false, detect_secrets: false}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        // SAFETY: unique var name for this test; no concurrent reader of it.
+        unsafe { std::env::set_var("GW_TEST_CONTENT_ADMIN", "s3cret") };
         assert!(
             !gw_state::sealing_available(),
             "test env has no content key"
@@ -3200,6 +3245,7 @@ mod tests {
         let state = Arc::new(GatewayState::from_config(&cfg));
         let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
         let store = app_state.handler.state().store.clone();
+        let router = app(app_state);
         let req = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -3209,7 +3255,7 @@ mod tests {
                 r#"{"model":"gpt-4o","messages":[{"role":"user","content":"here is sk-abcdefghijklmnopqrstuvwxyz012345"}]}"#,
             ))
             .unwrap();
-        let resp = app(app_state).oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let (_, rows) = store.ledger_snapshot(1).await.unwrap();
@@ -3231,6 +3277,33 @@ mod tests {
                 c.content
             );
         }
+
+        let read = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/admin/audit/content/{}", rows[0].request_id))
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let j = body_json(read).await;
+        let entries = j["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "prompt and response rows read back");
+        let prompt_entry = entries
+            .iter()
+            .find(|e| e["kind"] == "prompt")
+            .expect("prompt entry");
+        assert!(
+            prompt_entry["content"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_SECRET]"),
+            "read-back returns the redacted text"
+        );
     }
 
     #[derive(Debug)]

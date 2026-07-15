@@ -147,4 +147,6 @@ only its audit is aggregated (a store write per token would be too hot).
   Retention owns its redaction, so `redacted` — and a keyless `full` that falls
   back to it — never persists raw secrets/PII even if the tenant forwards
   traffic with DLP off. `full` refuses to store raw without a key. `days` sets
-  expiry; an hourly purge deletes elapsed content.
+  expiry; an hourly purge deletes elapsed content. Read back with
+  `GET /admin/audit/content/{request_id}` (tenant-scoped; sealed rows are
+  unsealed when the key is present, else returned as `content: null`).
