@@ -202,6 +202,13 @@ pub struct SecurityConf {
     /// enterprise ask: stop staff pasting credentials to a model).
     #[serde(default)]
     pub detect_secrets: bool,
+    /// Route inbound text through the wired external moderator; needs a
+    /// moderator plugged into the handler (the default one allows everything).
+    #[serde(default)]
+    pub moderate: bool,
+    /// On a moderator error, admit the request (`true`) or deny it (`false`).
+    #[serde(default)]
+    pub moderation_fail_open: bool,
     /// Named regex recognizers.
     #[serde(default)]
     pub regex_rules: Vec<RegexRule>,
@@ -326,6 +333,10 @@ pub struct TenantConf {
     /// Per-model charged-price overrides (else the model's list price applies).
     #[serde(default)]
     pub model_prices: std::collections::HashMap<String, PriceConf>,
+    /// Per-user daily token budget (a soft cap keyed by end user); `None` =
+    /// unlimited. Enforced only when the request carries a user attribution.
+    #[serde(default)]
+    pub user_daily_token_quota: Option<i64>,
     /// Content-safety policy for this tenant; `None` = use the global `security:`.
     #[serde(default)]
     pub security: Option<SecurityConf>,

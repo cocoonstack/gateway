@@ -18,10 +18,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
 
 [lints]

@@ -384,6 +384,31 @@ impl DagNode for AkTpmLimit {
     }
 }
 
+/// model_access/user_budget: per-user daily token budget (soft cap), keyed by
+/// the effective end user. No-op without a tenant limit or a user attribution.
+pub struct UserBudgetGate;
+
+#[async_trait::async_trait]
+impl DagNode for UserBudgetGate {
+    fn name(&self) -> &'static str {
+        "user_budget"
+    }
+    fn deps(&self) -> &'static [&'static str] {
+        &["ak_tpm"]
+    }
+    async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        let user = ctx.effective_user_id().to_owned();
+        admission::check_user_budget(
+            ctx.state.governance.as_ref(),
+            &ctx.cfg,
+            &ctx.ak.tenant,
+            &user,
+        )
+        .await
+        .map_err(limit_denied)
+    }
+}
+
 /// model_access/call_engine: factory dispatch + engine execution + failover.
 /// On an upstream 5xx the failed account is excluded and reselected once (a
 /// PTU → paygo spill sets `ptu_spillover`); a second failure propagates as-is.
@@ -395,7 +420,7 @@ impl DagNode for CallEngine {
         "call_engine"
     }
     fn deps(&self) -> &'static [&'static str] {
-        &["ak_tpm"]
+        &["user_budget"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let threshold = ctx.cfg.stability.failure_threshold;
@@ -625,6 +650,14 @@ async fn bill(
         },
     )
     .await;
+    admission::consume_user_budget(
+        ctx.state.governance.as_ref(),
+        &ctx.cfg,
+        &ctx.ak.tenant,
+        ctx.effective_user_id(),
+        record.total_tokens,
+    )
+    .await;
     ctx.decide(
         "cost_calc",
         format!(
@@ -707,6 +740,7 @@ pub fn default_layers() -> Vec<Layer> {
                 Box::new(ProductQpmLimit),
                 Box::new(ModelQpmLimit),
                 Box::new(AkTpmLimit),
+                Box::new(UserBudgetGate),
                 Box::new(CallEngine),
             ],
         },

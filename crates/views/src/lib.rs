@@ -295,6 +295,13 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
     admission::check_ak_rate(gov, &ak).await?;
     admission::check_product_qpm(gov, cfg, &ak.product).await?;
     admission::check_model_qpm(gov, cfg, model).await?;
+    admission::check_user_budget(
+        gov,
+        cfg,
+        &ak.tenant,
+        ak.owner.as_deref().unwrap_or_default(),
+    )
+    .await?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, model)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak, model), limit)
@@ -369,6 +376,14 @@ async fn bill_realtime_turn(
             reserved_at: admit.at,
             model_quota_key,
         },
+    )
+    .await;
+    admission::consume_user_budget(
+        state.governance.as_ref(),
+        cfg,
+        &ak.tenant,
+        ak.owner.as_deref().unwrap_or_default(),
+        total,
     )
     .await;
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it as u64);

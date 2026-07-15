@@ -25,6 +25,59 @@ pub fn model_quota_key(ak: &str, model: &str) -> String {
     format!("{ak}|{model}")
 }
 
+/// The per-user daily-budget counter key, namespaced by tenant so the same
+/// user id under two tenants meters separately.
+pub fn user_budget_key(tenant: &str, user: &str) -> String {
+    format!("ub:{tenant}:{user}")
+}
+
+/// Per-user daily token budget (a soft cap): admit while the user is under the
+/// tenant's limit. Skipped when the tenant sets no limit or the request carries
+/// no user attribution. Consumed at billing via [`consume_user_budget`].
+pub async fn check_user_budget(
+    gov: &dyn Governance,
+    cfg: &GatewayConfig,
+    tenant: &str,
+    user: &str,
+) -> Result<(), String> {
+    if user.is_empty() {
+        return Ok(());
+    }
+    let Some(limit) = cfg
+        .find_tenant(tenant)
+        .and_then(|t| t.user_daily_token_quota)
+    else {
+        return Ok(());
+    };
+    if gov.quota_check(&user_budget_key(tenant, user), limit).await {
+        Ok(())
+    } else {
+        Err(format!("daily token budget exhausted for user `{user}`"))
+    }
+}
+
+/// Accrue actual usage to the per-user daily budget (no-op without a limit or
+/// user). Soft cap: check-then-consume, so a burst can overshoot by one turn.
+pub async fn consume_user_budget(
+    gov: &dyn Governance,
+    cfg: &GatewayConfig,
+    tenant: &str,
+    user: &str,
+    total: i64,
+) {
+    if user.is_empty() || total <= 0 {
+        return;
+    }
+    if cfg
+        .find_tenant(tenant)
+        .and_then(|t| t.user_daily_token_quota)
+        .is_some()
+    {
+        gov.quota_consume(&user_budget_key(tenant, user), total)
+            .await;
+    }
+}
+
 /// The per-(AK, model) daily cap: AK override, else tenant default, else none.
 pub fn model_quota_limit(cfg: &GatewayConfig, ak: &AkInfo, model: &str) -> Option<i64> {
     ak.model_quotas.get(model).copied().or_else(|| {

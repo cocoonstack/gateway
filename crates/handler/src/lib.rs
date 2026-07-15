@@ -3,6 +3,7 @@
 //! DAG layers, then the plugin post-stage; `OfflineHandler` reuses the same
 //! chain for batches.
 
+pub mod moderation;
 pub mod offline;
 pub mod plugins;
 
@@ -14,7 +15,7 @@ use gw_config::GatewayConfig;
 use gw_dag::DagContext;
 use gw_engines::http_transport::UpstreamPolicy;
 use gw_engines::{EngineOutcome, SharedTransport};
-use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse};
+use gw_models::{Block, GResult, GatewayError, GatewayRequest, GatewayResponse};
 use gw_state::{AkInfo, GatewayState, SharedConfig};
 
 pub use offline::{BatchItem, OfflineHandler};
@@ -153,6 +154,7 @@ pub struct OnlineHandler {
     pub config: SharedConfig,
     pub transport: SharedTransport,
     plan: Arc<gw_dag::Plan>,
+    moderator: Arc<dyn moderation::Moderator>,
 }
 
 impl OnlineHandler {
@@ -166,9 +168,17 @@ impl OnlineHandler {
             config,
             transport,
             plan,
+            moderator: moderation::default_moderator(),
         };
         handler.push_policies(&handler.cfg());
         handler
+    }
+
+    /// Plug an external content moderator into the pre-stage (enable per tenant
+    /// via `security.moderate`).
+    pub fn with_moderator(mut self, moderator: Arc<dyn moderation::Moderator>) -> Self {
+        self.moderator = moderator;
+        self
     }
 
     /// The live config snapshot (cheap atomic load). Introspection surfaces read
@@ -243,6 +253,26 @@ impl OnlineHandler {
             });
             return Ok(ctx);
         }
+        // external moderation, on the ORIGINAL text (before DLP), when the tenant
+        // opted in; a real moderator is wired via with_moderator
+        if sec.moderate
+            && let Some(block) = self.moderate(&ctx, sec).await
+        {
+            ctx.decide("moderation", "denied");
+            let response = GatewayResponse {
+                message: block.message.clone(),
+                finish_reason: "content_filter".to_owned(),
+                ..Default::default()
+            };
+            ctx.outcome = Some(EngineOutcome {
+                response,
+                http_code: 200,
+                block,
+                ..Default::default()
+            });
+            return Ok(ctx);
+        }
+
         // capture raw prompt before DLP when the tenant retains full content
         let retention = snap.cfg.retention_for(&ctx.ak.tenant).copied();
         let full = matches!(
@@ -322,6 +352,38 @@ impl OnlineHandler {
         Ok(ctx)
     }
 
+    /// Run the wired moderator over the request's inbound text; `Some(Block)` to
+    /// deny. A moderator error resolves per `moderation_fail_open`. Records a
+    /// security event on a deny.
+    async fn moderate(&self, ctx: &DagContext, sec: &gw_config::SecurityConf) -> Option<Block> {
+        let text = ctx
+            .request
+            .message
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match self.moderator.review(&text).await {
+            Ok(moderation::Verdict::Allow) => None,
+            Ok(moderation::Verdict::Deny(reason)) => {
+                emit_security_event(ctx, "moderation", "block", 1).await;
+                Some(Block::blocked(
+                    reason,
+                    gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
+                (!sec.moderation_fail_open).then(|| {
+                    Block::blocked(
+                        "content moderation is unavailable",
+                        gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
+                    )
+                })
+            }
+        }
+    }
+
     /// Derive the upstream policies (timeouts/connect-retries) from `cfg` and
     /// apply them to the transport live.
     fn push_policies(&self, cfg: &GatewayConfig) {
@@ -387,6 +449,74 @@ mod tests {
             model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, name)),
             ..Default::default()
         }
+    }
+
+    #[derive(Debug)]
+    struct DenyModerator;
+
+    #[async_trait::async_trait]
+    impl moderation::Moderator for DenyModerator {
+        async fn review(&self, _text: &str) -> Result<moderation::Verdict, String> {
+            Ok(moderation::Verdict::Deny("nope".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn moderator_denies_when_tenant_enables_it() {
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.moderate = true;
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DenyModerator));
+        let ctx = h
+            .run(chat_req("gpt-4o", "hello"), ak(&h).await)
+            .await
+            .unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert!(out.block.block);
+        assert_eq!(out.response.finish_reason, "content_filter");
+        assert!(
+            h.state()
+                .store
+                .ledger_snapshot(1)
+                .await
+                .unwrap()
+                .1
+                .is_empty(),
+            "a moderated deny bills nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_user_budget_denies_over_the_cap() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, user_daily_token_quota: 5}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let with_user = |content: &str| GatewayRequest {
+            is_online: true,
+            message: vec![ChatMsg::text("user", content)],
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
+            user_id: Some("u1".into()),
+            ..Default::default()
+        };
+        h.run(with_user("first burns the budget"), key.clone())
+            .await
+            .unwrap();
+        let err = h
+            .run(with_user("second is over"), key)
+            .await
+            .err()
+            .expect("second denied by the per-user budget");
+        assert_eq!(err.http_status, 429);
     }
 
     #[tokio::test]
