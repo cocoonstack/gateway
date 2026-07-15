@@ -137,6 +137,7 @@ mod tests {
                 ak: "t".into(),
                 product: "demo".into(),
                 tenant: "default".into(),
+                owner: None,
                 qps: 10.0,
                 daily_token_quota: 1000,
                 tokens_per_minute: None,

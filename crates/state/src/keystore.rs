@@ -31,8 +31,9 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>>;
     /// Remove a key regardless of source; whether it existed.
     async fn revoke(&self, ak: &str) -> GResult<bool>;
-    /// Every key, sorted by ak for stable listings.
-    async fn list(&self) -> GResult<Vec<AkInfo>>;
+    /// A page of keys, sorted by ak (stable). `offset`/`limit` bound the scan so
+    /// a fleet key table with millions of rows never loads whole.
+    async fn list(&self, offset: usize, limit: usize) -> GResult<Vec<AkInfo>>;
     /// Re-apply the config file's key set, leaving admin-created keys untouched.
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()>;
 }
@@ -67,11 +68,16 @@ impl PostgresKeyStore {
                 expires_at_epoch_secs BIGINT,
                 banned BOOLEAN NOT NULL DEFAULT FALSE,
                 model_quotas TEXT NOT NULL DEFAULT '{}',
+                owner TEXT,
                 source TEXT NOT NULL DEFAULT 'admin')",
         )
         .execute(&pool)
         .await
         .map_err(|e| crate::sqlx_err("create access_keys schema", e))?;
+        sqlx::query("ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS owner TEXT")
+            .execute(&pool)
+            .await
+            .map_err(|e| crate::sqlx_err("migrate access_keys owner", e))?;
         Ok(Self {
             pool,
             cache: moka::sync::Cache::builder()
@@ -91,7 +97,7 @@ impl PostgresKeyStore {
     async fn fetch(&self, ak: &str) -> Result<Option<AkInfo>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas FROM access_keys WHERE ak = $1",
+             expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys WHERE ak = $1",
         )
         .bind(ak)
         .fetch_optional(&self.pool)
@@ -139,7 +145,7 @@ impl KeyStore for PostgresKeyStore {
             .map_err(|e| crate::sqlx_err("begin patch", e))?;
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas FROM access_keys
+             expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys
              WHERE ak = $1 FOR UPDATE",
         )
         .bind(ak)
@@ -181,11 +187,14 @@ impl KeyStore for PostgresKeyStore {
         Ok(n > 0)
     }
 
-    async fn list(&self) -> GResult<Vec<AkInfo>> {
+    async fn list(&self, offset: usize, limit: usize) -> GResult<Vec<AkInfo>> {
         let rows = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas FROM access_keys ORDER BY ak",
+             expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys
+             ORDER BY ak LIMIT $1 OFFSET $2",
         )
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .bind(offset.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("list keys", e))?;
@@ -229,14 +238,15 @@ async fn upsert(
     let quotas = serde_json::to_string(&*info.model_quotas).unwrap_or_else(|_| "{}".into());
     sqlx::query(
         "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
-         tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, source)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, owner, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (ak) DO UPDATE SET
            product = EXCLUDED.product, tenant = EXCLUDED.tenant,
            qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
            tokens_per_minute = EXCLUDED.tokens_per_minute,
            expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
            banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
+           owner = EXCLUDED.owner,
            source = CASE WHEN access_keys.source = 'config' AND EXCLUDED.source = 'admin'
                          THEN 'config' ELSE EXCLUDED.source END",
     )
@@ -249,6 +259,7 @@ async fn upsert(
     .bind(info.expires_at_epoch_secs)
     .bind(info.banned)
     .bind(&quotas)
+    .bind(&info.owner)
     .bind(source_str(source))
     .execute(exec)
     .await
@@ -268,6 +279,7 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
         model_quotas: std::sync::Arc::new(
             serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default(),
         ),
+        owner: row.get(9),
     }
 }
 
@@ -287,6 +299,7 @@ mod tests {
             ak: ak.into(),
             product: "p".into(),
             tenant: "default".into(),
+            owner: None,
             qps,
             daily_token_quota: 10,
             tokens_per_minute: None,

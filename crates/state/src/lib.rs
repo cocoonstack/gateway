@@ -35,6 +35,9 @@ pub struct AkInfo {
     pub product: String,
     /// Tenant this key belongs to (`gw_config::DEFAULT_TENANT` when undeclared).
     pub tenant: String,
+    /// End user this key is issued to; `Some` = authoritative user attribution
+    /// (one key per user), `None` = shared key, attribute from request metadata.
+    pub owner: Option<String>,
     pub qps: f64,
     pub daily_token_quota: i64,
     /// tokens-per-minute window cap; None = unlimited.
@@ -97,6 +100,7 @@ impl From<&gw_config::AkConf> for AkInfo {
             ak: k.ak.clone(),
             product: k.product.clone(),
             tenant: k.tenant.clone(),
+            owner: k.owner.clone(),
             qps: k.qps,
             daily_token_quota: k.daily_token_quota,
             tokens_per_minute: k.tokens_per_minute,
@@ -165,11 +169,11 @@ impl AkAuth {
         Some(e.0.clone())
     }
 
-    /// Every key in the table, sorted by ak for stable listings.
-    pub fn list(&self) -> Vec<AkInfo> {
+    /// A page of keys, sorted by ak (stable), `offset..offset+limit`.
+    pub fn list(&self, offset: usize, limit: usize) -> Vec<AkInfo> {
         let mut keys: Vec<AkInfo> = self.keys.iter().map(|e| e.value().0.clone()).collect();
         keys.sort_by(|a, b| a.ak.cmp(&b.ak));
-        keys
+        keys.into_iter().skip(offset).take(limit).collect()
     }
 
     /// Remove a key regardless of source; returns whether it existed.
@@ -205,8 +209,8 @@ impl KeyStore for AkAuth {
     async fn revoke(&self, ak: &str) -> gw_models::GResult<bool> {
         Ok(AkAuth::revoke(self, ak))
     }
-    async fn list(&self) -> gw_models::GResult<Vec<AkInfo>> {
-        Ok(AkAuth::list(self))
+    async fn list(&self, offset: usize, limit: usize) -> gw_models::GResult<Vec<AkInfo>> {
+        Ok(AkAuth::list(self, offset, limit))
     }
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> gw_models::GResult<()> {
         AkAuth::reload_config_keys(self, keys);
@@ -850,6 +854,7 @@ mod tests {
             ak: ak.into(),
             product: "p".into(),
             tenant: "default".into(),
+            owner: None,
             qps: 1.0,
             daily_token_quota: 10,
             tokens_per_minute: None,

@@ -583,6 +583,13 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
+    // effective user: the key's owner wins (authoritative), else request metadata
+    let user_id = ctx
+        .ak
+        .owner
+        .as_deref()
+        .or(ctx.request.user_id.as_deref())
+        .unwrap_or_default();
     let record = admission::settle_and_bill(
         ctx.state.governance.as_ref(),
         ctx.state.store.as_ref(),
@@ -592,6 +599,8 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 ak: &ctx.ak.ak,
                 product: &ctx.ak.product,
                 tenant: &ctx.ak.tenant,
+                user_id,
+                request_id: &ctx.request.request_id,
                 requested_model: requested,
                 served_model: served,
                 protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),

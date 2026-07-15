@@ -33,6 +33,16 @@ pub struct BillingRecord {
     pub ak: String,
     pub product: String,
     pub tenant: String,
+    /// Effective end user: the key's `owner` if set, else request metadata; empty
+    /// when neither is present. The precise per-user billing dimension.
+    #[serde(default)]
+    pub user_id: String,
+    /// Ingress correlation id, joins this row to the access log and audit events.
+    #[serde(default)]
+    pub request_id: String,
+    /// Unix seconds the call was billed — the billing-period axis.
+    #[serde(default)]
+    pub created_at_epoch_secs: i64,
     /// Public model the caller requested.
     pub model: String,
     /// Model that actually served (differs from `model` after a quota fallback).
@@ -125,6 +135,10 @@ pub struct BillingInput<'a> {
     pub ak: &'a str,
     pub product: &'a str,
     pub tenant: &'a str,
+    /// Effective end user (key owner else request metadata); empty when neither.
+    pub user_id: &'a str,
+    /// Ingress correlation id for this request.
+    pub request_id: &'a str,
     /// Public model the caller requested (accrues the per-(AK, model) counter).
     pub requested_model: &'a str,
     /// Model that actually served — charged at its price (may differ on fallback).
@@ -167,6 +181,9 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         ak: b.ak.to_owned(),
         product: b.product.to_owned(),
         tenant: b.tenant.to_owned(),
+        user_id: b.user_id.to_owned(),
+        request_id: b.request_id.to_owned(),
+        created_at_epoch_secs: crate::epoch_secs(),
         model: b.requested_model.to_owned(),
         served_model: b.served_model.to_owned(),
         protocol: b.protocol.to_owned(),
@@ -193,6 +210,54 @@ pub struct UsageRow {
     pub vendor_cost_micros: i64,
 }
 
+/// One row of the per-(user, model) usage rollup over a billing period.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserUsageRow {
+    pub user_id: String,
+    pub model: String,
+    pub requests: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub cost_micros: i64,
+    pub vendor_cost_micros: i64,
+}
+
+/// A content-safety outcome, recorded WITHOUT the offending text — only which
+/// key/user/rule fired and what the gateway did, so hits are queryable per
+/// ak/tenant without retaining prompt content.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SecurityEvent {
+    pub created_at_epoch_secs: i64,
+    pub request_id: String,
+    pub ak: String,
+    pub user_id: String,
+    pub tenant: String,
+    /// Which surface: chat/messages/responses/realtime/…
+    pub surface: String,
+    /// The rule family that fired: "blocklist" | "dlp" | a recognizer name.
+    pub rule: String,
+    /// What the gateway did: "block" | "redact" | "flag".
+    pub action: String,
+    pub hits: i64,
+}
+
+/// One admin-plane mutation, recorded with who/what/when for compliance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminAudit {
+    pub created_at_epoch_secs: i64,
+    /// The admin identity: "global" or the tenant name whose token was used.
+    pub actor: String,
+    /// The presented scope: "global" | "tenant".
+    pub scope: String,
+    /// The mutation: "key_create" | "key_patch" | "key_delete" | "config_publish" | "reload".
+    pub action: String,
+    /// The object acted on (an ak, a config version, …).
+    pub target: String,
+    pub summary: String,
+    pub source_ip: String,
+}
+
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_add(&self, r: &BillingRecord) -> GResult<()>;
@@ -201,6 +266,30 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
     /// Usage rolled up by (tenant, requested model), sorted.
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>>;
+    /// Precise per-user cost over `[since, until]` (unix secs), grouped by
+    /// (user, requested model); optional tenant/user filter. The billing-period
+    /// query behind per-user invoicing.
+    async fn usage_by_user(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+    ) -> GResult<Vec<UserUsageRow>>;
+
+    /// Append a content-safety event (no prompt text retained).
+    async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()>;
+    /// The most recent `limit` security events, newest first; optional tenant filter.
+    async fn security_events(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> GResult<Vec<SecurityEvent>>;
+
+    /// Append an admin-operation audit entry.
+    async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()>;
+    /// The most recent `limit` admin-audit entries, newest first.
+    async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>>;
 
     /// Store `content` under a fresh id owned by `tenant`; returns the metadata.
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile>;
@@ -285,6 +374,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     records: Mutex<Vec<BillingRecord>>,
+    sec_events: Mutex<Vec<SecurityEvent>>,
+    audit: Mutex<Vec<AdminAudit>>,
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
     seq: AtomicUsize,
@@ -360,6 +451,91 @@ impl Store for MemoryStore {
             e.vendor_cost_micros = e.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
         }
         Ok(rollup.into_values().collect())
+    }
+
+    async fn usage_by_user(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+    ) -> GResult<Vec<UserUsageRow>> {
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rollup: std::collections::BTreeMap<(String, String), UserUsageRow> =
+            std::collections::BTreeMap::new();
+        for r in records.iter() {
+            if tenant.is_some_and(|t| t != r.tenant)
+                || user.is_some_and(|u| u != r.user_id)
+                || r.created_at_epoch_secs < since
+                || r.created_at_epoch_secs > until
+            {
+                continue;
+            }
+            let e = rollup
+                .entry((r.user_id.clone(), r.model.clone()))
+                .or_insert_with(|| UserUsageRow {
+                    user_id: r.user_id.clone(),
+                    model: r.model.clone(),
+                    requests: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cost_micros: 0,
+                    vendor_cost_micros: 0,
+                });
+            e.requests += 1;
+            e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
+            e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
+            e.total_tokens = e.total_tokens.saturating_add(r.total_tokens);
+            e.cost_micros = e.cost_micros.saturating_add(r.cost_micros);
+            e.vendor_cost_micros = e.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
+        }
+        Ok(rollup.into_values().collect())
+    }
+
+    async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
+        self.sec_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(e.clone());
+        Ok(())
+    }
+
+    async fn security_events(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> GResult<Vec<SecurityEvent>> {
+        let events = self
+            .sec_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(events
+            .iter()
+            .rev()
+            .filter(|e| tenant.is_none_or(|t| t == e.tenant))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
+        self.audit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(e.clone());
+        Ok(())
+    }
+
+    async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
+        let audit = self
+            .audit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(audit.iter().rev().take(limit).cloned().collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -451,6 +627,9 @@ where
         cost_micros: row.get(10),
         vendor_cost_micros: row.get(11),
         ptu_spillover: row.get(12),
+        user_id: row.get(13),
+        request_id: row.get(14),
+        created_at_epoch_secs: row.get(15),
     }
 }
 
@@ -489,6 +668,63 @@ where
     }
 }
 
+fn user_usage_row<'r, R>(row: &'r R) -> UserUsageRow
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    UserUsageRow {
+        user_id: row.get(0),
+        model: row.get(1),
+        requests: row.get(2),
+        prompt_tokens: row.get(3),
+        completion_tokens: row.get(4),
+        total_tokens: row.get(5),
+        cost_micros: row.get(6),
+        vendor_cost_micros: row.get(7),
+    }
+}
+
+fn security_event_row<'r, R>(row: &'r R) -> SecurityEvent
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    SecurityEvent {
+        created_at_epoch_secs: row.get(0),
+        request_id: row.get(1),
+        ak: row.get(2),
+        user_id: row.get(3),
+        tenant: row.get(4),
+        surface: row.get(5),
+        rule: row.get(6),
+        action: row.get(7),
+        hits: row.get(8),
+    }
+}
+
+fn admin_audit_row<'r, R>(row: &'r R) -> AdminAudit
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    AdminAudit {
+        created_at_epoch_secs: row.get(0),
+        actor: row.get(1),
+        scope: row.get(2),
+        action: row.get(3),
+        target: row.get(4),
+        summary: row.get(5),
+        source_ip: row.get(6),
+    }
+}
+
 /// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
 /// file; ids derive from rowids so they stay unique across restarts.
 #[derive(Debug)]
@@ -524,7 +760,10 @@ impl SqliteStore {
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
                 vendor_cost_micros INTEGER NOT NULL DEFAULT 0,
-                ptu_spillover INTEGER NOT NULL DEFAULT 0)",
+                ptu_spillover INTEGER NOT NULL DEFAULT 0,
+                user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                created_at_epoch_secs INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -536,6 +775,17 @@ impl SqliteStore {
             "CREATE TABLE IF NOT EXISTS batch_results (
                 batch_id TEXT NOT NULL, idx INTEGER NOT NULL, ok INTEGER NOT NULL,
                 message TEXT NOT NULL, total_tokens INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS security_events (
+                n INTEGER PRIMARY KEY AUTOINCREMENT, created_at_epoch_secs INTEGER NOT NULL,
+                request_id TEXT NOT NULL DEFAULT '', ak TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '', tenant TEXT NOT NULL DEFAULT '',
+                surface TEXT NOT NULL DEFAULT '', rule TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '', hits INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS admin_audit (
+                n INTEGER PRIMARY KEY AUTOINCREMENT, created_at_epoch_secs INTEGER NOT NULL,
+                actor TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '', source_ip TEXT NOT NULL DEFAULT '')",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -547,6 +797,9 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE billing ADD COLUMN served_model TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN vendor_cost_micros INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE billing ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE billing ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE billing ADD COLUMN created_at_epoch_secs INTEGER NOT NULL DEFAULT 0",
             // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
@@ -576,8 +829,8 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.ak)
         .bind(&r.product)
@@ -592,6 +845,9 @@ impl Store for SqliteStore {
         .bind(r.cost_micros)
         .bind(r.vendor_cost_micros)
         .bind(r.ptu_spillover)
+        .bind(&r.user_id)
+        .bind(&r.request_id)
+        .bind(r.created_at_epoch_secs)
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert billing record", e))?;
@@ -618,7 +874,7 @@ impl Store for SqliteStore {
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs
              FROM billing ORDER BY n DESC LIMIT ?",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -653,6 +909,99 @@ impl Store for SqliteStore {
             }
             .map_err(|e| crate::sqlx_err("roll up usage", e))?;
         Ok(rows.iter().map(usage_row).collect())
+    }
+
+    async fn usage_by_user(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+    ) -> GResult<Vec<UserUsageRow>> {
+        let rows = sqlx::query(
+            "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             FROM billing
+             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
+               AND created_at_epoch_secs BETWEEN ?3 AND ?4
+             GROUP BY user_id, model ORDER BY user_id, model",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
+        Ok(rows.iter().map(user_usage_row).collect())
+    }
+
+    async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO security_events (created_at_epoch_secs, request_id, ak, user_id,
+             tenant, surface, rule, action, hits) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(e.created_at_epoch_secs)
+        .bind(&e.request_id)
+        .bind(&e.ak)
+        .bind(&e.user_id)
+        .bind(&e.tenant)
+        .bind(&e.surface)
+        .bind(&e.rule)
+        .bind(&e.action)
+        .bind(e.hits)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| crate::sqlx_err("insert security event", err))?;
+        Ok(())
+    }
+
+    async fn security_events(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> GResult<Vec<SecurityEvent>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule,
+             action, hits FROM security_events
+             WHERE (?1 IS NULL OR tenant = ?1) ORDER BY n DESC LIMIT ?2",
+        )
+        .bind(tenant)
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read security events", e))?;
+        Ok(rows.iter().map(security_event_row).collect())
+    }
+
+    async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO admin_audit (created_at_epoch_secs, actor, scope, action, target,
+             summary, source_ip) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(e.created_at_epoch_secs)
+        .bind(&e.actor)
+        .bind(&e.scope)
+        .bind(&e.action)
+        .bind(&e.target)
+        .bind(&e.summary)
+        .bind(&e.source_ip)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| crate::sqlx_err("insert admin audit", err))?;
+        Ok(())
+    }
+
+    async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, actor, scope, action, target, summary, source_ip
+             FROM admin_audit ORDER BY n DESC LIMIT ?",
+        )
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read admin audit", e))?;
+        Ok(rows.iter().map(admin_audit_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -816,7 +1165,21 @@ impl PostgresStore {
                 prompt_tokens BIGINT NOT NULL, completion_tokens BIGINT NOT NULL,
                 total_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL,
                 vendor_cost_micros BIGINT NOT NULL DEFAULT 0,
-                ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE)",
+                ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE,
+                user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                created_at_epoch_secs BIGINT NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
+            "CREATE TABLE IF NOT EXISTS security_events (
+                n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
+                request_id TEXT NOT NULL DEFAULT '', ak TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '', tenant TEXT NOT NULL DEFAULT '',
+                surface TEXT NOT NULL DEFAULT '', rule TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '', hits BIGINT NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS admin_audit (
+                n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
+                actor TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '', source_ip TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -848,13 +1211,17 @@ impl PostgresStore {
                 .await
                 .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
         }
-        sqlx::query(
-            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS
-             vendor_cost_micros BIGINT NOT NULL DEFAULT 0",
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| crate::sqlx_err("migrate postgres billing schema", e))?;
+        for ddl in [
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS vendor_cost_micros BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
+        ] {
+            sqlx::query(ddl)
+                .execute(&pool)
+                .await
+                .map_err(|e| crate::sqlx_err("migrate postgres billing schema", e))?;
+        }
         Ok(Self {
             pool,
             ledger_max_rows,
@@ -869,8 +1236,8 @@ impl Store for PostgresStore {
         sqlx::query(
             "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&r.ak)
         .bind(&r.product)
@@ -885,6 +1252,9 @@ impl Store for PostgresStore {
         .bind(r.cost_micros)
         .bind(r.vendor_cost_micros)
         .bind(r.ptu_spillover)
+        .bind(&r.user_id)
+        .bind(&r.request_id)
+        .bind(r.created_at_epoch_secs)
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert billing record", e))?;
@@ -911,7 +1281,7 @@ impl Store for PostgresStore {
         let mut rows = sqlx::query(
             "SELECT ak, product, tenant, model, served_model, protocol, account,
              prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover
+             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs
              FROM billing ORDER BY n DESC LIMIT $1",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -953,6 +1323,101 @@ impl Store for PostgresStore {
         }
         .map_err(|e| crate::sqlx_err("roll up usage", e))?;
         Ok(rows.iter().map(usage_row).collect())
+    }
+
+    async fn usage_by_user(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+    ) -> GResult<Vec<UserUsageRow>> {
+        let rows = sqlx::query(
+            "SELECT user_id, model, COUNT(*),
+             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             FROM billing
+             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
+               AND created_at_epoch_secs BETWEEN $3 AND $4
+             GROUP BY user_id, model ORDER BY user_id, model",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
+        Ok(rows.iter().map(user_usage_row).collect())
+    }
+
+    async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO security_events (created_at_epoch_secs, request_id, ak, user_id,
+             tenant, surface, rule, action, hits)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(e.created_at_epoch_secs)
+        .bind(&e.request_id)
+        .bind(&e.ak)
+        .bind(&e.user_id)
+        .bind(&e.tenant)
+        .bind(&e.surface)
+        .bind(&e.rule)
+        .bind(&e.action)
+        .bind(e.hits)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| crate::sqlx_err("insert security event", err))?;
+        Ok(())
+    }
+
+    async fn security_events(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> GResult<Vec<SecurityEvent>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule,
+             action, hits FROM security_events
+             WHERE ($1::text IS NULL OR tenant = $1) ORDER BY n DESC LIMIT $2",
+        )
+        .bind(tenant)
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read security events", e))?;
+        Ok(rows.iter().map(security_event_row).collect())
+    }
+
+    async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO admin_audit (created_at_epoch_secs, actor, scope, action, target,
+             summary, source_ip) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(e.created_at_epoch_secs)
+        .bind(&e.actor)
+        .bind(&e.scope)
+        .bind(&e.action)
+        .bind(&e.target)
+        .bind(&e.summary)
+        .bind(&e.source_ip)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| crate::sqlx_err("insert admin audit", err))?;
+        Ok(())
+    }
+
+    async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, actor, scope, action, target, summary, source_ip
+             FROM admin_audit ORDER BY n DESC LIMIT $1",
+        )
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read admin audit", e))?;
+        Ok(rows.iter().map(admin_audit_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -1271,6 +1736,8 @@ mod tests {
                 ak: "k",
                 product: "demo",
                 tenant: "default",
+                user_id: "u1",
+                request_id: "req-1",
                 requested_model: "gpt-4o",
                 served_model: "gpt-4o",
                 protocol: "openai-chat",
@@ -1292,6 +1759,9 @@ mod tests {
             ak: "ak-t".into(),
             product: "p".into(),
             tenant: "default".into(),
+            user_id: "u1".into(),
+            request_id: "req-1".into(),
+            created_at_epoch_secs: 1_000,
             model: model.into(),
             served_model: model.into(),
             protocol: "openai-chat".into(),
@@ -1362,6 +1832,90 @@ mod tests {
     #[tokio::test]
     async fn memory_store_roundtrip() {
         exercise(&MemoryStore::default()).await;
+    }
+
+    async fn exercise_audit(store: &dyn Store) {
+        let mut a = record("m1");
+        a.user_id = "alice".into();
+        a.created_at_epoch_secs = 500;
+        let mut b = record("m1");
+        b.user_id = "bob".into();
+        b.created_at_epoch_secs = 1_500;
+        store.ledger_add(&a).await.unwrap();
+        store.ledger_add(&b).await.unwrap();
+
+        let all = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
+        assert_eq!(all.len(), 2, "two users");
+        let alice = store
+            .usage_by_user(Some("default"), Some("alice"), 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].user_id, "alice");
+        assert_eq!(alice[0].total_tokens, 8);
+        let windowed = store
+            .usage_by_user(None, None, 1_000, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(windowed.len(), 1, "only bob is in the window");
+        assert_eq!(windowed[0].user_id, "bob");
+
+        store
+            .security_event_add(&SecurityEvent {
+                created_at_epoch_secs: 10,
+                request_id: "req-9".into(),
+                ak: "ak-t".into(),
+                user_id: "alice".into(),
+                tenant: "default".into(),
+                surface: "openai-chat".into(),
+                rule: "blocklist".into(),
+                action: "block".into(),
+                hits: 1,
+            })
+            .await
+            .unwrap();
+        let events = store.security_events(Some("default"), 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rule, "blocklist");
+        assert!(
+            store
+                .security_events(Some("ghost"), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "tenant filter excludes others"
+        );
+
+        store
+            .admin_audit_add(&AdminAudit {
+                created_at_epoch_secs: 20,
+                actor: "global".into(),
+                scope: "global".into(),
+                action: "key_create".into(),
+                target: "ak-new".into(),
+                summary: "tenant=t1".into(),
+                source_ip: "10.0.0.1".into(),
+            })
+            .await
+            .unwrap();
+        let audit = store.admin_audit_list(10).await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, "key_create");
+        assert_eq!(audit[0].target, "ak-new");
+    }
+
+    #[tokio::test]
+    async fn memory_audit_roundtrip() {
+        exercise_audit(&MemoryStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_audit_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("audit.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_audit(&store).await;
     }
 
     #[tokio::test]

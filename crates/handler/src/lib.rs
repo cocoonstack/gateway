@@ -19,6 +19,57 @@ use gw_state::{AkInfo, GatewayState, SharedConfig};
 
 pub use offline::{BatchItem, OfflineHandler};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Record a content-safety outcome (no prompt text) against this request's
+/// key/user/tenant. Best-effort: a store failure is logged, never fails the
+/// request. Surface = the request protocol, or "batch" for offline items.
+async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
+    let user_id = ctx
+        .ak
+        .owner
+        .as_deref()
+        .or(ctx.request.user_id.as_deref())
+        .unwrap_or_default()
+        .to_owned();
+    let surface = if ctx.request.is_online {
+        ctx.request
+            .model_param_v2
+            .as_ref()
+            .map(|p| p.protocol.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        "batch".to_owned()
+    };
+    let event = gw_state::SecurityEvent {
+        created_at_epoch_secs: gw_state::epoch_secs(),
+        request_id: ctx.request.request_id.clone(),
+        ak: ctx.ak.ak.clone(),
+        user_id,
+        tenant: ctx.ak.tenant.clone(),
+        surface,
+        rule: rule.to_owned(),
+        action: action.to_owned(),
+        hits,
+    };
+    if let Err(e) = ctx.state.store.security_event_add(&event).await {
+        tracing::warn!(error = %e, "security event write failed");
+    }
+}
+
+/// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
+/// unique within the process (the seq disambiguates same-millisecond requests).
+pub fn new_request_id() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Runs one request through the plugin pre-stage, the DAG, and the plugin post-stage.
 #[derive(Clone)]
 pub struct OnlineHandler {
@@ -67,6 +118,9 @@ impl OnlineHandler {
     /// Run one request: plugin pre → DAG (4 layers) → plugin post.
     /// The returned context carries the outcome, decision log, billing effects.
     pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
+        if request.request_id.is_empty() {
+            request.request_id = new_request_id();
+        }
         // one consistent snapshot for the whole request
         let snap = self.config.load();
         // outbound DLP is a response-buffering boundary: a masked span can
@@ -101,6 +155,7 @@ impl OnlineHandler {
                 block,
                 ..Default::default()
             });
+            emit_security_event(&ctx, "blocklist", "block", 1).await;
             return Ok(ctx);
         }
         let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
@@ -114,6 +169,7 @@ impl OnlineHandler {
         );
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
+            emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
         }
 
         // a panicking node must refund too, not leak the reserves; unwind-safe —
@@ -161,6 +217,7 @@ impl OnlineHandler {
         };
         if redacted_out > 0 {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
+            emit_security_event(&ctx, "dlp", "redact_out", redacted_out as i64).await;
         }
         Ok(ctx)
     }
@@ -558,6 +615,7 @@ mod tests {
             ak: "ak-t1".into(),
             product: "p".into(),
             tenant: "t1".into(),
+            owner: None,
             qps: 10.0,
             daily_token_quota: 100_000,
             tokens_per_minute: None,

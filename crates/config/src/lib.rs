@@ -64,6 +64,11 @@ pub struct AkConf {
     /// Tenant this key belongs to; empty = the implicit `default` tenant.
     #[serde(default)]
     pub tenant: String,
+    /// End user this key is issued to, when one key = one user (the enterprise
+    /// per-employee model); `None` when the key is shared and per-user
+    /// attribution rides on request metadata instead.
+    #[serde(default)]
+    pub owner: Option<String>,
     pub qps: f64,
     pub daily_token_quota: i64,
     /// tokens-per-minute window limit; None = unlimited.
