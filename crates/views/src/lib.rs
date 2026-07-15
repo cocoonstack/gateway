@@ -274,16 +274,6 @@ impl RealtimeAdmit {
     }
 }
 
-/// The attribution user for a realtime turn: the key's owner is authoritative,
-/// falling back to the client's connect-time `x-gw-user` hint (realtime has no
-/// per-turn body `user` field). The REST counterpart is `effective_user_id`.
-fn realtime_user<'a>(ak: &'a AkInfo, hint: &'a str) -> &'a str {
-    ak.owner
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(hint)
-}
-
 /// The REST admission chain applied per realtime generation via the shared
 /// [`admission`] checks, with the key re-fetched each turn so mid-session
 /// bans/de-entitlements take effect. Two deliberate divergences from the DAG:
@@ -316,7 +306,7 @@ async fn realtime_gate(
     admission::check_ak_rate(gov, &ak).await?;
     admission::check_product_qpm(gov, cfg, &ak.product).await?;
     admission::check_model_qpm(gov, cfg, model).await?;
-    admission::check_user_budget(gov, cfg, &ak.tenant, realtime_user(&ak, hint)).await?;
+    admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint)).await?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, model)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak, model), limit)
@@ -333,7 +323,7 @@ async fn realtime_gate(
             return Err(denied);
         }
     };
-    let user = realtime_user(&ak, hint).to_owned();
+    let user = ak.attributed_user(hint).to_owned();
     Ok(RealtimeAdmit {
         ak,
         user,
@@ -703,7 +693,7 @@ async fn realtime_bridge(
                                         .authenticate(&ak.ak)
                                         .await
                                         .unwrap_or_else(|| ak.clone());
-                                    let user = realtime_user(&billed, &hint).to_owned();
+                                    let user = billed.attributed_user(&hint).to_owned();
                                     let unreserved = RealtimeAdmit {
                                         ak: billed,
                                         user,
@@ -991,7 +981,7 @@ async fn emit_rt_hits(
             created_at_epoch_secs: gw_state::epoch_secs(),
             request_id: String::new(),
             ak: ak.ak.clone(),
-            user_id: realtime_user(ak, hint).to_owned(),
+            user_id: ak.attributed_user(hint).to_owned(),
             tenant: ak.tenant.clone(),
             surface: "realtime".to_owned(),
             rule: hit.rule.clone(),

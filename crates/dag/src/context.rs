@@ -72,13 +72,11 @@ impl DagContext {
     }
 
     /// The effective end user: the key's `owner` (authoritative) else request
-    /// metadata; `""` when neither is present.
+    /// metadata; `""` when neither is present. Resolution lives on [`AkInfo`] so
+    /// REST and realtime can't diverge on an empty owner.
     pub fn effective_user_id(&self) -> &str {
         self.ak
-            .owner
-            .as_deref()
-            .or(self.request.user_id.as_deref())
-            .unwrap_or_default()
+            .attributed_user(self.request.user_id.as_deref().unwrap_or_default())
     }
 
     /// The decision trail as `"stage: detail"` lines.

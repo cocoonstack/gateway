@@ -64,6 +64,18 @@ impl AkInfo {
         }
     }
 
+    /// The attributed end user: this key's `owner` when set to a non-empty value
+    /// (authoritative), else the caller-supplied `fallback` — request metadata
+    /// on REST surfaces, the `x-gw-user` connect hint on realtime. Empty when
+    /// neither is present. The one resolution every surface shares so an empty
+    /// owner can't fall back on one surface and swallow attribution on another.
+    pub fn attributed_user<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.owner
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback)
+    }
+
     /// Apply a partial quota/lifecycle patch.
     pub fn apply_patch(&mut self, patch: &KeyPatch) {
         if let Some(v) = patch.qps {
@@ -874,6 +886,25 @@ mod tests {
             banned: false,
             model_quotas: Default::default(),
         }
+    }
+
+    #[test]
+    fn attributed_user_prefers_nonempty_owner_else_fallback() {
+        let mut ak = ak_info("k");
+        assert_eq!(ak.attributed_user("hint"), "hint", "no owner → fallback");
+        ak.owner = Some(String::new());
+        assert_eq!(
+            ak.attributed_user("hint"),
+            "hint",
+            "empty owner is not an identity → fallback"
+        );
+        ak.owner = Some("alice".into());
+        assert_eq!(
+            ak.attributed_user("hint"),
+            "alice",
+            "owner wins over fallback"
+        );
+        assert_eq!(ak.attributed_user(""), "alice");
     }
 
     #[test]
