@@ -597,6 +597,8 @@ async fn realtime_bridge(
     let mut pending: std::collections::VecDeque<RealtimeAdmit> = std::collections::VecDeque::new();
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
+    // outbound DLP redactions summed within a turn, recorded once at its boundary
+    let mut out_redacted = 0i64;
     loop {
         tokio::select! {
             m = cl_rx.next() => {
@@ -682,6 +684,7 @@ async fn realtime_bridge(
                 };
                 let mut relay = true;
                 let mut redacted: Option<String> = None;
+                let mut turn_ended = false;
                 match frame {
                     Some(mut v) => {
                         if suppress {
@@ -746,17 +749,31 @@ async fn realtime_bridge(
                                 None => {}
                             }
                             recognized += 1;
+                            turn_ended = true;
                         }
                         // outbound DLP, per frame (a span straddling deltas is
                         // beyond a relay that cannot buffer)
                         let cfg = s.handler.cfg();
-                        if relay
-                            && gw_handler::plugins::dlp_redact_realtime_frame(
+                        let n = if relay {
+                            gw_handler::plugins::dlp_redact_realtime_frame(
                                 cfg.security_for(&ak.tenant),
                                 &mut v,
-                            ) > 0
-                        {
+                            )
+                        } else {
+                            0
+                        };
+                        if n > 0 {
                             redacted = Some(v.to_string());
+                        }
+                        // a per-token event stream would be too hot: sum the turn's
+                        // outbound redactions and record one event at its boundary
+                        out_redacted += n as i64;
+                        if turn_ended {
+                            if out_redacted > 0 {
+                                write_rt_event(&s, &ak, ak.attributed_user(&hint), "dlp", "redact", out_redacted)
+                                    .await;
+                            }
+                            out_redacted = 0;
                         }
                     }
                     // a denied turn's non-JSON output (e.g. audio deltas) is dropped too

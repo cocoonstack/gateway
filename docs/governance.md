@@ -124,10 +124,11 @@ error).
 
 The same policy applies on every surface, realtime included: a `/v1/realtime`
 WebSocket runs the blocklist, regex rules, DLP redaction, and the external
-moderator on inbound frames, so it is not a bypass. One deliberate exception:
-per-*delta* outbound DLP redactions on the streaming relay are not written as
-individual security events (a store write per token is too hot) — inbound
-redactions and every block/flag/moderation hit still are.
+moderator on inbound frames, so it is not a bypass. Every hit is audited: inbound
+block/flag/moderation and DLP redactions are recorded per frame; outbound DLP
+redactions (which stream token-by-token) are summed across the turn and recorded
+as one event at the turn boundary — the redaction still applies to every frame,
+only its audit is aggregated (a store write per token would be too hot).
 
 ## Audit trails
 
