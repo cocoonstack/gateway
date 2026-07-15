@@ -96,3 +96,37 @@ redacted text replayed** rather than forwarded token-by-token — DLP trades
 incremental delivery for a guarantee that no unmasked text reaches the client.
 Turn `dlp_redact` off to keep incremental delivery; note the embedded demo
 config ships with it on.
+
+## Per-user attribution and billing
+
+Every ledger row carries a `user_id`, `request_id`, and `created_at_epoch_secs`.
+The effective user is the key's `owner` (one key = one user, the enterprise
+model) if set, else request metadata — the `x-gw-user` header, OpenAI's `user`
+field, or Anthropic's `metadata.user_id`. `owner` is authoritative; the
+metadata hint is only trusted for shared keys. `GET /admin/usage/users?user=&since=&until=`
+returns per-(user, model) cost over a billing period (add `format=csv` for
+export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap.
+
+## Enterprise content policy
+
+`security:` is global by default; a tenant may override it whole with
+`tenants[].security`. Beyond the blocklist and DLP, a policy can carry
+`blocklist_action` (`block` denies, `flag` records, `shadow` trials a rule),
+named `regex_rules` (each with its own action), and `detect_secrets` (masks API
+keys / credentials). Every rule that fires is recorded — without the offending
+text — to the security-event stream, queryable at `GET /admin/audit/events`.
+Set `moderate: true` to route inbound text through an external moderator wired
+into the handler (`moderation_fail_open` picks the posture on a moderator
+error).
+
+## Audit trails
+
+- **Content-safety events** (`/admin/audit/events`): who/which-rule/what-action,
+  no prompt text; tenant-scoped.
+- **Admin operations** (`/admin/audit/ops`, global admin only): every key CRUD,
+  config publish, and reload with actor, action, target, and source IP.
+- **Content retention** (`tenants[].retention`): `none` (default), `redacted`
+  (post-DLP text), or `full` (raw). Stored in `request_content`, sealed at rest
+  with XChaCha20-Poly1305 under `GW_CONTENT_KEY` (64 hex chars); `full` refuses
+  to store raw without a key and falls back to redacted. `days` sets expiry; an
+  hourly purge deletes elapsed content.
