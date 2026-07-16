@@ -551,8 +551,9 @@ pub struct MemoryStore {
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<Vec<crate::ContentRecord>>,
-    /// (tenant, user, erased_at) markers backing [`Store::user_erased_since`].
-    erasures: Mutex<Vec<(String, String, i64)>>,
+    /// Latest erasure instant per (tenant, user), backing
+    /// [`Store::user_erased_since`] — one entry per pair, not a log.
+    erasures: Mutex<std::collections::HashMap<(String, String), i64>>,
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
     seq: AtomicUsize,
@@ -800,11 +801,10 @@ impl Store for MemoryStore {
         self.erasures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((
-                tenant.unwrap_or_default().to_owned(),
-                user.to_owned(),
+            .insert(
+                (tenant.unwrap_or_default().to_owned(), user.to_owned()),
                 crate::epoch_secs(),
-            ));
+            );
         audit.summary = format!("rows={erased}");
         self.audit
             .lock()
@@ -814,12 +814,16 @@ impl Store for MemoryStore {
     }
 
     async fn user_erased_since(&self, tenant: &str, user: &str, since: i64) -> GResult<bool> {
-        Ok(self
+        let erasures = self
             .erasures
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|(t, u, at)| u == user && *at >= since && (t.is_empty() || t == tenant)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hit = |t: &str| {
+            erasures
+                .get(&(t.to_owned(), user.to_owned()))
+                .is_some_and(|at| *at >= since)
+        };
+        Ok(hit("") || hit(tenant))
     }
 
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
@@ -1042,7 +1046,8 @@ impl SqliteStore {
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS erasures (
                 tenant TEXT NOT NULL, user_id TEXT NOT NULL,
-                erased_at_epoch_secs INTEGER NOT NULL)",
+                erased_at_epoch_secs INTEGER NOT NULL,
+                PRIMARY KEY (tenant, user_id))",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
                 minute_epoch INTEGER NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
                 model TEXT NOT NULL, requests INTEGER NOT NULL,
@@ -1423,7 +1428,9 @@ impl Store for SqliteStore {
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
         let erased = c.rows_affected() + m.rows_affected();
         sqlx::query(
-            "INSERT INTO erasures (tenant, user_id, erased_at_epoch_secs) VALUES (?, ?, ?)",
+            "INSERT INTO erasures (tenant, user_id, erased_at_epoch_secs) VALUES (?, ?, ?)
+             ON CONFLICT (tenant, user_id) DO UPDATE SET
+              erased_at_epoch_secs = excluded.erased_at_epoch_secs",
         )
         .bind(tenant.unwrap_or_default())
         .bind(user)

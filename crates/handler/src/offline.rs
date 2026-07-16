@@ -39,8 +39,14 @@ impl OfflineHandler {
                 .await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
+            // items are captured HERE: an erasure landing after this instant
+            // must stop them, so the marker comparison point is submission,
+            // not the spawned executor's first poll
+            let captured_at = gw_state::epoch_secs();
             // claim 0: non-distributed store — no fence, the heartbeat is a no-op
-            tokio::spawn(async move { this.execute(&id, &ak, &model, items, 0).await });
+            tokio::spawn(
+                async move { this.execute(&id, &ak, &model, items, 0, captured_at).await },
+            );
             Ok(job)
         }
     }
@@ -49,9 +55,16 @@ impl OfflineHandler {
     /// the terminal status, heartbeating between items. `claim` is the fence
     /// token (0 for the in-process path); once a heartbeat reports the batch
     /// reclaimed, this executor stops rather than double-running items.
-    async fn execute(&self, id: &str, ak: &AkInfo, model: &str, items: Vec<BatchItem>, claim: i64) {
+    async fn execute(
+        &self,
+        id: &str,
+        ak: &AkInfo,
+        model: &str,
+        items: Vec<BatchItem>,
+        claim: i64,
+        captured_at: i64,
+    ) {
         let store = self.online.state().store.clone();
-        let started = gw_state::epoch_secs();
         // the distributed claim already set status=running with the fence bump;
         // only the in-process path needs this write — unfenced on the distributed
         // path it could resurrect a batch a stale worker no longer owns
@@ -141,7 +154,7 @@ impl OfflineHandler {
             // run: fail it instead of sending an erased prompt upstream
             let erased_mid_batch = !store.distributed_batches()
                 && store
-                    .user_erased_since(&ak.tenant, &user, started)
+                    .user_erased_since(&ak.tenant, &user, captured_at)
                     .await
                     .unwrap_or(true);
             if erased_mid_batch || item.messages.is_empty() {
@@ -247,7 +260,15 @@ impl OfflineHandler {
                             continue;
                         }
                     };
-                    self.execute(&job.id, &ak, &job.model, items, claim).await;
+                    self.execute(
+                        &job.id,
+                        &ak,
+                        &job.model,
+                        items,
+                        claim,
+                        gw_state::epoch_secs(),
+                    )
+                    .await;
                 }
                 Ok(None) => tokio::time::sleep(poll).await,
                 Err(e) => {
