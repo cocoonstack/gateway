@@ -507,6 +507,17 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn batch_load_items(&self, _id: &str) -> GResult<Vec<gw_models::BatchItem>> {
         Ok(Vec::new())
     }
+    /// The current stored copy of one queued item, on backends that persist
+    /// items (`None` otherwise). Executors re-read this immediately before
+    /// dispatch, so an erasure landing while the batch sat queued stops the
+    /// item instead of letting the pre-load snapshot run.
+    async fn batch_item_snapshot(
+        &self,
+        _id: &str,
+        _idx: usize,
+    ) -> GResult<Option<gw_models::BatchItem>> {
+        Ok(None)
+    }
     /// Claim one pending batch (requeuing stale running ones first); `None` =
     /// nothing to run. The returned fence token (>= 1, bumped per claim) rides
     /// [`Store::batch_touch`] / [`Store::batch_set_status_owned`] so a reclaimed
@@ -2330,6 +2341,25 @@ impl Store for PostgresStore {
         })
     }
 
+    async fn batch_item_snapshot(
+        &self,
+        id: &str,
+        idx: usize,
+    ) -> GResult<Option<gw_models::BatchItem>> {
+        let row = sqlx::query(
+            "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 AND idx = $2",
+        )
+        .bind(id)
+        .bind(idx as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read batch item", e))?;
+        Ok(row.map(|r| gw_models::BatchItem {
+            messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
+            user: r.get(1),
+        }))
+    }
+
     async fn batch_load_items(&self, id: &str) -> GResult<Vec<gw_models::BatchItem>> {
         let rows = sqlx::query(
             "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 ORDER BY idx",
@@ -2889,6 +2919,15 @@ mod tests {
         assert!(
             loaded[0].messages.is_empty(),
             "u1's queued prompt erased before any drainer ran"
+        );
+        let fresh = store
+            .batch_item_snapshot(&pending.id, 0)
+            .await
+            .unwrap()
+            .expect("item row still present");
+        assert!(
+            fresh.messages.is_empty(),
+            "the pre-dispatch snapshot sees the erasure"
         );
         assert_eq!(
             loaded[1].messages[0].content, "keep me",

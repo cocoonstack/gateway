@@ -46,6 +46,8 @@ pub enum ConfigError {
     UnknownQuotaModel { owner: String, model: String },
     #[error("tenant `{tenant}` fallback model `{model}` is unknown or not entitled")]
     BadFallbackModel { tenant: String, model: String },
+    #[error("`{owner}` sets a negative price")]
+    NegativePrice { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
     SharedCacheNeedsRedis,
 }
@@ -592,6 +594,35 @@ impl GatewayConfig {
         if self.storage.shared_cache && self.storage.redis_url.is_empty() {
             return Err(ConfigError::SharedCacheNeedsRedis);
         }
+        // negative prices would make cost accounting non-monotonic (the usage
+        // rollup's max-upsert relies on per-column monotone sums)
+        let neg = |i: i64, o: i64| i < 0 || o < 0;
+        for m in &self.models {
+            if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros) {
+                return Err(ConfigError::NegativePrice {
+                    owner: format!("model {}", m.name),
+                });
+            }
+        }
+        for a in &self.accounts {
+            if neg(
+                a.cost_input_price_per_1k_micros,
+                a.cost_output_price_per_1k_micros,
+            ) {
+                return Err(ConfigError::NegativePrice {
+                    owner: format!("account {}", a.name),
+                });
+            }
+        }
+        for t in &self.tenants {
+            for (model, p) in &t.model_prices {
+                if neg(p.input_price_per_1k_micros, p.output_price_per_1k_micros) {
+                    return Err(ConfigError::NegativePrice {
+                        owner: format!("tenant {} price for {model}", t.name),
+                    });
+                }
+            }
+        }
         for m in &self.models {
             if m.protocol().is_none() {
                 return Err(ConfigError::UnknownModelMapping {
@@ -1079,6 +1110,15 @@ tenants: [{name: t1}, {name: t1}]
             GatewayConfig::from_yaml(dup),
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
         ));
+
+        let neg_price = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: -1}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(neg_price),
+                Err(ConfigError::NegativePrice { .. })
+            ),
+            "negative prices are rejected at load"
+        );
 
         let colon = "listen: {host: h, port: 1}\ntenants: [{name: 'a:b'}]";
         assert!(

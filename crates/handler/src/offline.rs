@@ -96,7 +96,7 @@ impl OfflineHandler {
                 }
             })
         };
-        for (index, item) in items.into_iter().enumerate() {
+        for (index, mut item) in items.into_iter().enumerate() {
             if lost.load(Relaxed) {
                 break; // reclaimed by another instance; stop running new items
             }
@@ -110,6 +110,11 @@ impl OfflineHandler {
             if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
                 break;
+            }
+            // re-read the stored copy just before dispatch: an erasure that
+            // landed while this batch sat queued blanks the persisted item
+            if let Ok(Some(fresh)) = store.batch_item_snapshot(id, index).await {
+                item = fresh;
             }
             let user = ak.attributed_user(&item.user).to_owned();
             // an erased item (messages blanked by content_erase_user) must not
