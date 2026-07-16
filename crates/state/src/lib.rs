@@ -863,6 +863,15 @@ pub fn epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Unix milliseconds; erasure markers use this so an erase-then-resubmit in
+/// the same second isn't misjudged as pre-erasure content.
+pub fn epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

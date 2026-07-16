@@ -25,6 +25,9 @@ pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
 /// Prune the SQL ledger every Nth insert instead of per write (the cap becomes
 /// approximate by at most this many rows, saving a round-trip per billing).
+/// Pruning spares rows the rollup hasn't folded yet (created at or past the
+/// watermark), so a burst can exceed `ledger_max_rows` briefly rather than
+/// lose usage — billing integrity outranks a strict cap.
 const LEDGER_PRUNE_EVERY: usize = 64;
 
 /// Usage-rollup bucket width.
@@ -518,12 +521,13 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<Option<gw_models::BatchItem>> {
         Ok(None)
     }
-    /// Whether `user`'s content was erased at or after `since` (unix secs).
-    /// Local executors check this before dispatching an item captured before
-    /// the erasure, so a long sequential batch can't keep running an erased
-    /// user's prompts; a batch submitted after the erasure passes (its start
-    /// postdates `since`). Item-persisting backends re-read rows at dispatch
-    /// instead and keep the default `false`.
+    /// Whether `user`'s content was erased at or after `since` (unix MILLIS —
+    /// second granularity would misjudge an erase-then-resubmit in the same
+    /// second). Local executors check this before dispatching an item captured
+    /// before the erasure, so a long sequential batch can't keep running an
+    /// erased user's prompts; a batch submitted after the erasure passes.
+    /// Item-persisting backends re-read rows at dispatch instead and keep the
+    /// default `false`.
     async fn user_erased_since(&self, _tenant: &str, _user: &str, _since: i64) -> GResult<bool> {
         Ok(false)
     }
@@ -573,6 +577,14 @@ impl MemoryStore {
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+        // watermark first: rollup-then-records is the lock order advance uses
+        let watermark = self
+            .rollup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .next_back()
+            .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
         let mut records = self
             .records
             .lock()
@@ -580,7 +592,14 @@ impl Store for MemoryStore {
         records.push(r.clone());
         if self.ledger_max_rows > 0 && records.len() > self.ledger_max_rows {
             let excess = records.len() - self.ledger_max_rows;
-            records.drain(..excess);
+            // spare rows the rollup hasn't folded yet — lost here means lost
+            // from usage forever; the cap yields to billing integrity
+            let cut = records
+                .iter()
+                .take(excess)
+                .take_while(|r| r.created_at_epoch_secs < watermark)
+                .count();
+            records.drain(..cut);
         }
         Ok(())
     }
@@ -803,7 +822,7 @@ impl Store for MemoryStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 (tenant.unwrap_or_default().to_owned(), user.to_owned()),
-                crate::epoch_secs(),
+                crate::epoch_millis(),
             );
         audit.summary = format!("rows={erased}");
         self.audit
@@ -1046,7 +1065,7 @@ impl SqliteStore {
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS erasures (
                 tenant TEXT NOT NULL, user_id TEXT NOT NULL,
-                erased_at_epoch_secs INTEGER NOT NULL,
+                erased_at_epoch_millis INTEGER NOT NULL,
                 PRIMARY KEY (tenant, user_id))",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
                 minute_epoch INTEGER NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -1161,11 +1180,15 @@ impl Store for SqliteStore {
                 .fetch_add(1, Ordering::Relaxed)
                 .is_multiple_of(LEDGER_PRUNE_EVERY)
         {
-            sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?")
-                .bind(self.ledger_max_rows as i64)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+            sqlx::query(
+                "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?
+                 AND created_at_epoch_secs <
+                  (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)",
+            )
+            .bind(self.ledger_max_rows as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("prune billing records", e))?;
         }
         Ok(())
     }
@@ -1428,13 +1451,13 @@ impl Store for SqliteStore {
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
         let erased = c.rows_affected() + m.rows_affected();
         sqlx::query(
-            "INSERT INTO erasures (tenant, user_id, erased_at_epoch_secs) VALUES (?, ?, ?)
+            "INSERT INTO erasures (tenant, user_id, erased_at_epoch_millis) VALUES (?, ?, ?)
              ON CONFLICT (tenant, user_id) DO UPDATE SET
-              erased_at_epoch_secs = excluded.erased_at_epoch_secs",
+              erased_at_epoch_millis = excluded.erased_at_epoch_millis",
         )
         .bind(tenant.unwrap_or_default())
         .bind(user)
-        .bind(crate::epoch_secs())
+        .bind(crate::epoch_millis())
         .execute(&mut *tx)
         .await
         .map_err(|e| crate::sqlx_err("record erasure", e))?;
@@ -1515,7 +1538,7 @@ impl Store for SqliteStore {
     async fn user_erased_since(&self, tenant: &str, user: &str, since: i64) -> GResult<bool> {
         let hit: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM erasures
-              WHERE user_id = ?1 AND erased_at_epoch_secs >= ?2
+              WHERE user_id = ?1 AND erased_at_epoch_millis >= ?2
                 AND (tenant = '' OR tenant = ?3))",
         )
         .bind(user)
@@ -1709,6 +1732,12 @@ impl PostgresStore {
             // per-item end-user attribution so a fleet drainer still bills/budgets it
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
+            // pre-upgrade results predate the user_id column; their items rows
+            // (pruned only at terminal status from this version on) still carry
+            // the owner — backfill so erasure reaches history. Idempotent.
+            "UPDATE batch_results r SET user_id = i.user_id FROM batch_items i
+             WHERE r.batch_id = i.batch_id AND r.idx = i.idx
+               AND r.user_id = '' AND i.user_id <> ''",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
             // fence token: bumped on every claim so a reclaimed executor's fenced writes no-op
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_seq BIGINT NOT NULL DEFAULT 0",
@@ -1782,11 +1811,15 @@ impl Store for PostgresStore {
                 .fetch_add(1, Ordering::Relaxed)
                 .is_multiple_of(LEDGER_PRUNE_EVERY)
         {
-            sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - $1")
-                .bind(self.ledger_max_rows as i64)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+            sqlx::query(
+                "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - $1
+                 AND created_at_epoch_secs <
+                  (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)",
+            )
+            .bind(self.ledger_max_rows as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("prune billing records", e))?;
         }
         Ok(())
     }
@@ -2717,25 +2750,37 @@ mod tests {
         exercise_audit(&store).await;
     }
 
-    async fn exercise_rollup(store: &dyn Store) {
+    /// `ns` namespaces tenant/user ids so shared-database (PG) runs stay
+    /// isolated from parallel tests without truncating anything.
+    async fn exercise_rollup(store: &dyn Store, ns: &str) {
+        let tenant = format!("tr{ns}");
         let mut a = record("m1");
+        a.tenant = tenant.clone();
         a.user_id = "alice".into();
         a.created_at_epoch_secs = 400;
         let mut b = record("m1");
+        b.tenant = tenant.clone();
         b.user_id = "bob".into();
         b.created_at_epoch_secs = 460;
         let mut tail = record("m1");
+        tail.tenant = tenant.clone();
         tail.user_id = "carol".into();
         tail.created_at_epoch_secs = 1_520;
         for r in [&a, &b, &tail] {
             store.ledger_add(r).await.unwrap();
         }
-        let baseline = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
+        let baseline = store
+            .usage_by_user(Some(&tenant), None, 0, i64::MAX)
+            .await
+            .unwrap();
         assert_eq!(baseline.len(), 3, "raw-only result before any rollup");
 
         store.usage_rollup_advance(1_500).await.unwrap();
         store.usage_rollup_advance(1_500).await.unwrap();
-        let after = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
+        let after = store
+            .usage_by_user(Some(&tenant), None, 0, i64::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             format!("{baseline:?}"),
             format!("{after:?}"),
@@ -2743,7 +2788,7 @@ mod tests {
         );
 
         let windowed = store
-            .usage_by_user(None, None, 450, i64::MAX)
+            .usage_by_user(Some(&tenant), None, 450, i64::MAX)
             .await
             .unwrap();
         assert!(
@@ -2759,7 +2804,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_rollup_roundtrip() {
-        exercise_rollup(&MemoryStore::default()).await;
+        exercise_rollup(&MemoryStore::default(), "").await;
     }
 
     #[tokio::test]
@@ -2768,7 +2813,7 @@ mod tests {
         let store = SqliteStore::open(dir.path().join("rollup.db").to_str().unwrap())
             .await
             .unwrap();
-        exercise_rollup(&store).await;
+        exercise_rollup(&store, "").await;
     }
 
     #[tokio::test]
@@ -2849,7 +2894,10 @@ mod tests {
         );
     }
 
-    async fn exercise_erase(store: &dyn Store) {
+    async fn exercise_erase(store: &dyn Store, ns: &str) {
+        let (t1, t2) = (format!("t1{ns}"), format!("t2{ns}"));
+        let (u1, u2) = (format!("u1{ns}"), format!("u2{ns}"));
+        let (t1, t2, u1, u2) = (t1.as_str(), t2.as_str(), u1.as_str(), u2.as_str());
         let rec = |req: &str, user: &str, tenant: &str| crate::ContentRecord {
             created_at_epoch_secs: 100,
             request_id: req.into(),
@@ -2861,10 +2909,11 @@ mod tests {
             sealed: false,
             expires_at_epoch_secs: 0,
         };
-        store.content_add(&rec("r1", "u1", "t1")).await.unwrap();
-        store.content_add(&rec("r2", "u1", "t2")).await.unwrap();
-        store.content_add(&rec("r3", "u2", "t1")).await.unwrap();
-        let job = store.batch_create("ak", "t1", "m", 1).await.unwrap();
+        let (r1, r2, r3) = (format!("r1{ns}"), format!("r2{ns}"), format!("r3{ns}"));
+        store.content_add(&rec(&r1, u1, t1)).await.unwrap();
+        store.content_add(&rec(&r2, u1, t2)).await.unwrap();
+        store.content_add(&rec(&r3, u2, t1)).await.unwrap();
+        let job = store.batch_create("ak", t1, "m", 1).await.unwrap();
         store
             .batch_push_result(
                 &job.id,
@@ -2873,7 +2922,7 @@ mod tests {
                     ok: true,
                     message: "generated for u1".into(),
                     total_tokens: 3,
-                    user: "u1".into(),
+                    user: u1.into(),
                 },
             )
             .await
@@ -2884,36 +2933,36 @@ mod tests {
             actor: "global".into(),
             scope: "global".into(),
             action: "content_erase".into(),
-            target: "u1".into(),
+            target: u1.into(),
             summary: String::new(),
             source_ip: "10.0.0.1".into(),
         };
         assert_eq!(
             store
-                .content_erase_user(Some("t1"), "u1", audit())
+                .content_erase_user(Some(t1), u1, audit())
                 .await
                 .unwrap(),
             2,
             "tenant-scoped erase: the content row plus the batch-result message"
         );
-        assert_eq!(store.content_for("r2").await.unwrap().len(), 1);
+        assert_eq!(store.content_for(&r2).await.unwrap().len(), 1);
         let results = store.batch_get(&job.id).await.unwrap().unwrap().results;
         assert_eq!(results[0].message, "", "generated output erased");
-        assert_eq!(results[0].user, "u1", "attribution survives for billing");
+        assert_eq!(results[0].user, u1, "attribution survives for billing");
         assert_eq!(
-            store.content_erase_user(None, "u1", audit()).await.unwrap(),
+            store.content_erase_user(None, u1, audit()).await.unwrap(),
             1,
             "global erase removes the remaining tenant's row"
         );
         assert_eq!(
-            store.content_for("r3").await.unwrap().len(),
+            store.content_for(&r3).await.unwrap().len(),
             1,
             "other users' content is untouched"
         );
-        let trail = store.admin_audit_list(10).await.unwrap();
+        let trail = store.admin_audit_list(1_000).await.unwrap();
         let erases: Vec<_> = trail
             .iter()
-            .filter(|e| e.action == "content_erase" && e.target == "u1")
+            .filter(|e| e.action == "content_erase" && e.target == u1)
             .collect();
         assert_eq!(erases.len(), 2, "each erasure committed its audit entry");
         let summaries: Vec<&str> = erases.iter().map(|e| e.summary.as_str()).collect();
@@ -2926,18 +2975,19 @@ mod tests {
 
     /// Local backends only: item-persisting stores (PG) re-read rows at
     /// dispatch and keep the trait's `false` default.
-    async fn exercise_erasure_markers(store: &dyn Store) {
-        let now = crate::epoch_secs();
+    async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
+        let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
+        let now = crate::epoch_millis();
         assert!(
-            store.user_erased_since("t1", "u1", now - 5).await.unwrap(),
+            store.user_erased_since(&t1, &u1, now - 5).await.unwrap(),
             "marker visible to a batch started before the erasure"
         );
         assert!(
-            !store.user_erased_since("t1", "u1", now + 5).await.unwrap(),
+            !store.user_erased_since(&t1, &u1, now + 5).await.unwrap(),
             "a batch started after the erasure is unaffected"
         );
         assert!(
-            !store.user_erased_since("t1", "u2", now - 5).await.unwrap(),
+            !store.user_erased_since(&t1, &u2, now - 5).await.unwrap(),
             "other users unaffected"
         );
     }
@@ -2945,8 +2995,8 @@ mod tests {
     #[tokio::test]
     async fn memory_erase_roundtrip() {
         let store = MemoryStore::default();
-        exercise_erase(&store).await;
-        exercise_erasure_markers(&store).await;
+        exercise_erase(&store, "").await;
+        exercise_erasure_markers(&store, "").await;
     }
 
     #[tokio::test]
@@ -2954,30 +3004,43 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        let store = PostgresStore::connect(&url).await.expect("pg connect");
-        sqlx::query(
-            "TRUNCATE billing, usage_rollup, request_content, admin_audit,
-             batches, batch_items, batch_results",
-        )
-        .execute(&store.pool)
-        .await
-        .expect("truncate");
-        exercise_rollup(&store).await;
-        exercise_erase(&store).await;
+        // a private database, not truncation: the shared one serves parallel
+        // tests, and the rollup watermark is global per database — leftovers
+        // from any earlier run would shadow this test's raw fixtures
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = format!("gwtest_{nonce}");
+        let admin = sqlx::PgPool::connect(&url).await.expect("pg admin");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
+            .execute(&admin)
+            .await
+            .expect("create test db");
+        let own_url = match url.rfind('/') {
+            Some(i) => format!("{}/{db}", &url[..i]),
+            None => url.clone(),
+        };
+        let store = PostgresStore::connect(&own_url).await.expect("pg connect");
+        let ns = format!("-{nonce}");
+        exercise_rollup(&store, &ns).await;
+        exercise_erase(&store, &ns).await;
 
-        // erasure reaches a still-pending batch's inputs (PG-only store)
+        // erasure reaches a still-pending batch's inputs, keyed by the
+        // EFFECTIVE user the enqueue persisted
+        let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
         let items = vec![
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "erase me")],
-                user: "u1".into(),
+                user: erika.clone(),
             },
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "keep me")],
-                user: "u2".into(),
+                user: format!("other{ns}"),
             },
         ];
         let pending = store
-            .batch_enqueue("ak", "t1", "gpt-4o", &items)
+            .batch_enqueue("ak", &t1, "gpt-4o", &items)
             .await
             .unwrap();
         let audit2 = AdminAudit {
@@ -2985,13 +3048,13 @@ mod tests {
             actor: "global".into(),
             scope: "global".into(),
             action: "content_erase".into(),
-            target: "u1".into(),
+            target: erika.clone(),
             summary: String::new(),
             source_ip: "10.0.0.1".into(),
         };
         assert_eq!(
             store
-                .content_erase_user(Some("t1"), "u1", audit2)
+                .content_erase_user(Some(&t1), &erika, audit2)
                 .await
                 .unwrap(),
             1,
@@ -3000,21 +3063,18 @@ mod tests {
         let loaded = store.batch_load_items(&pending.id).await.unwrap();
         assert!(
             loaded[0].messages.is_empty(),
-            "u1's queued prompt erased before any drainer ran"
+            "queued prompt erased before any drainer ran"
+        );
+        assert_eq!(
+            loaded[1].messages[0].content, "keep me",
+            "other users' queued items untouched"
         );
         let fresh = store
             .batch_item_snapshot(&pending.id, 0)
             .await
             .unwrap()
             .expect("item row still present");
-        assert!(
-            fresh.messages.is_empty(),
-            "the pre-dispatch snapshot sees the erasure"
-        );
-        assert_eq!(
-            loaded[1].messages[0].content, "keep me",
-            "other users' queued items untouched"
-        );
+        assert!(fresh.messages.is_empty(), "pre-dispatch snapshot sees it");
     }
 
     #[tokio::test]
@@ -3023,8 +3083,8 @@ mod tests {
         let store = SqliteStore::open(dir.path().join("erase.db").to_str().unwrap())
             .await
             .unwrap();
-        exercise_erase(&store).await;
-        exercise_erasure_markers(&store).await;
+        exercise_erase(&store, "").await;
+        exercise_erasure_markers(&store, "").await;
     }
 
     #[tokio::test]
@@ -3110,13 +3170,32 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_retention_caps_both_stores() {
+        // rows only prune once rolled: record() stamps created_at=1000, so an
+        // advance past the settle window folds them and re-arms the cap
         let mem = MemoryStore::with_ledger_cap(2);
-        for m in ["a", "b", "c"] {
+        for m in ["a", "b"] {
             mem.ledger_add(&record(m)).await.unwrap();
         }
+        mem.ledger_add(&record("unrolled")).await.unwrap();
+        let (total, _) = mem.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(total, 3, "unrolled rows are spared from the cap");
+        mem.usage_rollup_advance(1_000 + 3 * 60).await.unwrap();
+        // a live write always postdates the watermark (settle window)
+        let mut c = record("c");
+        c.created_at_epoch_secs = 1_200;
+        mem.ledger_add(&c).await.unwrap();
         let (total, page) = mem.ledger_snapshot(usize::MAX).await.unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(page[0].model, "b");
+        assert_eq!(total, 2, "rolled rows prune to the cap");
+        assert_eq!(page[0].model, "unrolled");
+        let usage = mem
+            .usage_by_user(Some("default"), None, 0, i64::MAX)
+            .await
+            .unwrap();
+        let total_requests: i64 = usage.iter().map(|r| r.requests).sum();
+        assert_eq!(
+            total_requests, 4,
+            "pruned rows stay billed via their buckets"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open_with_cap(dir.path().join("r.db").to_str().unwrap(), 2)
@@ -3125,9 +3204,21 @@ mod tests {
         for i in 0..=LEDGER_PRUNE_EVERY {
             store.ledger_add(&record(&format!("m{i}"))).await.unwrap();
         }
-        let (total, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
-        assert_eq!(total, 2, "prune cycle enforces the cap");
-        assert_eq!(page[0].model, format!("m{}", LEDGER_PRUNE_EVERY - 1));
+        let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(
+            total,
+            LEDGER_PRUNE_EVERY + 1,
+            "nothing prunes before the rollup folds the rows"
+        );
+        store.usage_rollup_advance(1_000 + 3 * 60).await.unwrap();
+        for i in 0..LEDGER_PRUNE_EVERY {
+            store.ledger_add(&record(&format!("n{i}"))).await.unwrap();
+        }
+        let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert!(
+            total <= 2 + LEDGER_PRUNE_EVERY,
+            "prune cycle enforces the cap on rolled rows (got {total})"
+        );
     }
 
     #[tokio::test]

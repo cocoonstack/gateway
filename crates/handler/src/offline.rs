@@ -29,6 +29,15 @@ impl OfflineHandler {
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
         if store.distributed_batches() {
+            // persist the EFFECTIVE user (owner overrides the hint): execution,
+            // billing, and erasure must all key on the same identity
+            let items: Vec<BatchItem> = items
+                .into_iter()
+                .map(|mut i| {
+                    i.user = ak.attributed_user(&i.user).to_owned();
+                    i
+                })
+                .collect();
             // atomic: the job becomes claimable only once all items are saved
             store
                 .batch_enqueue(&ak.ak, &ak.tenant, &model, &items)
@@ -42,7 +51,7 @@ impl OfflineHandler {
             // items are captured HERE: an erasure landing after this instant
             // must stop them, so the marker comparison point is submission,
             // not the spawned executor's first poll
-            let captured_at = gw_state::epoch_secs();
+            let captured_at = gw_state::epoch_millis();
             // claim 0: non-distributed store — no fence, the heartbeat is a no-op
             tokio::spawn(
                 async move { this.execute(&id, &ak, &model, items, 0, captured_at).await },
@@ -266,7 +275,7 @@ impl OfflineHandler {
                         &job.model,
                         items,
                         claim,
-                        gw_state::epoch_secs(),
+                        gw_state::epoch_millis(),
                     )
                     .await;
                 }

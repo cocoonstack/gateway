@@ -999,8 +999,8 @@ mod tests {
             .content_erase_user(None, "user-42", audit)
             .await
             .unwrap();
-        // cross the second boundary so the batch's start postdates the marker
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        // millisecond markers: a resubmit moments later must already pass
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let job = off
             .submit(
                 key,
