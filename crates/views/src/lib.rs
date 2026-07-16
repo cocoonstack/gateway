@@ -832,11 +832,7 @@ async fn health() -> Json<Value> {
 }
 
 /// Configured public models, filtered to the caller's tenant entitlement.
-async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
+async fn list_models(State(s): State<AppState>, Authed(ak): Authed) -> Response {
     let cfg = s.handler.cfg();
     let data: Vec<Value> = cfg
         .models
@@ -941,6 +937,26 @@ fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
     }
 }
 
+/// [`authenticate`] as an extractor, for the surfaces sharing the
+/// OpenAI-shaped error; `messages` (Anthropic error shape) and `realtime_ws`
+/// (subprotocol fallback) run their own. Runs before the body extractor, so
+/// an unauthenticated payload is never parsed.
+struct Authed(AkInfo);
+
+impl axum::extract::FromRequestParts<AppState> for Authed {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        s: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match authenticate(s, &parts.headers).await {
+            Ok(ak) => Ok(Authed(ak)),
+            Err((st, msg)) => Err(error_response(st, msg)),
+        }
+    }
+}
+
 fn error_response(status: u16, message: impl Into<String>) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -980,6 +996,17 @@ impl AdminScope {
             AdminScope::Tenant(t) => Some(t.as_str()),
             AdminScope::Global => q.get("tenant").map(String::as_str),
         }
+    }
+}
+
+impl axum::extract::FromRequestParts<AppState> for AdminScope {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        s: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        admin_auth(s, &parts.headers)
     }
 }
 
@@ -1290,14 +1317,10 @@ async fn admin_reload(
 /// survive a config reload; the config file remains the boot baseline.
 async fn admin_key_create(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
     Json(body): Json<Value>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
@@ -1368,15 +1391,11 @@ async fn admin_key_create(
 /// PATCH /admin/keys/{ak} — only the fields present in the body change.
 async fn admin_key_patch(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
@@ -1407,14 +1426,10 @@ async fn admin_key_patch(
 /// DELETE /admin/keys/{ak} — revoke a key (config- or admin-sourced).
 async fn admin_key_delete(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
@@ -1488,13 +1503,9 @@ async fn admin_config_put(
 /// admin sees only its own keys. Paginated so a fleet key table never loads whole.
 async fn admin_key_list(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
     // the scope filters in the store before paging, or a tenant admin's page could come back empty
@@ -1517,13 +1528,9 @@ async fn admin_key_list(
 /// admin sees only its own tenant; the global admin may filter with ?tenant=.
 async fn admin_usage(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let filter = scope.tenant_filter(&q);
     let usage = match s.handler.state().store.ledger_usage(filter).await {
         Ok(rows) => rows,
@@ -1537,13 +1544,9 @@ async fn admin_usage(
 /// [`admin_usage`]; `since`/`until` are unix seconds (default: all time).
 async fn admin_usage_users(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let tenant = scope.tenant_filter(&q);
     let since = q_num(&q, "since", 0);
     let until = q_num(&q, "until", i64::MAX);
@@ -1605,13 +1608,9 @@ fn csv_field(s: &str) -> String {
 /// first. Tenant-scoped: a tenant admin sees only its own tenant's events.
 async fn admin_security_events(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let tenant = scope.tenant_filter(&q);
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.security_events(tenant, limit).await {
@@ -1642,13 +1641,9 @@ async fn admin_audit_ops(
 /// without it returns `content: null`). Tenant-scoped like the other reads.
 async fn admin_content_get(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     Path(request_id): Path<String>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let rows = match s.handler.state().store.content_for(&request_id).await {
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
@@ -1687,14 +1682,10 @@ async fn admin_content_get(
 /// content and are kept.
 async fn admin_content_erase(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let scope = match admin_auth(&s, &headers) {
-        Ok(scope) => scope,
-        Err(r) => return r,
-    };
     let Some(user) = q.get("user").filter(|u| !u.is_empty()) else {
         return error_response(400, "user is required");
     };
@@ -1872,13 +1863,10 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
 async fn chat_completions(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     if body.messages.is_empty() {
         return error_response(400, "messages must not be empty");
     }
@@ -2088,8 +2076,9 @@ fn chat_stream_response(
         }
         fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
             match chunk {
-                Some(c) if c.error.is_some() => {
-                    let msg = c.error.unwrap_or_default();
+                Some(gw_engines::StreamChunk {
+                    error: Some(msg), ..
+                }) => {
                     self.queue.push_back(Event::default().data(
                         json!({"error": {"message": msg, "type": "gateway_error"}}).to_string(),
                     ));
@@ -2455,8 +2444,9 @@ fn messages_stream_response(
         }
         fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
             match chunk {
-                Some(c) if c.error.is_some() => {
-                    let msg = c.error.unwrap_or_default();
+                Some(gw_engines::StreamChunk {
+                    error: Some(msg), ..
+                }) => {
                     self.queue.push_back(St::ev(
                         "error",
                         json!({"type":"error","error":{"type":"api_error","message":msg}}),
@@ -2566,13 +2556,10 @@ fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) 
 async fn completions(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     // prompt: string or [string] (OpenAI accepts both)
     let prompt = match body.get_mut("prompt").map(Value::take) {
@@ -2633,13 +2620,10 @@ async fn completions(
 async fn responses(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     if model.is_empty() {
         return error_response(400, "model is required");
@@ -2708,9 +2692,10 @@ fn responses_stream_response(
         }
         fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
             match chunk {
-                Some(c) if c.error.is_some() => {
+                Some(gw_engines::StreamChunk {
+                    error: Some(msg), ..
+                }) => {
                     self.ensure_created();
-                    let msg = c.error.unwrap_or_default();
                     self.queue.push_back(
                         Event::default().data(
                             json!({"type":"error","error":{"type":"gateway_error","message":msg}})
@@ -2771,13 +2756,10 @@ fn responses_stream_response(
 async fn embeddings(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let input: Vec<String> = match body.get_mut("input").map(Value::take) {
         Some(Value::String(x)) => vec![x],
@@ -2819,13 +2801,10 @@ async fn embeddings(
 async fn images_generations(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let prompt = body["prompt"].as_str().unwrap_or_default().to_owned();
     if model.is_empty() || prompt.is_empty() {
@@ -2860,13 +2839,10 @@ async fn images_generations(
 async fn images_edits(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let prompt = body["prompt"].as_str().unwrap_or_default().to_owned();
     let image = body["image"].as_str().unwrap_or_default().to_owned();
@@ -2902,13 +2878,10 @@ async fn images_edits(
 async fn audio_speech(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let input = body["input"].as_str().unwrap_or_default().to_owned();
     if model.is_empty() || input.is_empty() {
@@ -2963,13 +2936,10 @@ async fn audio_speech(
 async fn audio_transcriptions(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let audio = body["audio_b64"].as_str().unwrap_or_default().to_owned();
     if model.is_empty() || audio.is_empty() {
@@ -3021,12 +2991,9 @@ fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
 async fn batches_submit(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
@@ -3097,13 +3064,9 @@ async fn batches_submit(
 /// the audio/images surfaces.
 async fn files_upload(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
     let Some(content) = body["file"].as_str() else {
         return error_response(400, "file content (string) is required");
@@ -3134,13 +3097,9 @@ async fn files_upload(
 /// GET /v1/files/{id}; another tenant's file answers 404, not 403.
 async fn files_get(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let found = s.handler.state().store.file_get(&id).await;
     match tenant_owned(found, |f| &f.tenant, &ak.tenant, "file", &id) {
         Ok(f) => (
@@ -3157,13 +3116,9 @@ async fn files_get(
 /// JSONL is the tenant's call — delete the file and re-upload if needed.
 async fn files_delete(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     // one guarded delete — a check-then-delete pair would race a concurrent
     // delete + id reuse into removing another tenant's file
     match s.handler.state().store.file_delete(&id, &ak.tenant).await {
@@ -3176,13 +3131,9 @@ async fn files_delete(
 /// GET /v1/files/{id}/content (download raw content: batch output, etc).
 async fn files_content(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let found = s.handler.state().store.file_get(&id).await;
     match tenant_owned(found, |f| &f.tenant, &ak.tenant, "file", &id) {
         Ok(f) => (StatusCode::OK, f.content).into_response(),
@@ -3193,13 +3144,9 @@ async fn files_content(
 /// GET /v1/batches/{id}. A batch owned by another tenant answers 404.
 async fn batches_get(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers).await {
-        Ok(ak) => ak,
-        Err((st, msg)) => return error_response(st, msg),
-    };
     let found = s.handler.state().store.batch_get(&id).await;
     match tenant_owned(found, |j| &j.tenant, &ak.tenant, "batch", &id) {
         Ok(job) => (StatusCode::OK, Json(json!(job))).into_response(),

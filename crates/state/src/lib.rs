@@ -526,13 +526,9 @@ impl AccountHealth {
 
     /// Available = not in an active cooldown (auto-recovers on expiry).
     pub fn available(&self, name: &str) -> bool {
-        match self.entries.get(name) {
-            Some(e) => match e.cooldown_until {
-                Some(until) => Instant::now() >= until,
-                None => true,
-            },
-            None => true,
-        }
+        self.entries
+            .get(name)
+            .is_none_or(|e| e.cooldown_until.is_none_or(|until| Instant::now() >= until))
     }
 }
 

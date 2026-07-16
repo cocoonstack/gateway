@@ -315,6 +315,35 @@ impl ModelEngine for EmbeddingsEngine {
     }
 }
 
+/// The uniform family-engine tail: a summary message plus the native payload,
+/// finished at "stop".
+fn family_outcome(
+    message: String,
+    model: &str,
+    v: serde_json::Value,
+    status: u16,
+) -> EngineOutcome {
+    EngineOutcome::with_status(
+        GatewayResponse {
+            message,
+            model: model.to_owned(),
+            response_v2: Some(v),
+            finish_reason: "stop".to_owned(),
+            ..Default::default()
+        },
+        status,
+    )
+}
+
+fn require_non_empty(v: &str, what: &str) -> GResult<()> {
+    if v.is_empty() {
+        return Err(GatewayError::bad_request(format!(
+            "{what} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
 base_engine!(ImageEngine);
 
 #[async_trait::async_trait]
@@ -332,9 +361,7 @@ impl ModelEngine for ImageEngine {
             ),
             _ => (self.base.last_message_text(), 1, None, None, None),
         };
-        if prompt.is_empty() {
-            return Err(GatewayError::bad_request("image prompt must not be empty"));
-        }
+        require_non_empty(prompt, "image prompt")?;
         let mut body = json!({"model": param.model_name, "prompt": prompt, "n": n});
         if let Some(s) = size {
             body["size"] = json!(s);
@@ -352,14 +379,12 @@ impl ModelEngine for ImageEngine {
         let (status, v) = self.base.round_trip(&url, body).await?;
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
-        let resp = GatewayResponse {
-            message: format!("{count} image(s) {verb}"),
-            model: param.model_name.clone(),
-            response_v2: Some(v),
-            finish_reason: "stop".to_owned(),
-            ..Default::default()
-        };
-        Ok(EngineOutcome::with_status(resp, status))
+        Ok(family_outcome(
+            format!("{count} image(s) {verb}"),
+            &param.model_name,
+            v,
+            status,
+        ))
     }
 }
 
@@ -400,9 +425,7 @@ impl ModelEngine for AudioEngine {
                     ),
                     _ => (self.base.last_message_text(), None, None),
                 };
-                if input.is_empty() {
-                    return Err(GatewayError::bad_request("tts input must not be empty"));
-                }
+                require_non_empty(input, "tts input")?;
                 let mut b = json!({"model": param.model_name, "input": input});
                 if let Some(v) = voice {
                     b["voice"] = json!(v);
@@ -417,9 +440,7 @@ impl ModelEngine for AudioEngine {
                     Some(TypedParams::AudioStt(p)) => (p.audio_b64.as_str(), p.language.as_deref()),
                     _ => ("", None),
                 };
-                if audio.is_empty() {
-                    return Err(GatewayError::bad_request("stt audio_b64 must not be empty"));
-                }
+                require_non_empty(audio, "stt audio_b64")?;
                 (
                     "/v1/audio/transcriptions",
                     json!({"model": param.model_name, "audio_b64": audio, "language": language}),
@@ -439,14 +460,7 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        let resp = GatewayResponse {
-            message,
-            model: param.model_name.clone(),
-            response_v2: Some(v),
-            finish_reason: "stop".to_owned(),
-            ..Default::default()
-        };
-        Ok(EngineOutcome::with_status(resp, status))
+        Ok(family_outcome(message, &param.model_name, v, status))
     }
 }
 
@@ -462,9 +476,7 @@ impl ModelEngine for VideoEngine {
             Some(TypedParams::Video(p)) => p.prompt.as_str(),
             _ => self.base.last_message_text(),
         };
-        if prompt.is_empty() {
-            return Err(GatewayError::bad_request("video prompt must not be empty"));
-        }
+        require_non_empty(prompt, "video prompt")?;
         let mut body = json!({"model": param.model_name, "prompt": prompt});
         if let Some(TypedParams::Video(p)) = &param.typed {
             if let Some(d) = p.duration_seconds {
@@ -484,15 +496,11 @@ impl ModelEngine for VideoEngine {
                 body,
             )
             .await?;
-        let resp = GatewayResponse {
-            message: v["video_url"].as_str().unwrap_or_default().to_owned(),
-            model: param.model_name.clone(),
-            step: v["status"].as_str().unwrap_or_default().to_owned(),
-            response_v2: Some(v),
-            finish_reason: "stop".to_owned(),
-            ..Default::default()
-        };
-        Ok(EngineOutcome::with_status(resp, status))
+        let message = v["video_url"].as_str().unwrap_or_default().to_owned();
+        let step = v["status"].as_str().unwrap_or_default().to_owned();
+        let mut out = family_outcome(message, &param.model_name, v, status);
+        out.response.step = step;
+        Ok(out)
     }
 }
 
@@ -507,9 +515,7 @@ impl ModelEngine for SearchEngine {
             Some(TypedParams::Search(p)) => (p.query.as_str(), p.count),
             _ => (self.base.last_message_text(), 3),
         };
-        if query.is_empty() {
-            return Err(GatewayError::bad_request("search query must not be empty"));
-        }
+        require_non_empty(query, "search query")?;
         let body = json!({"query": query, "count": count});
         let (status, v) = self
             .base
@@ -526,14 +532,12 @@ impl ModelEngine for SearchEngine {
                     .collect()
             })
             .unwrap_or_default();
-        let resp = GatewayResponse {
-            message: titles.join("; "),
-            model: param.model_name.clone(),
-            response_v2: Some(v),
-            finish_reason: "stop".to_owned(),
-            ..Default::default()
-        };
-        Ok(EngineOutcome::with_status(resp, status))
+        Ok(family_outcome(
+            titles.join("; "),
+            &param.model_name,
+            v,
+            status,
+        ))
     }
 }
 
@@ -556,18 +560,17 @@ impl ModelEngine for PassthroughEngine {
                 body,
             )
             .await?;
-        let resp = GatewayResponse {
-            message: if v["ok"].as_bool().unwrap_or(false) {
-                "ok".into()
-            } else {
-                "error".into()
-            },
-            model: param.model_name.clone(),
-            response_v2: Some(v),
-            finish_reason: "stop".to_owned(),
-            ..Default::default()
+        let message = if v["ok"].as_bool().unwrap_or(false) {
+            "ok"
+        } else {
+            "error"
         };
-        Ok(EngineOutcome::with_status(resp, status))
+        Ok(family_outcome(
+            message.to_owned(),
+            &param.model_name,
+            v,
+            status,
+        ))
     }
 }
 
