@@ -446,7 +446,6 @@ fn redact(text: &str) -> Option<(String, usize)> {
     // span = (start, end_exclusive, replacement)
     let mut spans: Vec<(usize, usize, &str)> = Vec::new();
 
-    // emails: expand around each '@'
     for (i, &c) in chars.iter().enumerate() {
         if c != '@' {
             continue;
@@ -466,7 +465,6 @@ fn redact(text: &str) -> Option<(String, usize)> {
         }
     }
 
-    // phones: 1[3-9] + 9 digits, not embedded in a longer digit run or an email span
     let in_span =
         |i: usize, spans: &[(usize, usize, &str)]| spans.iter().any(|&(s, e, _)| i >= s && i < e);
     let mut i = 0;
@@ -525,7 +523,7 @@ mod tests {
             ..Default::default()
         };
         let block = security_check(&sec(), &mut req).block.unwrap();
-        assert!(block.block && block.hit);
+        assert!(block.block);
         assert_eq!(block.err_code, 4003);
         assert!(
             security_check(&sec(), &mut GatewayRequest::default())
@@ -766,7 +764,6 @@ mod tests {
             "a blocklisted term inside a tool_result block must be caught"
         );
 
-        // a base64 image whose noise happens to contain the term must NOT block
         let mut clean = ChatMsg::text("user", "look");
         let noise = format!("AAAA{}BBBB", "forbiddenword");
         clean.parts = Some(serde_json::json!([
@@ -837,9 +834,6 @@ mod tests {
 
     #[test]
     fn media_file_handles_and_nested_containers_are_skipped() {
-        // file references (input_image/input_file by file_id) and the Chat
-        // `file` container hold no prose — a blocklist term or base64 noise in
-        // them must not block, mirroring the image_url/input_audio containers.
         let mut img = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
         img.raw = serde_json::json!({"input":[{"role":"user","content":[
             {"type":"input_image","file_id":"file-forbiddenword"}]}]});
@@ -869,8 +863,6 @@ mod tests {
             "base64 inside a Chat `file` container must not block"
         );
 
-        // the type-gating still holds: a `file_id` in a tool argument (no media
-        // block) is prose and stays scanned
         let mut msg = ChatMsg::text("user", String::new());
         msg.parts = Some(serde_json::json!([
             {"type":"tool_use","id":"t","name":"q","input":{"file_id":"forbiddenword"}}]));
@@ -886,10 +878,6 @@ mod tests {
 
     #[test]
     fn responses_raw_scans_tool_schema_and_metadata_not_just_media() {
-        // raw is the WHOLE Responses wire body, not a pure content tree: a
-        // like-named key (`source` in a JSON Schema, `user_id` in metadata)
-        // outside a media block is prose and must be scanned; media-skip fires
-        // only inside a recognized media content block.
         for raw in [
             serde_json::json!({"model":"m","tools":[{"type":"function","function":{
                 "name":"q","parameters":{"type":"object","properties":{
@@ -911,9 +899,6 @@ mod tests {
 
     #[test]
     fn flat_extra_bag_is_fully_scanned_not_content_block_skipped() {
-        // Chat/Messages `raw` is a flat vendor passthrough: keys named like a
-        // media/id field (`type`, `*_id`, Anthropic `metadata.user_id`) are
-        // still prose and must not be exempted the way content blocks are.
         for proto in [
             gw_consts::Protocol::OpenaiChat,
             gw_consts::Protocol::AnthropicMessages,

@@ -8,7 +8,6 @@
 
 pub mod bespoke;
 pub mod claude_engine;
-pub mod echo;
 pub mod engine;
 pub mod factory;
 pub mod families;
@@ -25,7 +24,6 @@ mod base;
 
 pub use bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
 pub use claude_engine::ClaudeEngine;
-pub use echo::EchoEngine;
 pub use engine::{EngineOutcome, ModelEngine, StreamChunk, vendor_error};
 pub use factory::get_engine;
 pub use families::{

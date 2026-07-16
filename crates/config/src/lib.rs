@@ -492,8 +492,6 @@ pub struct GatewayConfig {
     #[serde(skip)]
     model_idx: HashMap<String, usize>,
     #[serde(skip)]
-    ak_idx: HashMap<String, usize>,
-    #[serde(skip)]
     product_idx: HashMap<String, usize>,
     #[serde(skip)]
     tenant_idx: HashMap<String, usize>,
@@ -513,7 +511,6 @@ impl GatewayConfig {
 
     fn build_indices(&mut self) {
         self.model_idx = index_by(&self.models, |m| &m.name);
-        self.ak_idx = index_by(&self.access_keys, |a| &a.ak);
         self.product_idx = index_by(&self.products, |p| &p.name);
         self.tenant_idx = index_by(&self.tenants, |t| &t.name);
     }
@@ -809,10 +806,6 @@ impl GatewayConfig {
         }
     }
 
-    pub fn find_ak(&self, ak: &str) -> Option<&AkConf> {
-        self.access_keys.get(*self.ak_idx.get(ak)?)
-    }
-
     pub fn find_model(&self, name: &str) -> Option<&ModelConf> {
         self.models.get(*self.model_idx.get(name)?)
     }
@@ -1087,7 +1080,7 @@ accounts:
     fn embedded_default_parses_and_validates() {
         let cfg = GatewayConfig::embedded_default().unwrap();
         assert_eq!(cfg.listen.port, 8080);
-        assert!(cfg.find_ak("ak-demo-123").is_some());
+        assert!(cfg.access_keys.iter().any(|a| a.ak == "ak-demo-123"));
         let m = cfg.find_model("gpt-4o").unwrap();
         assert_eq!(m.protocol(), Some(Protocol::OpenaiChat));
         assert_eq!(cfg.prices_for("claude-sonnet"), (3000, 15000));
@@ -1118,7 +1111,8 @@ access_keys:
   - {ak: k2, product: p, qps: 1, daily_token_quota: 10}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
-        assert_eq!(cfg.find_ak("k2").unwrap().tenant, DEFAULT_TENANT);
+        let k2 = cfg.access_keys.iter().find(|a| a.ak == "k2").unwrap();
+        assert_eq!(k2.tenant, DEFAULT_TENANT);
         assert!(cfg.tenant_allows_model("t1", "m1"));
         assert!(!cfg.tenant_allows_model("t1", "m2"));
         assert!(cfg.tenant_allows_model(DEFAULT_TENANT, "m2"));

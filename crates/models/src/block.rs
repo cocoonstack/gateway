@@ -1,26 +1,23 @@
 //! The content-safety verdict (`Block`).
 
-/// Content-safety verdict. Invariant: a blocked verdict is always a hit; a hit
-/// is not necessarily a block.
+/// Content-safety verdict.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub block: bool,
-    pub hit: bool,
     pub message: String,
     pub err_code: i32,
 }
 
 impl Block {
-    /// A clean (not hit, not blocked) verdict.
+    /// A clean (not blocked) verdict.
     pub fn allow() -> Self {
         Self::default()
     }
 
-    /// A blocking verdict (implies hit, per the invariant above).
+    /// A blocking verdict.
     pub fn blocked(message: impl Into<String>, err_code: i32) -> Self {
         Self {
             block: true,
-            hit: true,
             message: message.into(),
             err_code,
         }
@@ -32,9 +29,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blocked_implies_hit() {
+    fn blocked_carries_message_and_code() {
         let b = Block::blocked("nope", 4003);
-        assert!(b.block && b.hit);
-        assert!(!Block::allow().hit);
+        assert!(b.block);
+        assert_eq!((b.message.as_str(), b.err_code), ("nope", 4003));
+        assert!(!Block::allow().block);
     }
 }
