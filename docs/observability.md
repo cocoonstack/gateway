@@ -36,6 +36,9 @@ Records persist when a SQLite store is configured and can be capped with
 product, `user_id` (effective end user), model, protocol, account, token counts,
 cost, `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag
 (set when counts came from an aborted stream rather than a vendor usage payload).
+Per-user usage additionally rolls into durable minute buckets every minute, so
+`GET /admin/usage/users` stays correct after `ledger_max_rows` pruning (see
+[Governance](governance.md#per-user-attribution-and-billing)).
 
 ## Audit trails
 

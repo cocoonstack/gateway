@@ -110,6 +110,14 @@ so a fleet drainer still attributes and budgets it). `GET /admin/usage/users?use
 returns per-(user, model) cost over a billing period (add `format=csv` for
 export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap.
 
+A background task folds completed ledger minutes into durable per-(minute,
+tenant, user, model) rollup buckets (recomputing a trailing 20-minute window
+each pass, so late rows and missed ticks self-heal). Usage queries are served
+from those buckets plus the raw ledger tail, so per-user cost stays correct
+after `storage.ledger_max_rows` prunes old billing rows — size the cap to hold
+at least the backfill window of traffic. Once a period is served from buckets,
+its `since`/`until` bounds are minute-aligned.
+
 ## Enterprise content policy
 
 `security:` is global by default; a tenant may override it whole with

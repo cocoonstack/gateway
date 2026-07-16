@@ -27,6 +27,14 @@ pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 /// approximate by at most this many rows, saving a round-trip per billing).
 const LEDGER_PRUNE_EVERY: usize = 64;
 
+/// Usage-rollup bucket width.
+const ROLLUP_BUCKET_SECS: i64 = 60;
+
+/// Each rollup advance recomputes this trailing window whole, so late rows and
+/// missed ticks self-heal. Size `ledger_max_rows` to hold at least this much
+/// traffic, or a recomputed bucket could undercount already-pruned rows.
+const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
+
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BillingRecord {
@@ -230,6 +238,61 @@ pub struct UserUsageRow {
     pub vendor_cost_micros: i64,
 }
 
+impl UserUsageRow {
+    fn zero(user_id: String, model: String) -> Self {
+        Self {
+            user_id,
+            model,
+            requests: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost_micros: 0,
+            vendor_cost_micros: 0,
+        }
+    }
+
+    /// Fold `o`'s counters into self (saturating).
+    fn absorb(&mut self, o: &UserUsageRow) {
+        self.requests = self.requests.saturating_add(o.requests);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(o.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(o.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(o.total_tokens);
+        self.cost_micros = self.cost_micros.saturating_add(o.cost_micros);
+        self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(o.vendor_cost_micros);
+    }
+}
+
+/// One raw ledger row as a single-request usage line.
+fn usage_of(r: &BillingRecord) -> UserUsageRow {
+    UserUsageRow {
+        user_id: r.user_id.clone(),
+        model: r.model.clone(),
+        requests: 1,
+        prompt_tokens: r.prompt_tokens,
+        completion_tokens: r.completion_tokens,
+        total_tokens: r.total_tokens,
+        cost_micros: r.cost_micros,
+        vendor_cost_micros: r.vendor_cost_micros,
+    }
+}
+
+/// Fold grouped usage rows into `map` by (user, model).
+fn fold_user_usage(
+    map: &mut std::collections::BTreeMap<(String, String), UserUsageRow>,
+    rows: impl IntoIterator<Item = UserUsageRow>,
+) {
+    for r in rows {
+        map.entry((r.user_id.clone(), r.model.clone()))
+            .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
+            .absorb(&r);
+    }
+}
+
+fn bucket_floor(ts: i64) -> i64 {
+    ts - ts.rem_euclid(ROLLUP_BUCKET_SECS)
+}
+
 /// A content-safety outcome, recorded WITHOUT the offending text — only which
 /// key/user/rule fired and what the gateway did, so hits are queryable per
 /// ak/tenant without retaining prompt content.
@@ -267,7 +330,8 @@ pub struct AdminAudit {
     pub actor: String,
     /// The presented scope: "global" | "tenant".
     pub scope: String,
-    /// The mutation: "key_create" | "key_patch" | "key_delete" | "config_publish" | "reload".
+    /// The mutation: "key_create" | "key_patch" | "key_delete" |
+    /// "config_publish" | "reload" | "content_erase".
     pub action: String,
     /// The object acted on (an ak, a config version, …).
     pub target: String,
@@ -283,9 +347,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
     /// Usage rolled up by (tenant, requested model), sorted.
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>>;
-    /// Precise per-user cost over `[since, until]` (unix secs), grouped by
-    /// (user, requested model); optional tenant/user filter. The billing-period
-    /// query behind per-user invoicing.
+    /// Per-user cost over `[since, until]` (unix secs), grouped by (user,
+    /// requested model); optional tenant/user filter. The billing-period query
+    /// behind per-user invoicing. Served from the minute rollup for rolled
+    /// minutes (where the bounds are minute-aligned) plus the raw ledger tail,
+    /// so the result survives `ledger_max_rows` pruning.
     async fn usage_by_user(
         &self,
         tenant: Option<&str>,
@@ -293,6 +359,12 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         since: i64,
         until: i64,
     ) -> GResult<Vec<UserUsageRow>>;
+    /// Roll completed minutes of the ledger into durable `usage_rollup`
+    /// buckets: every bucket in the trailing backfill window is recomputed
+    /// from the raw rows and upserted — never deleted — so the periodic task
+    /// is idempotent, self-heals missed ticks, and a bucket outlives the raw
+    /// rows it summarizes. Returns the buckets written.
+    async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64>;
 
     /// Append a content-safety event (no prompt text retained).
     async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()>;
@@ -398,6 +470,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     records: Mutex<Vec<BillingRecord>>,
+    /// Minute buckets keyed by (minute, tenant, user, model); see
+    /// [`Store::usage_rollup_advance`].
+    rollup: Mutex<std::collections::BTreeMap<(i64, String, String, String), UserUsageRow>>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<Vec<crate::ContentRecord>>,
@@ -485,40 +560,70 @@ impl Store for MemoryStore {
         since: i64,
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
+        let mut map = std::collections::BTreeMap::new();
+        let watermark = {
+            let rollup = self
+                .rollup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for ((minute, t, u, _), row) in rollup.iter() {
+                if *minute >= bucket_floor(since)
+                    && *minute <= bucket_floor(until)
+                    && tenant.is_none_or(|f| f == t)
+                    && user.is_none_or(|f| f == u)
+                {
+                    fold_user_usage(&mut map, [row.clone()]);
+                }
+            }
+            rollup
+                .keys()
+                .next_back()
+                .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+        };
         let records = self
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rollup: std::collections::BTreeMap<(String, String), UserUsageRow> =
-            std::collections::BTreeMap::new();
-        for r in records.iter() {
-            if tenant.is_some_and(|t| t != r.tenant)
-                || user.is_some_and(|u| u != r.user_id)
-                || r.created_at_epoch_secs < since
-                || r.created_at_epoch_secs > until
+        let tail = records.iter().filter(|r| {
+            r.created_at_epoch_secs >= since.max(watermark)
+                && r.created_at_epoch_secs <= until
+                && tenant.is_none_or(|t| t == r.tenant)
+                && user.is_none_or(|u| u == r.user_id)
+        });
+        fold_user_usage(&mut map, tail.map(usage_of));
+        Ok(map.into_values().collect())
+    }
+
+    async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
+        let hi = bucket_floor(now);
+        let lo = hi - ROLLUP_BACKFILL_SECS;
+        let mut fresh = std::collections::BTreeMap::new();
+        {
+            let records = self
+                .records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for r in records
+                .iter()
+                .filter(|r| r.created_at_epoch_secs >= lo && r.created_at_epoch_secs < hi)
             {
-                continue;
+                fresh
+                    .entry((
+                        bucket_floor(r.created_at_epoch_secs),
+                        r.tenant.clone(),
+                        r.user_id.clone(),
+                        r.model.clone(),
+                    ))
+                    .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
+                    .absorb(&usage_of(r));
             }
-            let e = rollup
-                .entry((r.user_id.clone(), r.model.clone()))
-                .or_insert_with(|| UserUsageRow {
-                    user_id: r.user_id.clone(),
-                    model: r.model.clone(),
-                    requests: 0,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                    cost_micros: 0,
-                    vendor_cost_micros: 0,
-                });
-            e.requests += 1;
-            e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
-            e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
-            e.total_tokens = e.total_tokens.saturating_add(r.total_tokens);
-            e.cost_micros = e.cost_micros.saturating_add(r.cost_micros);
-            e.vendor_cost_micros = e.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
         }
-        Ok(rollup.into_values().collect())
+        let written = fresh.len() as u64;
+        self.rollup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(fresh);
+        Ok(written)
     }
 
     async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
@@ -772,6 +877,13 @@ impl SqliteStore {
                 created_at_epoch_secs INTEGER NOT NULL DEFAULT 0,
                 estimated INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
+            "CREATE TABLE IF NOT EXISTS usage_rollup (
+                minute_epoch INTEGER NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
+                model TEXT NOT NULL, requests INTEGER NOT NULL,
+                prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
+                vendor_cost_micros INTEGER NOT NULL,
+                PRIMARY KEY (minute_epoch, tenant, user_id, model))",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -938,13 +1050,18 @@ impl Store for SqliteStore {
         since: i64,
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
-        let rows = sqlx::query(
-            "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let rolled = sqlx::query(
+            "SELECT user_id, model, SUM(requests), SUM(prompt_tokens), SUM(completion_tokens),
              SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
-             FROM billing
+             FROM usage_rollup
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
-               AND created_at_epoch_secs BETWEEN ?3 AND ?4
-             GROUP BY user_id, model ORDER BY user_id, model",
+               AND minute_epoch BETWEEN (?3/60)*60 AND (?4/60)*60
+             GROUP BY user_id, model",
         )
         .bind(tenant)
         .bind(user)
@@ -952,8 +1069,51 @@ impl Store for SqliteStore {
         .bind(until)
         .fetch_all(&self.pool)
         .await
+        .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
+        let raw = sqlx::query(
+            "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             FROM billing
+             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
+               AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
+             GROUP BY user_id, model",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .bind(watermark)
+        .fetch_all(&self.pool)
+        .await
         .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        Ok(rows.iter().map(user_usage_row).collect())
+        let mut map = std::collections::BTreeMap::new();
+        fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
+        fold_user_usage(&mut map, raw.iter().map(user_usage_row));
+        Ok(map.into_values().collect())
+    }
+
+    async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
+        let hi = bucket_floor(now);
+        let r = sqlx::query(
+            "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
+              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
+             SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
+              SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+              SUM(cost_micros), SUM(vendor_cost_micros)
+             FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2
+             GROUP BY 1, 2, 3, 4
+             ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
+              requests = excluded.requests, prompt_tokens = excluded.prompt_tokens,
+              completion_tokens = excluded.completion_tokens,
+              total_tokens = excluded.total_tokens, cost_micros = excluded.cost_micros,
+              vendor_cost_micros = excluded.vendor_cost_micros",
+        )
+        .bind(hi - ROLLUP_BACKFILL_SECS)
+        .bind(hi)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("advance usage rollup", e))?;
+        Ok(r.rows_affected())
     }
 
     async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
@@ -1235,6 +1395,13 @@ impl PostgresStore {
                 created_at_epoch_secs BIGINT NOT NULL DEFAULT 0,
                 estimated BOOLEAN NOT NULL DEFAULT FALSE)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
+            "CREATE TABLE IF NOT EXISTS usage_rollup (
+                minute_epoch BIGINT NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
+                model TEXT NOT NULL, requests BIGINT NOT NULL,
+                prompt_tokens BIGINT NOT NULL, completion_tokens BIGINT NOT NULL,
+                total_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL,
+                vendor_cost_micros BIGINT NOT NULL,
+                PRIMARY KEY (minute_epoch, tenant, user_id, model))",
             "CREATE TABLE IF NOT EXISTS security_events (
                 n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
                 request_id TEXT NOT NULL DEFAULT '', ak TEXT NOT NULL DEFAULT '',
@@ -1412,14 +1579,19 @@ impl Store for PostgresStore {
         since: i64,
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
-        let rows = sqlx::query(
-            "SELECT user_id, model, COUNT(*),
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let rolled = sqlx::query(
+            "SELECT user_id, model, SUM(requests)::BIGINT,
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
              SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
-             FROM billing
+             FROM usage_rollup
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
-               AND created_at_epoch_secs BETWEEN $3 AND $4
-             GROUP BY user_id, model ORDER BY user_id, model",
+               AND minute_epoch BETWEEN ($3/60)*60 AND ($4/60)*60
+             GROUP BY user_id, model",
         )
         .bind(tenant)
         .bind(user)
@@ -1427,8 +1599,53 @@ impl Store for PostgresStore {
         .bind(until)
         .fetch_all(&self.pool)
         .await
+        .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
+        let raw = sqlx::query(
+            "SELECT user_id, model, COUNT(*),
+             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             FROM billing
+             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
+               AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
+             GROUP BY user_id, model",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .bind(watermark)
+        .fetch_all(&self.pool)
+        .await
         .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        Ok(rows.iter().map(user_usage_row).collect())
+        let mut map = std::collections::BTreeMap::new();
+        fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
+        fold_user_usage(&mut map, raw.iter().map(user_usage_row));
+        Ok(map.into_values().collect())
+    }
+
+    async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
+        let hi = bucket_floor(now);
+        let r = sqlx::query(
+            "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
+              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
+             SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
+              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
+              SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
+              SUM(vendor_cost_micros)::BIGINT
+             FROM billing WHERE created_at_epoch_secs >= $1 AND created_at_epoch_secs < $2
+             GROUP BY 1, 2, 3, 4
+             ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
+              requests = excluded.requests, prompt_tokens = excluded.prompt_tokens,
+              completion_tokens = excluded.completion_tokens,
+              total_tokens = excluded.total_tokens, cost_micros = excluded.cost_micros,
+              vendor_cost_micros = excluded.vendor_cost_micros",
+        )
+        .bind(hi - ROLLUP_BACKFILL_SECS)
+        .bind(hi)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("advance usage rollup", e))?;
+        Ok(r.rows_affected())
     }
 
     async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
@@ -2081,6 +2298,90 @@ mod tests {
             .await
             .unwrap();
         exercise_audit(&store).await;
+    }
+
+    async fn exercise_rollup(store: &dyn Store) {
+        let mut a = record("m1");
+        a.user_id = "alice".into();
+        a.created_at_epoch_secs = 400;
+        let mut b = record("m1");
+        b.user_id = "bob".into();
+        b.created_at_epoch_secs = 460;
+        let mut tail = record("m1");
+        tail.user_id = "carol".into();
+        tail.created_at_epoch_secs = 1_520;
+        for r in [&a, &b, &tail] {
+            store.ledger_add(r).await.unwrap();
+        }
+        let baseline = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
+        assert_eq!(baseline.len(), 3, "raw-only result before any rollup");
+
+        store.usage_rollup_advance(1_500).await.unwrap();
+        store.usage_rollup_advance(1_500).await.unwrap();
+        let after = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
+        assert_eq!(
+            format!("{baseline:?}"),
+            format!("{after:?}"),
+            "rollup + tail union matches raw and advancing twice is idempotent"
+        );
+
+        let windowed = store
+            .usage_by_user(None, None, 450, i64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            windowed.iter().all(|r| r.user_id != "alice"),
+            "window excludes alice's earlier bucket"
+        );
+        assert!(
+            windowed.iter().any(|r| r.user_id == "bob")
+                && windowed.iter().any(|r| r.user_id == "carol"),
+            "window keeps the rolled bucket and the raw tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_rollup_roundtrip() {
+        exercise_rollup(&MemoryStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_rollup_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("rollup.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_rollup(&store).await;
+    }
+
+    #[tokio::test]
+    async fn rollup_survives_ledger_prune() {
+        let store = MemoryStore::with_ledger_cap(1);
+        let mut a = record("m1");
+        a.user_id = "alice".into();
+        a.created_at_epoch_secs = 9_000;
+        store.ledger_add(&a).await.unwrap();
+        store.usage_rollup_advance(10_000).await.unwrap();
+
+        let mut b = record("m1");
+        b.user_id = "bob".into();
+        b.created_at_epoch_secs = 9_970;
+        store.ledger_add(&b).await.unwrap();
+        let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(total, 1, "the cap pruned alice's raw row");
+
+        store.usage_rollup_advance(10_000).await.unwrap();
+        let usage = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
+        let alice = usage.iter().find(|r| r.user_id == "alice");
+        assert_eq!(
+            alice.map(|r| r.total_tokens),
+            Some(8),
+            "pruned row still billed via its bucket (re-advance never deletes)"
+        );
+        assert!(
+            usage.iter().any(|r| r.user_id == "bob"),
+            "unrolled tail served from the raw ledger"
+        );
     }
 
     #[tokio::test]

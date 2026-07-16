@@ -11,6 +11,8 @@ use gw_state::GatewayState;
 pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Retained content is swept for expiry this often.
 pub const PURGE_PERIOD: Duration = Duration::from_secs(60 * 60);
+/// Ledger minutes are rolled into the durable usage buckets this often.
+pub const ROLLUP_PERIOD: Duration = Duration::from_secs(60);
 
 /// Spawn the daily quota reset loop. Returns the join handle (abort to stop).
 /// `period` is configurable so tests don't wait 24h.
@@ -46,6 +48,28 @@ pub fn spawn_content_purge(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "content purge failed"),
+            }
+        }
+    })
+}
+
+/// Spawn the usage-rollup loop: folds completed ledger minutes into the
+/// durable per-user buckets. Returns the join handle (abort to stop).
+pub fn spawn_usage_rollup(
+    state: Arc<GatewayState>,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = state
+                .store
+                .usage_rollup_advance(gw_state::epoch_secs())
+                .await
+            {
+                tracing::warn!(error = %e, "usage rollup failed");
             }
         }
     })
