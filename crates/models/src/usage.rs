@@ -16,3 +16,17 @@ pub struct CommonUsage {
     pub completion: i64,
     pub reason: i64,
 }
+
+impl CommonUsage {
+    /// All input-side tokens: fresh input plus cache reads and writes.
+    pub fn prompt_total(&self) -> i64 {
+        self.platform_input
+            .saturating_add(self.read_cache)
+            .saturating_add(self.write_cache)
+    }
+
+    /// All output-side tokens: completion plus reasoning.
+    pub fn completion_total(&self) -> i64 {
+        self.completion.saturating_add(self.reason)
+    }
+}

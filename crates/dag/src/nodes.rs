@@ -578,10 +578,8 @@ impl DagNode for CostCalc {
                 };
                 let rate = gw_models::TokenRate::default();
                 (
-                    u.platform_input
-                        .saturating_add(u.read_cache)
-                        .saturating_add(u.write_cache),
-                    u.completion.saturating_add(u.reason),
+                    u.prompt_total(),
+                    u.completion_total(),
                     gw_models::platform_total(&ti, &rate),
                 )
             }

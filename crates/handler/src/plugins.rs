@@ -5,7 +5,7 @@
 //! surfaces buffer and replay the redacted text when outbound DLP is on.
 
 use gw_config::{Action, SecurityConf};
-use gw_models::{Block, GatewayRequest, GatewayResponse};
+use gw_models::{Block, ChatMsg, GatewayRequest, GatewayResponse};
 
 const BLOCKED_MSG: &str = "this content cannot be answered, please try a different request";
 
@@ -35,10 +35,7 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
     let mut counts = ScanCounts::new(sec);
     let mut visit = |s: &mut String| counts.visit(s);
     for msg in &mut request.message {
-        visit(&mut msg.content);
-        if let Some(parts) = &mut msg.parts {
-            walk_part_text(parts, &mut visit);
-        }
+        for_each_message_text(msg, &mut visit);
     }
     if let Some(param) = request.model_param_v2.as_mut() {
         walk_json_strings(&mut param.raw, &mut visit);
@@ -103,10 +100,11 @@ impl<'a> ScanCounts<'a> {
 }
 
 /// All inbound text a request carries — message content, multimodal text
-/// parts, the Responses raw body, and the family typed params — collected via
-/// the same traversals the blocklist scan and DLP run, so the field lists
-/// cannot drift apart. The one text view moderation and content retention
-/// operate on. `&mut` only to share those traversals; nothing is rewritten.
+/// parts, assistant tool_calls, the Responses raw body, and the family typed
+/// params — collected via the same traversals the blocklist scan and DLP run,
+/// so the field lists cannot drift apart. The one text view moderation and
+/// content retention operate on. `&mut` only to share those traversals;
+/// nothing is rewritten.
 pub fn inbound_text(request: &mut GatewayRequest) -> String {
     let mut out = String::new();
     let mut collect = |s: &mut String| {
@@ -114,10 +112,7 @@ pub fn inbound_text(request: &mut GatewayRequest) -> String {
         0
     };
     for m in &mut request.message {
-        collect(&mut m.content);
-        if let Some(parts) = &mut m.parts {
-            walk_part_text(parts, &mut collect);
-        }
+        for_each_message_text(m, &mut collect);
     }
     if let Some(param) = request.model_param_v2.as_mut() {
         walk_json_strings(&mut param.raw, &mut collect);
@@ -169,6 +164,21 @@ fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) 
     }
 }
 
+/// The text-bearing fields of one chat turn — flat content, multimodal parts,
+/// and assistant tool_calls, all forwarded to the vendor by the engines — the
+/// ONE per-message field list the blocklist scan, DLP, and the moderation
+/// text view traverse, so a `ChatMsg` field added here is covered by all three.
+fn for_each_message_text(msg: &mut ChatMsg, f: &mut impl FnMut(&mut String) -> usize) -> usize {
+    let mut n = f(&mut msg.content);
+    if let Some(parts) = &mut msg.parts {
+        n += walk_part_text(parts, f);
+    }
+    if let Some(tc) = &mut msg.tool_calls {
+        n += walk_json_strings(tc, f);
+    }
+    n
+}
+
 /// The free-text fields of the family typed params — the ONE field list both
 /// the blocklist scan and DLP redaction traverse, so a field added here is
 /// covered by both. Chat `tools`/`tool_choice` are client JSON forwarded to
@@ -198,39 +208,42 @@ fn for_each_typed_text(
     }
 }
 
-/// Keys under a multimodal part whose value is binary, a URL, or a structural
-/// identifier — never prose: skipped whole so a rewrite can't corrupt them and
-/// base64 noise can't false-match a blocklist term. Every OTHER string leaf (a
-/// text block's `text`, a `tool_result` block's `content`, a `tool_use` block's
-/// `input`) is visited, so no content type is a scan bypass.
+/// Keys under a multimodal CONTENT BLOCK whose value is never prose: media
+/// containers (`image_url`, `input_audio`, `source`), base64/URL leaves
+/// (`file_data`, `file_url`), and structural enums/ids — skipped whole so a
+/// rewrite can't corrupt them and base64 noise can't false-match a blocklist
+/// term. Does not apply inside `tool_use.input` (see [`walk_part_text`]).
 fn skip_part_key(k: &str) -> bool {
     matches!(
         k,
-        "image_url"
-            | "input_audio"
-            | "source"
-            | "data"
-            | "url"
-            | "file_data"
-            | "file_url"
-            | "file"
-            | "type"
-            | "media_type"
+        "image_url" | "input_audio" | "source" | "file_data" | "file_url" | "type" | "media_type"
     ) || k == "id"
         || k.ends_with("_id")
 }
 
-/// Walk a multimodal `parts` value's text leaves with a visitor that may rewrite
-/// them (skipping [`skip_part_key`] subtrees); returns summed hits.
+/// Walk a multimodal `parts` value's text leaves with a visitor that may
+/// rewrite them, skipping [`skip_part_key`] subtrees. A `tool_use` block's
+/// `input` is arbitrary tool-schema JSON, not content blocks — every string
+/// leaf in it is visited, so an argument named like a media key (`data`,
+/// `url`, `source`) is no scan bypass.
 fn walk_part_text(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     match v {
         serde_json::Value::String(s) => f(s),
         serde_json::Value::Array(a) => a.iter_mut().map(|x| walk_part_text(x, f)).sum(),
-        serde_json::Value::Object(o) => o
-            .iter_mut()
-            .filter(|(k, _)| !skip_part_key(k))
-            .map(|(_, x)| walk_part_text(x, f))
-            .sum(),
+        serde_json::Value::Object(o) => {
+            let tool_args = o.get("type").is_some_and(|t| t == "tool_use");
+            o.iter_mut()
+                .map(|(k, x)| {
+                    if tool_args && k == "input" {
+                        walk_json_strings(x, f)
+                    } else if skip_part_key(k) {
+                        0
+                    } else {
+                        walk_part_text(x, f)
+                    }
+                })
+                .sum()
+        }
         _ => 0,
     }
 }
@@ -287,12 +300,7 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
     let mut hits = 0;
     for msg in &mut request.message {
-        hits += redact_field(&mut msg.content);
-        // engines forward `parts` (not `content`) when present, so PII must be
-        // scrubbed inside the parts' text blocks too
-        if let Some(parts) = &mut msg.parts {
-            hits += walk_part_text(parts, &mut redact_field);
-        }
+        hits += for_each_message_text(msg, &mut redact_field);
     }
     // non-chat surfaces carry user text outside `message` (Responses raw body,
     // family typed params) — scrub those too or they reach the vendor unredacted
@@ -739,6 +747,105 @@ mod tests {
             security_check(&sec(), &mut req).block.is_none(),
             "base64 image data must not be scanned for blocklist terms"
         );
+    }
+
+    #[test]
+    fn blocklist_and_dlp_cover_tool_call_arguments() {
+        let mut msg = ChatMsg::text("assistant", String::new());
+        msg.tool_calls = Some(serde_json::json!([{
+            "id":"call_1","type":"function",
+            "function":{"name":"send_mail","arguments":"{\"body\":\"say forbiddenword\"}"}
+        }]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_some(),
+            "a blocklisted term inside tool_calls arguments must be caught"
+        );
+        assert!(
+            inbound_text(&mut req).contains("forbiddenword"),
+            "moderation view must include tool_calls arguments"
+        );
+
+        let mut msg = ChatMsg::text("assistant", String::new());
+        msg.tool_calls = Some(serde_json::json!([{
+            "id":"call_2","type":"function",
+            "function":{"name":"send_mail","arguments":"{\"to\":\"jane@corp.com\"}"}
+        }]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(dlp_redact_request(&sec(), &mut req) >= 1);
+        let tc = req.message[0].tool_calls.as_ref().unwrap();
+        assert!(
+            !tc.to_string().contains("jane@corp.com"),
+            "PII inside tool_calls arguments must be redacted: {tc}"
+        );
+    }
+
+    #[test]
+    fn tool_use_input_generic_keys_are_scanned() {
+        let mut msg = ChatMsg::text("user", String::new());
+        msg.parts = Some(serde_json::json!([
+            {"type":"tool_use","id":"toolu_1","name":"fetch",
+             "input":{"url":"https://x.test/forbiddenword","data":"reach ops@example.com"}}
+        ]));
+        let mut req = GatewayRequest {
+            message: vec![msg.clone()],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_some(),
+            "blocklist must reach tool_use input values named url/data"
+        );
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(dlp_redact_request(&sec(), &mut req) >= 1);
+        let parts = req.message[0].parts.as_ref().unwrap();
+        assert!(
+            !parts.to_string().contains("ops@example.com"),
+            "PII inside tool_use input must be redacted: {parts}"
+        );
+    }
+
+    #[test]
+    fn source_scanned_inside_tool_input_not_in_media_blocks() {
+        let noise = format!("AAAA{}BBBB", "forbiddenword");
+        let mut msg = ChatMsg::text("user", String::new());
+        msg.parts = Some(serde_json::json!([
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":noise}}
+        ]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_none(),
+            "a media block's source container must stay unscanned"
+        );
+
+        for input in [
+            serde_json::json!({"source":"cite forbiddenword"}),
+            serde_json::json!({"source":{"doc":"d","text":"cite forbiddenword"}}),
+        ] {
+            let mut msg = ChatMsg::text("user", String::new());
+            msg.parts = Some(serde_json::json!([
+                {"type":"tool_use","id":"toolu_2","name":"quote","input":input}
+            ]));
+            let mut req = GatewayRequest {
+                message: vec![msg],
+                ..Default::default()
+            };
+            assert!(
+                security_check(&sec(), &mut req).block.is_some(),
+                "a tool argument named source must be scanned whatever its shape"
+            );
+        }
     }
 
     #[test]

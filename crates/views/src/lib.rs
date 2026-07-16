@@ -1802,34 +1802,50 @@ fn finish_anthropic(fr: &str) -> String {
     }
 }
 
-/// The OpenAI wire usage from raw totals plus the normalized detail (cache /
-/// reasoning), emitted only when the vendor reported some.
-fn openai_usage(pt: i64, ct: i64, tt: i64, u: Option<&gw_models::CommonUsage>) -> Usage {
+/// The OpenAI wire usage. When the normalized parts are known they rebuild the
+/// totals — OpenAI counts cached reads inside `prompt_tokens` and reasoning
+/// inside `completion_tokens`, while an Anthropic engine reports cache tokens
+/// OUTSIDE `input_tokens` — so the details always stay subsets of the totals.
+fn openai_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) -> Usage {
+    let (pt, ct, tt) = u.map_or((pt, ct, tt), |d| {
+        let (p, c) = (d.prompt_total(), d.completion_total());
+        (p, c, p.saturating_add(c))
+    });
     Usage {
         prompt_tokens: pt,
         completion_tokens: ct,
         total_tokens: tt,
-        prompt_tokens_details: u.filter(|u| u.read_cache > 0).map(|u| {
+        prompt_tokens_details: u.filter(|d| d.read_cache > 0).map(|d| {
             gw_protocol::openai::PromptTokensDetails {
-                cached_tokens: u.read_cache,
+                cached_tokens: d.read_cache,
             }
         }),
-        completion_tokens_details: u.filter(|u| u.reason > 0).map(|u| {
+        completion_tokens_details: u.filter(|d| d.reason > 0).map(|d| {
             gw_protocol::openai::CompletionTokensDetails {
-                reasoning_tokens: u.reason,
+                reasoning_tokens: d.reason,
             }
         }),
     }
 }
 
-/// The Anthropic wire usage: input/output plus prompt-cache accounting.
-fn anthropic_usage(r: &gw_models::GatewayResponse) -> AnthUsage {
-    let u = r.common_usage.unwrap_or_default();
-    AnthUsage {
-        input_tokens: r.prompt_tokens,
-        output_tokens: r.completion_tokens,
-        cache_read_input_tokens: u.read_cache,
-        cache_creation_input_tokens: u.write_cache,
+/// The Anthropic wire usage: cache tokens ride OUTSIDE `input_tokens`. When
+/// the normalized parts are known they rebuild input/output — an OpenAI
+/// engine's `prompt_tokens` already contains its cached reads, and passing it
+/// through next to `cache_read_input_tokens` would double-count them.
+fn anthropic_usage(pt: i64, ct: i64, u: Option<gw_models::CommonUsage>) -> AnthUsage {
+    match u {
+        Some(u) => AnthUsage {
+            input_tokens: u.platform_input,
+            output_tokens: u.completion_total(),
+            cache_read_input_tokens: u.read_cache,
+            cache_creation_input_tokens: u.write_cache,
+        },
+        None => AnthUsage {
+            input_tokens: pt,
+            output_tokens: ct,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
     }
 }
 
@@ -1918,7 +1934,7 @@ async fn chat_completions(
         outcome.response.prompt_tokens,
         outcome.response.completion_tokens,
         outcome.response.total_tokens,
-        outcome.response.common_usage.as_ref(),
+        outcome.response.common_usage,
     );
     let model_out = outcome.response.model;
 
@@ -2095,7 +2111,7 @@ fn chat_stream_response(
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
                     };
-                    let usage = openai_usage(pt, ct, tt, c.common_usage.as_ref());
+                    let usage = openai_usage(pt, ct, tt, c.common_usage);
                     let mut fin = ChatCompletionChunk::finish(
                         &self.id,
                         self.created,
@@ -2252,7 +2268,11 @@ async fn messages(
         return anthropic_error(500, "pipeline produced no outcome");
     };
 
-    let usage = anthropic_usage(&outcome.response);
+    let usage = anthropic_usage(
+        outcome.response.prompt_tokens,
+        outcome.response.completion_tokens,
+        outcome.response.common_usage,
+    );
     let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.as_ref());
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
@@ -2400,11 +2420,7 @@ fn messages_stream_response(
                 .pending_finish
                 .take()
                 .unwrap_or_else(|| "end_turn".to_owned());
-            let mut usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
-            if let Some(u) = detail {
-                usage["cache_read_input_tokens"] = json!(u.read_cache);
-                usage["cache_creation_input_tokens"] = json!(u.write_cache);
-            }
+            let usage = anthropic_usage(input_tokens, output_tokens, detail);
             self.queue.push_back(Self::ev(
                 "message_delta",
                 json!({"type":"message_delta","delta":{"stop_reason":stop},"usage": usage}),
@@ -3779,5 +3795,48 @@ mod tests {
             assert_eq!(finish_anthropic(o), a, "openai→anthropic {o}");
             assert_eq!(finish_openai(a), o, "anthropic→openai {a}");
         }
+    }
+
+    #[test]
+    fn openai_usage_counts_anthropic_cache_inside_prompt() {
+        let u = gw_models::CommonUsage {
+            platform_input: 8,
+            read_cache: 2,
+            write_cache: 1,
+            completion: 5,
+            reason: 0,
+        };
+        let w = openai_usage(8, 5, 13, Some(u));
+        assert_eq!(
+            w.prompt_tokens, 11,
+            "cache reads/writes belong inside OpenAI prompt_tokens"
+        );
+        assert_eq!(w.total_tokens, 16);
+        assert_eq!(w.prompt_tokens_details.unwrap().cached_tokens, 2);
+
+        let w = openai_usage(8, 5, 13, None);
+        assert_eq!((w.prompt_tokens, w.total_tokens), (8, 13));
+        assert!(w.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn anthropic_usage_excludes_cache_from_input() {
+        let u = gw_models::CommonUsage {
+            platform_input: 6,
+            read_cache: 4,
+            write_cache: 0,
+            completion: 3,
+            reason: 2,
+        };
+        let w = anthropic_usage(10, 5, Some(u));
+        assert_eq!(
+            w.input_tokens, 6,
+            "OpenAI cached reads must not double-count into input_tokens"
+        );
+        assert_eq!(w.output_tokens, 5);
+        assert_eq!(w.cache_read_input_tokens, 4);
+
+        let w = anthropic_usage(10, 5, None);
+        assert_eq!((w.input_tokens, w.cache_read_input_tokens), (10, 0));
     }
 }
