@@ -518,6 +518,15 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<Option<gw_models::BatchItem>> {
         Ok(None)
     }
+    /// Whether `user`'s content was erased at or after `since` (unix secs).
+    /// Local executors check this before dispatching an item captured before
+    /// the erasure, so a long sequential batch can't keep running an erased
+    /// user's prompts; a batch submitted after the erasure passes (its start
+    /// postdates `since`). Item-persisting backends re-read rows at dispatch
+    /// instead and keep the default `false`.
+    async fn user_erased_since(&self, _tenant: &str, _user: &str, _since: i64) -> GResult<bool> {
+        Ok(false)
+    }
     /// Claim one pending batch (requeuing stale running ones first); `None` =
     /// nothing to run. The returned fence token (>= 1, bumped per claim) rides
     /// [`Store::batch_touch`] / [`Store::batch_set_status_owned`] so a reclaimed
@@ -542,6 +551,8 @@ pub struct MemoryStore {
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<Vec<crate::ContentRecord>>,
+    /// (tenant, user, erased_at) markers backing [`Store::user_erased_since`].
+    erasures: Mutex<Vec<(String, String, i64)>>,
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
     seq: AtomicUsize,
@@ -786,12 +797,29 @@ impl Store for MemoryStore {
                 }
             }
         }
+        self.erasures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                tenant.unwrap_or_default().to_owned(),
+                user.to_owned(),
+                crate::epoch_secs(),
+            ));
         audit.summary = format!("rows={erased}");
         self.audit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(audit);
         Ok(erased)
+    }
+
+    async fn user_erased_since(&self, tenant: &str, user: &str, since: i64) -> GResult<bool> {
+        Ok(self
+            .erasures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(t, u, at)| u == user && *at >= since && (t.is_empty() || t == tenant)))
     }
 
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
@@ -1012,6 +1040,9 @@ impl SqliteStore {
                 created_at_epoch_secs INTEGER NOT NULL DEFAULT 0,
                 estimated INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
+            "CREATE TABLE IF NOT EXISTS erasures (
+                tenant TEXT NOT NULL, user_id TEXT NOT NULL,
+                erased_at_epoch_secs INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
                 minute_epoch INTEGER NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
                 model TEXT NOT NULL, requests INTEGER NOT NULL,
@@ -1392,6 +1423,15 @@ impl Store for SqliteStore {
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
         let erased = c.rows_affected() + m.rows_affected();
         sqlx::query(
+            "INSERT INTO erasures (tenant, user_id, erased_at_epoch_secs) VALUES (?, ?, ?)",
+        )
+        .bind(tenant.unwrap_or_default())
+        .bind(user)
+        .bind(crate::epoch_secs())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| crate::sqlx_err("record erasure", e))?;
+        sqlx::query(
             "INSERT INTO admin_audit (created_at_epoch_secs, actor, scope, action, target,
              summary, source_ip) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -1463,6 +1503,21 @@ impl Store for SqliteStore {
             bytes: row.get::<i64, _>(3) as usize,
             content: row.get(4),
         }))
+    }
+
+    async fn user_erased_since(&self, tenant: &str, user: &str, since: i64) -> GResult<bool> {
+        let hit: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM erasures
+              WHERE user_id = ?1 AND erased_at_epoch_secs >= ?2
+                AND (tenant = '' OR tenant = ?3))",
+        )
+        .bind(user)
+        .bind(since)
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read erasure marker", e))?;
+        Ok(hit)
     }
 
     async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
@@ -2862,9 +2917,29 @@ mod tests {
         );
     }
 
+    /// Local backends only: item-persisting stores (PG) re-read rows at
+    /// dispatch and keep the trait's `false` default.
+    async fn exercise_erasure_markers(store: &dyn Store) {
+        let now = crate::epoch_secs();
+        assert!(
+            store.user_erased_since("t1", "u1", now - 5).await.unwrap(),
+            "marker visible to a batch started before the erasure"
+        );
+        assert!(
+            !store.user_erased_since("t1", "u1", now + 5).await.unwrap(),
+            "a batch started after the erasure is unaffected"
+        );
+        assert!(
+            !store.user_erased_since("t1", "u2", now - 5).await.unwrap(),
+            "other users unaffected"
+        );
+    }
+
     #[tokio::test]
     async fn memory_erase_roundtrip() {
-        exercise_erase(&MemoryStore::default()).await;
+        let store = MemoryStore::default();
+        exercise_erase(&store).await;
+        exercise_erasure_markers(&store).await;
     }
 
     #[tokio::test]
@@ -2942,6 +3017,7 @@ mod tests {
             .await
             .unwrap();
         exercise_erase(&store).await;
+        exercise_erasure_markers(&store).await;
     }
 
     #[tokio::test]

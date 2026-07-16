@@ -51,6 +51,7 @@ impl OfflineHandler {
     /// reclaimed, this executor stops rather than double-running items.
     async fn execute(&self, id: &str, ak: &AkInfo, model: &str, items: Vec<BatchItem>, claim: i64) {
         let store = self.online.state().store.clone();
+        let started = gw_state::epoch_secs();
         // the distributed claim already set status=running with the fence bump;
         // only the in-process path needs this write — unfenced on the distributed
         // path it could resurrect a batch a stale worker no longer owns
@@ -112,14 +113,38 @@ impl OfflineHandler {
                 break;
             }
             // re-read the stored copy just before dispatch: an erasure that
-            // landed while this batch sat queued blanks the persisted item
-            if let Ok(Some(fresh)) = store.batch_item_snapshot(id, index).await {
-                item = fresh;
+            // landed while this batch sat queued blanks the persisted item.
+            // Fail CLOSED — a read error or vanished row can't prove the item
+            // wasn't erased, so the stale pre-load copy never dispatches
+            if store.distributed_batches() {
+                match store.batch_item_snapshot(id, index).await {
+                    Ok(Some(fresh)) => item = fresh,
+                    Ok(None) | Err(_) => {
+                        let result = BatchItemResult {
+                            index,
+                            ok: false,
+                            message: "item unavailable at dispatch".into(),
+                            total_tokens: 0,
+                            user: ak.attributed_user(&item.user).to_owned(),
+                        };
+                        if let Err(e) = store.batch_push_result(id, result).await {
+                            tracing::error!(error = %e, batch = %id, "batch result write failed");
+                        }
+                        continue;
+                    }
+                }
             }
             let user = ak.attributed_user(&item.user).to_owned();
-            // an erased item (messages blanked by content_erase_user) must not
-            // run: fail it instead of sending an empty prompt upstream
-            if item.messages.is_empty() {
+            // local backends don't persist items, so a mid-batch erasure can't
+            // blank them — the erasure marker stops the user's remaining items
+            // (fail closed on a marker read error). An erased item must not
+            // run: fail it instead of sending an erased prompt upstream
+            let erased_mid_batch = !store.distributed_batches()
+                && store
+                    .user_erased_since(&ak.tenant, &user, started)
+                    .await
+                    .unwrap_or(true);
+            if erased_mid_batch || item.messages.is_empty() {
                 let result = BatchItemResult {
                     index,
                     ok: false,
