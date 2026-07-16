@@ -1,11 +1,9 @@
-//! Error codes.
-//!
-//! This module models two related things:
-//!   * `ErrorException{ code, msg }` values (SYSTEM_ERROR, ReqJsonErr, ...)
-//!   * an `ErrCode` numeric set used for metrics/logging
+//! Error codes carried by the gateway's error envelope and metrics/logging.
 //!
 //! Numeric codes are stable so the gateway's externally observable error
-//! codes remain consistent across releases.
+//! codes remain consistent across releases; the named constants catalog the
+//! whole reserved numbering — including codes no path emits today — so a
+//! number is never silently reused with a different meaning.
 
 use std::fmt;
 

@@ -59,9 +59,10 @@ async fn openai_chat_matches_go_recorded_response() {
     assert_eq!(out.response.prompt_tokens, 5);
     assert_eq!(out.response.completion_tokens, 3);
     assert_eq!(out.response.total_tokens, 8);
+    let usage: serde_json::Value = serde_json::from_slice(&out.response.raw_usage_json).unwrap();
     assert_eq!(
-        String::from_utf8(out.response.raw_usage_json).unwrap(),
-        r#"{"completion_tokens":3,"prompt_tokens":5,"total_tokens":8}"#
+        usage,
+        serde_json::json!({"completion_tokens": 3, "prompt_tokens": 5, "total_tokens": 8})
     );
 }
 
@@ -70,7 +71,7 @@ const GO_OPENAI_SSE: &str = "data: {\"id\":\"cmpl-7\",\"object\":\"text_completi
 #[tokio::test]
 async fn openai_sse_decodes_go_recorded_stream() {
     use gw_engines::SseDecoder;
-    let (events, done) = SseDecoder::decode_all(GO_OPENAI_SSE.as_bytes());
+    let (events, done) = SseDecoder::decode_all(GO_OPENAI_SSE.as_bytes()).unwrap();
     assert!(done, "must see [DONE] from the recorded stream");
     assert_eq!(events.len(), 1);
     let v: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
@@ -306,7 +307,7 @@ async fn anthropic_error_envelope_surfaces() {
 }
 
 #[tokio::test]
-async fn minimax_error_envelope_surfaces() {
+async fn vendor_http_code_string_maps_the_status() {
     let fixture = r#"{"type":"error","error":{"http_code":"529","message":"cluster overloaded"},"request_id":"t"}"#;
     let err = OpenAiEngine::new(
         openai_req(),
@@ -322,6 +323,70 @@ async fn minimax_error_envelope_surfaces() {
     .unwrap();
     assert_eq!(err.http_status, 529);
     assert!(err.message.contains("cluster overloaded"));
+}
+
+#[tokio::test]
+async fn minimax_base_resp_error_surfaces_as_502() {
+    let fixture = r#"{"reply":"","base_resp":{"status_code":1002,"status_msg":"rate limit"}}"#;
+    let err = gw_engines::MinimaxV1Engine::new(
+        GatewayRequest {
+            message: vec![ChatMsg::text("user", "hi")],
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::MinimaxV1, "abab6.5")),
+            ..Default::default()
+        },
+        Arc::new(FixtureTransport {
+            status: 200,
+            sse: false,
+            bytes: fixture.as_bytes().to_vec(),
+        }),
+    )
+    .run()
+    .await
+    .expect_err("a non-zero base_resp must not parse as an empty success");
+    assert_eq!(err.http_status, 502);
+    assert!(err.message.contains("1002"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn flat_error_bodies_surface_for_bespoke_vendors() {
+    let bedrock = r#"{"message":"The security token included in the request is invalid."}"#;
+    let err = gw_engines::LlamaEngine::new(
+        GatewayRequest {
+            message: vec![ChatMsg::text("user", "hi")],
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::AwsLlama, "llama3-70b")),
+            ..Default::default()
+        },
+        Arc::new(FixtureTransport {
+            status: 403,
+            sse: false,
+            bytes: bedrock.as_bytes().to_vec(),
+        }),
+    )
+    .run()
+    .await
+    .expect_err("a flat 403 body must not parse as an empty success");
+    assert_eq!(err.http_status, 403);
+    assert!(err.message.contains("security token"), "{}", err.message);
+
+    let dashscope =
+        r#"{"code":"Throttling.RateQuota","message":"Requests throttled","request_id":"r"}"#;
+    let err = gw_engines::DashScopeEngine::new(
+        GatewayRequest {
+            message: vec![ChatMsg::text("user", "hi")],
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::Dashscope, "qwen-max")),
+            ..Default::default()
+        },
+        Arc::new(FixtureTransport {
+            status: 429,
+            sse: false,
+            bytes: dashscope.as_bytes().to_vec(),
+        }),
+    )
+    .run()
+    .await
+    .expect_err("a flat 429 body must not parse as an empty success");
+    assert_eq!(err.http_status, 429);
+    assert!(err.message.contains("throttled"), "{}", err.message);
 }
 
 const GO_GEMINI: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":10,"totalTokenCount":25}}"#;

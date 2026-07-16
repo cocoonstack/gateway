@@ -2,6 +2,8 @@
 //! document may come from a local file or the Postgres config store (gw-state);
 //! this crate only defines its shape. Layer L1 — depends only on gw-consts.
 
+use std::collections::{HashMap, HashSet};
+
 use gw_consts::Protocol;
 use serde::Deserialize;
 
@@ -21,7 +23,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     #[error("parse config: {0}")]
-    Parse(#[from] serde_yaml::Error),
+    Parse(#[from] serde_saphyr::Error),
     #[error("account `{account}` references unknown protocol `{wire}`")]
     UnknownProtocol { account: String, wire: String },
     #[error("model `{model}` references unknown protocol `{wire}`")]
@@ -48,6 +50,8 @@ pub enum ConfigError {
     BadFallbackModel { tenant: String, model: String },
     #[error("`{owner}` sets a negative price")]
     NegativePrice { owner: String },
+    #[error("`{owner}` sets a negative limit")]
+    NegativeLimit { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
     SharedCacheNeedsRedis,
 }
@@ -82,7 +86,7 @@ pub struct AkConf {
     pub banned: bool,
     /// Per-model daily token caps for this key, overriding the tenant defaults.
     #[serde(default)]
-    pub model_quotas: std::collections::HashMap<String, i64>,
+    pub model_quotas: HashMap<String, i64>,
 }
 
 /// Public model name → dispatch type + demo pricing + per-model governance.
@@ -219,6 +223,15 @@ pub struct SecurityConf {
     pub regexes: Vec<CompiledRule>,
 }
 
+impl SecurityConf {
+    /// Whether responses must be redacted before leaving — the one predicate
+    /// the outbound-DLP masking AND the stream-buffering boundary share, so a
+    /// secrets-only tenant can't stream raw deltas past the masking.
+    pub fn redacts_output(&self) -> bool {
+        self.dlp_redact || self.detect_secrets
+    }
+}
+
 /// A compiled [`RegexRule`], ready to match on the hot path.
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
@@ -323,7 +336,7 @@ pub struct TenantConf {
     pub models: Option<Vec<String>>,
     /// Default per-model daily token caps, metered per key.
     #[serde(default)]
-    pub model_quotas: std::collections::HashMap<String, i64>,
+    pub model_quotas: HashMap<String, i64>,
     /// Where an over-quota request degrades to instead of hard-failing;
     /// None = pass through unmetered (the per-AK daily cap still backstops).
     #[serde(default)]
@@ -333,7 +346,7 @@ pub struct TenantConf {
     pub admin_token_env: String,
     /// Per-model charged-price overrides (else the model's list price applies).
     #[serde(default)]
-    pub model_prices: std::collections::HashMap<String, PriceConf>,
+    pub model_prices: HashMap<String, PriceConf>,
     /// Per-user daily token budget (a soft cap keyed by end user); `None` =
     /// unlimited. Enforced only when the request carries a user attribution.
     #[serde(default)]
@@ -477,18 +490,18 @@ pub struct GatewayConfig {
     generation: u64,
     /// name → index lookups, built once after parse to avoid per-request scans.
     #[serde(skip)]
-    model_idx: std::collections::HashMap<String, usize>,
+    model_idx: HashMap<String, usize>,
     #[serde(skip)]
-    ak_idx: std::collections::HashMap<String, usize>,
+    ak_idx: HashMap<String, usize>,
     #[serde(skip)]
-    product_idx: std::collections::HashMap<String, usize>,
+    product_idx: HashMap<String, usize>,
     #[serde(skip)]
-    tenant_idx: std::collections::HashMap<String, usize>,
+    tenant_idx: HashMap<String, usize>,
 }
 
 impl GatewayConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {
-        let mut cfg: GatewayConfig = serde_yaml::from_str(yaml)?;
+        let mut cfg: GatewayConfig = serde_saphyr::from_str(yaml)?;
         cfg.normalize()?;
         cfg.validate()?;
         cfg.build_indices();
@@ -623,6 +636,36 @@ impl GatewayConfig {
                 }
             }
         }
+        // a negative quota/qps is a typo that would silently deny (or never
+        // limit) — reject at load like negative prices
+        let neg_limit = |owner: String| ConfigError::NegativeLimit { owner };
+        for k in &self.access_keys {
+            if k.qps < 0.0
+                || k.daily_token_quota < 0
+                || k.tokens_per_minute.is_some_and(|v| v < 0)
+                || k.model_quotas.values().any(|v| *v < 0)
+            {
+                return Err(neg_limit(format!("access key {}", k.ak)));
+            }
+        }
+        for t in &self.tenants {
+            if t.qps.is_some_and(|v| v < 0.0)
+                || t.user_daily_token_quota.is_some_and(|v| v < 0)
+                || t.model_quotas.values().any(|v| *v < 0)
+            {
+                return Err(neg_limit(format!("tenant {}", t.name)));
+            }
+        }
+        for m in &self.models {
+            if m.qpm.is_some_and(|v| v < 0) {
+                return Err(neg_limit(format!("model {}", m.name)));
+            }
+        }
+        for p in &self.products {
+            if p.qpm.is_some_and(|v| v < 0) {
+                return Err(neg_limit(format!("product {}", p.name)));
+            }
+        }
         for m in &self.models {
             if m.protocol().is_none() {
                 return Err(ConfigError::UnknownModelMapping {
@@ -646,6 +689,8 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
+        // health/failover key by name — a duplicate would cool down the wrong account
+        check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         // a colon in a tenant name would alias another tenant's `ub:{tenant}:{user}` budget key
         for t in &self.tenants {
             if t.name.contains(':') {
@@ -691,8 +736,6 @@ impl GatewayConfig {
         for k in &self.access_keys {
             self.check_models_known(format!("access key {}", k.ak), k.model_quotas.keys())?;
         }
-        // health/failover key by name — a duplicate would cool down the wrong account
-        check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         Ok(())
     }
 
@@ -829,16 +872,18 @@ fn token_from_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|t| !t.is_empty())
 }
 
-/// Deterministic hash of the config document, stable across processes.
+/// Deterministic hash of the config document. sha256, NOT `DefaultHasher`:
+/// the generation feeds fleet-shared cache keys, and std's hasher is not
+/// guaranteed stable across Rust releases — mixed-build replicas would
+/// disagree on the identical document and collapse the shared-cache hit rate.
 fn stable_hash(yaml: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::hash::DefaultHasher::new();
-    yaml.hash(&mut h);
-    h.finish()
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(yaml.as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
 }
 
 /// Build a name → slot-index map for O(1) lookups.
-fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashMap<String, usize> {
+fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> HashMap<String, usize> {
     items
         .iter()
         .enumerate()
@@ -852,7 +897,7 @@ fn check_unique<'a>(
     kind: &'static str,
     names: impl Iterator<Item = &'a str>,
 ) -> Result<(), ConfigError> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for name in names {
         if name.is_empty() {
             return Err(ConfigError::EmptyName { kind });
@@ -1119,6 +1164,26 @@ tenants: [{name: t1}, {name: t1}]
             ),
             "negative prices are rejected at load"
         );
+
+        let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(neg_quota),
+                Err(ConfigError::NegativeLimit { .. })
+            ),
+            "negative quotas are rejected at load"
+        );
+        let neg_tenant_qps = "listen: {host: h, port: 1}\ntenants: [{name: t1, qps: -1}]";
+        assert!(matches!(
+            GatewayConfig::from_yaml(neg_tenant_qps),
+            Err(ConfigError::NegativeLimit { .. })
+        ));
+        let neg_qpm =
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, qpm: -2}]";
+        assert!(matches!(
+            GatewayConfig::from_yaml(neg_qpm),
+            Err(ConfigError::NegativeLimit { .. })
+        ));
 
         let colon = "listen: {host: h, port: 1}\ntenants: [{name: 'a:b'}]";
         assert!(

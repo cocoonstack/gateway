@@ -118,35 +118,6 @@ impl Run {
     }
 }
 
-/// Per-message structural overhead. gpt-3.5 uses 4, everything modern uses 3.
-fn tokens_per_message(model_name: &str) -> usize {
-    let m = model_name.to_ascii_lowercase();
-    if m.contains("gpt-3.5") || m.contains("gpt-35") || m.contains("gpt3.5") {
-        4
-    } else {
-        3
-    }
-}
-
-/// Extract the text a message contributes: multimodal `parts` → concatenated
-/// text parts only (vision tokens are the vendor's to count); else `content`.
-fn message_text(msg: &ChatMsg) -> String {
-    if let Some(Value::Array(parts)) = &msg.parts {
-        let mut out = String::new();
-        for p in parts {
-            if p["type"] == "text"
-                && let Some(t) = p["text"].as_str()
-            {
-                out.push_str(t);
-            }
-        }
-        if !out.is_empty() {
-            return out;
-        }
-    }
-    msg.content.clone()
-}
-
 /// Estimate the prompt tokens a chat request will cost upstream. `tools` is the
 /// request's tool definitions (OpenAI wire shape); their serialized schema is
 /// encoded as text.
@@ -194,6 +165,36 @@ pub fn estimate_prompt_tokens(
     num += 3;
 
     num as i64
+}
+
+/// Per-message structural overhead. gpt-3.5 uses 4, everything modern uses 3.
+fn tokens_per_message(model_name: &str) -> usize {
+    let m = model_name.to_ascii_lowercase();
+    if m.contains("gpt-3.5") || m.contains("gpt-35") || m.contains("gpt3.5") {
+        4
+    } else {
+        3
+    }
+}
+
+/// Extract the text a message contributes: multimodal `parts` → concatenated
+/// text parts only (vision tokens are the vendor's to count); else `content`,
+/// borrowed — the common case allocates nothing.
+fn message_text(msg: &ChatMsg) -> std::borrow::Cow<'_, str> {
+    if let Some(Value::Array(parts)) = &msg.parts {
+        let mut out = String::new();
+        for p in parts {
+            if p["type"] == "text"
+                && let Some(t) = p["text"].as_str()
+            {
+                out.push_str(t);
+            }
+        }
+        if !out.is_empty() {
+            return std::borrow::Cow::Owned(out);
+        }
+    }
+    std::borrow::Cow::Borrowed(&msg.content)
 }
 
 #[cfg(test)]

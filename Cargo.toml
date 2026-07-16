@@ -1,6 +1,6 @@
 # Gateway — LLM access point. Workspace manifest.
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/consts",
     "crates/models",
@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cocoonstack/gateway"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 
 [workspace.lints.clippy]
@@ -43,7 +43,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # --- serde ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde-saphyr = "0.0.29" # serde_yaml is unmaintained (archived 2024)
 # --- errors ---
 thiserror = "2"
 anyhow = "1"

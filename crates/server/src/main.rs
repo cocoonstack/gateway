@@ -67,7 +67,13 @@ async fn main() -> anyhow::Result<()> {
     let host = env::var("GW_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
     let port = env::var("GW_PORT")
         .ok()
-        .and_then(|p| p.parse::<u16>().ok())
+        .and_then(|p| match p.parse::<u16>() {
+            Ok(port) => Some(port),
+            Err(e) => {
+                tracing::warn!(value = %p, error = %e, "GW_PORT is not a port; using the config file");
+                None
+            }
+        })
         .unwrap_or(cfg.listen.port);
     let addr = format!("{host}:{port}");
 
@@ -179,8 +185,8 @@ async fn main() -> anyhow::Result<()> {
     let router = gw_views::app(app_state).route(
         "/metrics",
         axum::routing::get(move || {
-            let prometheus = prometheus.clone();
-            async move { prometheus.render() }
+            let body = prometheus.render();
+            async move { body }
         }),
     );
 

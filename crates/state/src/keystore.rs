@@ -49,6 +49,8 @@ pub struct PostgresKeyStore {
     cache: moka::sync::Cache<String, Option<AkInfo>>,
     /// Bumped on every write: an authenticate that overlapped a write skips
     /// caching its (possibly pre-write) fetch instead of poisoning the cache.
+    /// A write landing between the re-check and the insert still self-heals
+    /// within [`AUTH_CACHE_TTL`].
     write_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -210,7 +212,7 @@ impl KeyStore for PostgresKeyStore {
     }
 
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()> {
-        let wanted: Vec<String> = keys.iter().map(|k| k.ak.clone()).collect();
+        let wanted: Vec<&str> = keys.iter().map(|k| k.ak.as_str()).collect();
         let mut tx = self
             .pool
             .begin()

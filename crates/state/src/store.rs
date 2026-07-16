@@ -50,6 +50,10 @@ const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 /// the lock only avoids N replicas repeating the same scan).
 const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 
+/// One minute past the newest rolled bucket — where the raw ledger tail
+/// starts. Valid in both SQL dialects.
+const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup";
+
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BillingRecord {
@@ -428,7 +432,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
     /// Erase every retained trace of `user`'s content, optionally confined to
     /// one tenant (a tenant admin's scope): retained prompt/response rows,
-    /// generated batch-result messages, and leftover terminal batch inputs.
+    /// generated batch-result messages, and still-queued batch inputs (a
+    /// terminal batch's inputs are already pruned at its status write).
     /// `audit` (its `summary` set to the erased-row count here) is written in
     /// the same transaction on the SQL backends, so a recorded success can't
     /// separate from the deletion. Returns rows erased. Ledger rows and
@@ -591,15 +596,19 @@ impl Store for MemoryStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         records.push(r.clone());
         if self.ledger_max_rows > 0 && records.len() > self.ledger_max_rows {
-            let excess = records.len() - self.ledger_max_rows;
             // spare rows the rollup hasn't folded yet — lost here means lost
-            // from usage forever; the cap yields to billing integrity
-            let cut = records
-                .iter()
-                .take(excess)
-                .take_while(|r| r.created_at_epoch_secs < watermark)
-                .count();
-            records.drain(..cut);
+            // from usage forever; the cap yields to billing integrity. A full
+            // scan, not a prefix cut: completion order can wedge a young row
+            // ahead of prunable ones, which must not defeat the cap.
+            let mut excess = records.len() - self.ledger_max_rows;
+            records.retain(|r| {
+                if excess > 0 && r.created_at_epoch_secs < watermark {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
         }
         Ok(())
     }
@@ -1004,25 +1013,6 @@ where
     }
 }
 
-/// A terminal batch's input rows have served their purpose — delete them in
-/// the same transaction as the status write, so submitted prompt text cannot
-/// outlive the run even across a crash between statements.
-async fn prune_terminal_items(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: &str,
-    status: BatchStatus,
-) -> GResult<()> {
-    if !matches!(status, BatchStatus::Completed | BatchStatus::Failed) {
-        return Ok(());
-    }
-    sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
-        .bind(id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| crate::sqlx_err("prune batch items", e))?;
-    Ok(())
-}
-
 /// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
 /// file; ids derive from rowids so they stay unique across restarts.
 #[derive(Debug)]
@@ -1247,11 +1237,10 @@ impl Store for SqliteStore {
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
         let (since, until) = align_bounds(since, until);
-        let watermark: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let rolled = sqlx::query(
             "SELECT user_id, model, SUM(requests), SUM(prompt_tokens), SUM(completion_tokens),
              SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
@@ -1291,11 +1280,10 @@ impl Store for SqliteStore {
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
-        let watermark: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
               prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
@@ -1651,6 +1639,25 @@ impl Store for SqliteStore {
     }
 }
 
+/// A terminal batch's input rows have served their purpose — delete them in
+/// the same transaction as the status write, so submitted prompt text cannot
+/// outlive the run even across a crash between statements.
+async fn prune_terminal_items(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    status: BatchStatus,
+) -> GResult<()> {
+    if !matches!(status, BatchStatus::Completed | BatchStatus::Failed) {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| crate::sqlx_err("prune batch items", e))?;
+    Ok(())
+}
+
 /// Postgres-backed store shared across a fleet. Unlike [`SqliteStore`] there
 /// is no orphan sweep on open — a starting instance must not fail batches
 /// another live instance is still executing.
@@ -1749,13 +1756,6 @@ impl PostgresStore {
              WHERE a.ctid < b.ctid AND a.batch_id = b.batch_id AND a.idx = b.idx",
             "CREATE UNIQUE INDEX IF NOT EXISTS batch_results_uidx
              ON batch_results (batch_id, idx)",
-        ] {
-            sqlx::query(ddl)
-                .execute(&pool)
-                .await
-                .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
-        }
-        for ddl in [
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS vendor_cost_micros BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
@@ -1765,7 +1765,7 @@ impl PostgresStore {
             sqlx::query(ddl)
                 .execute(&pool)
                 .await
-                .map_err(|e| crate::sqlx_err("migrate postgres billing schema", e))?;
+                .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
         }
         Ok(Self {
             pool,
@@ -1885,11 +1885,10 @@ impl Store for PostgresStore {
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
         let (since, until) = align_bounds(since, until);
-        let watermark: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let rolled = sqlx::query(
             "SELECT user_id, model, SUM(requests)::BIGINT,
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
@@ -1944,11 +1943,10 @@ impl Store for PostgresStore {
         if !locked {
             return Ok(0);
         }
-        let watermark: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
               prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
@@ -2372,11 +2370,7 @@ impl Store for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("finalize write", e))?;
-        sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| crate::sqlx_err("finalize prune items", e))?;
+        prune_terminal_items(&mut tx, id, done).await?;
         tx.commit()
             .await
             .map_err(|e| crate::sqlx_err("finalize commit", e))?;
@@ -2750,8 +2744,7 @@ mod tests {
         exercise_audit(&store).await;
     }
 
-    /// `ns` namespaces tenant/user ids so shared-database (PG) runs stay
-    /// isolated from parallel tests without truncating anything.
+    /// `ns` isolates shared-database (PG) runs from parallel tests.
     async fn exercise_rollup(store: &dyn Store, ns: &str) {
         let tenant = format!("tr{ns}");
         let mut a = record("m1");
@@ -2853,8 +2846,7 @@ mod tests {
         a.user_id = "alice".into();
         a.created_at_epoch_secs = 400;
         store.ledger_add(&a).await.unwrap();
-        // first advance long after the row: the window trails back to the
-        // empty-rollup watermark (0), not just 20 minutes
+        // an advance long after the row must trail back to the empty watermark
         store.usage_rollup_advance(400 + 3 * 20 * 60).await.unwrap();
         let usage = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
         assert_eq!(
@@ -2973,8 +2965,7 @@ mod tests {
         );
     }
 
-    /// Local backends only: item-persisting stores (PG) re-read rows at
-    /// dispatch and keep the trait's `false` default.
+    /// Local backends only: item-persisting stores re-read rows at dispatch.
     async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
         let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
         let now = crate::epoch_millis();
@@ -3004,9 +2995,7 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        // a private database, not truncation: the shared one serves parallel
-        // tests, and the rollup watermark is global per database — leftovers
-        // from any earlier run would shadow this test's raw fixtures
+        // a private database: the watermark is global per db, so shared-db leftovers would shadow the fixtures
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3026,8 +3015,7 @@ mod tests {
         exercise_rollup(&store, &ns).await;
         exercise_erase(&store, &ns).await;
 
-        // erasure reaches a still-pending batch's inputs, keyed by the
-        // EFFECTIVE user the enqueue persisted
+        // erasure reaches a still-pending batch's inputs by the persisted effective user
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
         let items = vec![
             gw_models::BatchItem {
@@ -3170,8 +3158,7 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_retention_caps_both_stores() {
-        // rows only prune once rolled: record() stamps created_at=1000, so an
-        // advance past the settle window folds them and re-arms the cap
+        // rows only prune once rolled: an advance past the settle window re-arms the cap
         let mem = MemoryStore::with_ledger_cap(2);
         for m in ["a", "b"] {
             mem.ledger_add(&record(m)).await.unwrap();
@@ -3218,6 +3205,32 @@ mod tests {
         assert!(
             total <= 2 + LEDGER_PRUNE_EVERY,
             "prune cycle enforces the cap on rolled rows (got {total})"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_prune_survives_an_out_of_order_young_row() {
+        let store = MemoryStore::with_ledger_cap(2);
+        let at = |ts: i64| {
+            let mut r = record("m");
+            r.created_at_epoch_secs = ts;
+            r
+        };
+        for ts in [1_000, 1_000] {
+            store.ledger_add(&at(ts)).await.unwrap();
+        }
+        store.usage_rollup_advance(1_180).await.unwrap();
+        store.ledger_add(&at(5_000)).await.unwrap();
+        store.ledger_add(&at(1_010)).await.unwrap();
+        store.ledger_add(&at(1_010)).await.unwrap();
+        let (total, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(
+            total, 2,
+            "a young row wedged ahead of rolled rows must not defeat the cap"
+        );
+        assert!(
+            page.iter().any(|r| r.created_at_epoch_secs == 5_000),
+            "the unrolled young row is spared"
         );
     }
 

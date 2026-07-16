@@ -14,12 +14,10 @@ base_engine!(ClaudeEngine);
 impl ClaudeEngine {
     fn build_upstream(&self) -> GResult<UpstreamRequest> {
         let param = self.base.param()?;
-        // system prompt: typed.system takes priority; system turns in messages are merged in too
-        let mut system_text = String::new();
+        let system_text = self.base.system_text();
         let mut messages: Vec<Value> = Vec::new();
         for m in &self.base.request.message {
             if m.role == gw_consts::role::SYSTEM {
-                system_text.push_str(&m.content);
                 continue;
             }
             let role = if m.role == gw_consts::role::AI {
@@ -59,9 +57,6 @@ impl ClaudeEngine {
             // Anthropic's field is `stop_sequences` (array), not OpenAI's `stop`
             if let Some(stop) = &p.stop {
                 body.insert("stop_sequences".into(), stop.clone());
-            }
-            if let Some(s) = &p.system {
-                system_text = format!("{s}{system_text}");
             }
         }
         body.insert("max_tokens".into(), json!(max_tokens));
@@ -290,11 +285,13 @@ impl SseState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transport::MockTransport;
+    use std::sync::Arc;
+
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2, TypedParams};
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::transport::MockTransport;
 
     fn base_req() -> GatewayRequest {
         GatewayRequest {

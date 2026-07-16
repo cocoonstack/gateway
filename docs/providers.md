@@ -22,7 +22,7 @@ models:
 
 | kind | base URL | protocols | auth |
 |------|----------|-----------|------|
-| `openai` | `https://api.openai.com` | chat, embeddings, image, tts, stt, responses, completions, realtime | `Bearer` |
+| `openai` | `https://api.openai.com` | openai-chat, embeddings, image, tts, stt, responses, completions, realtime | `Bearer` |
 | `anthropic` | `https://api.anthropic.com` | anthropic-messages | `x-api-key` + `anthropic-version` |
 | `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
@@ -50,6 +50,14 @@ OpenAI-compatible shape, via a raw `accounts:` entry pinned to the vendor's
 | `gemini` | Google Gemini | `https://generativelanguage.googleapis.com` | `x-goog-api-key`; streams via `streamGenerateContent`; thinking tokens billed as reasoning |
 | `dashscope` | Alibaba Qwen (native) | `https://dashscope-intl.aliyuncs.com` | `Bearer`; streams via `X-DashScope-SSE` + `incremental_output` |
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
+| `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | `access_token` query param (non-streaming) |
+| `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming) |
+| `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming) |
+| `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer`; kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
+
+The factory also dispatches `video`, `search`, generic `audio`, and
+`passthrough` protocols (kling-video and brave-search ship example accounts in
+the default config).
 
 ```yaml
 accounts:
@@ -63,13 +71,9 @@ models:
     protocol: dashscope
 ```
 
-A vendor's legacy dialect that its platform has since retired (e.g. MiniMax's
-`abab*` v1) is not worth a bespoke engine — use its current OpenAI-compatible
-endpoint via `kind: openai`.
-
-A preset also accepts `endpoint`, `timeout_seconds`, and `connect_retries`,
-inherited by the synthesized account. An explicit `accounts:` entry with the
-same name wins over the preset.
+A preset also accepts `endpoint`, `timeout_seconds`, `connect_retries`, and
+`secret_key_env`, inherited by the synthesized account. An explicit `accounts:`
+entry with the same name wins over the preset.
 
 ## Going live
 
@@ -79,9 +83,15 @@ same name wins over the preset.
 3. Start the gateway. Requests egress to the real vendor and the ledger records
    real usage.
 
-`GW_TRANSPORT` overrides transport routing: unset routes `mock://` sentinel
-URLs in-process and real URLs over HTTP; `mock` forces zero egress; `http`
-disables the mock so a misconfigured account fails loudly.
+`GW_TRANSPORT` overrides transport routing: unset (or any value other than
+`mock`/`http`) routes `mock://` sentinel URLs in-process and real URLs over
+HTTP; `mock` forces zero egress; `http` disables the mock so a misconfigured
+account fails loudly.
+
+An account's `timeout_seconds` bounds a non-streaming request end to end. A
+streaming request instead gets that bound on the response headers and then on
+each gap between chunks — an actively flowing generation is never cut short by
+the total budget, while a stalled stream fails at the gap.
 
 ## Accounts, failover, and health
 

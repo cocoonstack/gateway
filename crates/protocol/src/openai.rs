@@ -114,6 +114,21 @@ pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// Cache/reasoning detail, emitted only when the vendor reported some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,7 +9,8 @@ description = "Local file configuration — no config center."
 [dependencies]
 gw-consts = { workspace = true }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }

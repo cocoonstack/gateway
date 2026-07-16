@@ -77,6 +77,25 @@ impl Base {
             .unwrap_or_default()
     }
 
+    /// System text for wires that carry it out-of-band: `typed.system` first,
+    /// then the request's system turns, newline-joined. Engines that consume
+    /// this must skip system-role messages when building their message lists.
+    pub fn system_text(&self) -> String {
+        let mut out = String::new();
+        if let Some(s) = self.chat_params().and_then(|p| p.system.as_deref()) {
+            out.push_str(s);
+        }
+        for m in &self.request.message {
+            if m.role == gw_consts::role::SYSTEM && !m.content.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&m.content);
+            }
+        }
+        out
+    }
+
     /// Bearer auth headers (the OpenAI-shaped families); real key when the
     /// account is live, inert "mock" otherwise.
     pub fn bearer_headers(&self) -> Vec<(String, String)> {

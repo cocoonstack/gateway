@@ -5,26 +5,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use gw_config::GatewayConfig;
-use gw_state::GatewayState;
-use gw_views::AppState;
 use serde_json::Value;
 use tower::ServiceExt;
 
-fn app() -> Router {
-    let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    gw_views::app(AppState::new(
-        cfg,
-        state,
-        Arc::new(gw_engines::MockTransport),
-    ))
-}
+mod common;
+use common::app;
 
 fn keys(v: &Value) -> BTreeSet<String> {
     v.as_object()
@@ -52,7 +40,8 @@ const ANTHROPIC_MSG_CANONICAL: &str = r#"{
   "model": "claude-sonnet",
   "content": [{"type": "text", "text": "Hello!"}],
   "stop_reason": "end_turn",
-  "usage": {"input_tokens": 12, "output_tokens": 6}
+  "usage": {"input_tokens": 12, "output_tokens": 6,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
 }"#;
 
 #[test]

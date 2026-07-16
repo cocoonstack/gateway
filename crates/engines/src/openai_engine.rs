@@ -286,11 +286,13 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transport::MockTransport;
+    use std::sync::Arc;
+
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2, TypedParams};
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::transport::MockTransport;
 
     fn req(stream: bool) -> GatewayRequest {
         GatewayRequest {

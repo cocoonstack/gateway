@@ -14,7 +14,7 @@ make docker      # build the container image
 make run         # cargo run -p gw-server
 ```
 
-CI runs fmt/clippy/test and `cargo deny` on every push. Releases are cut by
+CI runs fmt/clippy/test and `cargo deny` on every push to `main` and every pull request. Releases are cut by
 [dist](https://opensource.axo.dev/cargo-dist/) on a `v*` tag — it
 cross-compiles the binaries, generates the install script and checksums, and
 publishes the GitHub release (`.github/workflows/release.yml` is generated;
@@ -34,7 +34,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 |-------|------|
 | `consts` | error codes, the `Protocol` enum |
 | `models` | request/response types, typed params, usage, cost, token estimation |
-| `protocol` | OpenAI/Anthropic wire types, cross-protocol DSL |
+| `protocol` | OpenAI/Anthropic wire types + cross-protocol conversions |
 | `config` | YAML config, provider presets, name indices |
 | `state` | auth, account pool, health, cache; `Store` and `Governance` seams |
 | `engines` | per-protocol engines behind the `Transport` seam, SSE, SigV4 |

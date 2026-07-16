@@ -1,6 +1,6 @@
-//! Local background tasks: periodic AK daily quota reset and retained-content
-//! purge. Batch job execution lives in gw-handler::offline (spawned on submit)
-//! and needs no separate poller.
+//! Local background tasks: periodic AK daily quota reset, retained-content
+//! purge, and the usage rollup. Batch job execution lives in
+//! gw-handler::offline (spawned on submit) and needs no separate poller.
 
 use std::sync::Arc;
 use std::time::Duration;

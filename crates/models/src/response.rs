@@ -54,6 +54,8 @@ pub struct StreamChunk {
     pub finish_reason: Option<String>,
     /// final (prompt, completion, total) token counts; sent once at stream end.
     pub usage_totals: Option<(i64, i64, i64)>,
+    /// cache/reasoning detail riding with `usage_totals` when the vendor sent it.
+    pub common_usage: Option<CommonUsage>,
     /// set when the pipeline failed mid-stream; views emit it as an error frame.
     pub error: Option<String>,
 }

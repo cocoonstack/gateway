@@ -89,10 +89,10 @@ impl OnlineHandler {
         // one consistent snapshot for the whole request
         let snap = self.config.load();
         let sec = snap.cfg.security_for(&ak.tenant);
-        // outbound DLP is a response-buffering boundary: a masked span can
-        // straddle deltas, so no engine may stream raw ones — enforced here so
-        // no caller can opt out
-        let dlp = sec.dlp_redact;
+        // outbound redaction (PII or secrets) is a response-buffering boundary:
+        // a masked span can straddle deltas, so no engine may stream raw ones —
+        // enforced here so no caller can opt out
+        let dlp = sec.redacts_output();
         if dlp {
             request.stream_tx = None;
         }
@@ -815,6 +815,72 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct SecretStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for SecretStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"key sk-abcdefghijklmnopqrstuvwxyz012345 ok\"}}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from("data: [DONE]\n\n")),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_secrets_alone_buffers_and_masks_the_stream() {
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.dlp_redact = false;
+        cfg.security.detect_secrets = true;
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(SecretStream),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut req = chat_req("gpt-4o", "hello");
+        req.stream = true;
+        req.stream_tx = Some(tx);
+        let ctx = h.run(req, ak(&h).await).await.unwrap();
+        let mut live: Vec<String> = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            live.push(chunk.delta);
+        }
+        assert!(
+            live.iter().all(|d| !d.contains("sk-abc")),
+            "no raw secret delta may reach the live channel: {live:?}"
+        );
+        let out = ctx.outcome.expect("outcome");
+        assert!(
+            out.chunks.is_empty(),
+            "raw chunks cleared: {:?}",
+            out.chunks
+        );
+        assert!(
+            out.response.message.contains("[REDACTED_SECRET]")
+                && !out.response.message.contains("sk-abc"),
+            "{}",
+            out.response.message
+        );
+    }
+
     #[tokio::test]
     async fn blocklist_runs_before_dlp_redaction() {
         let mut cfg = GatewayConfig::embedded_default().unwrap();
@@ -999,7 +1065,6 @@ mod tests {
             .content_erase_user(None, "user-42", audit)
             .await
             .unwrap();
-        // millisecond markers: a resubmit moments later must already pass
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let job = off
             .submit(

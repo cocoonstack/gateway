@@ -17,15 +17,8 @@ use gw_views::AppState;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-fn app() -> Router {
-    let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    gw_views::app(AppState::new(
-        cfg,
-        state,
-        Arc::new(gw_engines::MockTransport),
-    ))
-}
+mod common;
+use common::app;
 
 #[tokio::test]
 async fn admin_audit_freezes_source_ip_before_a_trust_flip() {
@@ -469,7 +462,6 @@ async fn tenant_price_override_and_vendor_cost_reach_the_ledger() {
     let rec = j["records"]
         .as_array()
         .and_then(|a| a.iter().rev().find(|x| x["ak"] == "ak-beta-1"))
-        .cloned()
         .expect("beta record");
     let (p, c) = (
         rec["prompt_tokens"].as_i64().unwrap(),
@@ -849,7 +841,6 @@ async fn model_quota_degrades_to_fallback() {
                 .rev()
                 .find(|rec| rec["ak"] == "ak-beta-1" && rec["served_model"] == "gpt-4o-mini")
         })
-        .cloned()
         .expect("degraded call recorded in the ledger");
     assert_eq!(last["model"], "gpt-4o");
     assert_eq!(last["tenant"], "beta");
@@ -1084,7 +1075,7 @@ async fn ptu_failover_spills_to_paygo() {
     assert_eq!(resp.status(), StatusCode::OK);
     let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
-    let rec = j["records"].as_array().unwrap().last().unwrap().clone();
+    let rec = j["records"].as_array().unwrap().last().unwrap();
     assert_eq!(rec["account"], "mock-hunyuan-paygo");
     assert_eq!(rec["ptu_spillover"], true);
 }
@@ -1346,7 +1337,6 @@ async fn messages_cross_protocol_converts_tool_calls_to_tool_use() {
     let block = j["content"]
         .as_array()
         .and_then(|c| c.iter().find(|b| b["type"] == "tool_use"))
-        .cloned()
         .expect("tool_use block from a cross-protocol model");
     assert_eq!(block["name"], "get_weather");
     assert!(block["input"].is_object(), "arguments parsed: {block}");
@@ -1984,10 +1974,15 @@ accounts: [{name: a, provider: openai, protocols: ["responses"]}]
         .oneshot(post("/v1/responses", Some("ak-b"), body))
         .await
         .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a blocked Responses request answers a graceful 400, not a 500"
+    );
     let j = body_json(resp).await;
-    assert_ne!(
-        j["output"][0]["content"][0]["text"], "please say forbiddenword",
-        "blocked Responses input must not reach the vendor: {j}"
+    assert_eq!(
+        j["error"]["message"], "this content cannot be answered, please try a different request",
+        "{j}"
     );
 }
 
@@ -2389,20 +2384,24 @@ async fn account_cooldown_and_recovery() {
             .unwrap();
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
-    let r = app
-        .clone()
-        .oneshot(get("/internal/accounts"))
-        .await
-        .unwrap();
-    let j = body_json(r).await;
-    let spark = j["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["name"] == "mock-spark-down")
-        .unwrap()
-        .clone();
-    assert_eq!(spark["health"], "cooling");
+    let spark_health = async |app: &Router| {
+        let r = app
+            .clone()
+            .oneshot(get("/internal/accounts"))
+            .await
+            .unwrap();
+        let j = body_json(r).await;
+        j["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "mock-spark-down")
+            .unwrap()["health"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(spark_health(&app).await, "cooling");
     let r = app
         .clone()
         .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
@@ -2415,17 +2414,15 @@ async fn account_cooldown_and_recovery() {
             .unwrap()
             .contains("healthy")
     );
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
-    let r = app.oneshot(get("/internal/accounts")).await.unwrap();
-    let j = body_json(r).await;
-    let spark = j["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["name"] == "mock-spark-down")
-        .unwrap()
-        .clone();
-    assert_eq!(spark["health"], "ok");
+    let mut recovered = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if spark_health(&app).await == "ok" {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(recovered, "cooldown must auto-recover");
 }
 
 #[tokio::test]
@@ -2643,6 +2640,138 @@ models:
     assert_eq!(records[0].model, "rt-model");
     assert_eq!(records[0].account, "rt-vendor");
     assert_eq!(records[0].total_tokens, 13);
+}
+
+#[tokio::test]
+async fn realtime_second_create_during_a_turn_cannot_desync_billing() {
+    use axum::routing::any;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    async fn vendor_ws(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
+        ws.on_upgrade(|mut socket| async move {
+            use axum::extract::ws::Message as M;
+            let send = |v: Value| M::Text(v.to_string().into());
+            let turn_frames = || {
+                (
+                    serde_json::json!({"type":"response.output_text.delta","delta":"turn"}),
+                    serde_json::json!({"type":"response.done",
+                        "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}}),
+                )
+            };
+            let _ = socket
+                .send(send(serde_json::json!({"type":"session.created"})))
+                .await;
+            let mut active = false;
+            while let Some(Ok(M::Text(t))) = socket.recv().await {
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
+                match v["type"].as_str() {
+                    Some("response.create") if !active => active = true,
+                    Some("response.create") => {
+                        let _ = socket
+                            .send(send(serde_json::json!({"type":"error",
+                                "error":{"code":"conversation_already_has_active_response"}})))
+                            .await;
+                        let (a, b) = turn_frames();
+                        let _ = socket.send(send(a)).await;
+                        let _ = socket.send(send(b)).await;
+                        active = false;
+                    }
+                    Some("input_text") if active => {
+                        let (a, b) = turn_frames();
+                        let _ = socket.send(send(a)).await;
+                        let _ = socket.send(send(b)).await;
+                        active = false;
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+
+    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vendor_addr = vendor_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            vendor_listener,
+            axum::Router::new().route("/v1/realtime", any(vendor_ws)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let yaml = format!(
+        r#"
+listen: {{host: 127.0.0.1, port: 0}}
+access_keys:
+  - {{ak: ak-dup, product: rt, qps: 100, daily_token_quota: 1000000}}
+accounts:
+  - {{name: rt-vendor, provider: openai, endpoint: "http://{vendor_addr}", protocols: ["realtime"]}}
+models:
+  - {{name: rt-model, protocol: realtime}}
+"#
+    );
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let addr = serve_app(application).await;
+
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-dup".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    let _ = ws.next().await.unwrap().unwrap();
+
+    let create = || Message::text(serde_json::json!({"type":"response.create"}).to_string());
+    ws.send(create()).await.unwrap();
+    ws.send(create()).await.unwrap();
+    let mut saw_error = false;
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        match v["type"].as_str() {
+            Some("error") => saw_error = true,
+            Some("response.done") => break,
+            _ => {}
+        }
+    }
+    assert!(saw_error, "the duplicate create is rejected upstream");
+
+    ws.send(create()).await.unwrap();
+    ws.send(Message::text(
+        serde_json::json!({"type":"input_text","text":"go"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if v["type"] == "response.done" {
+            break;
+        }
+    }
+
+    assert_eq!(
+        state.governance.quota_used("ak-dup").await,
+        26,
+        "both turns settled to actuals with no reserve left dangling"
+    );
+    let (count, records) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+    assert_eq!(count, 2, "exactly the two real turns billed");
+    assert!(records.iter().all(|r| r.total_tokens == 13));
+    assert_ne!(
+        records[0].request_id, records[1].request_id,
+        "each turn billed under its own admission"
+    );
 }
 
 #[tokio::test]
@@ -3039,6 +3168,110 @@ models:
 }
 
 #[tokio::test]
+async fn erasure_round_trip_over_http() {
+    // SAFETY: unique var name for this test; no concurrent reader of it.
+    unsafe { std::env::set_var("GW_E2E_ERASE_ADMIN", "root-tok") };
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_E2E_ERASE_ADMIN}
+models: [{name: gpt-4o, protocol: openai-chat}]
+accounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]
+tenants: [{name: t1, retention: {content: redacted, days: 1}}]
+access_keys: [{ak: k-erase, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer k-erase")
+        .header("x-gw-user", "erase-me")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"remember this"}]}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (_, rows) = state.store.ledger_snapshot(1).await.unwrap();
+    let rid = rows[0].request_id.clone();
+
+    let admin_get = |uri: String| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", "Bearer root-tok")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(admin_get(format!("/admin/audit/content/{rid}")))
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["entries"].as_array().unwrap().len(),
+        2,
+        "prompt and response retained: {j}"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(admin_get("/admin/usage/users?user=erase-me".into()))
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["usage"][0]["user_id"], "erase-me", "{j}");
+    assert!(j["usage"][0]["total_tokens"].as_i64().unwrap() > 0);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/admin/audit/content?user=erase-me")
+                .header("authorization", "Bearer root-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["deleted"], 2);
+
+    let resp = app
+        .clone()
+        .oneshot(admin_get(format!("/admin/audit/content/{rid}")))
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert!(
+        j["entries"].as_array().unwrap().is_empty(),
+        "every retained row is gone: {j}"
+    );
+
+    let resp = app
+        .oneshot(admin_get("/admin/audit/ops".into()))
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert!(
+        j["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "content_erase" && e["target"] == "erase-me"),
+        "the erasure is audited: {j}"
+    );
+}
+
+#[tokio::test]
 async fn metrics_endpoint_exposes_request_counters() {
     let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
@@ -3061,23 +3294,7 @@ async fn metrics_endpoint_exposes_request_counters() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-
-    let resp = router.oneshot(get("/metrics")).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("gateway_requests_total"), "{text}");
-    assert!(text.contains("status=\"200\""), "{text}");
-    assert!(text.contains("gateway_node_duration_seconds"), "{text}");
-    assert!(text.contains("gateway_tokens_total"), "{text}");
-}
-
-#[tokio::test]
-async fn metrics_count_error_statuses_too() {
-    let app = app();
-    let resp = app
+    let resp = router
         .clone()
         .oneshot(post(
             "/v1/chat/completions",
@@ -3087,6 +3304,18 @@ async fn metrics_count_error_statuses_too() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = router.oneshot(get("/metrics")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("gateway_requests_total"), "{text}");
+    assert!(text.contains("status=\"200\""), "{text}");
+    assert!(text.contains("status=\"404\""), "{text}");
+    assert!(text.contains("gateway_node_duration_seconds"), "{text}");
+    assert!(text.contains("gateway_tokens_total"), "{text}");
 }
 
 #[tokio::test]

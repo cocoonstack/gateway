@@ -6,8 +6,6 @@
 //! the SSE decoder, usage normalization, the dispatch factory, and the engine
 //! implementations.
 
-mod base;
-
 pub mod bespoke;
 pub mod claude_engine;
 pub mod echo;
@@ -22,6 +20,8 @@ pub mod sigv4;
 pub mod sse;
 pub mod transport;
 pub mod usage_extract;
+
+mod base;
 
 pub use bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
 pub use claude_engine::ClaudeEngine;

@@ -11,18 +11,6 @@ use crate::{QuotaStore, RateLimiter, TokenWindow};
 /// Day-keyed quota buckets linger at most this long before self-expiring.
 const QUOTA_TTL_MS: i64 = 2 * 24 * 60 * 60 * 1000;
 
-/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
-/// rollover is implicit and identical across replicas. Callers pass the
-/// admission time so a reserve and its settle hit the same day.
-fn quota_key_at(key: &str, at_epoch_secs: i64) -> String {
-    format!("gw:quota:{}:{key}", at_epoch_secs / 86_400)
-}
-
-/// The day bucket for "now" — for single-shot ops outside a reserve/settle pair.
-fn quota_key(key: &str) -> String {
-    quota_key_at(key, crate::epoch_secs())
-}
-
 /// The governance operations the request pipeline calls.
 #[async_trait]
 pub trait Governance: Send + Sync + std::fmt::Debug {
@@ -216,11 +204,12 @@ impl Governance for RedisGovernance {
         if qps <= 0.0 {
             return false;
         }
-        // qps >= 1: N permits per 1s; qps < 1: 1 permit per 1/qps s (matches in-memory)
+        // qps >= 1: round(qps) permits per 1s (the in-memory bucket's rounding,
+        // so fleet and single-node enforce alike); qps < 1: 1 permit per 1/qps s
         let (limit, window) = if qps < 1.0 {
             (1, Duration::from_secs_f64(1.0 / qps))
         } else {
-            (qps.ceil() as i64, Duration::from_secs(1))
+            (qps.round().max(1.0) as i64, Duration::from_secs(1))
         };
         self.incr_window(&format!("gw:rate:{key}"), 1, window).await <= limit
     }
@@ -255,7 +244,7 @@ impl Governance for RedisGovernance {
             &self.conn,
             &quota_key_at(key, at),
             delta,
-            Some(Duration::from_millis(QUOTA_TTL_MS as u64)),
+            Duration::from_millis(QUOTA_TTL_MS as u64),
         )
         .await;
     }
@@ -293,7 +282,7 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        settle_floored(&self.conn, &format!("gw:tpm:{key}"), delta, Some(window)).await;
+        settle_floored(&self.conn, &format!("gw:tpm:{key}"), delta, window).await;
     }
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
         self.incr_window(&format!("gw:tpm:{key}"), tokens, window)
@@ -301,29 +290,41 @@ impl Governance for RedisGovernance {
     }
 }
 
+/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
+/// rollover is implicit and identical across replicas. Callers pass the
+/// admission time so a reserve and its settle hit the same day.
+fn quota_key_at(key: &str, at_epoch_secs: i64) -> String {
+    format!("gw:quota:{}:{key}", at_epoch_secs / 86_400)
+}
+
+/// The day bucket for "now" — for single-shot ops outside a reserve/settle pair.
+fn quota_key(key: &str) -> String {
+    quota_key_at(key, crate::epoch_secs())
+}
+
 /// Apply a settle delta and floor at 0 in one atomic step, so a reset or window
 /// rollover between reserve and settle can't plant a negative value that
-/// over-admits. Preserves an existing TTL, arming one when `window` is given.
+/// over-admits. Preserves an existing TTL (KEEPTTL across the floor), arming
+/// `window` when none is set.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,
     delta: i64,
-    window: Option<Duration>,
+    window: Duration,
 ) {
     let mut conn = conn.clone();
     let script = redis::Script::new(
         "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-         if v < 0 then redis.call('SET', KEYS[1], 0); v = 0 end
-         if ARGV[2] ~= '0' and redis.call('PTTL', KEYS[1]) < 0 then
+         if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
+         if redis.call('PTTL', KEYS[1]) < 0 then
            redis.call('PEXPIRE', KEYS[1], ARGV[2])
          end
          return v",
     );
-    let px = window.map(|w| w.as_millis() as i64).unwrap_or(0);
     if let Err(e) = script
         .key(key)
         .arg(delta)
-        .arg(px)
+        .arg(window.as_millis() as i64)
         .invoke_async::<i64>(&mut conn)
         .await
     {

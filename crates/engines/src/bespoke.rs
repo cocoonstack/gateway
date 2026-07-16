@@ -10,6 +10,9 @@ use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sigv4::{SigV4Params, sign};
 
+/// Deterministic SigV4 date for the mock round; live calls would stamp now().
+const MOCK_AMZ_DATE: &str = "20250101T000000Z";
+
 /// SigV4 headers for a bedrock-style call. `creds` = real `(access_key, secret_key)`
 /// at go-live (from the account's env-var pair), else the inert mock credentials.
 fn aws_headers(
@@ -18,7 +21,7 @@ fn aws_headers(
     payload: &[u8],
     creds: Option<(&str, &str)>,
 ) -> Vec<(String, String)> {
-    let amz_date = "20250101T000000Z"; // deterministic for the mock round
+    let amz_date = MOCK_AMZ_DATE;
     let (access_key, secret_key) = creds.unwrap_or(("AKIDMOCK", "mock-secret"));
     let (_, authorization) = sign(&SigV4Params {
         access_key,
@@ -91,14 +94,15 @@ impl ModelEngine for ErnieEngine {
         // move owned values into the body — json! interpolation would deep-copy them
         let mut body = json!({});
         body["messages"] = Value::Array(messages);
-        if let Some(p) = self.base.chat_params() {
-            if let Some(t) = p.temperature {
-                body["temperature"] = json!(t);
-            }
-            // ernie's system is a top-level field
-            if let Some(s) = &p.system {
-                body["system"] = json!(s);
-            }
+        // ernie's system is a top-level field (system turns are filtered above)
+        let system = self.base.system_text();
+        if !system.is_empty() {
+            body["system"] = json!(system);
+        }
+        if let Some(p) = self.base.chat_params()
+            && let Some(t) = p.temperature
+        {
+            body["temperature"] = json!(t);
         }
         // Baidu auth is an access_token query param; real token from the env var at go-live
         let url = format!(
@@ -147,6 +151,12 @@ impl ModelEngine for MinimaxV1Engine {
             .collect();
         let mut body = json!({"model": model});
         body["messages"] = Value::Array(messages);
+        // v1 carries the system instruction as top-level `prompt` + role_meta
+        let system = self.base.system_text();
+        if !system.is_empty() {
+            body["prompt"] = json!(system);
+            body["role_meta"] = json!({"user_name": "USER", "bot_name": "BOT"});
+        }
         let url = format!(
             "{}/v1/text/chatcompletion",
             self.base.base_url("mock://api.minimax.chat")
@@ -185,18 +195,21 @@ impl ModelEngine for CohereEngine {
     /// response {text, finish_reason, meta{tokens{input_tokens,output_tokens}}}.
     async fn run(&self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let mut history: Vec<Value> = Vec::new();
-        for m in &self.base.request.message {
-            if m.role == gw_consts::role::SYSTEM {
-                continue;
-            }
-            let role = if m.role == gw_consts::role::AI {
-                "CHATBOT"
-            } else {
-                "USER"
-            };
-            history.push(json!({"role": role, "message": m.content}));
-        }
+        let mut history: Vec<Value> = self
+            .base
+            .request
+            .message
+            .iter()
+            .filter(|m| m.role != gw_consts::role::SYSTEM)
+            .map(|m| {
+                let role = if m.role == gw_consts::role::AI {
+                    "CHATBOT"
+                } else {
+                    "USER"
+                };
+                json!({"role": role, "message": m.content})
+            })
+            .collect();
         // move owned values into the body — json! interpolation would deep-copy them
         let message = history
             .pop()
@@ -205,6 +218,11 @@ impl ModelEngine for CohereEngine {
         let mut body = json!({});
         body["message"] = message;
         body["chat_history"] = Value::Array(history);
+        // cohere's system slot is `preamble` (system turns are filtered above)
+        let system = self.base.system_text();
+        if !system.is_empty() {
+            body["preamble"] = json!(system);
+        }
         if let Some(p) = self.base.chat_params()
             && let Some(mt) = p.max_tokens
         {
@@ -252,7 +270,6 @@ impl ModelEngine for LlamaEngine {
             .map(|m| format!("{}: {}\n", m.role, m.content))
             .collect::<String>()
             + "assistant: ";
-        // move the prompt into the body — json! interpolation would copy it
         let mut body = json!({});
         body["prompt"] = prompt.into();
         if let Some(p) = self.base.chat_params() {

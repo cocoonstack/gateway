@@ -5,26 +5,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
 use std::time::Instant;
 
-use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use gw_config::GatewayConfig;
-use gw_state::GatewayState;
-use gw_views::AppState;
 use tower::ServiceExt;
 
-fn app() -> Router {
-    let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    gw_views::app(AppState::new(
-        cfg,
-        state,
-        Arc::new(gw_engines::MockTransport),
-    ))
-}
+mod common;
+use common::app;
 
 fn chat_req() -> Request<Body> {
     Request::builder()

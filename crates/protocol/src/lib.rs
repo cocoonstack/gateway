@@ -3,5 +3,4 @@
 //! Layer L1: pure serde types, no I/O.
 
 pub mod anthropic;
-pub mod dsl;
 pub mod openai;

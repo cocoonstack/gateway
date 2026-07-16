@@ -7,7 +7,9 @@ Authorization: Bearer <ak>
 x-api-key: <ak>
 ```
 
-A missing or unknown key is `401`. Errors use a consistent envelope:
+A missing or unknown key is `401`. Errors use a consistent envelope; the
+numeric `code` appears only on pipeline-originated errors (routing, quota,
+upstream) — auth and validation errors carry just `message` and `type`:
 
 ```json
 {"error": {"message": "...", "code": "3002", "type": "gateway_error"}}
@@ -76,7 +78,9 @@ sequence (`message_start` → `content_block_*` → `message_delta` →
 
 Each JSONL line is `{"body": {"model": ..., "messages": [...]}}`. A batch runs
 every item through the same pipeline as a live request (auth, quota, limits,
-billing all apply per item).
+billing all apply per item). Attribution inverts the REST precedence: a
+per-item `user` field wins over the connection's `x-gw-user` header, so a
+shared-key batch keeps per-item attribution.
 
 Files and batches are owned by the uploading key's tenant. A file or batch
 belonging to another tenant answers `404` (not `403`, so sequential ids can't be
@@ -112,7 +116,7 @@ Realtime event shape) for offline development.
 |--------|------|-------|
 | GET | `/health` | liveness |
 | GET | `/metrics` | Prometheus registry (see [Observability](observability.md)) |
-| GET | `/internal/ledger` | billing records; `?limit=N` pages (newest first, `count` is the total) |
+| GET | `/internal/ledger` | billing records; `?limit=N` returns the N most recent (oldest-first within the page; `count` is the total) |
 | GET | `/internal/accounts` | account pool view with health |
 
 `/internal/*` is an operator surface: keep it off the public load balancer
@@ -122,15 +126,16 @@ to the operator network).
 ## Admin (dynamic config)
 
 `/admin/*` lets operators change config at runtime without a redeploy. It is
-disabled (routes 404) unless `admin.token_env` names an env var holding a bearer
-token; every request must present `Authorization: Bearer <token>`. Keep the
-surface on a private network regardless.
+disabled (routes 404) unless a token is configured — the global `admin.token_env`
+or at least one tenant's `admin_token_env`; every request must present
+`Authorization: Bearer <token>`. Keep the surface on a private network
+regardless.
 
 | Method | Path | Notes |
 |--------|------|-------|
 | POST | `/admin/reload` | re-read config from source and swap it in atomically (global token only) |
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed (global token; needs `storage.postgres_url`) |
-| GET | `/admin/keys` | list keys (a tenant token sees only its own tenant's) |
+| GET | `/admin/keys` | list keys, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's) |
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
 | PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` |
 | DELETE | `/admin/keys/{ak}` | revoke a key |

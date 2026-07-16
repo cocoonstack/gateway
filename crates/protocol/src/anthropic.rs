@@ -88,6 +88,11 @@ pub enum ContentBlock {
 pub struct AnthUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Prompt-cache accounting (the real API always sends these; 0 = none).
+    #[serde(default)]
+    pub cache_read_input_tokens: i64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,11 +127,50 @@ impl MessagesResponse {
     }
 }
 
+/// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
+/// Anthropic `tool_use` content blocks. `arguments` is a JSON string on the
+/// OpenAI wire; it parses into the block's structured `input` (kept verbatim
+/// when unparseable). Entries without a `function` are skipped.
+pub fn tool_calls_to_tool_use(calls: &[Value]) -> Vec<Value> {
+    calls
+        .iter()
+        .filter(|c| c.get("function").is_some())
+        .map(|c| {
+            let f = &c["function"];
+            let input = f["arguments"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| f["arguments"].clone());
+            serde_json::json!({"type": "tool_use", "id": c["id"], "name": f["name"], "input": input})
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn tool_calls_convert_to_tool_use_blocks() {
+        let calls = vec![
+            json!({"id":"call_1","type":"function",
+                   "function":{"name":"get_weather","arguments":"{\"city\":\"sf\"}"}}),
+            json!({"id":"call_2","function":{"name":"raw","arguments":"not json"}}),
+            json!({"type":"tool_use","id":"native"}),
+        ];
+        let blocks = tool_calls_to_tool_use(&calls);
+        assert_eq!(blocks.len(), 2, "no-function entries are skipped");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["input"]["city"], "sf");
+        assert_eq!(
+            blocks[1]["input"], "not json",
+            "unparseable arguments ride verbatim"
+        );
+    }
 
     #[test]
     fn content_string_and_blocks() {

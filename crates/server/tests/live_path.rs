@@ -91,6 +91,7 @@ fn gateway(vendor_url: &str) -> Router {
 listen: {{ host: 127.0.0.1, port: 0 }}
 access_keys:
   - {{ ak: ak-live, product: demo, qps: 100, daily_token_quota: 1000000 }}
+  - {{ ak: ak-tight, product: demo, qps: 1, daily_token_quota: 1000000 }}
 models:
   - {{ name: gpt-live, protocol: openai-chat, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000 }}
   - {{ name: claude-live, protocol: anthropic-messages, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000 }}
@@ -244,15 +245,26 @@ async fn claude_messages_over_real_http() {
 async fn auth_and_limits_still_apply_over_real_http() {
     let vendor = spawn_vendor().await;
     let app = gateway(&vendor);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .header("authorization", "Bearer wrong")
-        .body(Body::from(
-            r#"{"model":"gpt-live","messages":[{"role":"user","content":"x"}]}"#,
-        ))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
+    let chat = |token: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                r#"{"model":"gpt-live","messages":[{"role":"user","content":"x"}]}"#,
+            ))
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(chat("wrong")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app.clone().oneshot(chat("ak-tight")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "first request fits qps 1");
+    let resp = app.oneshot(chat("ak-tight")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "second request in the same second trips the limit over real http"
+    );
 }

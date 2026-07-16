@@ -11,7 +11,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 |-------------|-------|------|
 | `consts`    | L0    | error codes, the `Protocol` enum |
 | `models`    | L1    | request/response domain types, typed params, usage, cost |
-| `protocol`  | L1    | OpenAI / Anthropic wire types, DSL response transforms |
+| `protocol`  | L1    | OpenAI / Anthropic wire types + cross-protocol conversions |
 | `config`    | L1    | YAML config loading (`conf/gateway.yaml`) |
 | `state`     | L2    | auth, account pool, quotas, rate limits, ledger, batch/file stores (in-process defaults; Postgres/Redis fleet backends) |
 | `engines`   | L3    | engine implementations behind the `Transport` seam, SSE decoding, usage extraction, SigV4 |

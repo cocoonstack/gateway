@@ -29,6 +29,9 @@ pub use keystore::{KeyStore, PostgresKeyStore};
 pub use store::*;
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
+/// A failure streak idle this long restarts on the next failure — mirrors the
+/// Redis health backend's failure-key TTL so both backends trip identically.
+const FAILS_DECAY: Duration = Duration::from_secs(3_600);
 
 /// Resolved identity for an authenticated AK.
 #[derive(Debug, Clone)]
@@ -94,17 +97,6 @@ impl AkInfo {
     }
 }
 
-/// A partial quota/lifecycle update: `None` = leave the field; on the
-/// double-`Option` fields `Some(None)` = clear, `Some(Some(v))` = set.
-#[derive(Debug, Clone, Default)]
-pub struct KeyPatch {
-    pub qps: Option<f64>,
-    pub daily_token_quota: Option<i64>,
-    pub tokens_per_minute: Option<Option<i64>>,
-    pub expires_at_epoch_secs: Option<Option<i64>>,
-    pub banned: Option<bool>,
-}
-
 impl From<&gw_config::AkConf> for AkInfo {
     fn from(k: &gw_config::AkConf) -> Self {
         Self {
@@ -120,6 +112,17 @@ impl From<&gw_config::AkConf> for AkInfo {
             model_quotas: Arc::new(k.model_quotas.clone()),
         }
     }
+}
+
+/// A partial quota/lifecycle update: `None` = leave the field; on the
+/// double-`Option` fields `Some(None)` = clear, `Some(Some(v))` = set.
+#[derive(Debug, Clone, Default)]
+pub struct KeyPatch {
+    pub qps: Option<f64>,
+    pub daily_token_quota: Option<i64>,
+    pub tokens_per_minute: Option<Option<i64>>,
+    pub expires_at_epoch_secs: Option<Option<i64>>,
+    pub banned: Option<bool>,
 }
 
 /// Key lifecycle state: expired and banned keys authenticate to distinct 403s.
@@ -321,42 +324,12 @@ impl QuotaStore {
     }
 }
 
-/// The entry for `key`, inserting `init()` on first use — the key String is
-/// allocated only on the miss path.
-fn slot_mut<'a, V>(
-    map: &'a DashMap<String, V>,
-    key: &str,
-    init: impl Fn() -> V,
-) -> dashmap::mapref::one::RefMut<'a, String, V> {
-    loop {
-        if let Some(e) = map.get_mut(key) {
-            return e;
-        }
-        map.entry(key.to_owned()).or_insert_with(&init);
-    }
-}
-
-/// Admit while spent-before < `limit`, adding `amount` so in-flight work
-/// counts — the one in-process reserve semantics (Redis mirrors it in
-/// `reserve_capped`).
-fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
-    if *counter >= limit {
-        return false;
-    }
-    *counter = counter.saturating_add(amount);
-    true
-}
-
-/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
-fn settle_on(counter: &mut i64, delta: i64) {
-    *counter = counter.saturating_add(delta).max(0);
-}
-
 /// Account pool: pick the highest-priority slot serving a model type, round-robin
-/// within the tie.
+/// within the tie. Slots are `Arc`'d — selection is per-request, so handing out
+/// a refcount bump beats copying the account's strings every time.
 #[derive(Debug, Default)]
 pub struct AccountPool {
-    accounts: Vec<Account>,
+    accounts: Vec<Arc<Account>>,
     rr: AtomicUsize,
 }
 
@@ -366,21 +339,23 @@ impl AccountPool {
         let accounts = cfg
             .accounts
             .iter()
-            .map(|a| Account {
-                name: a.name.clone(),
-                provider: a.provider.clone(),
-                priority: a.priority,
-                tier: a.tier.clone(),
-                endpoint: a.endpoint.clone(),
-                api_key_env: a.api_key_env.clone(),
-                secret_key_env: a.secret_key_env.clone(),
-                cost_input_price_per_1k_micros: a.cost_input_price_per_1k_micros,
-                cost_output_price_per_1k_micros: a.cost_output_price_per_1k_micros,
-                protocols: a
-                    .protocols
-                    .iter()
-                    .filter_map(|w| Protocol::from_wire(w))
-                    .collect(),
+            .map(|a| {
+                Arc::new(Account {
+                    name: a.name.clone(),
+                    provider: a.provider.clone(),
+                    priority: a.priority,
+                    tier: a.tier.clone(),
+                    endpoint: a.endpoint.clone(),
+                    api_key_env: a.api_key_env.clone(),
+                    secret_key_env: a.secret_key_env.clone(),
+                    cost_input_price_per_1k_micros: a.cost_input_price_per_1k_micros,
+                    cost_output_price_per_1k_micros: a.cost_output_price_per_1k_micros,
+                    protocols: a
+                        .protocols
+                        .iter()
+                        .filter_map(|w| Protocol::from_wire(w))
+                        .collect(),
+                })
             })
             .collect();
         Self {
@@ -389,33 +364,35 @@ impl AccountPool {
         }
     }
 
-    pub fn select(&self, p: Protocol, provider: Option<&str>) -> Option<Account> {
+    pub fn select(&self, p: Protocol, provider: Option<&str>) -> Option<Arc<Account>> {
         self.select_excluding(p, provider, &[])
     }
 
-    /// [`Self::select_excluding`] plus a health filter: cooldown accounts are excluded.
+    /// [`Self::select_excluding`] plus a health filter: cooldown accounts are
+    /// excluded. Only accounts that could actually be selected (protocol AND
+    /// provider match) are health-checked — the others would waste lookups.
     pub async fn select_healthy(
         &self,
         p: Protocol,
         provider: Option<&str>,
         excluded: &[String],
         health: &dyn HealthStore,
-    ) -> Option<Account> {
-        let candidates: Vec<&Account> = self
+    ) -> Option<Arc<Account>> {
+        let candidates: Vec<&Arc<Account>> = self
             .accounts
             .iter()
-            .filter(|a| a.protocols.contains(&p))
+            .filter(|a| a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want))
             .collect();
         let checks =
             futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
-        let unhealthy: Vec<String> = candidates
-            .iter()
-            .zip(checks)
-            .filter(|(_, ok)| !ok)
-            .map(|(a, _)| a.name.clone())
-            .collect();
         let mut all_excluded = excluded.to_vec();
-        all_excluded.extend(unhealthy);
+        all_excluded.extend(
+            candidates
+                .iter()
+                .zip(checks)
+                .filter(|(_, ok)| !ok)
+                .map(|(a, _)| a.name.clone()),
+        );
         self.select_excluding(p, provider, &all_excluded)
     }
 
@@ -427,8 +404,8 @@ impl AccountPool {
         p: Protocol,
         provider: Option<&str>,
         excluded: &[String],
-    ) -> Option<Account> {
-        let candidates: Vec<&Account> = self
+    ) -> Option<Arc<Account>> {
+        let candidates: Vec<&Arc<Account>> = self
             .accounts
             .iter()
             .filter(|a| {
@@ -437,18 +414,19 @@ impl AccountPool {
                     && provider.is_none_or(|want| a.provider == want)
             })
             .collect();
-        let tier: Vec<&Account> = {
-            let ptu: Vec<&Account> = candidates.iter().copied().filter(|a| a.is_ptu()).collect();
+        let tier: Vec<&Arc<Account>> = {
+            let ptu: Vec<&Arc<Account>> =
+                candidates.iter().copied().filter(|a| a.is_ptu()).collect();
             if ptu.is_empty() { candidates } else { ptu }
         };
         let best = tier.iter().map(|a| a.priority).min()?;
-        let top: Vec<&Account> = tier
+        let top: Vec<&Arc<Account>> = tier
             .iter()
             .copied()
             .filter(|a| a.priority == best)
             .collect();
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % top.len();
-        Some(top[idx].clone())
+        Some(Arc::clone(top[idx]))
     }
 
     pub fn len(&self) -> usize {
@@ -501,10 +479,13 @@ impl TokenWindow {
 #[derive(Debug, Default)]
 struct HealthEntry {
     consecutive_failures: usize,
+    last_failure: Option<Instant>,
     cooldown_until: Option<Instant>,
 }
 
-/// Account health: consecutive-failure cooldown with auto-recovery.
+/// Account health: consecutive-failure cooldown with auto-recovery. A streak
+/// idle past [`FAILS_DECAY`] restarts at 1 — the same self-expiry the Redis
+/// backend's failure-key TTL applies, so both backends trip identically.
 #[derive(Debug, Default)]
 pub struct AccountHealth {
     entries: DashMap<String, HealthEntry>,
@@ -520,6 +501,10 @@ impl AccountHealth {
         cooldown: std::time::Duration,
     ) -> bool {
         let mut e = self.entries.entry(name.to_owned()).or_default();
+        if e.last_failure.is_some_and(|at| at.elapsed() >= FAILS_DECAY) {
+            e.consecutive_failures = 0;
+        }
+        e.last_failure = Some(Instant::now());
         e.consecutive_failures += 1;
         // an expired cooldown re-arms: a still-failing account re-trips, not latches open
         let armed = e.cooldown_until.is_none_or(|until| Instant::now() >= until);
@@ -842,6 +827,35 @@ impl std::fmt::Debug for SharedConfig {
     }
 }
 
+/// The entry for `key`, inserting `init()` on first use — the key String is
+/// allocated only on the miss path.
+fn slot_mut<'a, V>(
+    map: &'a DashMap<String, V>,
+    key: &str,
+    init: impl FnOnce() -> V,
+) -> dashmap::mapref::one::RefMut<'a, String, V> {
+    if let Some(e) = map.get_mut(key) {
+        return e;
+    }
+    map.entry(key.to_owned()).or_insert_with(init)
+}
+
+/// Admit while spent-before < `limit`, adding `amount` so in-flight work
+/// counts — the one in-process reserve semantics (Redis mirrors it in
+/// `reserve_capped`).
+fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
+    if *counter >= limit {
+        return false;
+    }
+    *counter = counter.saturating_add(amount);
+    true
+}
+
+/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
+fn settle_on(counter: &mut i64, delta: i64) {
+    *counter = counter.saturating_add(delta).max(0);
+}
+
 /// Wrap a sqlx error as an internal gateway error with context.
 pub(crate) fn sqlx_err(what: &str, e: sqlx::Error) -> gw_models::GatewayError {
     gw_models::GatewayError::internal(what).with_source(e)
@@ -1144,6 +1158,19 @@ mod tests {
                 .select(Protocol::Video, Some("nonexistent"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn failure_streak_decays_when_idle() {
+        let h = AccountHealth::default();
+        let cd = Duration::from_millis(10);
+        assert!(!h.record_failure("a", 2, cd));
+        h.entries.get_mut("a").unwrap().last_failure = Instant::now().checked_sub(FAILS_DECAY);
+        assert!(
+            !h.record_failure("a", 2, cd),
+            "an hour-idle streak restarts at 1 instead of instantly re-tripping"
+        );
+        assert!(h.record_failure("a", 2, cd), "then trips at threshold");
     }
 
     #[test]

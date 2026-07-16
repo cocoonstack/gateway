@@ -41,6 +41,22 @@ pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) ->
     Ok(())
 }
 
+/// A mid-stream transport/decode fault: after bytes reached the client it is a
+/// committed abort — keep what was delivered, no failover (`None`); before
+/// that it is a plain upstream failure (`Some(err)`).
+fn stream_fault(vendor: &'static str, e: &str, sent_any: bool) -> Option<GatewayError> {
+    if sent_any {
+        tracing::warn!(vendor, error = %e, "upstream stream failed mid-response");
+        None
+    } else {
+        Some(GatewayError::new(
+            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+            502,
+            format!("upstream stream failed: {e}"),
+        ))
+    }
+}
+
 pub async fn pump_sse<F>(
     vendor: &'static str,
     body: UpstreamBody,
@@ -59,7 +75,8 @@ where
             )));
         }
         UpstreamBody::Sse(b) => {
-            let (events, _done) = SseDecoder::decode_all(&b);
+            let (events, _done) = SseDecoder::decode_all(&b)
+                .map_err(|e| GatewayError::internal(format!("decode {vendor} sse body: {e}")))?;
             for ev in events {
                 let v: Value = serde_json::from_slice(ev.as_bytes()).map_err(|e| {
                     GatewayError::internal(format!("parse {vendor} sse frame")).with_source(e)
@@ -71,23 +88,26 @@ where
             let mut dec = SseDecoder::default();
             let mut sent_any = false;
             while let Some(item) = s.next().await {
-                let bytes = match item {
+                let bytes = match item.map_err(|e| stream_fault(vendor, &e, sent_any)) {
                     Ok(b) => b,
-                    Err(e) if sent_any => {
-                        // committed: keep what was delivered, no failover
-                        tracing::warn!(vendor, error = %e, "upstream stream failed mid-response");
+                    Err(Some(err)) => return Err(err),
+                    Err(None) => {
                         out.aborted = true;
                         break;
                     }
-                    Err(e) => {
-                        return Err(GatewayError::new(
-                            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-                            502,
-                            format!("upstream stream failed: {e}"),
-                        ));
+                };
+                let events = match dec
+                    .feed(&bytes)
+                    .map_err(|e| stream_fault(vendor, &e, sent_any))
+                {
+                    Ok(events) => events,
+                    Err(Some(err)) => return Err(err),
+                    Err(None) => {
+                        out.aborted = true;
+                        break;
                     }
                 };
-                for data in dec.feed(&bytes) {
+                for data in events {
                     let v: Value = serde_json::from_str(&data).map_err(|e| {
                         GatewayError::internal(format!("parse {vendor} sse frame")).with_source(e)
                     })?;

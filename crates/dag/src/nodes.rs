@@ -24,6 +24,9 @@ fn limit_denied(msg: String) -> GatewayError {
 /// tenant default, else unmetered (the per-AK daily cap backstops). Over-quota
 /// degrades to the tenant's fallback model when one is configured. Runs before
 /// resolve_model so a swap re-routes protocol, entitlement, and cache.
+/// A soft cap like the user budget: check-then-consume, so concurrent in-flight
+/// requests can overshoot before the counter accrues — the routing trigger
+/// doesn't warrant reserve/settle; the reserved AK daily quota hard-caps spend.
 pub struct ModelQuotaGate;
 
 #[async_trait::async_trait]

@@ -54,7 +54,7 @@ docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
 ```
 
 The image binds `0.0.0.0` (`GW_HOST`) and ships a `/health` HEALTHCHECK.
-Published multi-arch to `ghcr.io/cocoonstack/gateway` on push.
+Published multi-arch to `ghcr.io/cocoonstack/gateway` on `v*` tags.
 
 ## Development
 
@@ -64,12 +64,13 @@ make test     # cargo test --workspace
 make lint     # clippy -D warnings
 make fmt      # cargo fmt --all
 make deny     # cargo deny check (advisories + licenses)
-make release  # optimized gw-server binary (--locked)
+make release  # optimized `gw` binary (--locked)
 make docker   # build the container image
 ```
 
-CI runs fmt/clippy/test + `cargo deny` on every push; tagged `v*` pushes
-build multi-arch binaries (release) and a multi-arch image (docker).
+CI runs fmt/clippy/test + `cargo deny` on every push to `main` and every PR;
+tagged `v*` pushes build multi-arch binaries (release) and a multi-arch image
+(docker).
 
 ## License
 

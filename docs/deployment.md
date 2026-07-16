@@ -59,8 +59,10 @@ storage:
 ```
 
 - **Durable records** (ledger, files, batches): SQLite when `sqlite_path` is
-  set (survives restarts), otherwise in-memory. Orphaned `running` batch jobs
-  from a dead process are swept to `failed` on startup.
+  set (survives restarts), otherwise in-memory. The single-node SQLite store
+  sweeps orphaned `pending`/`running` batch jobs to `failed` on startup; the
+  Postgres store deliberately does not (another live instance may still be
+  executing them — stale claims are requeued via the fleet drain instead).
 - **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
   namespaced under `gw:`, windows self-expire), otherwise in-process. Without
   Redis, each replica limits independently.

@@ -55,7 +55,9 @@ pub struct UpstreamResponse {
 impl UpstreamResponse {
     /// Drain a live SSE stream into buffered bytes; Json/Sse pass through.
     /// Engines that don't forward incrementally call this once up front.
+    /// Capped so a hostile upstream can't OOM the buffered path.
     pub async fn buffered(mut self) -> GResult<Self> {
+        const MAX_BUFFERED_SSE: usize = 64 * 1024 * 1024;
         if let UpstreamBody::SseStream(mut s) = self.body {
             use futures::StreamExt;
             let mut buf = Vec::new();
@@ -68,6 +70,13 @@ impl UpstreamResponse {
                     )
                 })?;
                 buf.extend_from_slice(&bytes);
+                if buf.len() > MAX_BUFFERED_SSE {
+                    return Err(GatewayError::new(
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        502,
+                        format!("upstream sse body exceeds {MAX_BUFFERED_SSE} bytes"),
+                    ));
+                }
             }
             self.body = UpstreamBody::Sse(buf);
         }

@@ -47,7 +47,7 @@ impl OfflineHandler {
                 .batch_create(&ak.ak, &ak.tenant, &model, items.len())
                 .await?;
             let this = self.clone();
-            let (id, model) = (job.id.clone(), model.clone());
+            let (id, model) = (job.id.clone(), model);
             // items are captured HERE: an erasure landing after this instant
             // must stop them, so the marker comparison point is submission,
             // not the spawned executor's first poll

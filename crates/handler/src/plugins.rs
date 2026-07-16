@@ -37,7 +37,7 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
     for msg in &mut request.message {
         visit(&mut msg.content);
         if let Some(parts) = &mut msg.parts {
-            walk_json_strings(parts, &mut visit);
+            walk_part_text(parts, &mut visit);
         }
     }
     if let Some(param) = request.model_param_v2.as_mut() {
@@ -116,7 +116,7 @@ pub fn inbound_text(request: &mut GatewayRequest) -> String {
     for m in &mut request.message {
         collect(&mut m.content);
         if let Some(parts) = &mut m.parts {
-            for_each_part_text(parts, &mut collect);
+            walk_part_text(parts, &mut collect);
         }
     }
     if let Some(param) = request.model_param_v2.as_mut() {
@@ -198,25 +198,41 @@ fn for_each_typed_text(
     }
 }
 
-/// Visit a multimodal `parts` array's text blocks; returns summed hits.
-/// Deliberately narrower than the blocklist scan: non-text parts (image URLs,
-/// base64 data) are never visited, so a rewrite can't corrupt them.
-fn for_each_part_text(
-    parts: &mut serde_json::Value,
-    f: &mut impl FnMut(&mut String) -> usize,
-) -> usize {
-    let Some(arr) = parts.as_array_mut() else {
-        return 0;
-    };
-    let mut hits = 0;
-    for p in arr {
-        if p["type"] == "text"
-            && let Some(serde_json::Value::String(s)) = p.get_mut("text")
-        {
-            hits += f(s);
-        }
+/// Keys under a multimodal part whose value is binary, a URL, or a structural
+/// identifier — never prose: skipped whole so a rewrite can't corrupt them and
+/// base64 noise can't false-match a blocklist term. Every OTHER string leaf (a
+/// text block's `text`, a `tool_result` block's `content`, a `tool_use` block's
+/// `input`) is visited, so no content type is a scan bypass.
+fn skip_part_key(k: &str) -> bool {
+    matches!(
+        k,
+        "image_url"
+            | "input_audio"
+            | "source"
+            | "data"
+            | "url"
+            | "file_data"
+            | "file_url"
+            | "file"
+            | "type"
+            | "media_type"
+    ) || k == "id"
+        || k.ends_with("_id")
+}
+
+/// Walk a multimodal `parts` value's text leaves with a visitor that may rewrite
+/// them (skipping [`skip_part_key`] subtrees); returns summed hits.
+fn walk_part_text(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
+    match v {
+        serde_json::Value::String(s) => f(s),
+        serde_json::Value::Array(a) => a.iter_mut().map(|x| walk_part_text(x, f)).sum(),
+        serde_json::Value::Object(o) => o
+            .iter_mut()
+            .filter(|(k, _)| !skip_part_key(k))
+            .map(|(_, x)| walk_part_text(x, f))
+            .sum(),
+        _ => 0,
     }
-    hits
 }
 
 /// Scan a realtime frame's text-bearing fields against the blocklist AND the
@@ -275,7 +291,7 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
         // engines forward `parts` (not `content`) when present, so PII must be
         // scrubbed inside the parts' text blocks too
         if let Some(parts) = &mut msg.parts {
-            hits += for_each_part_text(parts, &mut redact_field);
+            hits += walk_part_text(parts, &mut redact_field);
         }
     }
     // non-chat surfaces carry user text outside `message` (Responses raw body,
@@ -314,11 +330,6 @@ fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     hits
 }
 
-/// Redact one string in place; email/phone only (the outbound response path).
-fn redact_str(s: &mut String) -> usize {
-    redact_in_place(s, true, false)
-}
-
 /// Mask credential shapes (API keys, tokens, private-key headers) with
 /// `[REDACTED_SECRET]`. High-precision patterns to avoid mauling normal text.
 fn redact_secrets(text: &str) -> Option<(String, usize)> {
@@ -339,17 +350,21 @@ fn redact_secrets(text: &str) -> Option<(String, usize)> {
 
 /// DLP outbound redaction: the flat `message` plus the structured payloads the
 /// non-chat surfaces return (`response_v2`, `tool_calls`), so vendor-introduced
-/// PII can't leak through a field the surface serializes verbatim.
+/// PII or echoed credentials can't leak through a field the surface serializes
+/// verbatim. Honors both `dlp_redact` and `detect_secrets`, like the inbound
+/// and realtime paths.
 pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
-    if !sec.dlp_redact {
+    if !sec.redacts_output() {
         return 0;
     }
-    let mut hits = redact_str(&mut response.message);
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
+    let mut hits = redact_field(&mut response.message);
     if let Some(v) = &mut response.response_v2 {
-        hits += walk_json_strings(v, &mut redact_str);
+        hits += walk_json_strings(v, &mut redact_field);
     }
     if let Some(v) = &mut response.tool_calls {
-        hits += walk_json_strings(v, &mut redact_str);
+        hits += walk_json_strings(v, &mut redact_field);
     }
     hits
 }
@@ -587,6 +602,25 @@ mod tests {
     }
 
     #[test]
+    fn response_redaction_honors_detect_secrets_alone() {
+        let s = SecurityConf {
+            detect_secrets: true,
+            dlp_redact: false,
+            ..Default::default()
+        };
+        let mut resp = GatewayResponse {
+            message: "your key is sk-abcdefghijklmnopqrstuvwxyz012345".into(),
+            ..Default::default()
+        };
+        assert_eq!(dlp_redact_response(&s, &mut resp), 1);
+        assert!(
+            resp.message.contains("[REDACTED_SECRET]") && !resp.message.contains("sk-abc"),
+            "{}",
+            resp.message
+        );
+    }
+
+    #[test]
     fn redact_retained_strips_pii_and_secrets_unconditionally() {
         let out =
             redact_retained("mail john.doe@example.com key sk-abcdefghijklmnopqrstuvwxyz012345");
@@ -672,5 +706,57 @@ mod tests {
             "original email must not survive anywhere in parts"
         );
         assert_eq!(parts[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn blocklist_scans_tool_result_text_but_not_base64() {
+        let mut msg = ChatMsg::text("user", String::new());
+        msg.parts = Some(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"toolu_1","content":"leak forbiddenword here"},
+        ]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_some(),
+            "a blocklisted term inside a tool_result block must be caught"
+        );
+
+        // a base64 image whose noise happens to contain the term must NOT block
+        let mut clean = ChatMsg::text("user", "look");
+        let noise = format!("AAAA{}BBBB", "forbiddenword");
+        clean.parts = Some(serde_json::json!([
+            {"type":"text","text":"look at this"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data": noise}},
+            {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{noise}")}},
+        ]));
+        let mut req = GatewayRequest {
+            message: vec![clean],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_none(),
+            "base64 image data must not be scanned for blocklist terms"
+        );
+    }
+
+    #[test]
+    fn dlp_redacts_tool_result_content() {
+        let mut msg = ChatMsg::text("user", String::new());
+        msg.parts = Some(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"toolu_2",
+             "content":[{"type":"text","text":"reach me at bob@corp.com"}]},
+        ]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(dlp_redact_request(&sec(), &mut req) >= 1);
+        let parts = req.message[0].parts.as_ref().unwrap();
+        assert!(
+            !parts.to_string().contains("bob@corp.com"),
+            "PII inside a tool_result block must be redacted: {parts}"
+        );
     }
 }

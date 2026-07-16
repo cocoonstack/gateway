@@ -6,7 +6,9 @@ pub use domain::*;
 /// Everything an engine needs to serve one request.
 #[derive(Debug, Default, Clone)]
 pub struct GatewayRequest {
-    pub account: Option<Account>,
+    /// Arc'd: selected from the shared pool per request and cloned along the
+    /// engine seam — sharing beats copying six strings per hop.
+    pub account: Option<std::sync::Arc<Account>>,
     pub message: Vec<ChatMsg>,
     pub stream: bool,
     pub model_param_v2: Option<ModelParamV2>,

@@ -65,11 +65,15 @@ impl VertexEngine {
     }
 
     fn build_body(&self) -> GResult<Value> {
+        // system turns go to systemInstruction, never the contents: Gemini has
+        // no system content role, and a `user`-role downgrade both loses the
+        // directive's authority and breaks turn alternation
         let contents: Vec<Value> = self
             .base
             .request
             .message
             .iter()
+            .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
                 let role = if m.role == gw_consts::role::AI {
                     gw_consts::role::MODEL
@@ -82,6 +86,10 @@ impl VertexEngine {
         // moved in — json! interpolation would deep-copy the conversation
         let mut body = json!({});
         body["contents"] = Value::Array(contents);
+        let system = self.base.system_text();
+        if !system.is_empty() {
+            body["systemInstruction"] = json!({"parts": [{"text": system}]});
+        }
         // sampling params → generationConfig — else Gemini silently uses defaults
         if let Some(p) = self.base.chat_params() {
             let mut gen_cfg = json!({});
@@ -160,16 +168,29 @@ impl ModelEngine for VertexEngine {
         let mut resp = GatewayResponse {
             message: text,
             model: self.base.param()?.model_name.clone(),
-            finish_reason: v["candidates"][0]["finishReason"]
-                .as_str()
-                .unwrap_or_default()
-                .to_lowercase(),
+            finish_reason: vertex_finish_reason(
+                v["candidates"][0]["finishReason"]
+                    .as_str()
+                    .unwrap_or_default(),
+            ),
             ..Default::default()
         };
         vertex_apply_usage(&v["usageMetadata"], &mut resp);
         crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
+    }
+}
+
+/// Gemini finishReason → the shared vocabulary: safety-family values become
+/// `content_filter` so clients detect moderation blocks; the rest lowercase
+/// (`finish_openai` already maps `max_tokens` → `length`).
+fn vertex_finish_reason(fr: &str) -> String {
+    match fr {
+        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" => {
+            "content_filter".to_owned()
+        }
+        other => other.to_lowercase(),
     }
 }
 
@@ -197,7 +218,7 @@ fn vertex_apply_frame(
         });
     }
     if let Some(fr) = v["candidates"][0]["finishReason"].as_str() {
-        resp.finish_reason = fr.to_lowercase();
+        resp.finish_reason = vertex_finish_reason(fr);
         chunks.push(StreamChunk {
             finish_reason: Some(resp.finish_reason.clone()),
             ..Default::default()
@@ -247,7 +268,6 @@ impl ModelEngine for EmbeddingsEngine {
     /// Merges the openai/ali/vertex embedding engines to the openai shape.
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
-        // borrow the inputs into the body — one copy (the body), not two
         let input = match &param.typed {
             Some(TypedParams::Embeddings(p)) => json!(p.input),
             _ => Value::Array(
@@ -302,7 +322,6 @@ impl ModelEngine for ImageEngine {
     /// Merges the dalle/wanx/flux/stability/... engines to the images/generations shape.
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
-        // borrow the params into the body — one copy (the body), not two
         let (prompt, n, size, image, mask) = match &param.typed {
             Some(TypedParams::Image(p)) => (
                 p.prompt.as_str(),
@@ -316,7 +335,10 @@ impl ModelEngine for ImageEngine {
         if prompt.is_empty() {
             return Err(GatewayError::bad_request("image prompt must not be empty"));
         }
-        let mut body = json!({"model": param.model_name, "prompt": prompt, "n": n, "size": size});
+        let mut body = json!({"model": param.model_name, "prompt": prompt, "n": n});
+        if let Some(s) = size {
+            body["size"] = json!(s);
+        }
         let (path, is_edit) = if let Some(img) = image {
             body["image"] = json!(img);
             if let Some(m) = mask {
@@ -370,7 +392,6 @@ impl ModelEngine for AudioEngine {
         let param = self.base.param()?;
         let (path, body) = match self.kind {
             AudioKind::Tts => {
-                // borrow the params into the body — one copy (the body), not two
                 let (input, voice, format) = match &param.typed {
                     Some(TypedParams::AudioTts(p)) => (
                         p.input.as_str(),
@@ -382,7 +403,10 @@ impl ModelEngine for AudioEngine {
                 if input.is_empty() {
                     return Err(GatewayError::bad_request("tts input must not be empty"));
                 }
-                let mut b = json!({"model": param.model_name, "input": input, "voice": voice});
+                let mut b = json!({"model": param.model_name, "input": input});
+                if let Some(v) = voice {
+                    b["voice"] = json!(v);
+                }
                 if let Some(f) = format {
                     b["response_format"] = json!(f);
                 }
@@ -562,7 +586,6 @@ impl ModelEngine for CompletionsEngine {
             .iter()
             .map(|m| m.content.as_str())
             .collect();
-        // move the prompt into the body — json! interpolation would copy it
         let mut body = json!({"model": param.model_name});
         body["prompt"] = prompt.into();
         if let Some(p) = self.base.chat_params() {
@@ -618,6 +641,146 @@ impl ModelEngine for CompletionsEngine {
 }
 
 base_engine!(ResponsesEngine);
+
+impl ResponsesEngine {
+    fn model_name(&self) -> String {
+        self.base.model_name().unwrap_or_default().to_owned()
+    }
+
+    /// Native passthrough: forward the client's Responses-shaped body verbatim,
+    /// ensuring `model` is present.
+    fn build_body(&self) -> GResult<Value> {
+        let param = self.base.param()?;
+        let mut body = match &param.raw {
+            Value::Object(_) => param.raw.clone(),
+            _ => json!({}),
+        };
+        if let Some(map) = body.as_object_mut() {
+            map.entry("model".to_owned())
+                .or_insert_with(|| json!(param.model_name));
+        }
+        Ok(body)
+    }
+
+    fn url(&self) -> String {
+        format!(
+            "{}/v1/responses",
+            self.base.base_url("mock://api.openai.com")
+        )
+    }
+
+    /// Streaming Responses pumped live: delta frames forwarded through
+    /// `stream_tx` as they arrive; `response.completed` carries final usage.
+    async fn run_stream(&self) -> GResult<EngineOutcome> {
+        let reply = self
+            .base
+            .send_upstream_raw(
+                &self.url(),
+                self.base.bearer_headers(),
+                self.build_body()?,
+                true,
+            )
+            .await?;
+        let status = reply.status;
+        let mut resp = GatewayResponse {
+            model: self.model_name(),
+            finish_reason: "completed".to_owned(),
+            ..Default::default()
+        };
+        crate::pump::reject_json_error("responses", status, &reply.body)?;
+        let mut full = String::new();
+        let r = crate::pump::pump_sse(
+            "responses",
+            reply.body,
+            self.base.request.stream_tx.clone(),
+            |v| responses_apply_frame(v, status, &mut resp, &mut full),
+        )
+        .await?;
+        resp.message = full;
+        Ok(EngineOutcome::from_pump(resp, status, r))
+    }
+
+    /// Non-streaming Responses reply: full `output` array + `usage`.
+    fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
+        let v: Value = serde_json::from_slice(bytes)
+            .map_err(|e| GatewayError::internal("parse responses reply").with_source(e))?;
+        if let Some(err) = crate::engine::vendor_error(status, &v) {
+            return Err(err);
+        }
+        let (text, tool_calls) = responses_output(&v);
+        let (input, output, raw_usage_json) = responses_usage(&v["usage"]);
+        let resp = GatewayResponse {
+            message: text,
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(Value::Array(tool_calls))
+            },
+            model: v["model"].as_str().unwrap_or(&self.model_name()).to_owned(),
+            finish_reason: v["status"].as_str().unwrap_or("completed").to_owned(),
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input.saturating_add(output),
+            raw_usage_json,
+            response_v2: Some(v),
+            ..Default::default()
+        };
+        Ok(EngineOutcome::with_status(resp, status))
+    }
+
+    /// Buffered Responses SSE: the same [`responses_apply_frame`] semantics the
+    /// live pump drives, over pre-decoded events.
+    fn parse_sse(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
+        let (events, _done) = SseDecoder::decode_all(bytes)
+            .map_err(|e| GatewayError::internal(format!("decode responses sse body: {e}")))?;
+        let mut resp = GatewayResponse {
+            model: self.model_name(),
+            finish_reason: "completed".to_owned(),
+            ..Default::default()
+        };
+        let mut full = String::new();
+        let mut chunks = Vec::new();
+        for ev in events {
+            let v: Value = serde_json::from_slice(ev.as_bytes())
+                .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
+            chunks.extend(responses_apply_frame(&v, status, &mut resp, &mut full)?);
+        }
+        resp.message = full;
+        Ok(EngineOutcome {
+            response: resp,
+            http_code: status,
+            chunks,
+            ..Default::default()
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelEngine for ResponsesEngine {
+    /// OpenAI Responses API (POST /v1/responses): native body passthrough with
+    /// the `model` field ensured; usage normalized to the openai shape.
+    async fn run(&self) -> GResult<EngineOutcome> {
+        if self.base.request.stream {
+            return self.run_stream().await;
+        }
+        let reply = self
+            .base
+            .send_upstream(
+                &self.url(),
+                self.base.bearer_headers(),
+                self.build_body()?,
+                false,
+            )
+            .await?;
+        match &reply.body {
+            UpstreamBody::Json(b) => self.parse_json(reply.status, b),
+            UpstreamBody::Sse(b) => self.parse_sse(reply.status, b),
+            UpstreamBody::SseStream(_) => Err(GatewayError::internal(
+                "unbuffered stream reached responses engine",
+            )),
+        }
+    }
+}
 
 /// Extract assistant text from a Responses `output` array (message items'
 /// `output_text` content), plus any function_call items.
@@ -714,160 +877,18 @@ fn responses_apply_frame(
     Ok(chunks)
 }
 
-impl ResponsesEngine {
-    fn model_name(&self) -> String {
-        self.base
-            .request
-            .model_param_v2
-            .as_ref()
-            .map(|p| p.model_name.clone())
-            .unwrap_or_default()
-    }
-
-    /// Native passthrough: forward the client's Responses-shaped body verbatim,
-    /// ensuring `model` is present.
-    fn build_body(&self) -> GResult<Value> {
-        let param = self.base.param()?;
-        let mut body = match &param.raw {
-            Value::Object(_) => param.raw.clone(),
-            _ => json!({}),
-        };
-        if let Some(map) = body.as_object_mut() {
-            map.entry("model".to_owned())
-                .or_insert_with(|| json!(param.model_name));
-        }
-        Ok(body)
-    }
-
-    fn url(&self) -> String {
-        format!(
-            "{}/v1/responses",
-            self.base.base_url("mock://api.openai.com")
-        )
-    }
-
-    /// Streaming Responses pumped live: delta frames forwarded through
-    /// `stream_tx` as they arrive; `response.completed` carries final usage.
-    async fn run_stream(&self) -> GResult<EngineOutcome> {
-        let reply = self
-            .base
-            .send_upstream_raw(
-                &self.url(),
-                self.base.bearer_headers(),
-                self.build_body()?,
-                true,
-            )
-            .await?;
-        let status = reply.status;
-        let mut resp = GatewayResponse {
-            model: self.model_name(),
-            finish_reason: "completed".to_owned(),
-            ..Default::default()
-        };
-        crate::pump::reject_json_error("responses", status, &reply.body)?;
-        let mut full = String::new();
-        let r = crate::pump::pump_sse(
-            "responses",
-            reply.body,
-            self.base.request.stream_tx.clone(),
-            |v| responses_apply_frame(v, status, &mut resp, &mut full),
-        )
-        .await?;
-        resp.message = full;
-        Ok(EngineOutcome::from_pump(resp, status, r))
-    }
-
-    /// Non-streaming Responses reply: full `output` array + `usage`.
-    fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let v: Value = serde_json::from_slice(bytes)
-            .map_err(|e| GatewayError::internal("parse responses reply").with_source(e))?;
-        if let Some(err) = crate::engine::vendor_error(status, &v) {
-            return Err(err);
-        }
-        let (text, tool_calls) = responses_output(&v);
-        let (input, output, raw_usage_json) = responses_usage(&v["usage"]);
-        let resp = GatewayResponse {
-            message: text,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(Value::Array(tool_calls))
-            },
-            model: v["model"].as_str().unwrap_or(&self.model_name()).to_owned(),
-            finish_reason: v["status"].as_str().unwrap_or("completed").to_owned(),
-            prompt_tokens: input,
-            completion_tokens: output,
-            total_tokens: input.saturating_add(output),
-            raw_usage_json,
-            response_v2: Some(v),
-            ..Default::default()
-        };
-        Ok(EngineOutcome::with_status(resp, status))
-    }
-
-    /// Buffered Responses SSE: the same [`responses_apply_frame`] semantics the
-    /// live pump drives, over pre-decoded events.
-    fn parse_sse(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let (events, _done) = SseDecoder::decode_all(bytes);
-        let mut resp = GatewayResponse {
-            model: self.model_name(),
-            finish_reason: "completed".to_owned(),
-            ..Default::default()
-        };
-        let mut full = String::new();
-        let mut chunks = Vec::new();
-        for ev in events {
-            let v: Value = serde_json::from_slice(ev.as_bytes())
-                .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
-            chunks.extend(responses_apply_frame(&v, status, &mut resp, &mut full)?);
-        }
-        resp.message = full;
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks,
-            ..Default::default()
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelEngine for ResponsesEngine {
-    /// OpenAI Responses API (POST /v1/responses): native body passthrough with
-    /// the `model` field ensured; usage normalized to the openai shape.
-    async fn run(&self) -> GResult<EngineOutcome> {
-        if self.base.request.stream {
-            return self.run_stream().await;
-        }
-        let reply = self
-            .base
-            .send_upstream(
-                &self.url(),
-                self.base.bearer_headers(),
-                self.build_body()?,
-                false,
-            )
-            .await?;
-        match &reply.body {
-            UpstreamBody::Json(b) => self.parse_json(reply.status, b),
-            UpstreamBody::Sse(b) => self.parse_sse(reply.status, b),
-            UpstreamBody::SseStream(_) => Err(GatewayError::internal(
-                "unbuffered stream reached responses engine",
-            )),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transport::MockTransport;
+    use std::sync::Arc;
+
     use gw_consts::Protocol;
     use gw_models::{
         ChatMsg, EmbeddingParams, ImageParams, ModelParamV2, SearchParams, SttParams, TtsParams,
         VideoParams,
     };
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::transport::MockTransport;
 
     fn req(mt: Protocol, name: &str, typed: Option<TypedParams>) -> GatewayRequest {
         let mut p = ModelParamV2::with_name(mt, name);
@@ -1032,10 +1053,10 @@ mod tests {
     #[tokio::test]
     async fn down_account_fails_upstream() {
         let mut r = req(Protocol::Gemini, "gemini-pro", None);
-        r.account = Some(gw_models::Account {
+        r.account = Some(std::sync::Arc::new(gw_models::Account {
             name: "mock-vertex-down".into(),
             ..Default::default()
-        });
+        }));
         let e = VertexEngine::new(r, t());
         let err = e.run().await.err().unwrap();
         assert_eq!(err.http_status, 503);

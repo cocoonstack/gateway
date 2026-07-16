@@ -109,14 +109,35 @@ impl Transport for HttpTransport {
         let body = bytes::Bytes::from(req.body);
         let mut attempt = 0u32;
         let resp = loop {
-            let mut builder = self
-                .client
-                .request(method.clone(), &req.url)
-                .timeout(policy.timeout);
+            let mut builder = self.client.request(method.clone(), &req.url);
+            // reqwest's request timeout is a TOTAL deadline including the body,
+            // which would kill a streaming generation longer than the policy —
+            // streams get a header-phase deadline here and an idle gap cap below
+            if !req.stream {
+                builder = builder.timeout(policy.timeout);
+            }
             for (k, v) in &req.headers {
                 builder = builder.header(k, v);
             }
-            match builder.body(body.clone()).send().await {
+            let sent = builder.body(body.clone()).send();
+            let result = if req.stream {
+                match tokio::time::timeout(policy.timeout, sent).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Err(GatewayError::new(
+                            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                            502,
+                            format!(
+                                "upstream request failed: no response headers within {:?}",
+                                policy.timeout
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                sent.await
+            };
+            match result {
                 Ok(resp) => break resp,
                 Err(e) if e.is_connect() && attempt < policy.connect_retries => {
                     attempt += 1;
@@ -145,16 +166,27 @@ impl Transport for HttpTransport {
             .unwrap_or(false);
         if is_sse {
             use futures::TryStreamExt;
+            let stream = Box::pin(resp.bytes_stream().map_err(|e| e.to_string()));
             return Ok(UpstreamResponse {
                 status,
-                body: UpstreamBody::SseStream(Box::pin(
-                    resp.bytes_stream().map_err(|e| e.to_string()),
-                )),
+                body: idle_capped(stream, policy.timeout),
             });
         }
-        let bytes = resp
-            .bytes()
-            .await
+        let read = resp.bytes();
+        let bytes = if req.stream {
+            tokio::time::timeout(policy.timeout, read)
+                .await
+                .map_err(|_| {
+                    GatewayError::new(
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        502,
+                        format!("upstream body not read within {:?}", policy.timeout),
+                    )
+                })?
+        } else {
+            read.await
+        };
+        let bytes = bytes
             .map_err(|e| GatewayError::internal("read upstream body").with_source(e))?
             .to_vec();
         Ok(UpstreamResponse {
@@ -162,6 +194,27 @@ impl Transport for HttpTransport {
             body: UpstreamBody::Json(bytes),
         })
     }
+}
+
+/// Wrap a live SSE byte stream so a vendor that stops sending for `gap` yields
+/// one terminal error item — no gap between chunks may exceed the policy
+/// timeout, but an actively flowing stream lives as long as the generation.
+fn idle_capped(
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
+    gap: Duration,
+) -> UpstreamBody {
+    use futures::StreamExt;
+    UpstreamBody::SseStream(Box::pin(futures::stream::unfold(
+        Some(stream),
+        move |state| async move {
+            let mut s = state?;
+            match tokio::time::timeout(gap, s.next()).await {
+                Ok(Some(item)) => Some((item, Some(s))),
+                Ok(None) => None,
+                Err(_) => Some((Err(format!("stream idle for {gap:?}")), None)),
+            }
+        },
+    )))
 }
 
 /// Default transport: `mock://` sentinel URLs (accounts with no configured

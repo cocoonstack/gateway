@@ -113,8 +113,8 @@ providers:
   - name: openai
     kind: openai              # openai | anthropic | gemini | deepseek | openrouter
     api_key_env: OPENAI_API_KEY
-    # endpoint / timeout_seconds / connect_retries may be set here too and
-    # are inherited by the synthesized account
+    # endpoint / timeout_seconds / connect_retries / secret_key_env may be
+    # set here too and are inherited by the synthesized account
 models:
   - name: gpt-4o
     provider: openai          # fills the protocol with the kind's default
@@ -138,6 +138,8 @@ accounts:
     endpoint: ""               # empty → mock transport; real base URL → real upstream
     timeout_seconds: 60        # upstream request timeout (default 60)
     connect_retries: 1         # connect-phase retries; an in-flight request is never replayed
+                               # timeout_seconds bounds a non-streaming request whole; a streaming
+                               # one gets it on the headers and then per gap between chunks
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
     cost_input_price_per_1k_micros: 100   # optional: what this vendor charges us (margin accounting)
@@ -178,6 +180,18 @@ policy runs on the realtime WebSocket, so it is not a bypass. `moderate` needs a
 moderator wired into the handler — the default one allows everything. See
 [Governance](governance.md#enterprise-content-policy).
 
+### `admin` — the runtime-admin gate
+
+```yaml
+admin:
+  token_env: GW_ADMIN_TOKEN    # env var holding the global admin bearer token;
+                               # absent (and no tenant admin_token_env) = the whole
+                               # /admin/* surface answers 404
+```
+
+The global token manages everything; a tenant's `admin_token_env` token is
+scoped to that tenant (see [API — Admin](api.md#admin-dynamic-config)).
+
 ### Top-level flags
 
 ```yaml
@@ -193,7 +207,7 @@ trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unf
 `gateway_node_duration_seconds` (pipeline stage), `gateway_tokens_total`,
 `gateway_cache_hits_total`, `gateway_ledger_write_failures_total`, and
 `gateway_upstream_connect_retries_total` (account). One structured access
-log line per request goes to stdout.
+log line per successfully served request goes to stdout.
 
 ## Going live against real upstreams
 

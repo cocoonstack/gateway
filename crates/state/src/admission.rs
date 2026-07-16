@@ -225,6 +225,8 @@ pub async fn settle_and_bill(
     let settle_daily = gov.quota_settle(s.billing.ak, total - s.reserved, s.reserved_at);
     let consume_model = async {
         if let Some(key) = &s.model_quota_key {
+            // accrues to the CURRENT day, not the admission day — this counter
+            // has no paired reserve that must land on the admission bucket
             gov.quota_consume(key, total).await;
         }
     };

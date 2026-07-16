@@ -217,11 +217,11 @@ async fn go_live_seam_routes_to_configured_endpoint() {
         r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
     let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
-    req.account = Some(Account {
+    req.account = Some(std::sync::Arc::new(Account {
         name: "live-anthropic".into(),
         endpoint: "https://api.anthropic.com".into(),
         ..Default::default()
-    });
+    }));
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     assert_eq!(t.url(), "https://api.anthropic.com/v1/messages");
     assert!(
@@ -234,11 +234,11 @@ async fn go_live_seam_routes_to_configured_endpoint() {
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
     let mut req2 = chat_req(Protocol::Gemini, "gemini-pro");
-    req2.account = Some(Account {
+    req2.account = Some(std::sync::Arc::new(Account {
         name: "live-gemini".into(),
         endpoint: "https://generativelanguage.googleapis.com".into(),
         ..Default::default()
-    });
+    }));
     let _ = VertexEngine::new(req2, t2.clone()).run().await.unwrap();
     assert!(
         t2.url()
@@ -263,13 +263,13 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         r#"{"text":"ok","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
     let mut req = chat_req(Protocol::AwsCohere, "cohere.command-r");
-    req.account = Some(Account {
+    req.account = Some(std::sync::Arc::new(Account {
         name: "live-bedrock".into(),
         endpoint: "https://bedrock-runtime.eu-west-1.amazonaws.com".into(),
         api_key_env: "GW_TEST_AWS_AK".into(),
         secret_key_env: "GW_TEST_AWS_SK".into(),
         ..Default::default()
-    });
+    }));
     let _ = CohereEngine::new(req, t.clone()).run().await.unwrap();
     assert!(
         t.url()
@@ -302,11 +302,11 @@ async fn go_live_seam_bespoke_dashscope() {
         r#"{"output":{"text":"ok","finish_reason":"stop"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
     );
     let mut req = chat_req(Protocol::Dashscope, "qwen-max");
-    req.account = Some(Account {
+    req.account = Some(std::sync::Arc::new(Account {
         name: "live-dashscope".into(),
         endpoint: "https://dashscope.aliyuncs.com".into(),
         ..Default::default()
-    });
+    }));
     let _ = DashScopeEngine::new(req, t.clone()).run().await.unwrap();
     assert!(
         t.url()
@@ -411,6 +411,72 @@ async fn ernie_request_shape() {
         t.header("content-type").as_deref(),
         Some("application/json")
     );
+}
+
+#[tokio::test]
+async fn system_prompt_reaches_every_bespoke_wire() {
+    let ernie = RecordingTransport::new(r#"{"result":"ok","usage":{}}"#);
+    ErnieEngine::new(chat_req(Protocol::Ernie, "ernie-4.0"), ernie.clone())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(ernie.body_json()["system"], "be brief", "ernie system slot");
+
+    let minimax = RecordingTransport::new(
+        r#"{"reply":"ok","usage":{"total_tokens":1},"base_resp":{"status_code":0}}"#,
+    );
+    MinimaxV1Engine::new(chat_req(Protocol::MinimaxV1, "abab6.5"), minimax.clone())
+        .run()
+        .await
+        .unwrap();
+    let mb = minimax.body_json();
+    assert_eq!(mb["prompt"], "be brief", "minimax carries system as prompt");
+    assert!(
+        mb["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["sender_type"] != "USER" || m["text"] != "be brief"),
+        "system must not be downgraded to a USER turn: {mb}"
+    );
+
+    let cohere = RecordingTransport::new(
+        r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
+    );
+    CohereEngine::new(chat_req(Protocol::AwsCohere, "command-r"), cohere.clone())
+        .run()
+        .await
+        .unwrap();
+    let cb = cohere.body_json();
+    assert_eq!(cb["preamble"], "be brief", "cohere system slot");
+    assert!(
+        cb["chat_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["message"] != "be brief"),
+        "system must not leak into chat_history: {cb}"
+    );
+}
+
+#[tokio::test]
+async fn vertex_system_goes_to_system_instruction() {
+    let t = RecordingTransport::new(
+        r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{}}"#,
+    );
+    VertexEngine::new(chat_req(Protocol::Gemini, "gemini-pro"), t.clone())
+        .run()
+        .await
+        .unwrap();
+    let b = t.body_json();
+    assert_eq!(b["systemInstruction"]["parts"][0]["text"], "be brief");
+    assert_eq!(
+        b["contents"].as_array().unwrap().len(),
+        1,
+        "only the user turn is in contents: {b}"
+    );
+    assert_eq!(b["contents"][0]["role"], "user");
+    assert_eq!(b["contents"][0]["parts"][0]["text"], "hello");
 }
 
 #[tokio::test]

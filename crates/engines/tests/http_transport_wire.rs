@@ -169,7 +169,7 @@ async fn engine_through_real_http_transport_end_to_end() {
         ..Default::default()
     };
     let request = GatewayRequest {
-        account: Some(account),
+        account: Some(Arc::new(account)),
         message: vec![ChatMsg::text("user", "over the wire")],
         model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "srv")),
         ..Default::default()
@@ -240,6 +240,87 @@ async fn per_account_policy_and_connect_retry() {
     assert!(
         started.elapsed() >= Duration::from_millis(300),
         "two backoffs must have elapsed: {:?}",
+        started.elapsed()
+    );
+}
+
+async fn spawn_paced_vendor(frames: usize, gap: Duration) -> String {
+    let app = Router::new().route(
+        "/paced",
+        post(move || async move {
+            let sse = futures::stream::unfold(0usize, move |i| async move {
+                if i > frames {
+                    return None;
+                }
+                tokio::time::sleep(gap).await;
+                let frame = if i == frames {
+                    "data: [DONE]\n\n".to_owned()
+                } else {
+                    format!("data: {{\"n\":{i}}}\n\n")
+                };
+                Some((Ok::<_, std::convert::Infallible>(frame), i + 1))
+            });
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}/paced")
+}
+
+fn paced_req(url: String) -> UpstreamRequest {
+    UpstreamRequest {
+        protocol: Protocol::OpenaiChat,
+        method: "POST".into(),
+        url,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: b"{}".to_vec(),
+        stream: true,
+        account: "paced".into(),
+    }
+}
+
+#[tokio::test]
+async fn slow_stream_outlives_the_total_policy_timeout() {
+    let url = spawn_paced_vendor(5, Duration::from_millis(300)).await;
+    let transport = HttpTransport::new(Duration::from_secs(1)).unwrap();
+    let resp = transport.send(paced_req(url)).await.unwrap();
+    let resp = resp
+        .buffered()
+        .await
+        .expect("a 1.8s stream must survive a 1s policy timeout");
+    let UpstreamBody::Sse(b) = resp.body else {
+        panic!("expected buffered sse")
+    };
+    let text = String::from_utf8(b).unwrap();
+    assert!(
+        text.contains(r#"{"n":4}"#) && text.contains("[DONE]"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn stalled_stream_errors_at_the_idle_gap_instead_of_hanging() {
+    let url = spawn_paced_vendor(2, Duration::from_secs(20)).await;
+    let transport = HttpTransport::new(Duration::from_millis(300)).unwrap();
+    let started = std::time::Instant::now();
+    let err = match transport.send(paced_req(url)).await {
+        Ok(resp) => resp
+            .buffered()
+            .await
+            .expect_err("stalled stream must error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.http_status, 502);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must fail at the idle gap, not wait out the vendor: {:?}",
         started.elapsed()
     );
 }

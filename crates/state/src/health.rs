@@ -12,7 +12,9 @@ use crate::AccountHealth;
 /// cooldowns are seconds-granular, so a 1s lag is invisible.
 const AVAILABLE_CACHE_TTL: Duration = Duration::from_millis(1000);
 const AVAILABLE_CACHE_MAX: u64 = 10_000;
-/// Failure streaks self-expire (hygiene only — a success deletes them).
+/// Failure streaks self-expire after an hour idle, so a stale streak restarts
+/// instead of instantly re-tripping (the in-process backend mirrors this via
+/// its `FAILS_DECAY`); a success deletes them outright.
 const FAILS_TTL_MS: i64 = 3_600_000;
 
 /// Consecutive-failure cooldown with auto-recovery, shared or per-node.

@@ -44,8 +44,9 @@ unconfigured (key, model) pairs never touch a counter.
 | QPM | per model | `models[].qpm` |
 | QPM | per product | `products[].qpm` |
 
-Exceeding any limit returns `429`. QPS uses a smooth GCRA limiter in-process (a
-fixed 1s window in Redis); the token/window counters are fixed windows. When
+Exceeding any limit returns `429`. QPS uses a smooth GCRA limiter in-process
+(in Redis: a fixed 1s window for qps ≥ 1, a 1/qps-second window below); the
+token/window counters are fixed windows. When
 Redis is configured and unreachable, limits fail open (requests pass) and a
 warning is logged — a persistent outage never silently wedges the gateway.
 
@@ -108,7 +109,11 @@ REST, realtime (the `x-gw-user` hint is captured at WS connect), and batch
 (each item's `user`, or the submitter's `x-gw-user`, is persisted with the item
 so a fleet drainer still attributes and budgets it). `GET /admin/usage/users?user=&since=&until=`
 returns per-(user, model) cost over a billing period (add `format=csv` for
-export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap.
+export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap —
+enforced with a hard `429` once exceeded; "soft" means check-then-consume, so
+concurrent in-flight turns can overshoot it by one before the counter accrues.
+The per-(key, model) quota is soft the same way: it is a routing trigger (the
+fallback-model degrade), while the reserved per-key daily quota hard-caps spend.
 
 A background task folds completed ledger minutes into durable per-(minute,
 tenant, user, model) rollup buckets. Each pass recomputes from the rollup

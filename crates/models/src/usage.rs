@@ -6,7 +6,7 @@
 //! top-level token fields on `GatewayResponse`.
 
 /// Normalized token accounting across vendors.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommonUsage {
     /// input tokens excluding cache.
     pub platform_input: i64,

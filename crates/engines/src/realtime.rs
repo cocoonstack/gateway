@@ -50,7 +50,7 @@ fn delta_is_text(frame_type: &str) -> bool {
 /// Visit the text-bearing string leaves of a realtime frame with a visitor
 /// that may rewrite them; returns summed hits. The content-security seam for
 /// the WebSocket surface — which fields are NOT text is dialect knowledge
-/// owned here (see [`skip_key`]).
+/// owned here (see [`skip_scalar`]).
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     let text_delta = v["type"].as_str().map(delta_is_text).unwrap_or(false);
     walk(v, text_delta, f)

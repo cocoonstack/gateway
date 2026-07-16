@@ -1,4 +1,6 @@
-FROM rust:1 AS builder
+# Pinned: successive image builds must embed the same toolchain, not whatever
+# `rust:1` floats to on the day of the build.
+FROM rust:1.94 AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p gw-server --locked
