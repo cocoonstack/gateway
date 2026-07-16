@@ -175,10 +175,10 @@ fn for_each_message_text(msg: &mut ChatMsg, f: &mut impl FnMut(&mut String) -> u
 
 /// The text-bearing fields of the request tail — the raw native body plus the
 /// family typed params — the ONE tail field list all three scans traverse.
-/// `raw` is a content-block tree only on Responses (the whole wire body, where
-/// the media-skip walker keeps base64 out of the scan); Chat/Messages put a
-/// flat vendor `extra` passthrough there, whose keys are arbitrary and may be
-/// prose (e.g. Anthropic `metadata`), so every string leaf must be visited.
+/// Responses `raw` is the whole wire body: content blocks (media-aware walk,
+/// base64 kept out of the scan) mixed with arbitrary bags (`tools`, `metadata`)
+/// the same walk scans in full. Chat/Messages put only a flat vendor `extra`
+/// passthrough there, so every string leaf is visited.
 fn for_each_param_text(
     param: &mut ModelParamV2,
     f: &mut impl FnMut(&mut String) -> usize,
@@ -223,35 +223,51 @@ fn for_each_typed_text(
     }
 }
 
-/// Keys under a multimodal CONTENT BLOCK whose value is never prose: media
-/// containers (`image_url`, `input_audio`, `source`), base64/URL leaves
-/// (`file_data`, `file_url`), and structural enums/ids — skipped whole so a
-/// rewrite can't corrupt them and base64 noise can't false-match a blocklist
-/// term. Does not apply inside `tool_use.input` (see [`walk_part_text`]).
-fn skip_part_key(k: &str) -> bool {
+/// Whether a `type` value names a media content block — one whose payload keys
+/// carry base64/URL data rather than prose (`{"type":"image", ...}`,
+/// `input_image`, `input_file`, …). Only inside such a block does
+/// [`walk_part_text`] skip the media payload keys.
+fn is_media_block(ty: &str) -> bool {
     matches!(
-        k,
-        "image_url" | "input_audio" | "source" | "file_data" | "file_url" | "type" | "media_type"
-    ) || k == "id"
-        || k.ends_with("_id")
+        ty,
+        "image"
+            | "image_url"
+            | "input_image"
+            | "audio"
+            | "input_audio"
+            | "input_file"
+            | "file"
+            | "document"
+    )
 }
 
-/// Walk a multimodal `parts` value's text leaves with a visitor that may
-/// rewrite them, skipping [`skip_part_key`] subtrees. A `tool_use` block's
-/// `input` is arbitrary tool-schema JSON, not content blocks — every string
-/// leaf in it is visited, so an argument named like a media key (`data`,
-/// `url`, `source`) is no scan bypass.
+/// A media block's binary payload keys: base64/URL leaves a rewrite would
+/// corrupt and base64 noise could false-match a blocklist term. Skipped only
+/// inside a [`is_media_block`] object; the same name in a tool argument, a JSON
+/// Schema, or a metadata bag is prose and stays scanned.
+fn is_media_payload_key(k: &str) -> bool {
+    matches!(
+        k,
+        "image_url" | "input_audio" | "source" | "data" | "url" | "file_data" | "file_url"
+    )
+}
+
+/// Walk a content-block tree's text leaves with a visitor that may rewrite
+/// them. Every string leaf is visited EXCEPT a media block's payload keys, so
+/// base64/URL never enters the scan while a `tool_use.input` argument, a tool
+/// JSON Schema, or a `metadata` field named like a media key is no bypass.
 fn walk_part_text(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     match v {
         serde_json::Value::String(s) => f(s),
         serde_json::Value::Array(a) => a.iter_mut().map(|x| walk_part_text(x, f)).sum(),
         serde_json::Value::Object(o) => {
-            let tool_args = o.get("type").is_some_and(|t| t == "tool_use");
+            let media = o
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_media_block);
             o.iter_mut()
                 .map(|(k, x)| {
-                    if tool_args && k == "input" {
-                        walk_json_strings(x, f)
-                    } else if skip_part_key(k) {
+                    if media && is_media_payload_key(k) {
                         0
                     } else {
                         walk_part_text(x, f)
@@ -808,6 +824,31 @@ mod tests {
             req.model_param_v2.unwrap().raw.to_string().contains(blob),
             "secret-shaped base64 noise inside file_data must not be rewritten"
         );
+    }
+
+    #[test]
+    fn responses_raw_scans_tool_schema_and_metadata_not_just_media() {
+        // raw is the WHOLE Responses wire body, not a pure content tree: a
+        // like-named key (`source` in a JSON Schema, `user_id` in metadata)
+        // outside a media block is prose and must be scanned; media-skip fires
+        // only inside a recognized media content block.
+        for raw in [
+            serde_json::json!({"model":"m","tools":[{"type":"function","function":{
+                "name":"q","parameters":{"type":"object","properties":{
+                    "source":{"type":"string","description":"say forbiddenword"}}}}}]}),
+            serde_json::json!({"model":"m","metadata":{"user_id":"forbiddenword"}}),
+        ] {
+            let mut param = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+            param.raw = raw;
+            let mut req = GatewayRequest {
+                model_param_v2: Some(param),
+                ..Default::default()
+            };
+            assert!(
+                security_check(&sec(), &mut req).block.is_some(),
+                "prose under a media-like key outside a media block must be scanned"
+            );
+        }
     }
 
     #[test]
