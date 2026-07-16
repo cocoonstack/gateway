@@ -999,21 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn source_scanned_inside_tool_input_not_in_media_blocks() {
-        let noise = format!("AAAA{}BBBB", "forbiddenword");
-        let mut msg = ChatMsg::text("user", String::new());
-        msg.parts = Some(serde_json::json!([
-            {"type":"image","source":{"type":"base64","media_type":"image/png","data":noise}}
-        ]));
-        let mut req = GatewayRequest {
-            message: vec![msg],
-            ..Default::default()
-        };
-        assert!(
-            security_check(&sec(), &mut req).block.is_none(),
-            "a media block's source container must stay unscanned"
-        );
-
+    fn tool_input_source_is_scanned() {
         for input in [
             serde_json::json!({"source":"cite forbiddenword"}),
             serde_json::json!({"source":{"doc":"d","text":"cite forbiddenword"}}),

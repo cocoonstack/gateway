@@ -1849,6 +1849,25 @@ fn anthropic_usage(pt: i64, ct: i64, u: Option<gw_models::CommonUsage>) -> AnthU
     }
 }
 
+/// The Responses wire usage: like OpenAI, cached reads count inside
+/// `input_tokens` and reasoning inside `output_tokens`, so the normalized
+/// parts rebuild the totals and the details stay subsets.
+fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) -> Value {
+    let Some(u) = u else {
+        return json!({"input_tokens": pt, "output_tokens": ct, "total_tokens": tt});
+    };
+    let (p, c) = (u.prompt_total(), u.completion_total());
+    let mut usage =
+        json!({"input_tokens": p, "output_tokens": c, "total_tokens": p.saturating_add(c)});
+    if u.read_cache > 0 {
+        usage["input_tokens_details"] = json!({"cached_tokens": u.read_cache});
+    }
+    if u.reason > 0 {
+        usage["output_tokens_details"] = json!({"reasoning_tokens": u.reason});
+    }
+    usage
+}
+
 /// POST /v1/chat/completions (OpenAI-compatible surface)
 async fn chat_completions(
     State(s): State<AppState>,
@@ -2599,11 +2618,12 @@ async fn completions(
         "created": gw_state::epoch_secs(),
         "model": r.model,
         "choices": [{"text": r.message, "index": 0, "finish_reason": finish}],
-        "usage": {
-            "prompt_tokens": r.prompt_tokens,
-            "completion_tokens": r.completion_tokens,
-            "total_tokens": r.total_tokens,
-        },
+        "usage": openai_usage(
+            r.prompt_tokens,
+            r.completion_tokens,
+            r.total_tokens,
+            r.common_usage
+        ),
     });
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -2720,7 +2740,7 @@ fn responses_stream_response(
                         Event::default().data(
                             json!({"type":"response.completed","response":{
                                 "model": self.model, "status": self.status,
-                                "usage":{"input_tokens":pt,"output_tokens":ct,"total_tokens":tt},
+                                "usage": responses_usage(pt, ct, tt, c.common_usage),
                             }})
                             .to_string(),
                         ),
@@ -3806,7 +3826,7 @@ mod tests {
             completion: 5,
             reason: 0,
         };
-        let w = openai_usage(8, 5, 13, Some(u));
+        let w = openai_usage(999, 999, 999, Some(u));
         assert_eq!(
             w.prompt_tokens, 11,
             "cache reads/writes belong inside OpenAI prompt_tokens"
@@ -3828,7 +3848,7 @@ mod tests {
             completion: 3,
             reason: 2,
         };
-        let w = anthropic_usage(10, 5, Some(u));
+        let w = anthropic_usage(999, 999, Some(u));
         assert_eq!(
             w.input_tokens, 6,
             "OpenAI cached reads must not double-count into input_tokens"
@@ -3838,5 +3858,30 @@ mod tests {
 
         let w = anthropic_usage(10, 5, None);
         assert_eq!((w.input_tokens, w.cache_read_input_tokens), (10, 0));
+    }
+
+    #[test]
+    fn responses_usage_rebuilds_from_common_usage() {
+        let u = gw_models::CommonUsage {
+            platform_input: 8,
+            read_cache: 2,
+            write_cache: 1,
+            completion: 5,
+            reason: 2,
+        };
+        let w = responses_usage(999, 999, 999, Some(u));
+        assert_eq!(
+            (w["input_tokens"].as_i64(), w["output_tokens"].as_i64()),
+            (Some(11), Some(7)),
+            "totals rebuilt from the normalized parts, not the raw args"
+        );
+        assert_eq!(w["total_tokens"], 18);
+        assert_eq!(w["input_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(w["output_tokens_details"]["reasoning_tokens"], 2);
+
+        let w = responses_usage(9, 4, 13, None);
+        assert_eq!(w["input_tokens"], 9);
+        assert_eq!(w["total_tokens"], 13);
+        assert!(w.get("input_tokens_details").is_none());
     }
 }

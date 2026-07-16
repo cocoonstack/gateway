@@ -1187,9 +1187,9 @@ tenants: [{name: t1}, {name: t1}]
             ),
             "a NaN qps would rebuild a full rate bucket per request"
         );
-        let nan_tenant_qps = "listen: {host: h, port: 1}\ntenants: [{name: t1, qps: .inf}]";
+        let inf_tenant_qps = "listen: {host: h, port: 1}\ntenants: [{name: t1, qps: .inf}]";
         assert!(matches!(
-            GatewayConfig::from_yaml(nan_tenant_qps),
+            GatewayConfig::from_yaml(inf_tenant_qps),
             Err(ConfigError::NegativeLimit { .. })
         ));
         let neg_qpm =
