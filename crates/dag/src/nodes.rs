@@ -356,9 +356,12 @@ impl DagNode for ModelQpmLimit {
         &["product_qpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(param) = ctx.request.model_param_v2.as_ref() else {
-            return Ok(());
-        };
+        // fail loud: silently skipping would waive the limit on a broken plan
+        let param = ctx
+            .request
+            .model_param_v2
+            .as_ref()
+            .ok_or_else(|| GatewayError::internal("model_qpm before resolve_model"))?;
         admission::check_model_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &param.model_name)
             .await
             .map_err(limit_denied)
@@ -451,7 +454,12 @@ impl DagNode for CallEngine {
                     .request
                     .protocol()
                     .ok_or_else(|| GatewayError::internal("call_engine without model type"))?;
-                let failed = ctx.request.account.clone().unwrap_or_default();
+                // fail loud: a default account would corrupt health bookkeeping
+                let failed = ctx
+                    .request
+                    .account
+                    .clone()
+                    .ok_or_else(|| GatewayError::internal("call_engine without an account"))?;
                 if ctx
                     .state
                     .health
@@ -541,9 +549,11 @@ impl DagNode for CostCalc {
         &["common_usage"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(outcome) = ctx.outcome.as_ref() else {
-            return Ok(());
-        };
+        // fail loud: silently skipping here would serve a response unbilled
+        let outcome = ctx
+            .outcome
+            .as_ref()
+            .ok_or_else(|| GatewayError::internal("cost_calc without an engine outcome"))?;
         let resp = &outcome.response;
         // An aborted stream delivered text but never the final usage frame — bill it.
         // Gate on completion_tokens==0, not total: Anthropic reports input up front,
