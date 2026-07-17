@@ -504,6 +504,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failover_recovery_records_one_availability_success() {
+        // a-down (priority 1) always 503s, a-up recovers via failover; the
+        // model must sample exactly one success, no error
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: ['openai-chat']}, {name: a-up, provider: p, priority: 2, protocols: ['openai-chat']}]\nstability: {failure_threshold: 100}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("m", "hi"), key).await.unwrap();
+        assert!(
+            ctx.decisions
+                .iter()
+                .any(|(_, w)| w.contains("failover a-down -> a-up")),
+            "request must have gone through failover: {:?}",
+            ctx.decisions
+        );
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(avail.window("m", minute - 5, minute).await, (1, 0));
+    }
+
+    #[tokio::test]
     async fn variant_split_bills_requested_serves_target() {
         // tenant entitled only to the public name: entitlement precedes the swap
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";

@@ -1349,6 +1349,24 @@ tenants: [{name: t1}, {name: t1}]
         let cfg = GatewayConfig::from_yaml(split).unwrap();
         assert_eq!(cfg.find_model("m1").unwrap().variants.len(), 2);
 
+        for bad in [
+            "availability_window_minutes: 0",
+            "availability_window_minutes: 61",
+            "unstable_error_rate: 1.5",
+            "unstable_error_rate: 0.6, unavailable_error_rate: 0.5",
+        ] {
+            let yaml = format!("listen: {{host: h, port: 1}}\nstability: {{{bad}}}");
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&yaml),
+                    Err(ConfigError::BadStability { .. })
+                ),
+                "stability `{bad}` is rejected at load"
+            );
+        }
+        let ok = "listen: {host: h, port: 1}\nstability: {availability_window_minutes: 60}";
+        assert!(GatewayConfig::from_yaml(ok).is_ok());
+
         let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
         assert!(
             matches!(

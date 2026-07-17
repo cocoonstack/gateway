@@ -1156,6 +1156,9 @@ async fn chat_non_stream_full_pipeline_bills_the_ledger() {
     assert_eq!(rec["ak"], "ak-demo-123");
     assert_eq!(rec["model"], "gpt-4o");
     assert_eq!(rec["account"], "mock-openai-1");
+    // holds because gpt-4o sets no token_rate: the ledger total is the weighted
+    // platform total, the wire usage stays vendor-raw — they diverge by design
+    // once weights are configured
     assert_eq!(rec["total_tokens"].as_i64().unwrap(), total);
     assert!(rec["cost_micros"].as_i64().unwrap() > 0);
 }
