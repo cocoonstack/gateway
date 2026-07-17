@@ -43,15 +43,6 @@ pub struct TokenInput {
     pub reasoning: i64,
 }
 
-/// Cache-normalized prompt (clamped at 0).
-fn normalize_prompt(input: &TokenInput, rate: &TokenRate) -> i64 {
-    let mut prompt = input.prompt;
-    if rate.prompt_includes_cache {
-        prompt -= input.read_cache + input.write_cache;
-    }
-    prompt.max(0)
-}
-
 /// Cost in micro-dollars for one call at per-1k-token prices. Saturating, so a
 /// malformed/hostile token count can't overflow the multiply into a wrong bill.
 pub fn cost_micros(prompt: i64, completion: i64, price_per_1k: (i64, i64)) -> i64 {
@@ -78,6 +69,15 @@ pub fn weighted_completion(input: &TokenInput, rate: &TokenRate) -> i64 {
 /// quota consumption and per-side billing cannot drift.
 pub fn platform_total(input: &TokenInput, rate: &TokenRate) -> i64 {
     weighted_prompt(input, rate).saturating_add(weighted_completion(input, rate))
+}
+
+/// Cache-normalized prompt (clamped at 0).
+fn normalize_prompt(input: &TokenInput, rate: &TokenRate) -> i64 {
+    let mut prompt = input.prompt;
+    if rate.prompt_includes_cache {
+        prompt -= input.read_cache + input.write_cache;
+    }
+    prompt.max(0)
 }
 
 fn round_tokens(sum: f64) -> i64 {
