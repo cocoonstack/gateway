@@ -695,6 +695,7 @@ impl GatewayConfig {
         // negative prices would make cost accounting non-monotonic (the usage
         // rollup's max-upsert relies on per-column monotone sums)
         let neg = |i: i64, o: i64| i < 0 || o < 0;
+        let neg_or_nan = |v: f64| !v.is_finite() || v < 0.0;
         for m in &self.models {
             if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros) {
                 return Err(ConfigError::NegativePrice {
@@ -704,7 +705,7 @@ impl GatewayConfig {
             // a NaN weight would poison every downstream cost computation
             if let Some(rate) = &m.token_rate {
                 for (field, v) in rate.fields() {
-                    if !v.is_finite() || v < 0.0 {
+                    if neg_or_nan(v) {
                         return Err(ConfigError::BadTokenRate {
                             model: m.name.clone(),
                             field,
@@ -718,9 +719,8 @@ impl GatewayConfig {
                     variant: v.model.clone(),
                     reason,
                 };
-                // realtime sessions never traverse VariantSelect (they pin a
-                // model at handshake) — accepting the config would silently
-                // serve 100% parent
+                // realtime pins its model at handshake, never traversing
+                // VariantSelect — accepting this would silently serve the parent
                 if m.protocol() == Some(Protocol::Realtime) {
                     return Err(bad("variants are not supported on realtime models"));
                 }
@@ -765,9 +765,8 @@ impl GatewayConfig {
         // a negative quota/qps is a typo that would silently deny (or never
         // limit); a NaN qps would bypass the rate bucket — reject both at load
         let neg_limit = |owner: String| ConfigError::NegativeLimit { owner };
-        let bad_qps = |v: f64| !v.is_finite() || v < 0.0;
         for k in &self.access_keys {
-            if bad_qps(k.qps)
+            if neg_or_nan(k.qps)
                 || k.daily_token_quota < 0
                 || k.tokens_per_minute.is_some_and(|v| v < 0)
                 || k.model_quotas.values().any(|v| *v < 0)
@@ -776,7 +775,7 @@ impl GatewayConfig {
             }
         }
         for t in &self.tenants {
-            if t.qps.is_some_and(bad_qps)
+            if t.qps.is_some_and(neg_or_nan)
                 || t.user_daily_token_quota.is_some_and(|v| v < 0)
                 || t.model_quotas.values().any(|v| *v < 0)
             {

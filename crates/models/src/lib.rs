@@ -14,7 +14,7 @@ pub mod usage;
 
 pub use block::Block;
 pub use cost::{
-    TokenInput, TokenRate, cost_micros, platform_total, weighted_completion, weighted_prompt,
+    TokenInput, TokenRate, cost_micros, weighted_completion, weighted_pair, weighted_prompt,
 };
 pub use error::{GResult, GatewayError};
 pub use params::{

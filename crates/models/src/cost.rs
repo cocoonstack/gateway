@@ -65,10 +65,19 @@ pub fn weighted_completion(input: &TokenInput, rate: &TokenRate) -> i64 {
     round_tokens(sum)
 }
 
-/// Weighted platform-total token count; always the sum of the two sides so
-/// quota consumption and per-side billing cannot drift.
-pub fn platform_total(input: &TokenInput, rate: &TokenRate) -> i64 {
-    weighted_prompt(input, rate).saturating_add(weighted_completion(input, rate))
+/// Weighted (prompt, completion) for the paths carrying no cache/reasoning
+/// components (estimates, realtime turns) — one implementation, so no billing
+/// surface can skip the rate.
+pub fn weighted_pair(prompt: i64, completion: i64, rate: &TokenRate) -> (i64, i64) {
+    let input = TokenInput {
+        prompt,
+        completion,
+        ..Default::default()
+    };
+    (
+        weighted_prompt(&input, rate),
+        weighted_completion(&input, rate),
+    )
 }
 
 /// Cache-normalized prompt (clamped at 0).
@@ -100,7 +109,9 @@ mod tests {
 
     #[test]
     fn default_rate_is_plain_sum() {
-        assert_eq!(platform_total(&sample(), &TokenRate::default()), 20);
+        let rate = TokenRate::default();
+        assert_eq!(weighted_prompt(&sample(), &rate), 13);
+        assert_eq!(weighted_completion(&sample(), &rate), 7);
     }
 
     #[test]
@@ -109,7 +120,7 @@ mod tests {
             prompt_includes_cache: true,
             ..Default::default()
         };
-        assert_eq!(platform_total(&sample(), &rate), 17);
+        assert_eq!(weighted_prompt(&sample(), &rate), 10);
     }
 
     #[test]
@@ -119,7 +130,8 @@ mod tests {
             completion_weight: 0.5,
             ..Default::default()
         };
-        assert_eq!(platform_total(&sample(), &rate), 23);
+        assert_eq!(weighted_prompt(&sample(), &rate), 18);
+        assert_eq!(weighted_completion(&sample(), &rate), 5);
     }
 
     #[test]
@@ -138,21 +150,15 @@ mod tests {
         };
         assert_eq!(weighted_prompt(&input, &rate), 250);
         assert_eq!(weighted_completion(&input, &rate), 60);
-        assert_eq!(platform_total(&input, &rate), 310);
     }
 
     #[test]
-    fn total_is_sum_of_sides() {
+    fn weighted_pair_carries_flat_counts() {
         let rate = TokenRate {
-            prompt_weight: 1.5,
-            completion_weight: 0.5,
+            prompt_weight: 0.5,
             ..Default::default()
         };
-        let input = sample();
-        assert_eq!(
-            platform_total(&input, &rate),
-            weighted_prompt(&input, &rate) + weighted_completion(&input, &rate)
-        );
+        assert_eq!(weighted_pair(100, 50, &rate), (50, 50));
     }
 
     #[test]
@@ -167,6 +173,6 @@ mod tests {
             write_cache: 5,
             ..Default::default()
         };
-        assert_eq!(platform_total(&input, &rate), 10);
+        assert_eq!(weighted_prompt(&input, &rate), 10);
     }
 }

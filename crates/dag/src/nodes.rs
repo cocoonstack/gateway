@@ -210,8 +210,7 @@ fn pick_variant<'a>(
         }
         roll -= u64::from(v.weight);
     }
-    // weights are validated >= 1, so the loop always returns; this arm only
-    // quiets the type checker
+    // unreachable (weights validated >= 1); quiets the type checker
     &variants[0]
 }
 
@@ -356,10 +355,11 @@ impl DagNode for SelectAccount {
             .select_healthy(mt, provider, &[], ctx.state.health.as_ref())
             .await;
         let Some(account) = account else {
-            // an exhausted pool (all accounts cooling, or none configured) is a
-            // client-visible model failure; without this sample a sustained
-            // outage sits below min_samples and reads as no_data forever
-            ctx.state.avail.record(requested_model(ctx), false);
+            // an exhausted pool is a client-visible model failure; unsampled,
+            // a sustained outage would sit below min_samples as no_data forever
+            ctx.state
+                .avail
+                .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
             return Err(GatewayError::new(
                 ErrCode::SYSTEM_ERROR,
                 503,
@@ -519,7 +519,9 @@ impl DagNode for CallEngine {
             Ok(outcome) => {
                 // an aborted stream is neither a success nor an account fault
                 if !outcome.response.aborted {
-                    ctx.state.avail.record(requested_model(ctx), true);
+                    ctx.state
+                        .avail
+                        .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
                     if let Some(a) = ctx.request.account.as_ref() {
                         ctx.state.health.record_success(&a.name).await;
                     }
@@ -571,7 +573,9 @@ impl DagNode for CallEngine {
                     )
                     .await;
                 let Some(next) = next else {
-                    ctx.state.avail.record(requested_model(ctx), false);
+                    ctx.state
+                        .avail
+                        .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
                     return Err(first_err);
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
@@ -586,14 +590,18 @@ impl DagNode for CallEngine {
                 let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        ctx.state.avail.record(requested_model(ctx), true);
+                        ctx.state
+                            .avail
+                            .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
                         ctx.state.health.record_success(&next.name).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
                     }
                     Err(e) => {
-                        ctx.state.avail.record(requested_model(ctx), false);
+                        ctx.state
+                            .avail
+                            .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
                         ctx.state
                             .health
                             .record_failure(&next.name, threshold, cooldown)
@@ -660,12 +668,16 @@ impl DagNode for CostCalc {
                 gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
             };
             let ct = enc.encode_len(&resp.message) as i64;
-            let rate = gw_state::model_token_rate(&ctx.cfg, served_model(ctx));
+            let rate = gw_state::model_token_rate(
+                &ctx.cfg,
+                served_model(ctx.request.model_param_v2.as_ref()),
+            );
             let tokens = BillTokens::weighted(pt, ct, &rate);
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
             return bill(ctx, tokens, true).await;
         }
-        let rate = gw_state::model_token_rate(&ctx.cfg, served_model(ctx));
+        let rate =
+            gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
         // saturating sums so a malformed usage subtree can't overflow the totals
         let tokens = match &resp.common_usage {
             Some(u) => {
@@ -704,16 +716,13 @@ impl BillTokens {
     /// paths without a usage payload (estimates, malformed usage) must price
     /// identically to the happy path or a cut stream changes effective pricing.
     fn weighted(prompt: i64, completion: i64, rate: &gw_models::TokenRate) -> Self {
-        let ti = gw_models::TokenInput {
-            prompt,
-            completion,
-            ..Default::default()
-        };
+        let (billable_prompt, billable_completion) =
+            gw_models::weighted_pair(prompt, completion, rate);
         Self {
             prompt,
             completion,
-            billable_prompt: gw_models::weighted_prompt(&ti, rate),
-            billable_completion: gw_models::weighted_completion(&ti, rate),
+            billable_prompt,
+            billable_completion,
         }
     }
 
@@ -735,10 +744,8 @@ async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GRes
     let param = ctx.request.model_param_v2.as_ref();
     // cost bills at the served (post-fallback) model's price; the (AK, model)
     // counter accrues against the requested name
-    let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-    let requested = param
-        .and_then(|p| p.fallback_from.as_deref())
-        .unwrap_or(served);
+    let served = served_model(param);
+    let requested = requested_model(param);
     // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
     let (reserved, tpm_reserved, model_quota_key) = (
         ctx.quota_reserved.take().unwrap_or(0),
@@ -887,22 +894,17 @@ fn model_provider(ctx: &DagContext) -> Option<&str> {
     ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())
 }
 
-/// The model name the request currently targets (post-fallback).
-fn served_model(ctx: &DagContext) -> &str {
-    ctx.request
-        .model_param_v2
-        .as_ref()
-        .map(|p| p.model_name.as_str())
-        .unwrap_or_default()
+/// The model name the request currently targets (post-fallback). Takes the
+/// param, not the whole context, so `bill` can call it across its ctx takes.
+fn served_model(param: Option<&gw_models::ModelParamV2>) -> &str {
+    param.map(|p| p.model_name.as_str()).unwrap_or_default()
 }
 
 /// The public name the caller requested (pre-fallback/variant) — availability
 /// attributes here: callers and the tenant status view know this name, not the
 /// backend the split routed to.
-fn requested_model(ctx: &DagContext) -> &str {
-    ctx.request
-        .model_param_v2
-        .as_ref()
+fn requested_model(param: Option<&gw_models::ModelParamV2>) -> &str {
+    param
         .map(|p| p.fallback_from.as_deref().unwrap_or(p.model_name.as_str()))
         .unwrap_or_default()
 }

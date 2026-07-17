@@ -364,18 +364,9 @@ async fn bill_realtime_turn(
         return;
     }
     let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
-    // same weights as the request pipeline; realtime usage carries no cache
-    // components, so only the prompt/completion weights can bite
+    // pipeline parity: the same shared weighting the DAG estimate paths use
     let rate = gw_state::model_token_rate(cfg, model);
-    let ti = gw_models::TokenInput {
-        prompt: it,
-        completion: ot,
-        ..Default::default()
-    };
-    let (bp, bc) = (
-        gw_models::weighted_prompt(&ti, &rate),
-        gw_models::weighted_completion(&ti, &rate),
-    );
+    let (bp, bc) = gw_models::weighted_pair(it, ot, &rate);
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, model)
         .map(|_| admission::model_quota_key(&ak.ak, model));
@@ -1541,9 +1532,8 @@ async fn admin_key_list(
 
 /// GET /admin/models/status — per-model availability over the configured
 /// window, judged from minute-bucketed success/error counts. A tenant admin
-/// sees only its entitled models. Realtime models are excluded: sessions
-/// don't traverse the sampled engine path, and listing them would show a
-/// permanent (misleading) no_data.
+/// sees only its entitled models. Realtime models are excluded: never
+/// sampled, listing them would read as a permanent no_data.
 async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Response {
     let cfg = s.handler.cfg();
     let st = &cfg.stability;
@@ -3467,8 +3457,7 @@ mod tests {
 
     #[tokio::test]
     async fn sustained_pool_exhaustion_converges_to_unavailable() {
-        // low threshold: requests past the 2nd die in SelectAccount during the
-        // cooldown — those 503s must sample too, or the outage reads no_data
+        // past the 2nd request the pool is cooling: those 503s must sample too
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_OUT_ADMIN}\nmodels: [{name: m-out, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-down, provider: downp, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {failure_threshold: 2, cooldown_seconds: 300, availability_min_samples: 5}";
         // SAFETY: unique var name for this test; no concurrent reader of it.
         unsafe {

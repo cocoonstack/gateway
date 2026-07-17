@@ -505,8 +505,6 @@ mod tests {
 
     #[tokio::test]
     async fn failover_recovery_records_one_availability_success() {
-        // a-down (priority 1) always 503s, a-up recovers via failover; the
-        // model must sample exactly one success, no error
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: ['openai-chat']}, {name: a-up, provider: p, priority: 2, protocols: ['openai-chat']}]\nstability: {failure_threshold: 100}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
