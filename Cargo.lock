@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "gw-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gw-consts",
  "regex",
@@ -869,14 +869,14 @@ dependencies = [
 
 [[package]]
 name = "gw-consts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "gw-dag"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "gw-config",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "gw-engines"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "gw-handler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "gw-models"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gw-consts",
  "serde",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "gw-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "gw-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "gw-state"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "gw-task"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gw-state",
  "tokio",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "gw-views"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
