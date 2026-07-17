@@ -1541,16 +1541,21 @@ async fn admin_key_list(
 
 /// GET /admin/models/status — per-model availability over the configured
 /// window, judged from minute-bucketed success/error counts. A tenant admin
-/// sees only its entitled models.
+/// sees only its entitled models. Realtime models are excluded: sessions
+/// don't traverse the sampled engine path, and listing them would show a
+/// permanent (misleading) no_data.
 async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Response {
     let cfg = s.handler.cfg();
     let st = &cfg.stability;
     let until = gw_state::epoch_secs() / 60;
     let since = until - (st.availability_window_minutes - 1);
     let state = s.handler.state();
-    let entitled = cfg.models.iter().filter(|m| match &scope {
-        AdminScope::Tenant(t) => cfg.tenant_allows_model(t, &m.name),
-        AdminScope::Global => true,
+    let entitled = cfg.models.iter().filter(|m| {
+        m.protocol() != Some(gw_consts::Protocol::Realtime)
+            && match &scope {
+                AdminScope::Tenant(t) => cfg.tenant_allows_model(t, &m.name),
+                AdminScope::Global => true,
+            }
     });
     let avail = &state.avail;
     let counts = futures::future::join_all(
@@ -3397,7 +3402,7 @@ mod tests {
     #[tokio::test]
     async fn models_status_classifies_and_scopes() {
         // high threshold + disjoint providers: cooldown/round-robin must not skew samples
-        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_AVAIL_ADMIN}\nmodels: [{name: m-ok, protocol: openai-chat, provider: openai}, {name: m-bad, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-up, provider: openai, protocols: ['openai-chat']}, {name: a-down, provider: downp, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m-ok], admin_token_env: GW_TEST_AVAIL_T1}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {availability_min_samples: 3, failure_threshold: 100}";
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_AVAIL_ADMIN}\nmodels: [{name: m-ok, protocol: openai-chat, provider: openai}, {name: m-bad, protocol: openai-chat, provider: downp}, {name: rt-m, protocol: realtime}]\naccounts: [{name: a-up, provider: openai, protocols: ['openai-chat']}, {name: a-down, provider: downp, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m-ok], admin_token_env: GW_TEST_AVAIL_T1}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {availability_min_samples: 3, failure_threshold: 100}";
         // SAFETY: unique var names for this test; no concurrent reader of them.
         unsafe {
             std::env::set_var("GW_TEST_AVAIL_ADMIN", "root-tok");
@@ -3444,6 +3449,10 @@ mod tests {
         assert_eq!(of("m-ok")["requests"], 4);
         assert_eq!(of("m-bad")["state"], "unavailable");
         assert_eq!(of("m-bad")["errors"], 4);
+        assert!(
+            !rows.iter().any(|r| r["model"] == "rt-m"),
+            "realtime models are not listed (never sampled)"
+        );
 
         let resp = router.clone().oneshot(status("t1-tok")).await.unwrap();
         let j = body_json(resp).await;

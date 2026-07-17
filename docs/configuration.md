@@ -104,7 +104,21 @@ models:
     output_price_per_1k_micros: 10000
     qpm: 60                          # optional model-level rate limit
     cache_ttl_seconds: 60            # optional request-level response cache
+    token_rate:                      # optional per-component billing weights
+      read_cache: 0.1                #   cache reads at 10% of the input price
+      write_cache: 1.25              #   (prompt/completion/reasoning default 1.0)
+    variants:                        # optional weighted canary split, sticky per user
+      - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
+      - {model: gpt-4o-next, weight: 10}
 ```
+
+`token_rate` weights scale cost and quota consumption per token component; the
+ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
+is the weighted platform total. `variants` splits a public name across other
+declared same-protocol models (one level, no realtime): entitlement and the
+per-(AK, model) daily counter judge the public name, billing prices the served
+variant, and the response echoes the requested name. Selection hashes the
+effective user, so a user sticks to one backend across the fleet.
 
 ### `providers` — first-class provider presets
 
@@ -168,6 +182,10 @@ security:                      # global default; a tenant may override it whole
 stability:
   failure_threshold: 3         # consecutive failures before an account cools down
   cooldown_seconds: 300
+  availability_window_minutes: 5   # /admin/models/status judgment window (max 60)
+  unstable_error_rate: 0.1         # window error rate that reports `unstable`
+  unavailable_error_rate: 0.5      # ... and `unavailable`
+  availability_min_samples: 20     # fewer samples than this reports `no_data`
 
 products:
   - name: myproduct

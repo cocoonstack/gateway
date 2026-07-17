@@ -141,6 +141,7 @@ regardless.
 | DELETE | `/admin/keys/{ak}` | revoke a key |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped |
+| GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible request outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models are not sampled and not listed; tenant-scoped |
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
 | GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |

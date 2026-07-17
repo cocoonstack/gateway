@@ -549,6 +549,15 @@ mod tests {
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger[0].model, "pub-m");
         assert_eq!(ledger[0].served_model, "canary-m");
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(
+            avail.window("pub-m", minute - 5, minute).await,
+            (1, 0),
+            "availability attributes to the requested public name"
+        );
+        assert_eq!(avail.window("canary-m", minute - 5, minute).await, (0, 0));
     }
 
     #[derive(Debug)]

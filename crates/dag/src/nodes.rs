@@ -495,7 +495,8 @@ impl DagNode for UserBudgetGate {
 /// PTU → paygo spill sets `ptu_spillover`); a second failure propagates as-is.
 /// Availability samples record the client-visible terminal outcome only — an
 /// attempt recovered by failover is the account health layer's business, not
-/// a model error.
+/// a model error — and attribute to the requested public name, so a variant
+/// split doesn't scatter a model's health across backend names.
 pub struct CallEngine;
 
 #[async_trait::async_trait]
@@ -514,7 +515,7 @@ impl DagNode for CallEngine {
             Ok(outcome) => {
                 // an aborted stream is neither a success nor an account fault
                 if !outcome.response.aborted {
-                    ctx.state.avail.record(served_model(ctx), true);
+                    ctx.state.avail.record(requested_model(ctx), true);
                     if let Some(a) = ctx.request.account.as_ref() {
                         ctx.state.health.record_success(&a.name).await;
                     }
@@ -566,7 +567,7 @@ impl DagNode for CallEngine {
                     )
                     .await;
                 let Some(next) = next else {
-                    ctx.state.avail.record(served_model(ctx), false);
+                    ctx.state.avail.record(requested_model(ctx), false);
                     return Err(first_err);
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
@@ -581,14 +582,14 @@ impl DagNode for CallEngine {
                 let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        ctx.state.avail.record(served_model(ctx), true);
+                        ctx.state.avail.record(requested_model(ctx), true);
                         ctx.state.health.record_success(&next.name).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
                     }
                     Err(e) => {
-                        ctx.state.avail.record(served_model(ctx), false);
+                        ctx.state.avail.record(requested_model(ctx), false);
                         ctx.state
                             .health
                             .record_failure(&next.name, threshold, cooldown)
@@ -888,6 +889,17 @@ fn served_model(ctx: &DagContext) -> &str {
         .model_param_v2
         .as_ref()
         .map(|p| p.model_name.as_str())
+        .unwrap_or_default()
+}
+
+/// The public name the caller requested (pre-fallback/variant) — availability
+/// attributes here: callers and the tenant status view know this name, not the
+/// backend the split routed to.
+fn requested_model(ctx: &DagContext) -> &str {
+    ctx.request
+        .model_param_v2
+        .as_ref()
+        .map(|p| p.fallback_from.as_deref().unwrap_or(p.model_name.as_str()))
         .unwrap_or_default()
 }
 

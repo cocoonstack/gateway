@@ -718,6 +718,12 @@ impl GatewayConfig {
                     variant: v.model.clone(),
                     reason,
                 };
+                // realtime sessions never traverse VariantSelect (they pin a
+                // model at handshake) — accepting the config would silently
+                // serve 100% parent
+                if m.protocol() == Some(Protocol::Realtime) {
+                    return Err(bad("variants are not supported on realtime models"));
+                }
                 if v.weight == 0 {
                     return Err(bad("weight must be >= 1"));
                 }
@@ -1348,6 +1354,15 @@ tenants: [{name: t1}, {name: t1}]
         let split = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, variants: [{model: m1, weight: 9}, {model: m2, weight: 1}]}, {name: m2, protocol: openai-chat}]";
         let cfg = GatewayConfig::from_yaml(split).unwrap();
         assert_eq!(cfg.find_model("m1").unwrap().variants.len(), 2);
+
+        let rt = "listen: {host: h, port: 1}\nmodels: [{name: r1, protocol: realtime, variants: [{model: r2, weight: 1}]}, {name: r2, protocol: realtime}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(rt),
+                Err(ConfigError::BadVariant { .. })
+            ),
+            "realtime variants are rejected at load"
+        );
 
         for bad in [
             "availability_window_minutes: 0",

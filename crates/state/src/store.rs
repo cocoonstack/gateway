@@ -2897,8 +2897,13 @@ mod tests {
     async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
         let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
         let now = crate::epoch_millis();
+        // wide margin: the erasure ran earlier in this test, and a tight one
+        // (5ms) flaked under parallel-suite load
         assert!(
-            store.user_erased_since(&t1, &u1, now - 5).await.unwrap(),
+            store
+                .user_erased_since(&t1, &u1, now - 60_000)
+                .await
+                .unwrap(),
             "marker visible to a batch started before the erasure"
         );
         assert!(
