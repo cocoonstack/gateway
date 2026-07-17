@@ -434,10 +434,11 @@ impl DagNode for CallEngine {
         match engine.run().await {
             Ok(outcome) => {
                 // an aborted stream is neither a success nor an account fault
-                if !outcome.response.aborted
-                    && let Some(a) = ctx.request.account.as_ref()
-                {
-                    ctx.state.health.record_success(&a.name).await;
+                if !outcome.response.aborted {
+                    ctx.state.avail.record(served_model(ctx), true);
+                    if let Some(a) = ctx.request.account.as_ref() {
+                        ctx.state.health.record_success(&a.name).await;
+                    }
                 }
                 ctx.decide(
                     "call_engine",
@@ -450,6 +451,7 @@ impl DagNode for CallEngine {
                 Ok(())
             }
             Err(first_err) if first_err.http_status >= 500 => {
+                ctx.state.avail.record(served_model(ctx), false);
                 let mt = ctx
                     .request
                     .protocol()
@@ -500,12 +502,16 @@ impl DagNode for CallEngine {
                 let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
+                        ctx.state.avail.record(served_model(ctx), true);
                         ctx.state.health.record_success(&next.name).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
                     }
                     Err(e) => {
+                        if e.http_status >= 500 {
+                            ctx.state.avail.record(served_model(ctx), false);
+                        }
                         ctx.state
                             .health
                             .record_failure(&next.name, threshold, cooldown)
@@ -809,6 +815,15 @@ pub fn default_layers() -> Vec<Layer> {
 fn model_provider(ctx: &DagContext) -> Option<&str> {
     let name = &ctx.request.model_param_v2.as_ref()?.model_name;
     ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())
+}
+
+/// The model name the request currently targets (post-fallback).
+fn served_model(ctx: &DagContext) -> &str {
+    ctx.request
+        .model_param_v2
+        .as_ref()
+        .map(|p| p.model_name.as_str())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

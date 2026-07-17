@@ -124,6 +124,7 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/keys", post(admin_key_create).get(admin_key_list))
         .route("/admin/usage", get(admin_usage))
         .route("/admin/usage/users", get(admin_usage_users))
+        .route("/admin/models/status", get(admin_models_status))
         .route("/admin/audit/events", get(admin_security_events))
         .route("/admin/audit/ops", get(admin_audit_ops))
         .route("/admin/audit/content/{request_id}", get(admin_content_get))
@@ -1524,6 +1525,41 @@ async fn admin_key_list(
     let mut resp = json!({ "count": keys.len(), "offset": offset });
     resp["keys"] = Value::Array(keys);
     Json(resp).into_response()
+}
+
+/// GET /admin/models/status — per-model availability over the configured
+/// window, judged from minute-bucketed success/error counts. A tenant admin
+/// sees only its entitled models.
+async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Response {
+    let cfg = s.handler.cfg();
+    let st = &cfg.stability;
+    let until = gw_state::epoch_secs() / 60;
+    let since = until - (st.availability_window_minutes - 1);
+    let avail = &s.handler.state().avail;
+    let mut rows = Vec::new();
+    for m in &cfg.models {
+        if let AdminScope::Tenant(t) = &scope
+            && !cfg.tenant_allows_model(t, &m.name)
+        {
+            continue;
+        }
+        let (ok, err) = avail.window(&m.name, since, until).await;
+        let state = gw_state::classify(
+            ok,
+            err,
+            st.availability_min_samples,
+            st.unstable_error_rate,
+            st.unavailable_error_rate,
+        );
+        rows.push(json!({
+            "model": m.name,
+            "state": state,
+            "requests": ok + err,
+            "errors": err,
+            "window_minutes": st.availability_window_minutes,
+        }));
+    }
+    Json(json!({ "models": rows })).into_response()
 }
 
 /// GET /admin/usage — ledger rollup by (tenant, requested model). A tenant
@@ -3339,6 +3375,69 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["deleted"], true);
         assert!(store.file_get(&f.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn models_status_classifies_and_scopes() {
+        // failure_threshold high so account cooldown never blocks a sample;
+        // models bound to disjoint providers so round-robin can't cross-route
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_AVAIL_ADMIN}\nmodels: [{name: m-ok, protocol: openai-chat, provider: openai}, {name: m-bad, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-up, provider: openai, protocols: ['openai-chat']}, {name: a-down, provider: downp, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m-ok], admin_token_env: GW_TEST_AVAIL_T1}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {availability_min_samples: 3, failure_threshold: 100}";
+        // SAFETY: unique var names for this test; no concurrent reader of them.
+        unsafe {
+            std::env::set_var("GW_TEST_AVAIL_ADMIN", "root-tok");
+            std::env::set_var("GW_TEST_AVAIL_T1", "t1-tok");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let avail = app_state.handler.state().avail.clone();
+        let router = app(app_state);
+        let chat = |model: &str| {
+            chat_req(
+                Some("k1"),
+                &format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"x"}}]}}"#),
+            )
+        };
+        for _ in 0..4 {
+            let ok = router.clone().oneshot(chat("m-ok")).await.unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            let bad = router.clone().oneshot(chat("m-bad")).await.unwrap();
+            assert_eq!(bad.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        avail.flush().await;
+
+        let status = |token: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri("/admin/models/status")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router.clone().oneshot(status("root-tok")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        let rows = j["models"].as_array().unwrap();
+        let of = |name: &str| {
+            rows.iter()
+                .find(|r| r["model"] == name)
+                .unwrap_or_else(|| panic!("row for {name}"))
+                .clone()
+        };
+        assert_eq!(of("m-ok")["state"], "available");
+        assert_eq!(of("m-ok")["requests"], 4);
+        assert_eq!(of("m-bad")["state"], "unavailable");
+        assert_eq!(of("m-bad")["errors"], 4);
+
+        let resp = router.clone().oneshot(status("t1-tok")).await.unwrap();
+        let j = body_json(resp).await;
+        let names: Vec<_> = j["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["model"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["m-ok"], "tenant admin sees only entitled models");
     }
 
     #[tokio::test]

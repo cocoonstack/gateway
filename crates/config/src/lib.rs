@@ -52,6 +52,8 @@ pub enum ConfigError {
     NegativePrice { owner: String },
     #[error("model `{model}` token_rate `{field}` must be finite and >= 0")]
     BadTokenRate { model: String, field: &'static str },
+    #[error("stability: bad {field}")]
+    BadStability { field: &'static str },
     #[error("`{owner}` sets a negative or non-finite limit")]
     NegativeLimit { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
@@ -287,10 +289,34 @@ pub struct StabilityConf {
     /// Cooldown duration (seconds); auto-recovers on expiry.
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
+    /// Minutes of per-model success/error counts the status API judges over.
+    #[serde(default = "default_availability_window_minutes")]
+    pub availability_window_minutes: i64,
+    /// Window error rate at or above which a model reports `unstable`.
+    #[serde(default = "default_unstable_error_rate")]
+    pub unstable_error_rate: f64,
+    /// Window error rate at or above which a model reports `unavailable`.
+    #[serde(default = "default_unavailable_error_rate")]
+    pub unavailable_error_rate: f64,
+    /// Below this many window samples the verdict is `no_data`.
+    #[serde(default = "default_availability_min_samples")]
+    pub availability_min_samples: u64,
 }
 
 fn default_failure_threshold() -> usize {
     3
+}
+fn default_availability_window_minutes() -> i64 {
+    5
+}
+fn default_unstable_error_rate() -> f64 {
+    0.1
+}
+fn default_unavailable_error_rate() -> f64 {
+    0.5
+}
+fn default_availability_min_samples() -> u64 {
+    20
 }
 fn default_cooldown_seconds() -> u64 {
     30
@@ -301,6 +327,10 @@ impl Default for StabilityConf {
         Self {
             failure_threshold: default_failure_threshold(),
             cooldown_seconds: default_cooldown_seconds(),
+            availability_window_minutes: default_availability_window_minutes(),
+            unstable_error_rate: default_unstable_error_rate(),
+            unavailable_error_rate: default_unavailable_error_rate(),
+            availability_min_samples: default_availability_min_samples(),
         }
     }
 }
@@ -712,6 +742,23 @@ impl GatewayConfig {
             if p.qpm.is_some_and(|v| v < 0) {
                 return Err(neg_limit(format!("product {}", p.name)));
             }
+        }
+        let st = &self.stability;
+        let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
+        if st.availability_window_minutes < 1 {
+            return Err(ConfigError::BadStability {
+                field: "availability_window_minutes",
+            });
+        }
+        if bad_rate(st.unstable_error_rate) || bad_rate(st.unavailable_error_rate) {
+            return Err(ConfigError::BadStability {
+                field: "error rates (must be finite, within [0, 1])",
+            });
+        }
+        if st.unstable_error_rate > st.unavailable_error_rate {
+            return Err(ConfigError::BadStability {
+                field: "unstable_error_rate above unavailable_error_rate",
+            });
         }
         for m in &self.models {
             if m.protocol().is_none() {
