@@ -502,6 +502,29 @@ mod tests {
         assert_eq!(rec.total_tokens, 28 + rec.completion_tokens);
     }
 
+    #[tokio::test]
+    async fn variant_split_bills_requested_serves_target() {
+        // tenant entitled only to the public name — proves entitlement is
+        // judged before the variant swap
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
+        assert_eq!(
+            ctx.outcome.expect("outcome").response.model,
+            "pub-m",
+            "response echoes the requested public name"
+        );
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger[0].model, "pub-m");
+        assert_eq!(ledger[0].served_model, "canary-m");
+    }
+
     #[derive(Debug)]
     struct DenyModerator;
 

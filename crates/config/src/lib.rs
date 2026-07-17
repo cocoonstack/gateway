@@ -54,6 +54,12 @@ pub enum ConfigError {
     BadTokenRate { model: String, field: &'static str },
     #[error("stability: bad {field}")]
     BadStability { field: &'static str },
+    #[error("model `{model}` variant `{variant}`: {reason}")]
+    BadVariant {
+        model: String,
+        variant: String,
+        reason: &'static str,
+    },
     #[error("`{owner}` sets a negative or non-finite limit")]
     NegativeLimit { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
@@ -116,12 +122,24 @@ pub struct ModelConf {
     /// Billing weights per token component; None = every component at 1.0.
     #[serde(default)]
     pub token_rate: Option<TokenRateConf>,
+    /// Weighted routing split across other declared models (canary/gray);
+    /// empty = this name serves itself. A self-referencing entry keeps a
+    /// share on this model.
+    #[serde(default)]
+    pub variants: Vec<VariantConf>,
 }
 
 impl ModelConf {
     pub fn protocol(&self) -> Option<Protocol> {
         Protocol::from_wire(&self.protocol)
     }
+}
+
+/// One weighted routing target of a public model name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VariantConf {
+    pub model: String,
+    pub weight: u32,
 }
 
 /// Per-component billing weights relative to the model's unit prices
@@ -690,6 +708,26 @@ impl GatewayConfig {
                             field,
                         });
                     }
+                }
+            }
+            for v in &m.variants {
+                let bad = |reason| ConfigError::BadVariant {
+                    model: m.name.clone(),
+                    variant: v.model.clone(),
+                    reason,
+                };
+                if v.weight == 0 {
+                    return Err(bad("weight must be >= 1"));
+                }
+                let Some(target) = self.models.iter().find(|t| t.name == v.model) else {
+                    return Err(bad("unknown model"));
+                };
+                if target.protocol() != m.protocol() {
+                    return Err(bad("protocol differs from the parent"));
+                }
+                // one level only: nested splits would make routing unauditable
+                if target.name != m.name && !target.variants.is_empty() {
+                    return Err(bad("variant target declares variants itself"));
                 }
             }
         }
@@ -1277,6 +1315,27 @@ tenants: [{name: t1}, {name: t1}]
         let tr = cfg.find_model("m1").unwrap().token_rate.unwrap();
         assert_eq!((tr.read_cache, tr.write_cache), (0.1, 1.25));
         assert_eq!((tr.prompt, tr.completion, tr.reasoning), (1.0, 1.0, 1.0));
+
+        for (variants, reason) in [
+            ("[{model: nope, weight: 1}]", "unknown target"),
+            ("[{model: m2, weight: 0}]", "zero weight"),
+            ("[{model: emb, weight: 1}]", "cross-protocol"),
+            ("[{model: nested, weight: 1}]", "nested variants"),
+        ] {
+            let bad = format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: m1, protocol: openai-chat, variants: {variants}}}, {{name: m2, protocol: openai-chat}}, {{name: emb, protocol: embeddings}}, {{name: nested, protocol: openai-chat, variants: [{{model: m2, weight: 1}}]}}]"
+            );
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&bad),
+                    Err(ConfigError::BadVariant { .. })
+                ),
+                "{reason} is rejected at load"
+            );
+        }
+        let split = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, variants: [{model: m1, weight: 9}, {model: m2, weight: 1}]}, {name: m2, protocol: openai-chat}]";
+        let cfg = GatewayConfig::from_yaml(split).unwrap();
+        assert_eq!(cfg.find_model("m1").unwrap().variants.len(), 2);
 
         let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
         assert!(
