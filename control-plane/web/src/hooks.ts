@@ -18,7 +18,7 @@ export function useAPI<T>(path: string | null) {
     return () => { active = false; };
   }, [path, version]);
 
-  return { data, error, loading: path !== null && data === null && error === "", reload, setData };
+  return { data, error, loading: path !== null && data === null && error === "", reload };
 }
 
 export function useAction(fallback = "Request failed") {

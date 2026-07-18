@@ -1,5 +1,6 @@
 import { type FormEvent, useState } from "react";
 import { api, jsonBody } from "../api";
+import { ErrorNotice } from "../components/UI";
 import { useAction } from "../hooks";
 import type { Session } from "../types";
 
@@ -39,7 +40,7 @@ export default function LoginPage({ onLogin }: { onLogin: (session: Session) => 
           <p className="muted">Use your control-plane account to continue.</p>
           <label>Email<input autoFocus type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
           <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
-          {error && <div className="notice notice-error">{error}</div>}
+          {error && <ErrorNotice message={error} />}
           <button className="button primary wide" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
         </form>
         <p className="login-foot">Protected by an opaque, server-side session.</p>

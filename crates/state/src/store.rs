@@ -306,7 +306,7 @@ impl UserUsageRow {
     }
 
     /// Fold `o`'s counters into self (saturating).
-    pub fn absorb(&mut self, o: &UserUsageRow) {
+    fn absorb(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.saturating_add(o.requests);
         self.prompt_tokens = self.prompt_tokens.saturating_add(o.prompt_tokens);
         self.completion_tokens = self.completion_tokens.saturating_add(o.completion_tokens);

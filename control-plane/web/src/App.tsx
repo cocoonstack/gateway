@@ -16,7 +16,6 @@ import AuditPage from "./pages/AuditPage";
 
 interface AuthState {
   session: Session;
-  setSession: (session: Session) => void;
   logout: () => Promise<void>;
 }
 
@@ -53,7 +52,6 @@ export default function App() {
     if (!session) return null;
     return {
       session,
-      setSession: applySession,
       async logout() {
         await api<void>("/api/v1/auth/logout", { method: "POST" });
         applySession(null);
