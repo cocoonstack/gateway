@@ -11,6 +11,11 @@ const KEEP_VERSIONS: i64 = 20;
 /// The Postgres NOTIFY channel a publish fires on (payload = version id).
 pub const CONFIG_CHANNEL: &str = "gw_config";
 
+/// Every publish serializes on this advisory lock: a `MAX(id)`-guarded insert
+/// is not atomic under READ COMMITTED — two concurrent guarded publishes both
+/// see the old head and both insert.
+const PG_PUBLISH_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('gw_config_publish'))";
+
 /// Metadata for one retained config document, newest first in list responses.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigVersion {
@@ -84,40 +89,62 @@ impl PostgresConfigStore {
     /// Store a new version and notify every listening instance. The caller
     /// validates the YAML first — the store never holds an unparsable config.
     pub async fn publish(&self, yaml: &str) -> GResult<i64> {
-        let id: i64 = sqlx::query_scalar(
-            "WITH ins AS (INSERT INTO gw_config (yaml) VALUES ($1) RETURNING id)
-             SELECT id FROM ins, pg_notify($2, ins.id::text)",
-        )
-        .bind(yaml)
-        .bind(CONFIG_CHANNEL)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("publish config", e))?;
+        let mut tx = self.begin_locked().await?;
+        let id = Self::insert_notify(&mut tx, yaml).await?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit config publish", e))?;
         self.prune().await?;
         Ok(id)
     }
 
     /// [`Self::publish`] only if `expected` is still the newest version;
-    /// `None` when a concurrent publish moved the head (compare-and-insert,
-    /// atomic in one statement).
+    /// `None` when a concurrent publish moved the head (head checked under
+    /// the publish lock).
     pub async fn publish_if(&self, yaml: &str, expected: i64) -> GResult<Option<i64>> {
-        let id = sqlx::query_scalar(
-            "WITH ins AS (
-               INSERT INTO gw_config (yaml)
-               SELECT $1 WHERE COALESCE((SELECT MAX(id) FROM gw_config), 0) = $3
-               RETURNING id)
+        let mut tx = self.begin_locked().await?;
+        let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM gw_config")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("read config head", e))?;
+        if head != expected {
+            return Ok(None);
+        }
+        let id = Self::insert_notify(&mut tx, yaml).await?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit config publish", e))?;
+        self.prune().await?;
+        Ok(Some(id))
+    }
+
+    async fn begin_locked(&self) -> GResult<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin config publish", e))?;
+        sqlx::query(PG_PUBLISH_LOCK_SQL)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("lock config publish", e))?;
+        Ok(tx)
+    }
+
+    // NOTIFY is transactional: peers hear the id only after the commit
+    async fn insert_notify(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        yaml: &str,
+    ) -> GResult<i64> {
+        sqlx::query_scalar(
+            "WITH ins AS (INSERT INTO gw_config (yaml) VALUES ($1) RETURNING id)
              SELECT id FROM ins, pg_notify($2, ins.id::text)",
         )
         .bind(yaml)
         .bind(CONFIG_CHANNEL)
-        .bind(expected)
-        .fetch_optional(&self.pool)
+        .fetch_one(&mut **tx)
         .await
-        .map_err(|e| crate::sqlx_err("publish config (guarded)", e))?;
-        if id.is_some() {
-            self.prune().await?;
-        }
-        Ok(id)
+        .map_err(|e| crate::sqlx_err("publish config", e))
     }
 
     async fn prune(&self) -> GResult<()> {
@@ -206,5 +233,17 @@ mod tests {
         let n = listener.recv().await.expect("notify");
         assert_eq!(n.channel(), CONFIG_CHANNEL);
         assert_eq!(n.payload(), v1.to_string());
+
+        let store = &store;
+        let contenders = futures::future::join_all((0..8).map(|i| {
+            let yaml = format!("listen: {{host: c{i}, port: 4}}");
+            async move { store.publish_if(&yaml, v3).await.unwrap() }
+        }))
+        .await;
+        assert_eq!(
+            contenders.iter().flatten().count(),
+            1,
+            "concurrent guarded publishes admit exactly one"
+        );
     }
 }
