@@ -217,12 +217,9 @@ fn pick_variant<'a>(
 /// FNV-1a 64: deterministic across processes and releases (std's hasher is
 /// neither), which the fleet-consistent sticky mapping depends on.
 fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// preprocess/cache_lookup: request-level TTL cache. On a hit the outcome is

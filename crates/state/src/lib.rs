@@ -22,7 +22,7 @@ pub mod health;
 pub mod keystore;
 pub mod store;
 
-pub use avail::{AvailState, AvailTracker, classify};
+pub use avail::{AvailState, AvailStore, classify};
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
 pub use content::{ContentRecord, sealing_available};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
@@ -666,7 +666,7 @@ pub struct GatewayState {
     /// Request-level response cache: in-process by default, Redis when shared.
     pub cache: Arc<dyn ResponseCache>,
     /// Per-model availability counters; Redis for fleet-wide aggregation.
-    pub avail: Arc<avail::AvailTracker>,
+    pub avail: Arc<dyn avail::AvailStore>,
 }
 
 impl Default for GatewayState {
@@ -678,9 +678,7 @@ impl Default for GatewayState {
             store: Arc::new(MemoryStore::default()),
             health: Arc::new(AccountHealth::default()),
             cache: Arc::new(MemoryResponseCache::default()),
-            avail: Arc::new(avail::AvailTracker::new(Arc::new(
-                avail::MemoryAvail::default(),
-            ))),
+            avail: Arc::new(avail::MemoryAvail::default()),
         }
     }
 }
@@ -761,7 +759,7 @@ impl GatewayState {
             }
             match avail::RedisAvail::connect(&cfg.storage.redis_url).await {
                 Ok(a) => {
-                    state.avail = Arc::new(avail::AvailTracker::new(Arc::new(a)));
+                    state.avail = Arc::new(a);
                     tracing::info!("model availability = redis (fleet-wide counts)");
                 }
                 Err(e) => {
