@@ -74,6 +74,8 @@ jobs:
       - name: Control-plane browser E2E
         working-directory: control-plane/web
         run: npm run e2e
+      - name: Control-plane image builds
+        run: docker build control-plane/
 
   deny:
     runs-on: ubuntu-latest

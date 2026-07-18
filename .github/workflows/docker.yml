@@ -36,3 +36,16 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: docker/metadata-action@v5
+        id: meta-cp
+        with:
+          images: ghcr.io/${{ github.repository }}-control-plane
+      - uses: docker/build-push-action@v6
+        with:
+          context: control-plane
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-cp.outputs.tags }}
+          labels: ${{ steps.meta-cp.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

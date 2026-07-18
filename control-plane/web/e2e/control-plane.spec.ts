@@ -24,9 +24,25 @@ test("member and system admin receive different control surfaces", async ({ page
   await expect(page.getByText("gw-b", { exact: true })).toBeVisible();
 
   await page.getByRole("link", { name: "Configuration" }).click();
-  await expect(page.getByText("Current version 3")).toBeVisible();
+  await expect(page.getByText(/Current version \d+/)).toBeVisible();
   await page.getByRole("button", { name: "Validate" }).click();
   await expect(page.getByText("Configuration is valid and ready to publish.")).toBeVisible();
+
+  page.on("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "Publish configuration" }).click();
+  await expect(page.getByText(/Published as version \d+/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Restore" }).first().click();
+  await expect(page.getByText(/restored as version \d+/)).toBeVisible();
+});
+
+test("failed login shows an error and grants nothing", async ({ page }) => {
+  await page.goto("/");
+  await page.getByLabel("Email").fill("admin@example.com");
+  await page.getByLabel("Password").fill("wrong-password!");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("invalid email or password")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Main navigation" })).toHaveCount(0);
 });
 
 async function signIn(page: import("@playwright/test").Page, email: string, password: string) {

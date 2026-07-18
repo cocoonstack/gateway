@@ -44,11 +44,8 @@ func Load() (Config, error) {
 		BootstrapEmail:    os.Getenv("CP_BOOTSTRAP_ADMIN_EMAIL"),
 		BootstrapPassword: os.Getenv("CP_BOOTSTRAP_ADMIN_PASSWORD"),
 		LogLevel:          cmp.Or(os.Getenv("CP_LOG_LEVEL"), "info"),
-	}
-	if _, set := os.LookupEnv("CP_DEV_SEED"); set {
-		cfg.DevSeed = envBool("CP_DEV_SEED", false)
-	} else {
-		cfg.DevSeed = cfg.StoreDriver == "memory"
+		// never inferred: fixed demo credentials only appear on explicit request
+		DevSeed: envBool("CP_DEV_SEED", false),
 	}
 	if raw := os.Getenv("CP_SESSION_TTL"); raw != "" {
 		ttl, err := time.ParseDuration(raw)

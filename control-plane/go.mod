@@ -7,6 +7,7 @@ require (
 	github.com/projecteru2/core v0.0.0-20241016125006-ff909eefe04c
 	github.com/redis/go-redis/v9 v9.21.0
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sync v0.22.0
 )
 
 require (
@@ -31,7 +32,6 @@ require (
 	github.com/rs/zerolog v1.29.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20230425010034-47ecfdc1ba53 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	google.golang.org/grpc v1.60.1 // indirect

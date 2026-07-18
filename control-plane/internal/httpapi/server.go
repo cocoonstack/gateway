@@ -2,7 +2,9 @@
 package httpapi
 
 import (
+	"cmp"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +44,7 @@ type Server struct {
 	sessionTTL   time.Duration
 	cookieSecure bool
 	webDir       string
+	throttle     *loginThrottle
 }
 
 func New(
@@ -59,9 +62,11 @@ func New(
 		sessionTTL:   sessionTTL,
 		cookieSecure: cookieSecure,
 		webDir:       webDir,
+		throttle:     newLoginThrottle(),
 	}
 }
 
+// Routes are mirrored in api/openapi.yaml — update both together.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
@@ -103,12 +108,13 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		u, err := s.users.ByID(r.Context(), session.UserID)
-		if err != nil || u.Disabled {
+		if err != nil || u.Disabled || u.PasswordChangedAt > 0 && session.IssuedAt <= u.PasswordChangedAt {
 			_ = s.sessions.Delete(r.Context(), session.ID)
 			writeError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
-		if mutating(r.Method) && r.Header.Get("X-CSRF-Token") != session.CSRFToken {
+		if mutating(r.Method) &&
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(session.CSRFToken)) != 1 {
 			writeError(w, http.StatusForbidden, "invalid CSRF token")
 			return
 		}
@@ -119,7 +125,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 
 func (s *Server) requireAdmin(next http.Handler) http.Handler {
 	return s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if current(r).User.Role == user.RoleMember {
+		if role := current(r).User.Role; role != user.RoleTenantAdmin && role != user.RoleSystemAdmin {
 			writeError(w, http.StatusForbidden, "admin role required")
 			return
 		}
@@ -196,12 +202,16 @@ func scopeFor(u user.User) gateway.Scope {
 	case user.RoleTenantAdmin:
 		return gateway.Scope{Tenant: u.Tenant}
 	default:
-		userID := u.GatewayUserID
-		if userID == "" {
-			userID = u.ID
-		}
-		return gateway.Scope{Tenant: u.Tenant, User: userID}
+		return gateway.Scope{Tenant: u.Tenant, User: cmp.Or(u.GatewayUserID, u.ID)}
 	}
+}
+
+// scopedTenant pins a tenant admin to its own tenant; others keep `requested`.
+func scopedTenant(p principal, requested string) string {
+	if p.User.Role == user.RoleTenantAdmin {
+		return p.User.Tenant
+	}
+	return requested
 }
 
 func period(r *http.Request) (int64, int64, string, error) {
@@ -242,9 +252,8 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, value any) 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		log.WithFunc("httpapi.writeJSON").Error(wrappedContext(), err, "encode response")
-	}
+	// the status line is already committed; an encode error is a gone client
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
@@ -260,16 +269,25 @@ func mutating(method string) bool {
 	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 
-func wrappedContext() context.Context { return context.Background() }
+// auditLog records who performed a mutating admin action; the accessLog line
+// carries only the route, not the authenticated principal.
+func auditLog(r *http.Request, action, target string) {
+	p := current(r)
+	log.WithFunc("httpapi.audit").Infof(
+		r.Context(),
+		"actor=%s role=%s action=%s target=%s ip=%s",
+		p.User.Email, p.User.Role, action, target, clientIP(r),
+	)
+}
 
-func mapError(w http.ResponseWriter, err error) {
+func mapError(ctx context.Context, w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, user.ErrNotFound):
+	case errors.Is(err, user.ErrNotFound), errors.Is(err, gateway.ErrNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, user.ErrConflict):
+	case errors.Is(err, user.ErrConflict), errors.Is(err, gateway.ErrConflict):
 		writeError(w, http.StatusConflict, err.Error())
 	default:
-		log.WithFunc("httpapi.mapError").Error(wrappedContext(), err, "request failed")
+		log.WithFunc("httpapi.mapError").Error(ctx, err, "request failed")
 		writeError(w, http.StatusBadGateway, err.Error())
 	}
 }

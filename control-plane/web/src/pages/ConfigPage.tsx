@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { Card, ErrorNotice, Loading, PageHeader } from "../components/UI";
 import { dateTime } from "../format";
-import { useAPI } from "../hooks";
+import { useAPI, useAction } from "../hooks";
 import type { ConfigDocument, ConfigVersion } from "../types";
 
 interface VersionList {
@@ -13,19 +13,17 @@ export default function ConfigPage() {
   const current = useAPI<ConfigDocument>("/api/v1/admin/config");
   const history = useAPI<VersionList>("/api/v1/admin/config/versions");
   const [yaml, setYAML] = useState("");
-  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  const [error, setError] = useState("");
+  const { run, busy, error } = useAction();
 
   useEffect(() => {
     if (current.data) setYAML(current.data.yaml);
   }, [current.data]);
 
-  async function act(kind: "validate" | "publish") {
-    setBusy(true);
-    setError("");
+  function act(kind: "validate" | "publish") {
+    if (kind === "publish" && !window.confirm("Publish this configuration to the whole fleet?")) return;
     setMessage("");
-    try {
+    void run(async () => {
       if (kind === "validate") {
         await api("/api/v1/admin/config/validate", {
           method: "POST",
@@ -35,36 +33,26 @@ export default function ConfigPage() {
       } else {
         const result = await api<{ version: number }>("/api/v1/admin/config", {
           method: "PUT",
-          body: JSON.stringify({ yaml }),
+          body: JSON.stringify({ yaml, expected_version: current.data?.version ?? 0 }),
         });
         setMessage(`Published as version ${result.version}.`);
         current.reload();
         history.reload();
       }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Configuration request failed");
-    } finally {
-      setBusy(false);
-    }
+    });
   }
 
-  async function rollback(version: number) {
+  function rollback(version: number) {
     if (!window.confirm(`Roll back to version ${version}? A new version will be published.`)) return;
-    setBusy(true);
-    setError("");
     setMessage("");
-    try {
+    void run(async () => {
       const result = await api<{ version: number }>(`/api/v1/admin/config/versions/${version}/rollback`, {
         method: "POST",
       });
       setMessage(`Version ${version} restored as version ${result.version}.`);
       current.reload();
       history.reload();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Rollback failed");
-    } finally {
-      setBusy(false);
-    }
+    });
   }
 
   if (current.loading) return <Loading label="Loading gateway configuration" />;
@@ -95,8 +83,8 @@ export default function ConfigPage() {
             onChange={(event) => setYAML(event.target.value)}
           />
           <div className="form-actions">
-            <button className="button secondary" disabled={busy || !yaml} onClick={() => void act("validate")}>Validate</button>
-            <button className="button primary" disabled={busy || !yaml} onClick={() => void act("publish")}>Publish configuration</button>
+            <button className="button secondary" disabled={busy || !yaml} onClick={() => act("validate")}>Validate</button>
+            <button className="button primary" disabled={busy || !yaml} onClick={() => act("publish")}>Publish configuration</button>
           </div>
         </Card>
 
@@ -112,7 +100,7 @@ export default function ConfigPage() {
                 <div><strong>Version {version.id}</strong><span>{dateTime(version.created_at_epoch_secs)}</span></div>
                 {version.id === current.data?.version
                   ? <span className="current-tag">Current</span>
-                  : <button className="table-button" disabled={busy} onClick={() => void rollback(version.id)}>Restore</button>}
+                  : <button className="table-button" disabled={busy} onClick={() => rollback(version.id)}>Restore</button>}
               </div>
             ))}
           </div>

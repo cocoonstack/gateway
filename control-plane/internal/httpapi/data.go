@@ -3,6 +3,8 @@ package httpapi
 import (
 	"net/http"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
 )
@@ -15,19 +17,26 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	}
 	p := current(r)
 	scope := scopeFor(p.User)
-	usage, err := s.gateway.Usage(r.Context(), scope, since, until)
-	if err != nil {
-		mapError(w, err)
-		return
-	}
-	series, err := s.gateway.UsageSeries(r.Context(), scope, bucket, since, until)
-	if err != nil {
-		mapError(w, err)
-		return
-	}
-	models, err := s.gateway.Models(r.Context(), scope)
-	if err != nil {
-		mapError(w, err)
+	var (
+		usage  []gateway.UsageRow
+		series gateway.Series
+		models []gateway.ModelStatus
+	)
+	g, ctx := errgroup.WithContext(r.Context())
+	g.Go(func() (err error) {
+		usage, err = s.gateway.Usage(ctx, scope, since, until)
+		return err
+	})
+	g.Go(func() (err error) {
+		series, err = s.gateway.UsageSeries(ctx, scope, bucket, since, until)
+		return err
+	})
+	g.Go(func() (err error) {
+		models, err = s.gateway.Models(ctx, scope)
+		return err
+	})
+	if err := g.Wait(); err != nil {
+		mapError(r.Context(), w, err)
 		return
 	}
 	stripVendorCost(p.User.Role, usage, series.Points)
@@ -57,7 +66,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	p := current(r)
 	rows, err := s.gateway.Usage(r.Context(), scopeFor(p.User), since, until)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	stripVendorCost(p.User.Role, rows, nil)
@@ -73,7 +82,7 @@ func (s *Server) usageSeries(w http.ResponseWriter, r *http.Request) {
 	p := current(r)
 	series, err := s.gateway.UsageSeries(r.Context(), scopeFor(p.User), bucket, since, until)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	stripVendorCost(p.User.Role, nil, series.Points)
@@ -83,7 +92,7 @@ func (s *Server) usageSeries(w http.ResponseWriter, r *http.Request) {
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	models, err := s.gateway.Models(r.Context(), scopeFor(current(r).User))
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
@@ -92,7 +101,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 func (s *Server) instances(w http.ResponseWriter, r *http.Request) {
 	instances, err := s.gateway.Instances(r.Context())
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"instances": instances})

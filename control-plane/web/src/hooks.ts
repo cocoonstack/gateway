@@ -14,9 +14,30 @@ export function useAPI<T>(path: string | null) {
     setError("");
     api<T>(path)
       .then((value) => active && setData(value))
-      .catch((err: unknown) => active && setError(err instanceof Error ? err.message : "Request failed"));
+      .catch((err: unknown) => active && setError(errorMessage(err, "Request failed")));
     return () => { active = false; };
   }, [path, version]);
 
   return { data, error, loading: path !== null && data === null && error === "", reload, setData };
+}
+
+export function useAction(fallback = "Request failed") {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const run = useCallback(async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+    } catch (err) {
+      setError(errorMessage(err, fallback));
+    } finally {
+      setBusy(false);
+    }
+  }, [fallback]);
+  return { run, busy, error };
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
 }

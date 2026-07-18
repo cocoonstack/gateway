@@ -1,9 +1,10 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -103,7 +104,7 @@ func (m *MockClient) Keys(_ context.Context, tenant string) ([]Key, error) {
 			keys = append(keys, cloneJSON(key))
 		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i].AK < keys[j].AK })
+	slices.SortFunc(keys, func(a, b Key) int { return cmp.Compare(a.AK, b.AK) })
 	return keys, nil
 }
 
@@ -125,7 +126,7 @@ func (m *MockClient) PatchKey(_ context.Context, ak string, patch map[string]any
 	defer m.mu.Unlock()
 	key, ok := m.keys[ak]
 	if !ok {
-		return Key{}, fmt.Errorf("key %s not found", ak)
+		return Key{}, fmt.Errorf("key %s: %w", ak, ErrNotFound)
 	}
 	if value, ok := patch["qps"].(float64); ok {
 		key.QPS = value
@@ -151,7 +152,7 @@ func (m *MockClient) DeleteKey(_ context.Context, ak string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.keys[ak]; !ok {
-		return fmt.Errorf("key %s not found", ak)
+		return fmt.Errorf("key %s: %w", ak, ErrNotFound)
 	}
 	delete(m.keys, ak)
 	m.record("key_delete", ak)
@@ -178,12 +179,15 @@ func (m *MockClient) ValidateConfig(_ context.Context, yaml string) (map[string]
 	return map[string]any{"valid": true, "models": strings.Count(yaml, "name:")}, nil
 }
 
-func (m *MockClient) PublishConfig(_ context.Context, yaml string) (int64, error) {
+func (m *MockClient) PublishConfig(_ context.Context, yaml string, expectedVersion int64) (int64, error) {
 	if _, err := m.ValidateConfig(context.Background(), yaml); err != nil {
 		return 0, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if expectedVersion > 0 && expectedVersion != m.version {
+		return 0, fmt.Errorf("config head is at version %d: %w", m.version, ErrConflict)
+	}
 	m.version++
 	m.yaml = yaml
 	m.versions = append([]ConfigVersion{{ID: m.version, CreatedAtEpochSecs: time.Now().Unix()}}, m.versions...)
@@ -200,12 +204,8 @@ func (m *MockClient) ConfigVersions(context.Context) ([]ConfigVersion, error) {
 func (m *MockClient) RollbackConfig(_ context.Context, id int64) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	found := false
-	for _, version := range m.versions {
-		found = found || version.ID == id
-	}
-	if !found {
-		return 0, fmt.Errorf("config version %d not found", id)
+	if !slices.ContainsFunc(m.versions, func(v ConfigVersion) bool { return v.ID == id }) {
+		return 0, fmt.Errorf("config version %d: %w", id, ErrNotFound)
 	}
 	m.version++
 	m.versions = append([]ConfigVersion{{ID: m.version, CreatedAtEpochSecs: time.Now().Unix()}}, m.versions...)
@@ -217,7 +217,7 @@ func (m *MockClient) Audit(context.Context) ([]AuditEntry, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	entries := append([]AuditEntry(nil), m.audit...)
-	sort.Slice(entries, func(i, j int) bool { return entries[i].CreatedAtEpochSecs > entries[j].CreatedAtEpochSecs })
+	slices.SortFunc(entries, func(a, b AuditEntry) int { return cmp.Compare(b.CreatedAtEpochSecs, a.CreatedAtEpochSecs) })
 	return entries, nil
 }
 
@@ -238,5 +238,3 @@ func (m *MockClient) record(action, target string) {
 		Action: action, Target: target, SourceIP: "127.0.0.1",
 	})
 }
-
-var _ Client = (*MockClient)(nil)

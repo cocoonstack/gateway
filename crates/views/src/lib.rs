@@ -1614,6 +1614,7 @@ async fn admin_config_put(
     State(s): State<AppState>,
     headers: HeaderMap,
     AuditSourceIp(source): AuditSourceIp,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
@@ -1626,9 +1627,24 @@ async fn admin_config_put(
     if let Err(e) = GatewayConfig::from_yaml(&body) {
         return error_response(400, format!("invalid config: {e}"));
     }
-    let version = match store.publish(&body).await {
-        Ok(v) => v,
-        Err(e) => return gateway_error(e),
+    let version = match q
+        .get("expected_version")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        Some(expected) => match store.publish_if(&body, expected).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return error_response(
+                    409,
+                    format!("config head moved past version {expected}; reload and retry"),
+                );
+            }
+            Err(e) => return gateway_error(e),
+        },
+        None => match store.publish(&body).await {
+            Ok(v) => v,
+            Err(e) => return gateway_error(e),
+        },
     };
     // audit before the local reload can fail — the published version already leads the fleet
     let reload = s.reload().await;
@@ -1673,9 +1689,21 @@ async fn admin_config_rollback(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let version = match store.rollback(source_id).await {
-        Ok(Some(v)) => v,
+    let yaml = match store.load_version(source_id).await {
+        Ok(Some(y)) => y,
         Ok(None) => return error_response(404, format!("config version {source_id} not found")),
+        Err(e) => return gateway_error(e),
+    };
+    // a retained document can predate stricter validation — republishing it
+    // unvalidated would brick peers' reloads and fresh boots
+    if let Err(e) = GatewayConfig::from_yaml(&yaml) {
+        return error_response(
+            400,
+            format!("config version {source_id} no longer validates: {e}"),
+        );
+    }
+    let version = match store.publish(&yaml).await {
+        Ok(v) => v,
         Err(e) => return gateway_error(e),
     };
     let reload = s.reload().await;
@@ -1863,24 +1891,23 @@ async fn admin_usage_series(
     }
     let tenant = scope.tenant_filter(&q);
     let user = q.get("user").map(String::as_str);
+    let mut by_bucket: std::collections::BTreeMap<i64, gw_state::UserUsageRow> = match s
+        .handler
+        .state()
+        .store
+        .usage_series(tenant, user, since, until, bucket_secs)
+        .await
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => return gateway_error(e),
+    };
     let mut series = Vec::with_capacity(points as usize);
     for idx in 0..points {
         let start = first.saturating_add(idx * bucket_secs);
         let end = start.saturating_add(bucket_secs - 1).min(until);
-        let rows = match s
-            .handler
-            .state()
-            .store
-            .usage_by_user(tenant, user, start.max(since), end)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => return gateway_error(e),
-        };
-        let mut totals = gw_state::UserUsageRow::zero(String::new(), String::new());
-        for row in &rows {
-            totals.absorb(row);
-        }
+        let totals = by_bucket
+            .remove(&start)
+            .unwrap_or_else(|| gw_state::UserUsageRow::zero(String::new(), String::new()));
         series.push(json!({
             "start": start,
             "end": end,

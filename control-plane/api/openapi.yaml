@@ -1,3 +1,5 @@
+# Mirrors internal/httpapi/server.go routes and the wire types in
+# internal/gateway + internal/user — update together.
 openapi: 3.1.0
 info:
   title: Gateway Control Plane API
@@ -146,6 +148,7 @@ paths:
       requestBody: {$ref: "#/components/requestBodies/Config"}
       responses:
         "200": {description: Published version, content: {application/json: {schema: {type: object}}}}
+        "409": {description: Head moved past expected_version; reload and retry}
   /admin/config/validate:
     post:
       summary: Validate gateway configuration without publishing
@@ -170,7 +173,7 @@ paths:
   /admin/audit:
     get:
       summary: Gateway operational audit or scoped security events
-      x-role: tenant_admin_or_system_admin
+      x-role: "kind=ops: system_admin; kind=security: tenant_admin_or_system_admin"
       parameters:
         - {name: kind, in: query, schema: {type: string, enum: [ops, security], default: ops}}
         - {name: tenant, in: query, schema: {type: string}}
@@ -200,7 +203,9 @@ components:
           schema:
             type: object
             required: [yaml]
-            properties: {yaml: {type: string}}
+            properties:
+              yaml: {type: string}
+              expected_version: {type: integer, format: int64, description: "When >0, publish only if this is still the head version"}
     UserCreate:
       required: true
       content:
@@ -247,6 +252,10 @@ components:
         owner: {type: [string, "null"]}
         qps: {type: number}
         daily_token_quota: {type: integer, format: int64}
+        tokens_per_minute: {type: [integer, "null"], format: int64}
+        expires_at_epoch_secs: {type: [integer, "null"], format: int64}
+        suspended_until_epoch_secs: {type: [integer, "null"], format: int64}
+        model_quotas: {type: object, additionalProperties: {type: integer, format: int64}}
         banned: {type: boolean}
         status: {type: string, enum: [active, banned, expired, suspended]}
         available: {type: boolean}

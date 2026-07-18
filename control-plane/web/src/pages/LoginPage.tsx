@@ -1,28 +1,22 @@
 import { FormEvent, useState } from "react";
 import { api, jsonBody } from "../api";
+import { useAction } from "../hooks";
 import type { Session } from "../types";
 
 export default function LoginPage({ onLogin }: { onLogin: (session: Session) => void }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const { run, busy, error } = useAction("Sign in failed");
 
-  async function submit(event: FormEvent) {
+  function submit(event: FormEvent) {
     event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
+    void run(async () => {
       const session = await api<Session>("/api/v1/auth/login", {
         method: "POST",
         ...jsonBody({ email, password }),
       });
       onLogin(session);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Sign in failed");
-    } finally {
-      setBusy(false);
-    }
+    });
   }
 
   return (

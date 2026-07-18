@@ -4,6 +4,12 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+)
+
+var (
+	ErrNotFound = errors.New("not found")
+	ErrConflict = errors.New("conflict")
 )
 
 type UsageRow struct {
@@ -126,7 +132,7 @@ type Client interface {
 	Instances(context.Context) ([]Instance, error)
 	Config(context.Context) (ConfigDocument, error)
 	ValidateConfig(context.Context, string) (map[string]any, error)
-	PublishConfig(context.Context, string) (int64, error)
+	PublishConfig(context.Context, string, int64) (int64, error)
 	ConfigVersions(context.Context) ([]ConfigVersion, error)
 	RollbackConfig(context.Context, int64) (int64, error)
 	Audit(context.Context) ([]AuditEntry, error)

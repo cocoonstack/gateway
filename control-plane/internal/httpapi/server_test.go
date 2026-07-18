@@ -153,3 +153,75 @@ func TestTenantAdminCannotMutateAnotherTenantKey(t *testing.T) {
 		t.Fatalf("cross-tenant patch status = %d, want 404; body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestTenantAdminCannotHijackForeignKeyViaCreate(t *testing.T) {
+	handler := testServer(t)
+	manager := loginAs(t, handler, "manager@example.com")
+	rec := request(
+		t,
+		handler,
+		manager,
+		http.MethodPost,
+		"/api/v1/admin/keys",
+		map[string]any{"ak": "ak-labs-paused", "product": "standard"},
+		true,
+	)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("foreign-ak create status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	}
+	rec = request(
+		t,
+		handler,
+		manager,
+		http.MethodPost,
+		"/api/v1/admin/keys",
+		map[string]any{"ak": "ak-acme-new", "product": "standard"},
+		true,
+	)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("own-tenant create status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLoginThrottleLocksAfterRepeatedFailures(t *testing.T) {
+	handler := testServer(t)
+	body, _ := json.Marshal(map[string]string{"email": "admin@example.com", "password": "wrong-password"})
+	var last int
+	for range loginMaxAttempts + 1 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		last = rec.Code
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("attempt %d status = %d, want 429", loginMaxAttempts+1, last)
+	}
+}
+
+func TestPasswordResetEvictsExistingSessions(t *testing.T) {
+	handler := testServer(t)
+	admin := loginAs(t, handler, "admin@example.com")
+	member := loginAs(t, handler, "user@example.com")
+
+	rec := request(t, handler, member, http.MethodGet, "/api/v1/session", nil, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pre-reset session status = %d, want 200", rec.Code)
+	}
+	rec = request(
+		t,
+		handler,
+		admin,
+		http.MethodPatch,
+		"/api/v1/admin/users/member",
+		map[string]any{"password": "brand-new-pass-1!"},
+		true,
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("password reset status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = request(t, handler, member, http.MethodGet, "/api/v1/session", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("post-reset session status = %d, want 401", rec.Code)
+	}
+}

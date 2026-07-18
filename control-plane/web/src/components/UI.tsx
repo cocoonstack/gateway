@@ -1,5 +1,5 @@
-import type { ReactNode } from "react";
-import { compact, money } from "../format";
+import type { FormEvent, ReactNode } from "react";
+import { compact } from "../format";
 
 export function PageHeader({
   eyebrow,
@@ -74,6 +74,50 @@ export function ErrorNotice({ message }: { message: string }) {
   return <div className="notice notice-error">{message}</div>;
 }
 
+export function FormModal({
+  eyebrow,
+  title,
+  busy,
+  error,
+  submitLabel,
+  busyLabel,
+  onClose,
+  onSubmit,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  busy: boolean;
+  error: string;
+  submitLabel: string;
+  busyLabel: string;
+  onClose: () => void;
+  onSubmit: (event: FormEvent) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="form-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <p className="eyebrow">{eyebrow}</p>
+            <h2 id="form-modal-title">{title}</h2>
+          </div>
+          <button className="icon-button" aria-label="Close" onClick={onClose}>×</button>
+        </div>
+        <form className="form-grid" onSubmit={onSubmit}>
+          {children}
+          {error && <ErrorNotice message={error} />}
+          <div className="form-actions">
+            <button type="button" className="button secondary" onClick={onClose}>Cancel</button>
+            <button className="button primary" disabled={busy}>{busy ? busyLabel : submitLabel}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 export function LineChart({
   data,
   value,
@@ -119,8 +163,4 @@ export function LineChart({
       </svg>
     </div>
   );
-}
-
-export function Cost({ micros }: { micros: number }) {
-  return <>{money(micros)}</>;
 }

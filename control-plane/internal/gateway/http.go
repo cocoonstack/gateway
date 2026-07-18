@@ -2,13 +2,14 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -130,10 +131,7 @@ func (c *HTTPClient) DeleteKey(ctx context.Context, ak string) error {
 }
 
 func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
-	type result struct {
-		instance Instance
-	}
-	ch := make(chan result, len(c.targets))
+	ch := make(chan Instance, len(c.targets))
 	for _, target := range c.targets {
 		go func(target Target) {
 			started := time.Now()
@@ -144,7 +142,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 			if err := c.doJSON(ctx, target, http.MethodGet, "/health", nil, &health, false); err != nil {
 				instance.Error = err.Error()
 				instance.LatencyMS = time.Since(started).Milliseconds()
-				ch <- result{instance: instance}
+				ch <- instance
 				return
 			}
 			var accounts struct {
@@ -158,14 +156,14 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 				instance.Accounts = accounts.Accounts
 			}
 			instance.LatencyMS = time.Since(started).Milliseconds()
-			ch <- result{instance: instance}
+			ch <- instance
 		}(target)
 	}
 	instances := make([]Instance, 0, len(c.targets))
 	for range c.targets {
-		instances = append(instances, (<-ch).instance)
+		instances = append(instances, <-ch)
 	}
-	sort.Slice(instances, func(i, j int) bool { return instances[i].ID < instances[j].ID })
+	slices.SortFunc(instances, func(a, b Instance) int { return cmp.Compare(a.ID, b.ID) })
 	return instances, nil
 }
 
@@ -181,11 +179,15 @@ func (c *HTTPClient) ValidateConfig(ctx context.Context, yaml string) (map[strin
 	return result, err
 }
 
-func (c *HTTPClient) PublishConfig(ctx context.Context, yaml string) (int64, error) {
+func (c *HTTPClient) PublishConfig(ctx context.Context, yaml string, expectedVersion int64) (int64, error) {
+	path := "/admin/config"
+	if expectedVersion > 0 {
+		path += "?expected_version=" + strconv.FormatInt(expectedVersion, 10)
+	}
 	var result struct {
 		Version int64 `json:"version"`
 	}
-	err := c.doText(ctx, c.primary(), http.MethodPut, "/admin/config", yaml, &result)
+	err := c.doText(ctx, c.primary(), http.MethodPut, path, yaml, &result)
 	return result.Version, err
 }
 
@@ -292,6 +294,12 @@ func (c *HTTPClient) send(req *http.Request, output any) error {
 		message := strings.TrimSpace(envelope.Error.Message)
 		if message == "" {
 			message = strings.TrimSpace(string(body))
+		}
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			return fmt.Errorf("%w: %s", ErrNotFound, message)
+		case http.StatusConflict:
+			return fmt.Errorf("%w: %s", ErrConflict, message)
 		}
 		return fmt.Errorf("gateway %s: %s", resp.Status, message)
 	}

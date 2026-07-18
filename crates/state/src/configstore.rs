@@ -97,20 +97,23 @@ impl PostgresConfigStore {
         Ok(id)
     }
 
-    /// Publish the exact document from a retained version as a new head.
-    /// Returns `None` when `source_id` has already been pruned or never existed.
-    pub async fn rollback(&self, source_id: i64) -> GResult<Option<i64>> {
+    /// [`Self::publish`] only if `expected` is still the newest version;
+    /// `None` when a concurrent publish moved the head (compare-and-insert,
+    /// atomic in one statement).
+    pub async fn publish_if(&self, yaml: &str, expected: i64) -> GResult<Option<i64>> {
         let id = sqlx::query_scalar(
             "WITH ins AS (
-               INSERT INTO gw_config (yaml) SELECT yaml FROM gw_config WHERE id = $1
+               INSERT INTO gw_config (yaml)
+               SELECT $1 WHERE COALESCE((SELECT MAX(id) FROM gw_config), 0) = $3
                RETURNING id)
              SELECT id FROM ins, pg_notify($2, ins.id::text)",
         )
-        .bind(source_id)
+        .bind(yaml)
         .bind(CONFIG_CHANNEL)
+        .bind(expected)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| crate::sqlx_err("rollback config version", e))?;
+        .map_err(|e| crate::sqlx_err("publish config (guarded)", e))?;
         if id.is_some() {
             self.prune().await?;
         }
@@ -185,12 +188,20 @@ mod tests {
             Some("listen: {host: a, port: 1}")
         );
 
-        let v3 = store.rollback(v1).await.unwrap().expect("retained version");
+        let stale = store
+            .publish_if("listen: {host: c, port: 3}", v1)
+            .await
+            .unwrap();
+        assert!(stale.is_none(), "stale expected head must not publish");
+        let v3 = store
+            .publish_if("listen: {host: a, port: 1}", v2)
+            .await
+            .unwrap()
+            .expect("matching head publishes");
         assert!(v3 > v2);
         let (id, yaml) = store.load_latest().await.unwrap().expect("latest");
         assert_eq!(id, v3);
         assert!(yaml.contains("host: a"));
-        assert!(store.rollback(i64::MAX).await.unwrap().is_none());
 
         let n = listener.recv().await.expect("notify");
         assert_eq!(n.channel(), CONFIG_CHANNEL);

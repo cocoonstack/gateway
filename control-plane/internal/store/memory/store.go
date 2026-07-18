@@ -2,8 +2,9 @@
 package memory
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
@@ -69,7 +70,7 @@ func (s *Store) List(_ context.Context) ([]user.User, error) {
 	for _, u := range s.byID {
 		users = append(users, u)
 	}
-	sort.Slice(users, func(i, j int) bool { return users[i].Email < users[j].Email })
+	slices.SortFunc(users, func(a, b user.User) int { return cmp.Compare(a.Email, b.Email) })
 	return users, nil
 }
 

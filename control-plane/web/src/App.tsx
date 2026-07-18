@@ -1,8 +1,9 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { api, APIError, setCSRF } from "./api";
+import { api, APIError, setCSRF, setUnauthorizedHandler } from "./api";
 import { roleLabel } from "./format";
-import type { Session } from "./types";
+import type { Role, Session } from "./types";
 import { Loading } from "./components/UI";
 import LoginPage from "./pages/LoginPage";
 import OverviewPage from "./pages/OverviewPage";
@@ -32,6 +33,10 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setCSRF("");
+      updateSession(null);
+    });
     api<Session>("/api/v1/session")
       .then((value) => {
         setCSRF(value.csrf_token);
@@ -78,23 +83,21 @@ interface NavItem {
   to: string;
   label: string;
   icon: string;
+  minRole: Role;
+  page: ReactNode;
   end?: boolean;
 }
 
-const baseLinks: NavItem[] = [
-  { to: "/", label: "Overview", icon: "◫", end: true },
-  { to: "/usage", label: "Usage & cost", icon: "⌁" },
-  { to: "/availability", label: "Availability", icon: "◉" },
-];
+const roleRank: Record<Role, number> = { member: 0, tenant_admin: 1, system_admin: 2 };
 
-const adminLinks: NavItem[] = [
-  { to: "/keys", label: "Access keys", icon: "⌘" },
-  { to: "/audit", label: "Audit", icon: "≣" },
-];
-
-const systemLinks: NavItem[] = [
-  { to: "/users", label: "Users & roles", icon: "♙" },
-  { to: "/configuration", label: "Configuration", icon: "⌗" },
+const navItems: NavItem[] = [
+  { to: "/", label: "Overview", icon: "◫", end: true, minRole: "member", page: <OverviewPage /> },
+  { to: "/usage", label: "Usage & cost", icon: "⌁", minRole: "member", page: <UsagePage /> },
+  { to: "/availability", label: "Availability", icon: "◉", minRole: "member", page: <AvailabilityPage /> },
+  { to: "/keys", label: "Access keys", icon: "⌘", minRole: "tenant_admin", page: <KeysPage /> },
+  { to: "/audit", label: "Audit", icon: "≣", minRole: "tenant_admin", page: <AuditPage /> },
+  { to: "/users", label: "Users & roles", icon: "♙", minRole: "system_admin", page: <UsersPage /> },
+  { to: "/configuration", label: "Configuration", icon: "⌗", minRole: "system_admin", page: <ConfigPage /> },
 ];
 
 function Shell() {
@@ -102,11 +105,7 @@ function Shell() {
   const role = session.user.role;
   const location = useLocation();
   const navigate = useNavigate();
-  const links = [
-    ...baseLinks,
-    ...(role !== "member" ? adminLinks : []),
-    ...(role === "system_admin" ? systemLinks : []),
-  ];
+  const links = navItems.filter((item) => roleRank[role] >= roleRank[item.minRole]);
 
   useEffect(() => {
     window.scrollTo({ top: 0 });
@@ -137,13 +136,9 @@ function Shell() {
       </aside>
       <main className="main-content">
         <Routes>
-          <Route path="/" element={<OverviewPage />} />
-          <Route path="/usage" element={<UsagePage />} />
-          <Route path="/availability" element={<AvailabilityPage />} />
-          <Route path="/keys" element={role !== "member" ? <KeysPage /> : <Navigate to="/" />} />
-          <Route path="/audit" element={role !== "member" ? <AuditPage /> : <Navigate to="/" />} />
-          <Route path="/users" element={role === "system_admin" ? <UsersPage /> : <Navigate to="/" />} />
-          <Route path="/configuration" element={role === "system_admin" ? <ConfigPage /> : <Navigate to="/" />} />
+          {navItems.map((item) => (
+            <Route key={item.to} path={item.to} element={roleRank[role] >= roleRank[item.minRole] ? item.page : <Navigate to="/" />} />
+          ))}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

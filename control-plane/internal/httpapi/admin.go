@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -11,10 +13,15 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
 )
 
+var patchableKeyFields = map[string]bool{
+	"qps": true, "daily_token_quota": true, "tokens_per_minute": true,
+	"expires_at_epoch_secs": true, "banned": true, "suspended_until_epoch_secs": true,
+}
+
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := s.users.List(r.Context())
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	for idx := range users {
@@ -42,7 +49,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := auth.RandomToken(12)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	now := time.Now().Unix()
@@ -52,20 +59,17 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := s.users.Create(r.Context(), u); err != nil {
-		if errors.Is(err, user.ErrConflict) {
-			writeError(w, http.StatusConflict, "email already exists")
-		} else {
-			writeError(w, http.StatusBadRequest, err.Error())
-		}
+		writeUserSaveError(w, err)
 		return
 	}
+	auditLog(r, "user_create", u.Email)
 	writeJSON(w, http.StatusCreated, publicUser(u))
 }
 
 func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 	u, err := s.users.ByID(r.Context(), r.PathValue("id"))
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	var body struct {
@@ -92,6 +96,9 @@ func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// evict every session issued before the reset — incident response
+		// must cut off a stolen cookie, not just future logins
+		u.PasswordChangedAt = time.Now().Unix()
 	}
 	if body.Tenant != nil {
 		u.Tenant = *body.Tenant
@@ -107,25 +114,19 @@ func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 	}
 	u.UpdatedAt = time.Now().Unix()
 	if err := s.users.Update(r.Context(), u); err != nil {
-		if errors.Is(err, user.ErrConflict) {
-			writeError(w, http.StatusConflict, "email already exists")
-		} else {
-			writeError(w, http.StatusBadRequest, err.Error())
-		}
+		writeUserSaveError(w, err)
 		return
 	}
+	auditLog(r, "user_patch", u.ID)
 	writeJSON(w, http.StatusOK, publicUser(u))
 }
 
 func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	p := current(r)
-	tenant := r.URL.Query().Get("tenant")
-	if p.User.Role == user.RoleTenantAdmin {
-		tenant = p.User.Tenant
-	}
+	tenant := scopedTenant(p, r.URL.Query().Get("tenant"))
 	keys, err := s.gateway.Keys(r.Context(), tenant)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
@@ -137,24 +138,39 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := current(r)
-	if p.User.Role == user.RoleTenantAdmin {
-		key.Tenant = p.User.Tenant
-	}
+	key.Tenant = scopedTenant(p, key.Tenant)
 	if key.AK == "" || key.Product == "" || key.Tenant == "" {
 		writeError(w, http.StatusBadRequest, "ak, product and tenant are required")
 		return
 	}
+	// gateway create is an upsert: without this check a tenant admin could
+	// silently take over another tenant's existing key by name
+	if p.User.Role == user.RoleTenantAdmin {
+		all, err := s.gateway.Keys(r.Context(), "")
+		if err != nil {
+			mapError(r.Context(), w, err)
+			return
+		}
+		taken := slices.ContainsFunc(all, func(k gateway.Key) bool {
+			return k.AK == key.AK && k.Tenant != key.Tenant
+		})
+		if taken {
+			writeError(w, http.StatusConflict, "ak already exists")
+			return
+		}
+	}
 	if err := s.gateway.CreateKey(r.Context(), key); err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
+	auditLog(r, "key_create", key.AK)
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "created", "ak": key.AK})
 }
 
 func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 	ak := r.PathValue("ak")
 	p := current(r)
-	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r, ak, p.User.Tenant) {
+	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r.Context(), ak, p.User.Tenant) {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
 	}
@@ -162,55 +178,48 @@ func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, maxJSONBody, &patch) {
 		return
 	}
-	allowed := map[string]bool{
-		"qps": true, "daily_token_quota": true, "tokens_per_minute": true,
-		"expires_at_epoch_secs": true, "banned": true, "suspended_until_epoch_secs": true,
-	}
 	for field := range patch {
-		if !allowed[field] {
+		if !patchableKeyFields[field] {
 			writeError(w, http.StatusBadRequest, "unsupported key field: "+field)
 			return
 		}
 	}
 	key, err := s.gateway.PatchKey(r.Context(), ak, patch)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
+	auditLog(r, "key_patch", ak)
 	writeJSON(w, http.StatusOK, key)
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 	ak := r.PathValue("ak")
 	p := current(r)
-	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r, ak, p.User.Tenant) {
+	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r.Context(), ak, p.User.Tenant) {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
 	}
 	if err := s.gateway.DeleteKey(r.Context(), ak); err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
+	auditLog(r, "key_delete", ak)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) keyBelongsTo(r *http.Request, ak, tenant string) bool {
-	keys, err := s.gateway.Keys(r.Context(), tenant)
+func (s *Server) keyBelongsTo(ctx context.Context, ak, tenant string) bool {
+	keys, err := s.gateway.Keys(ctx, tenant)
 	if err != nil {
 		return false
 	}
-	for _, key := range keys {
-		if key.AK == ak {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(keys, func(k gateway.Key) bool { return k.AK == ak })
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.gateway.Config(r.Context())
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, doc)
@@ -230,22 +239,30 @@ func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishConfig(w http.ResponseWriter, r *http.Request) {
-	yaml, ok := configBody(w, r)
-	if !ok {
+	var body struct {
+		YAML            string `json:"yaml"`
+		ExpectedVersion int64  `json:"expected_version"`
+	}
+	if !decodeJSON(w, r, maxConfigBody, &body) {
 		return
 	}
-	version, err := s.gateway.PublishConfig(r.Context(), yaml)
+	if body.YAML == "" {
+		writeError(w, http.StatusBadRequest, "yaml is required")
+		return
+	}
+	version, err := s.gateway.PublishConfig(r.Context(), body.YAML, body.ExpectedVersion)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
+	auditLog(r, "config_publish", strconv.FormatInt(version, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "published", "version": version})
 }
 
 func (s *Server) configVersions(w http.ResponseWriter, r *http.Request) {
 	versions, err := s.gateway.ConfigVersions(r.Context())
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"versions": versions})
@@ -259,24 +276,11 @@ func (s *Server) rollbackConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	version, err := s.gateway.RollbackConfig(r.Context(), id)
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
+	auditLog(r, "config_rollback", strconv.FormatInt(version, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "rolled_back", "version": version})
-}
-
-func configBody(w http.ResponseWriter, r *http.Request) (string, bool) {
-	var body struct {
-		YAML string `json:"yaml"`
-	}
-	if !decodeJSON(w, r, maxConfigBody, &body) {
-		return "", false
-	}
-	if body.YAML == "" {
-		writeError(w, http.StatusBadRequest, "yaml is required")
-		return "", false
-	}
-	return body.YAML, true
 }
 
 func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
@@ -292,7 +296,7 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		}
 		entries, err := s.gateway.Audit(r.Context())
 		if err != nil {
-			mapError(w, err)
+			mapError(r.Context(), w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
@@ -302,14 +306,32 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "kind must be ops or security")
 		return
 	}
-	tenant := r.URL.Query().Get("tenant")
-	if p.User.Role == user.RoleTenantAdmin {
-		tenant = p.User.Tenant
-	}
-	events, err := s.gateway.SecurityEvents(r.Context(), tenant)
+	events, err := s.gateway.SecurityEvents(r.Context(), scopedTenant(p, r.URL.Query().Get("tenant")))
 	if err != nil {
-		mapError(w, err)
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+func writeUserSaveError(w http.ResponseWriter, err error) {
+	if errors.Is(err, user.ErrConflict) {
+		writeError(w, http.StatusConflict, "email already exists")
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
+}
+
+func configBody(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var body struct {
+		YAML string `json:"yaml"`
+	}
+	if !decodeJSON(w, r, maxConfigBody, &body) {
+		return "", false
+	}
+	if body.YAML == "" {
+		writeError(w, http.StatusBadRequest, "yaml is required")
+		return "", false
+	}
+	return body.YAML, true
 }

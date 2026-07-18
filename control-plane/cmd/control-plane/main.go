@@ -116,50 +116,48 @@ func buildGateway(cfg config.Config) (gateway.Client, error) {
 
 func seedUsers(ctx context.Context, store user.Store, cfg config.Config) error {
 	if cfg.DevSeed {
-		seeds := []struct {
-			id, email, displayName, password, tenant, gatewayUserID string
-			role                                                    user.Role
-		}{
+		seeds := []userSeed{
 			{"dev-admin", "admin@example.com", "System Admin", "admin12345!", "", "", user.RoleSystemAdmin},
 			{"dev-tenant-admin", "manager@example.com", "Acme Admin", "manager123!", "acme", "", user.RoleTenantAdmin},
 			{"dev-member", "user@example.com", "Alice Chen", "user12345!", "acme", "alice", user.RoleMember},
 		}
 		for _, seed := range seeds {
-			if err := ensureUser(ctx, store, seed.id, seed.email, seed.displayName, seed.password, seed.tenant, seed.gatewayUserID, seed.role); err != nil {
+			if err := ensureUser(ctx, store, seed); err != nil {
 				return err
 			}
 		}
 	}
 	if cfg.BootstrapEmail != "" {
-		if err := ensureUser(ctx, store, "bootstrap-admin", cfg.BootstrapEmail, "System Admin", cfg.BootstrapPassword, "", "", user.RoleSystemAdmin); err != nil {
+		seed := userSeed{"bootstrap-admin", cfg.BootstrapEmail, "System Admin", cfg.BootstrapPassword, "", "", user.RoleSystemAdmin}
+		if err := ensureUser(ctx, store, seed); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func ensureUser(
-	ctx context.Context,
-	store user.Store,
-	id, email, displayName, password, tenant, gatewayUserID string,
-	role user.Role,
-) error {
-	if _, err := store.ByEmail(ctx, email); err == nil {
+type userSeed struct {
+	id, email, displayName, password, tenant, gatewayUserID string
+	role                                                    user.Role
+}
+
+func ensureUser(ctx context.Context, store user.Store, seed userSeed) error {
+	if _, err := store.ByEmail(ctx, seed.email); err == nil {
 		return nil
 	} else if !errors.Is(err, user.ErrNotFound) {
 		return err
 	}
-	hash, err := auth.HashPassword(password)
+	hash, err := auth.HashPassword(seed.password)
 	if err != nil {
 		return fmt.Errorf("hash seed password: %w", err)
 	}
 	now := time.Now().Unix()
 	if err := store.Create(ctx, user.User{
-		ID: id, Email: email, DisplayName: displayName, PasswordHash: hash,
-		Tenant: tenant, GatewayUserID: gatewayUserID, Role: role,
+		ID: seed.id, Email: seed.email, DisplayName: seed.displayName, PasswordHash: hash,
+		Tenant: seed.tenant, GatewayUserID: seed.gatewayUserID, Role: seed.role,
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
-		return fmt.Errorf("seed user %s: %w", email, err)
+		return fmt.Errorf("seed user %s: %w", seed.email, err)
 	}
 	return nil
 }

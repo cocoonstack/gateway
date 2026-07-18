@@ -1,4 +1,5 @@
 let csrfToken = "";
+let onUnauthorized: (() => void) | null = null;
 
 export class APIError extends Error {
   status: number;
@@ -11,6 +12,10 @@ export class APIError extends Error {
 
 export function setCSRF(token: string): void {
   csrfToken = token;
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -34,6 +39,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       message = body.error?.message ?? message;
     } catch {
       // The status line remains the useful fallback for a non-JSON proxy error.
+    }
+    if (response.status === 401 && path !== "/api/v1/auth/login" && path !== "/api/v1/session") {
+      onUnauthorized?.();
     }
     throw new APIError(response.status, message);
   }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useAuth } from "../App";
 import { compact, dateTime, money } from "../format";
 import { useAPI } from "../hooks";
@@ -8,8 +8,10 @@ import { Card, ErrorNotice, LineChart, Loading, PageHeader } from "../components
 export default function UsagePage() {
   const { session } = useAuth();
   const [days, setDays] = useState(30);
-  const until = Math.floor(Date.now() / 1000);
-  const since = until - (days - 1) * 86_400;
+  const { since, until } = useMemo(() => {
+    const now = Math.floor(Date.now() / 1000);
+    return { since: now - (days - 1) * 86_400, until: now };
+  }, [days]);
   const { data: usageData, error: usageError } = useAPI<{ usage: UsageRow[] }>(`/api/v1/usage?since=${since}&until=${until}`);
   const { data: series, error: seriesError } = useAPI<UsageSeries>(`/api/v1/usage/series?bucket=day&since=${since}&until=${until}`);
   const isSystem = session.user.role === "system_admin";

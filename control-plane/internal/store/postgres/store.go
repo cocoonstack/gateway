@@ -2,14 +2,16 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"embed"
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
+	"io/fs"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
@@ -17,6 +19,9 @@ import (
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
+
+const userSelect = `SELECT id, email, display_name, password_hash, tenant,
+ gateway_user_id, role, disabled, password_changed_at, created_at, updated_at FROM users`
 
 var _ user.Store = (*Store)(nil)
 
@@ -51,7 +56,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return cmp.Compare(a.Name(), b.Name()) })
 	for _, entry := range entries {
 		name := entry.Name()
 		var applied bool
@@ -90,13 +95,13 @@ func (s *Store) Create(ctx context.Context, u user.User) error {
 	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO users (id, email, display_name, password_hash, tenant,
-		 gateway_user_id, role, disabled, created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		 gateway_user_id, role, disabled, password_changed_at, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		u.ID, user.NormalizeEmail(u.Email), u.DisplayName, u.PasswordHash, u.Tenant,
-		u.GatewayUserID, u.Role, u.Disabled, u.CreatedAt, u.UpdatedAt,
+		u.GatewayUserID, u.Role, u.Disabled, u.PasswordChangedAt, u.CreatedAt, u.UpdatedAt,
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate key") {
+		if isDuplicate(err) {
 			return user.ErrConflict
 		}
 		return fmt.Errorf("create user: %w", err)
@@ -138,12 +143,12 @@ func (s *Store) Update(ctx context.Context, u user.User) error {
 	}
 	result, err := s.pool.Exec(ctx,
 		`UPDATE users SET email=$2, display_name=$3, password_hash=$4, tenant=$5,
-		 gateway_user_id=$6, role=$7, disabled=$8, updated_at=$9 WHERE id=$1`,
+		 gateway_user_id=$6, role=$7, disabled=$8, password_changed_at=$9, updated_at=$10 WHERE id=$1`,
 		u.ID, user.NormalizeEmail(u.Email), u.DisplayName, u.PasswordHash, u.Tenant,
-		u.GatewayUserID, u.Role, u.Disabled, u.UpdatedAt,
+		u.GatewayUserID, u.Role, u.Disabled, u.PasswordChangedAt, u.UpdatedAt,
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate key") {
+		if isDuplicate(err) {
 			return user.ErrConflict
 		}
 		return fmt.Errorf("update user: %w", err)
@@ -154,18 +159,20 @@ func (s *Store) Update(ctx context.Context, u user.User) error {
 	return nil
 }
 
-const userSelect = `SELECT id, email, display_name, password_hash, tenant,
- gateway_user_id, role, disabled, created_at, updated_at FROM users`
-
 type scanner interface {
 	Scan(...any) error
+}
+
+func isDuplicate(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func scanUser(row scanner) (user.User, error) {
 	var u user.User
 	if err := row.Scan(
 		&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash, &u.Tenant,
-		&u.GatewayUserID, &u.Role, &u.Disabled, &u.CreatedAt, &u.UpdatedAt,
+		&u.GatewayUserID, &u.Role, &u.Disabled, &u.PasswordChangedAt, &u.CreatedAt, &u.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return user.User{}, user.ErrNotFound

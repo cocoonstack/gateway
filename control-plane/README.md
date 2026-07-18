@@ -39,7 +39,7 @@ KV and a deterministic gateway mock:
 
 ```sh
 cd control-plane
-go run ./cmd/control-plane
+CP_DEV_SEED=true go run ./cmd/control-plane
 ```
 
 In another terminal:
@@ -58,8 +58,8 @@ Open <http://127.0.0.1:5173>. Development accounts are:
 | Tenant admin | `manager@example.com` | `manager123!` |
 | Member | `user@example.com` | `user12345!` |
 
-These accounts are enabled only when `CP_DEV_SEED=true`; it defaults to true for
-the memory store and false for Postgres.
+These accounts exist only when `CP_DEV_SEED=true` is set explicitly — the
+default is always false, for every store backend.
 
 ## Configuration
 
@@ -70,6 +70,7 @@ the memory store and false for Postgres.
 | `CP_DATABASE_URL` | — | Control-plane Postgres URL |
 | `CP_KV` | `memory` | `memory` or `redis` for browser sessions |
 | `CP_REDIS_URL` | — | Control-plane Redis URL |
+| `CP_DEV_SEED` | `false` | Seed fixed demo accounts (never enable in production) |
 | `CP_GATEWAY_MODE` | `mock` | `mock` or `http` |
 | `CP_GATEWAY_TARGETS` | `local=http://127.0.0.1:8080` | Comma-separated `id=url` targets |
 | `CP_GATEWAY_ADMIN_TOKEN` | — | Global Rust gateway admin bearer token |

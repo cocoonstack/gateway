@@ -16,7 +16,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: "GOWORK=off go run ./cmd/control-plane",
+      command: "CP_DEV_SEED=true GOWORK=off go run ./cmd/control-plane",
       cwd: path.resolve(here, ".."),
       url: "http://127.0.0.1:8090/api/v1/health",
       reuseExistingServer: true,
