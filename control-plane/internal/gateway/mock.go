@@ -123,8 +123,9 @@ func (m *MockClient) CreateKey(_ context.Context, actingTenant string, key Key) 
 	if key.AK == "" || key.Product == "" || key.Tenant == "" {
 		return fmt.Errorf("ak, product and tenant are required")
 	}
+	// the real gateway answers an uncovered existing ak with 404 (scoped_key anti-probing), never 409
 	if existing, ok := m.keys[key.AK]; ok && actingTenant != "" && existing.Tenant != actingTenant {
-		return fmt.Errorf("ak already exists: %w", ErrConflict)
+		return fmt.Errorf("key %s: %w", key.AK, ErrNotFound)
 	}
 	key.Status = "active"
 	key.Available = true

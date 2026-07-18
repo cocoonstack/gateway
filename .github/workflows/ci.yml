@@ -35,6 +35,8 @@ jobs:
       GW_TEST_REDIS_URL: redis://127.0.0.1:6379
       CP_TEST_PG_URL: postgres://postgres:gwtest@127.0.0.1:5432/gw?sslmode=disable
       CP_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      # built by the cargo test step; drives the tenant-token full-chain E2E
+      CP_TEST_GW_BIN: ${{ github.workspace }}/target/debug/gw
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +58,7 @@ jobs:
         run: |
           GOWORK=off go vet ./...
           GOWORK=off go test ./...
-          GOWORK=off go test -tags=integration ./internal/integration
+          GOWORK=off go test -tags=integration -count=1 ./internal/integration
       - uses: actions/setup-node@v4
         with:
           node-version: 24

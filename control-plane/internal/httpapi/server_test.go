@@ -165,8 +165,8 @@ func TestTenantAdminCannotHijackForeignKeyViaCreate(t *testing.T) {
 		map[string]any{"ak": "ak-labs-paused", "product": "standard"},
 		true,
 	)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("foreign-ak create status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign-ak create status = %d, want 404 like the gateway's scoped_key; body = %s", rec.Code, rec.Body.String())
 	}
 	rec = request(
 		t,
