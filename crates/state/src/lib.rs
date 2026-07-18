@@ -33,6 +33,10 @@ pub use keystore::{KeyStore, PostgresKeyStore};
 pub use store::*;
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
+/// Postgres `IF NOT EXISTS` DDL can still race in `pg_class` when replicas
+/// bootstrap together. One transaction-scoped lock serializes gateway schema
+/// setup while leaving normal reads and writes untouched.
+const PG_SCHEMA_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('cocoon_gateway_schema'))";
 /// A failure streak idle this long restarts on the next failure — mirrors the
 /// Redis health backend's failure-key TTL so both backends trip identically.
 const FAILS_DECAY: Duration = Duration::from_secs(3_600);

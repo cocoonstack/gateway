@@ -61,6 +61,14 @@ impl PostgresKeyStore {
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres key store", e))?;
+        let mut schema = pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin access_keys schema", e))?;
+        sqlx::query(crate::PG_SCHEMA_LOCK_SQL)
+            .execute(&mut *schema)
+            .await
+            .map_err(|e| crate::sqlx_err("lock access_keys schema", e))?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS access_keys (
                 ak TEXT PRIMARY KEY,
@@ -75,19 +83,23 @@ impl PostgresKeyStore {
                 owner TEXT,
                 source TEXT NOT NULL DEFAULT 'admin')",
         )
-        .execute(&pool)
+        .execute(&mut *schema)
         .await
         .map_err(|e| crate::sqlx_err("create access_keys schema", e))?;
         sqlx::query("ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS owner TEXT")
-            .execute(&pool)
+            .execute(&mut *schema)
             .await
             .map_err(|e| crate::sqlx_err("migrate access_keys owner", e))?;
         sqlx::query(
             "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS suspended_until_epoch_secs BIGINT",
         )
-        .execute(&pool)
+        .execute(&mut *schema)
         .await
         .map_err(|e| crate::sqlx_err("migrate access_keys suspension", e))?;
+        schema
+            .commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit access_keys schema", e))?;
         Ok(Self {
             pool,
             cache: moka::sync::Cache::builder()

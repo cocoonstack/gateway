@@ -1769,6 +1769,14 @@ impl PostgresStore {
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres store", e))?;
+        let mut schema = pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin postgres schema", e))?;
+        sqlx::query(crate::PG_SCHEMA_LOCK_SQL)
+            .execute(&mut *schema)
+            .await
+            .map_err(|e| crate::sqlx_err("lock postgres schema", e))?;
         for ddl in [
             "CREATE TABLE IF NOT EXISTS billing (
                 n BIGSERIAL PRIMARY KEY,
@@ -1852,10 +1860,14 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
         ] {
             sqlx::query(ddl)
-                .execute(&pool)
+                .execute(&mut *schema)
                 .await
                 .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
         }
+        schema
+            .commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit postgres schema", e))?;
         Ok(Self {
             pool,
             ledger_max_rows,

@@ -32,15 +32,27 @@ impl PostgresConfigStore {
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres config store", e))?;
+        let mut schema = pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin gw_config schema", e))?;
+        sqlx::query(crate::PG_SCHEMA_LOCK_SQL)
+            .execute(&mut *schema)
+            .await
+            .map_err(|e| crate::sqlx_err("lock gw_config schema", e))?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS gw_config (
                 id BIGSERIAL PRIMARY KEY,
                 yaml TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
         )
-        .execute(&pool)
+        .execute(&mut *schema)
         .await
         .map_err(|e| crate::sqlx_err("create gw_config schema", e))?;
+        schema
+            .commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit gw_config schema", e))?;
         Ok(Self { pool })
     }
 
