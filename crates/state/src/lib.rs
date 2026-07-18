@@ -34,7 +34,7 @@ pub use store::*;
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
 /// Postgres `IF NOT EXISTS` DDL can still race in `pg_class` when replicas
-/// bootstrap together; one transaction-scoped lock serializes schema setup.
+/// bootstrap together; every schema DDL runs under this lock.
 const PG_SCHEMA_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('cocoon_gateway_schema'))";
 /// A failure streak idle this long restarts on the next failure — mirrors the
 /// Redis health backend's failure-key TTL so both backends trip identically.
@@ -921,23 +921,24 @@ pub(crate) async fn setup_schema(
     what: &str,
     ddls: &[&'static str],
 ) -> gw_models::GResult<()> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| sqlx_err(&format!("begin {what} schema"), e))?;
-    sqlx::query(PG_SCHEMA_LOCK_SQL)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| sqlx_err(&format!("lock {what} schema"), e))?;
     for ddl in ddls.iter().copied() {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| sqlx_err(&format!("begin {what} schema"), e))?;
+        sqlx::query(PG_SCHEMA_LOCK_SQL)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| sqlx_err(&format!("lock {what} schema"), e))?;
         sqlx::query(ddl)
             .execute(&mut *tx)
             .await
             .map_err(|e| sqlx_err(&format!("create {what} schema"), e))?;
+        tx.commit()
+            .await
+            .map_err(|e| sqlx_err(&format!("commit {what} schema"), e))?;
     }
-    tx.commit()
-        .await
-        .map_err(|e| sqlx_err(&format!("commit {what} schema"), e))
+    Ok(())
 }
 
 /// Open a Redis connection manager (the governance/health/cache backends).
