@@ -14,6 +14,7 @@ use gw_consts::Protocol;
 use gw_models::Account;
 
 pub mod admission;
+pub mod alerts;
 pub mod avail;
 pub mod configstore;
 pub mod content;
@@ -22,6 +23,7 @@ pub mod health;
 pub mod keystore;
 pub mod store;
 
+pub use alerts::{AlertBus, AlertEvent};
 pub use avail::{AvailState, AvailStore, classify};
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
 pub use content::{ContentRecord, sealing_available};
@@ -52,16 +54,26 @@ pub struct AkInfo {
     pub expires_at_epoch_secs: Option<i64>,
     /// A banned key stays in the table but fails auth with a distinct 403.
     pub banned: bool,
+    /// Abuse auto-suspension deadline; the key self-recovers when it passes.
+    /// Runtime state — a config reload must not clear it.
+    pub suspended_until_epoch_secs: Option<i64>,
     /// Per-model daily token caps overriding the tenant defaults; empty = none.
     /// Arc'd: `AkInfo` is cloned per request and the map is write-rare.
     pub model_quotas: Arc<std::collections::HashMap<String, i64>>,
 }
 
 impl AkInfo {
-    /// Lifecycle state at `now` (unix seconds). Ban wins over expiry.
+    /// Lifecycle state at `now` (unix seconds). Ban wins over suspension,
+    /// suspension over expiry; an elapsed suspension self-recovers.
     pub fn status_at(&self, now_epoch_secs: i64) -> KeyStatus {
         if self.banned {
             return KeyStatus::Banned;
+        }
+        if self
+            .suspended_until_epoch_secs
+            .is_some_and(|t| now_epoch_secs < t)
+        {
+            return KeyStatus::Suspended;
         }
         match self.expires_at_epoch_secs {
             Some(t) if now_epoch_secs >= t => KeyStatus::Expired,
@@ -96,6 +108,9 @@ impl AkInfo {
         if let Some(v) = patch.banned {
             self.banned = v;
         }
+        if let Some(v) = patch.suspended_until_epoch_secs {
+            self.suspended_until_epoch_secs = v;
+        }
     }
 }
 
@@ -111,6 +126,7 @@ impl From<&gw_config::AkConf> for AkInfo {
             tokens_per_minute: k.tokens_per_minute,
             expires_at_epoch_secs: k.expires_at_epoch_secs,
             banned: k.banned,
+            suspended_until_epoch_secs: None,
             model_quotas: Arc::new(k.model_quotas.clone()),
         }
     }
@@ -125,6 +141,7 @@ pub struct KeyPatch {
     pub tokens_per_minute: Option<Option<i64>>,
     pub expires_at_epoch_secs: Option<Option<i64>>,
     pub banned: Option<bool>,
+    pub suspended_until_epoch_secs: Option<Option<i64>>,
 }
 
 /// Key lifecycle state: expired and banned keys authenticate to distinct 403s.
@@ -133,6 +150,7 @@ pub enum KeyStatus {
     Active,
     Banned,
     Expired,
+    Suspended,
 }
 
 /// Where a key came from: the config file (re-applied on reload) or the admin
@@ -159,7 +177,7 @@ impl AkAuth {
     /// Insert or replace a key. Config ownership is sticky: an admin write to a
     /// config-declared key keeps it `Config` (so a reload can still revoke it),
     /// while a config write claims an admin key. Atomic via the entry lock.
-    pub fn put(&self, info: AkInfo, source: KeySource) {
+    pub fn put(&self, mut info: AkInfo, source: KeySource) {
         use dashmap::mapref::entry::Entry;
         match self.keys.entry(info.ak.clone()) {
             Entry::Occupied(mut e) => {
@@ -169,6 +187,11 @@ impl AkAuth {
                 } else {
                     source
                 };
+                // an upsert never clears a runtime suspension — only a patch
+                // does (mirrors the Postgres upsert, which omits the column)
+                if info.suspended_until_epoch_secs.is_none() {
+                    info.suspended_until_epoch_secs = e.get().0.suspended_until_epoch_secs;
+                }
                 e.insert((info, source));
             }
             Entry::Vacant(e) => {
@@ -667,6 +690,8 @@ pub struct GatewayState {
     pub cache: Arc<dyn ResponseCache>,
     /// Per-model availability counters; Redis for fleet-wide aggregation.
     pub avail: Arc<dyn avail::AvailStore>,
+    /// Advisory alert bus; the server's dispatch task drains it.
+    pub alerts: Arc<alerts::AlertBus>,
 }
 
 impl Default for GatewayState {
@@ -679,6 +704,7 @@ impl Default for GatewayState {
             health: Arc::new(AccountHealth::default()),
             cache: Arc::new(MemoryResponseCache::default()),
             avail: Arc::new(avail::MemoryAvail::default()),
+            alerts: Arc::new(alerts::AlertBus::default()),
         }
     }
 }
@@ -783,6 +809,7 @@ impl GatewayState {
             health: prev.health.clone(),
             cache: prev.cache.clone(),
             avail: prev.avail.clone(),
+            alerts: prev.alerts.clone(),
         })
     }
 }
@@ -918,8 +945,45 @@ mod tests {
             tokens_per_minute: None,
             expires_at_epoch_secs: None,
             banned: false,
+            suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
         }
+    }
+
+    #[test]
+    fn suspension_orders_below_ban_and_self_recovers() {
+        let mut ak = ak_info("k");
+        ak.suspended_until_epoch_secs = Some(100);
+        assert_eq!(ak.status_at(50), KeyStatus::Suspended);
+        assert_eq!(ak.status_at(100), KeyStatus::Active, "deadline passed");
+        ak.banned = true;
+        assert_eq!(ak.status_at(50), KeyStatus::Banned, "ban wins");
+        ak.banned = false;
+        ak.expires_at_epoch_secs = Some(40);
+        assert_eq!(
+            ak.status_at(50),
+            KeyStatus::Suspended,
+            "suspension reported over expiry"
+        );
+    }
+
+    #[test]
+    fn config_reapply_keeps_runtime_suspension() {
+        let auth = AkAuth::default();
+        auth.put(ak_info("k"), KeySource::Config);
+        auth.patch(
+            "k",
+            &KeyPatch {
+                suspended_until_epoch_secs: Some(Some(i64::MAX)),
+                ..Default::default()
+            },
+        );
+        auth.put(ak_info("k"), KeySource::Config);
+        assert_eq!(
+            auth.authenticate("k").unwrap().suspended_until_epoch_secs,
+            Some(i64::MAX),
+            "re-applied config key keeps the suspension"
+        );
     }
 
     #[test]

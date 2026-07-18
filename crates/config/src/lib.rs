@@ -355,6 +355,55 @@ impl Default for StabilityConf {
     }
 }
 
+/// One automatic-suspension tier: this many admission rejections in a day
+/// suspend the key for `suspend_hours`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AbuseTier {
+    pub rejects: i64,
+    pub suspend_hours: u64,
+}
+
+/// Automatic abuse suspension; empty tiers = disabled (no counting at all).
+/// Tiers must ascend in both fields (validated) — the highest reject
+/// threshold met wins. Counts REST admission rejections only: the realtime
+/// gate denies per turn without feeding this counter.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AbuseConf {
+    #[serde(default)]
+    pub tiers: Vec<AbuseTier>,
+}
+
+/// Outbound alert webhook. Advisory: delivery failures are logged and dropped.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlertsConf {
+    /// Env var naming the webhook URL; empty = alerts disabled.
+    #[serde(default)]
+    pub webhook_url_env: String,
+    /// Repeat alerts for the same (kind, subject) are muted this long.
+    #[serde(default = "default_alert_dedup_seconds")]
+    pub dedup_seconds: u64,
+}
+
+impl AlertsConf {
+    /// The webhook target, if configured and the env var is set non-empty.
+    pub fn webhook_url(&self) -> Option<String> {
+        token_from_env(&self.webhook_url_env)
+    }
+}
+
+impl Default for AlertsConf {
+    fn default() -> Self {
+        Self {
+            webhook_url_env: String::new(),
+            dedup_seconds: default_alert_dedup_seconds(),
+        }
+    }
+}
+
+fn default_alert_dedup_seconds() -> u64 {
+    300
+}
+
 /// Durable-record backend selection.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StorageConf {
@@ -568,6 +617,12 @@ pub struct GatewayConfig {
     /// Admin surface gate (dynamic config reload / key management).
     #[serde(default)]
     pub admin: AdminConf,
+    /// Automatic abuse suspension tiers (empty = off).
+    #[serde(default)]
+    pub abuse: AbuseConf,
+    /// Outbound alert webhook (unset = off).
+    #[serde(default)]
+    pub alerts: AlertsConf,
     /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
     /// default: the audit records the real TCP peer, which a client can't forge.
     /// Enable only when a trusted proxy fronts the gateway and sets those headers.
@@ -792,6 +847,14 @@ impl GatewayConfig {
                 return Err(neg_limit(format!("product {}", p.name)));
             }
         }
+        for (i, t) in self.abuse.tiers.iter().enumerate() {
+            let ascending = self.abuse.tiers[..i]
+                .iter()
+                .all(|p| p.rejects < t.rejects && p.suspend_hours <= t.suspend_hours);
+            if t.rejects <= 0 || t.suspend_hours == 0 || !ascending {
+                return Err(neg_limit("abuse tier (ascending rejects/hours)".to_owned()));
+            }
+        }
         let st = &self.stability;
         let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
         // upper bound mirrors the store's one-hour retention — a longer window
@@ -842,6 +905,16 @@ impl GatewayConfig {
                 return Err(ConfigError::DuplicateName {
                     kind: "tenant (':' not allowed in name)",
                     name: t.name.clone(),
+                });
+            }
+        }
+        // a colon in an ak would collide with the prefixed governance keyspaces
+        // (`abuse:{ak}` above all — a key named `abuse:X` could force-suspend X)
+        for k in &self.access_keys {
+            if k.ak.contains(':') {
+                return Err(ConfigError::DuplicateName {
+                    kind: "access_key (':' not allowed)",
+                    name: k.ak.clone(),
                 });
             }
         }
@@ -1380,6 +1453,33 @@ tenants: [{name: t1}, {name: t1}]
         }
         let ok = "listen: {host: h, port: 1}\nstability: {availability_window_minutes: 60}";
         assert!(GatewayConfig::from_yaml(ok).is_ok());
+
+        for bad in [
+            "abuse: {tiers: [{rejects: 0, suspend_hours: 2}]}",
+            "abuse: {tiers: [{rejects: 30, suspend_hours: 2}, {rejects: 20, suspend_hours: 24}]}",
+            "abuse: {tiers: [{rejects: 20, suspend_hours: 24}, {rejects: 30, suspend_hours: 2}]}",
+        ] {
+            let yaml = format!("listen: {{host: h, port: 1}}\n{bad}");
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&yaml),
+                    Err(ConfigError::NegativeLimit { .. })
+                ),
+                "non-ascending or zero abuse tier is rejected: {bad}"
+            );
+        }
+        let colon_ak = "listen: {host: h, port: 1}\naccess_keys: [{ak: 'abuse:x', product: p, qps: 1, daily_token_quota: 1}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(colon_ak),
+                Err(ConfigError::DuplicateName { .. })
+            ),
+            "':' in an ak collides with governance prefixes"
+        );
+        let tiers = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 20, suspend_hours: 2}, {rejects: 30, suspend_hours: 24}]}\nalerts: {webhook_url_env: GW_ALERT_URL}";
+        let cfg = GatewayConfig::from_yaml(tiers).unwrap();
+        assert_eq!(cfg.abuse.tiers.len(), 2);
+        assert_eq!(cfg.alerts.dedup_seconds, 300, "default dedup window");
 
         let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
         assert!(

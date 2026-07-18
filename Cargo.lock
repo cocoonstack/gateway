@@ -1007,7 +1007,12 @@ dependencies = [
 name = "gw-task"
 version = "0.1.1"
 dependencies = [
+ "futures",
+ "gw-config",
+ "gw-consts",
  "gw-state",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
 ]

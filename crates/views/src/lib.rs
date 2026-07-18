@@ -940,6 +940,9 @@ fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
         gw_state::KeyStatus::Active => Ok(()),
         gw_state::KeyStatus::Banned => Err((403, "access key is banned")),
         gw_state::KeyStatus::Expired => Err((403, "access key has expired")),
+        gw_state::KeyStatus::Suspended => {
+            Err((403, "access key is suspended for abuse; retry later"))
+        }
     }
 }
 
@@ -1256,6 +1259,7 @@ fn ak_public_json(k: &AkInfo) -> Value {
         "tokens_per_minute": k.tokens_per_minute,
         "expires_at_epoch_secs": k.expires_at_epoch_secs,
         "banned": k.banned,
+        "suspended_until_epoch_secs": k.suspended_until_epoch_secs,
     })
 }
 
@@ -1331,6 +1335,11 @@ async fn admin_key_create(
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
+    // same ban as config load: a ':' would collide with the prefixed
+    // governance keyspaces (`abuse:{ak}` could force-suspend another key)
+    if ak.is_empty() || ak.contains(':') {
+        return error_response(400, "ak must be non-empty and must not contain ':'");
+    }
     let default_tenant = match &scope {
         AdminScope::Global => gw_config::DEFAULT_TENANT,
         AdminScope::Tenant(t) => t.as_str(),
@@ -1359,6 +1368,7 @@ async fn admin_key_create(
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
         expires_at_epoch_secs: body["expires_at_epoch_secs"].as_i64(),
         banned: body["banned"].as_bool().unwrap_or(false),
+        suspended_until_epoch_secs: None,
         model_quotas: Arc::new(
             body["model_quotas"]
                 .as_object()
@@ -1418,6 +1428,7 @@ async fn admin_key_patch(
         tokens_per_minute: tri("tokens_per_minute"),
         expires_at_epoch_secs: tri("expires_at_epoch_secs"),
         banned: body["banned"].as_bool(),
+        suspended_until_epoch_secs: tri("suspended_until_epoch_secs"),
     };
     let patched = s.handler.state().auth.patch(&ak, &patch).await;
     match patched {

@@ -545,6 +545,14 @@ impl DagNode for CallEngine {
                     .record_failure(&failed.name, threshold, cooldown)
                     .await
                 {
+                    ctx.state.alerts.emit(
+                        "account_cooldown",
+                        failed.name.clone(),
+                        format!(
+                            "{} consecutive failures; cooling {}s",
+                            threshold, ctx.cfg.stability.cooldown_seconds
+                        ),
+                    );
                     ctx.decide(
                         "account_health",
                         format!(

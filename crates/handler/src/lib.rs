@@ -212,6 +212,9 @@ impl OnlineHandler {
                     ctx.quota_at,
                 )
                 .await;
+            if e.code == gw_consts::ErrCode::STOP_LIMIT_MSG {
+                note_abuse(&ctx).await;
+            }
             return Err(e);
         }
 
@@ -347,6 +350,62 @@ pub fn new_request_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Count one admission rejection against the key's daily abuse counter and
+/// suspend it when a configured tier trips. Deny-path only, so the serving
+/// path never pays for it; the day-scoped quota counter is fleet-shared.
+async fn note_abuse(ctx: &DagContext) {
+    let tiers = &ctx.cfg.abuse.tiers;
+    if tiers.is_empty() {
+        return;
+    }
+    let now = gw_state::epoch_secs();
+    // fresh read: a concurrent rejection may have suspended the key already
+    match ctx.state.auth.authenticate(&ctx.ak.ak).await {
+        Some(fresh) if fresh.status_at(now) != gw_state::KeyStatus::Suspended => {}
+        _ => return,
+    }
+    // ':' is banned in ak names, so the prefix cannot collide with a real key
+    let counter = format!("abuse:{}", ctx.ak.ak);
+    ctx.state.governance.quota_consume(&counter, 1).await;
+    let rejects = ctx.state.governance.quota_used(&counter).await;
+    let Some(tier) = tiers
+        .iter()
+        .filter(|t| rejects >= t.rejects)
+        .max_by_key(|t| t.rejects)
+    else {
+        return;
+    };
+    let until = now + (tier.suspend_hours * 3600) as i64;
+    let patch = gw_state::KeyPatch {
+        suspended_until_epoch_secs: Some(Some(until)),
+        ..Default::default()
+    };
+    if let Err(e) = ctx.state.auth.patch(&ctx.ak.ak, &patch).await {
+        tracing::warn!(error = %e, ak = %ctx.ak.ak, "abuse suspension patch failed");
+        return;
+    }
+    let summary = format!(
+        "{rejects} admission rejects today; suspended {}h",
+        tier.suspend_hours
+    );
+    ctx.state
+        .store
+        .admin_audit_add(&gw_state::AdminAudit {
+            created_at_epoch_secs: now,
+            actor: "system".to_owned(),
+            scope: "global".to_owned(),
+            action: "abuse_suspend".to_owned(),
+            target: ctx.ak.ak.clone(),
+            summary: summary.clone(),
+            source_ip: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| tracing::warn!(error = %e, "abuse audit write failed"));
+    ctx.state
+        .alerts
+        .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
 }
 
 /// Record a moderation denial: decision line + content-filter outcome. Event
@@ -799,6 +858,57 @@ mod tests {
                 .message
                 .contains("no fallback model configured")
         );
+    }
+
+    #[tokio::test]
+    async fn abuse_tiers_suspend_after_repeated_rejections() {
+        // daily_token_quota 1: every request rejects at reserve time (429)
+        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 2, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 1}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let mut alerts = h.state().alerts.take_receiver().expect("receiver");
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let reject = |k: AkInfo| h.run(chat_req("gpt-4o", "hi"), k);
+        assert!(
+            reject(key.clone()).await.is_ok(),
+            "first request admits and burns the 1-token quota"
+        );
+        assert_eq!(
+            reject(key.clone()).await.err().map(|e| e.http_status),
+            Some(429)
+        );
+        let now = gw_state::epoch_secs();
+        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            fresh.status_at(now),
+            gw_state::KeyStatus::Active,
+            "one reject is under the tier"
+        );
+        assert_eq!(reject(key).await.err().map(|e| e.http_status), Some(429));
+        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            fresh.status_at(now),
+            gw_state::KeyStatus::Suspended,
+            "second reject trips the 2-reject tier"
+        );
+        let until = fresh.suspended_until_epoch_secs.expect("deadline set");
+        assert!(
+            (until - now - 2 * 3600).abs() < 60,
+            "2h suspension: {until}"
+        );
+        let trail = h.state().store.admin_audit_list(10).await.unwrap();
+        assert!(
+            trail
+                .iter()
+                .any(|e| e.action == "abuse_suspend" && e.actor == "system" && e.target == "k1"),
+            "audit row: {trail:?}"
+        );
+        let ev = alerts.recv().await.expect("alert emitted");
+        assert_eq!((ev.kind, ev.subject.as_str()), ("abuse_suspend", "k1"));
     }
 
     #[tokio::test]
@@ -1269,6 +1379,7 @@ mod tests {
             tokens_per_minute: None,
             expires_at_epoch_secs: None,
             banned: false,
+            suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
         };
         h.state()

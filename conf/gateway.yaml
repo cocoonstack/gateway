@@ -276,3 +276,10 @@ stability:
 products:
   - name: qpmprod
     qpm: 2
+
+# Abuse auto-suspension and the alert webhook (uncomment to enable):
+# abuse:
+#   tiers: [{rejects: 20, suspend_hours: 2}, {rejects: 30, suspend_hours: 24}]
+# alerts:
+#   webhook_url_env: GW_ALERT_WEBHOOK
+#   dedup_seconds: 300

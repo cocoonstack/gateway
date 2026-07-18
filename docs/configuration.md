@@ -177,6 +177,8 @@ security:                      # global default; a tenant may override it whole
   regex_rules:                 # named recognizers, each with its own action
     - {name: ssn, pattern: '\d{3}-\d{2}-\d{4}', action: block}
   moderate: false              # route inbound text through the wired external moderator
+                               # (its verdicts: allow / mask spans / degrade to the
+                               # tenant fallback model / deny)
   moderation_fail_open: false  # on a moderator error: admit (true) or deny (false)
 
 stability:
@@ -190,6 +192,15 @@ stability:
 products:
   - name: myproduct
     qpm: 120                   # product-level request rate
+
+abuse:                         # automatic suspension; omit = off
+  tiers:                       # highest tier at or under the day's reject count wins
+    - {rejects: 20, suspend_hours: 2}
+    - {rejects: 30, suspend_hours: 24}
+
+alerts:                        # outbound webhook; omit = off
+  webhook_url_env: GW_ALERT_WEBHOOK   # env var naming the URL (secrets stay out of config)
+  dedup_seconds: 300           # mute repeats of the same (kind, subject)
 ```
 
 Every rule that fires (block / flag / DLP / moderation) is recorded without the
