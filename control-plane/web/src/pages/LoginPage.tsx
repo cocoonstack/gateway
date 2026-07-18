@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { type FormEvent, useState } from "react";
 import { api, jsonBody } from "../api";
 import { useAction } from "../hooks";
 import type { Session } from "../types";

@@ -4,6 +4,7 @@
 //! [`SqliteStore`] (`storage.sqlite_path`, one durable node), and
 //! [`PostgresStore`] (`storage.postgres_url`, shared across a fleet).
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -354,7 +355,7 @@ fn usage_of(r: &BillingRecord) -> UserUsageRow {
 
 /// Fold grouped usage rows into `map` by (user, model).
 fn fold_user_usage(
-    map: &mut std::collections::BTreeMap<(String, String), UserUsageRow>,
+    map: &mut BTreeMap<(String, String), UserUsageRow>,
     rows: impl IntoIterator<Item = UserUsageRow>,
 ) {
     for r in rows {
@@ -365,7 +366,7 @@ fn fold_user_usage(
 }
 
 fn fold_series(
-    map: &mut std::collections::BTreeMap<i64, UserUsageRow>,
+    map: &mut BTreeMap<i64, UserUsageRow>,
     rows: impl IntoIterator<Item = (i64, UserUsageRow)>,
 ) {
     for (start, r) in rows {
@@ -637,7 +638,7 @@ pub struct MemoryStore {
     records: Mutex<Vec<BillingRecord>>,
     /// Minute buckets keyed by (minute, tenant, user, model); see
     /// [`Store::usage_rollup_advance`].
-    rollup: Mutex<std::collections::BTreeMap<(i64, String, String, String), UserUsageRow>>,
+    rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<Vec<crate::ContentRecord>>,
@@ -709,8 +710,7 @@ impl Store for MemoryStore {
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rollup: std::collections::BTreeMap<(String, String), UsageRow> =
-            std::collections::BTreeMap::new();
+        let mut rollup: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
         for r in records.iter() {
             if tenant.is_some_and(|t| t != r.tenant) {
                 continue;
@@ -748,7 +748,7 @@ impl Store for MemoryStore {
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
         let (since, until) = align_bounds(since, until);
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         let watermark = {
             let rollup = self
                 .rollup
@@ -794,8 +794,7 @@ impl Store for MemoryStore {
     ) -> GResult<Vec<(i64, UserUsageRow)>> {
         let bucket = |t: i64| t - t.rem_euclid(bucket_secs);
         let (since, until) = align_bounds(since, until);
-        let mut map: std::collections::BTreeMap<i64, UserUsageRow> =
-            std::collections::BTreeMap::new();
+        let mut map: BTreeMap<i64, UserUsageRow> = BTreeMap::new();
         let watermark = {
             let rollup = self
                 .rollup
@@ -845,7 +844,7 @@ impl Store for MemoryStore {
             .next_back()
             .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
         let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
-        let mut fresh = std::collections::BTreeMap::new();
+        let mut fresh = BTreeMap::new();
         {
             let records = self
                 .records
@@ -1615,7 +1614,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
         fold_user_usage(&mut map, raw.iter().map(user_usage_row));
         Ok(map.into_values().collect())
@@ -1669,7 +1668,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         fold_series(&mut map, rolled.iter().map(series_row));
         fold_series(&mut map, raw.iter().map(series_row));
         Ok(map.into_iter().collect())
@@ -2099,7 +2098,7 @@ sql_store_impl!(PostgresStore, postgres, {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
         fold_user_usage(&mut map, raw.iter().map(user_usage_row));
         Ok(map.into_values().collect())
@@ -2153,7 +2152,7 @@ sql_store_impl!(PostgresStore, postgres, {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         fold_series(&mut map, rolled.iter().map(series_row));
         fold_series(&mut map, raw.iter().map(series_row));
         Ok(map.into_iter().collect())

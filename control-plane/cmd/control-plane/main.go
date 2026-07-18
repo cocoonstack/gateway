@@ -20,9 +20,9 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/kv"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
 	kvredis "github.com/cocoonstack/gateway/control-plane/internal/kv/redis"
-	storememory "github.com/cocoonstack/gateway/control-plane/internal/store/memory"
-	storepostgres "github.com/cocoonstack/gateway/control-plane/internal/store/postgres"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
+	usermemory "github.com/cocoonstack/gateway/control-plane/internal/user/memory"
+	userpostgres "github.com/cocoonstack/gateway/control-plane/internal/user/postgres"
 )
 
 func main() {
@@ -39,7 +39,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, cfg); err != nil {
-		log.WithFunc("main.run").Error(ctx, err, "control plane stopped")
+		log.WithFunc("main").Error(ctx, err, "control plane stopped")
 		os.Exit(1)
 	}
 }
@@ -77,7 +77,7 @@ func run(ctx context.Context, cfg config.Config) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.WithFunc("main.shutdown").Error(shutdownCtx, err, "drain HTTP server")
+			log.WithFunc("main.run").Error(shutdownCtx, err, "drain HTTP server")
 		}
 	}()
 	log.WithFunc("main.run").Infof(ctx, "control plane listening on http://%s", cfg.ListenAddr)
@@ -91,9 +91,9 @@ func run(ctx context.Context, cfg config.Config) error {
 
 func buildUserStore(ctx context.Context, cfg config.Config) (user.Store, func(), error) {
 	if cfg.StoreDriver == "memory" {
-		return storememory.New(), func() {}, nil
+		return usermemory.New(), func() {}, nil
 	}
-	store, err := storepostgres.Connect(ctx, cfg.DatabaseURL)
+	store, err := userpostgres.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -112,6 +112,11 @@ func buildGateway(cfg config.Config) (gateway.Client, error) {
 		return gateway.NewMock(), nil
 	}
 	return gateway.NewHTTP(cfg.GatewayTargets, cfg.GatewayAdminToken)
+}
+
+type userSeed struct {
+	id, email, displayName, password, tenant, gatewayUserID string
+	role                                                    user.Role
 }
 
 func seedUsers(ctx context.Context, store user.Store, cfg config.Config) error {
@@ -134,11 +139,6 @@ func seedUsers(ctx context.Context, store user.Store, cfg config.Config) error {
 		}
 	}
 	return nil
-}
-
-type userSeed struct {
-	id, email, displayName, password, tenant, gatewayUserID string
-	role                                                    user.Role
 }
 
 func ensureUser(ctx context.Context, store user.Store, seed userSeed) error {

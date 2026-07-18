@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -11,8 +12,8 @@ import (
 
 	"github.com/cocoonstack/gateway/control-plane/internal/kv"
 	kvredis "github.com/cocoonstack/gateway/control-plane/internal/kv/redis"
-	storepostgres "github.com/cocoonstack/gateway/control-plane/internal/store/postgres"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
+	userpostgres "github.com/cocoonstack/gateway/control-plane/internal/user/postgres"
 )
 
 func TestPostgresIdentityAndRedisSession(t *testing.T) {
@@ -22,10 +23,10 @@ func TestPostgresIdentityAndRedisSession(t *testing.T) {
 		t.Skip("CP_TEST_PG_URL and CP_TEST_REDIS_URL are required")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 
-	users, err := storepostgres.Connect(ctx, pgURL)
+	users, err := userpostgres.Connect(ctx, pgURL)
 	if err != nil {
 		t.Fatalf("connect postgres: %v", err)
 	}
@@ -65,7 +66,7 @@ func TestPostgresIdentityAndRedisSession(t *testing.T) {
 	if err := sessions.Delete(ctx, session.ID); err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
-	if _, err := sessions.Get(ctx, session.ID); err != kv.ErrNotFound {
+	if _, err := sessions.Get(ctx, session.ID); !errors.Is(err, kv.ErrNotFound) {
 		t.Fatalf("deleted session error = %v, want %v", err, kv.ErrNotFound)
 	}
 }

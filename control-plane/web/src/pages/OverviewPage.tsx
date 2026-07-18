@@ -13,9 +13,8 @@ export default function OverviewPage() {
   if (!data) return <Loading label="Loading overview" />;
 
   const available = data.models.filter((model) => model.state === "available").length;
-  const margin = (data.totals.vendor_cost_micros ?? 0) > 0
-    ? data.totals.cost_micros - (data.totals.vendor_cost_micros ?? 0)
-    : 0;
+  const vendorCost = data.totals.vendor_cost_micros ?? 0;
+  const margin = vendorCost > 0 ? data.totals.cost_micros - vendorCost : 0;
 
   return (
     <>

@@ -11,8 +11,7 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
 )
 
-// dummyHash keeps unknown-email logins as expensive as real ones, so response
-// time does not reveal which emails exist.
+// dummyHash keeps unknown-email logins as expensive as real ones so timing does not reveal which emails exist.
 var dummyHash = sync.OnceValue(func() string {
 	hash, err := auth.HashPassword("control-plane-timing-decoy")
 	if err != nil {

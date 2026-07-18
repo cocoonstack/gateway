@@ -3,7 +3,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 )
 
@@ -137,11 +136,4 @@ type Client interface {
 	RollbackConfig(context.Context, int64) (int64, error)
 	Audit(context.Context) ([]AuditEntry, error)
 	SecurityEvents(context.Context, string) ([]SecurityEvent, error)
-}
-
-func cloneJSON[T any](value T) T {
-	body, _ := json.Marshal(value)
-	var out T
-	_ = json.Unmarshal(body, &out)
-	return out
 }

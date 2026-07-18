@@ -96,8 +96,7 @@ func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// evict every session issued before the reset — incident response
-		// must cut off a stolen cookie, not just future logins
+		// evict sessions issued before the reset so a stolen cookie dies too
 		u.PasswordChangedAt = time.Now().Unix()
 	}
 	if body.Tenant != nil {
@@ -143,8 +142,7 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ak, product and tenant are required")
 		return
 	}
-	// gateway create is an upsert: without this check a tenant admin could
-	// silently take over another tenant's existing key by name
+	// gateway create is an upsert: block a tenant admin from taking over another tenant's key by name
 	if p.User.Role == user.RoleTenantAdmin {
 		all, err := s.gateway.Keys(r.Context(), "")
 		if err != nil {
@@ -168,10 +166,8 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
-	ak := r.PathValue("ak")
-	p := current(r)
-	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r.Context(), ak, p.User.Tenant) {
-		writeError(w, http.StatusNotFound, "key not found")
+	ak, ok := s.scopedKey(w, r)
+	if !ok {
 		return
 	}
 	var patch map[string]any
@@ -194,10 +190,8 @@ func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
-	ak := r.PathValue("ak")
-	p := current(r)
-	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r.Context(), ak, p.User.Tenant) {
-		writeError(w, http.StatusNotFound, "key not found")
+	ak, ok := s.scopedKey(w, r)
+	if !ok {
 		return
 	}
 	if err := s.gateway.DeleteKey(r.Context(), ak); err != nil {
@@ -206,14 +200,6 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 	}
 	auditLog(r, "key_delete", ak)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) keyBelongsTo(ctx context.Context, ak, tenant string) bool {
-	keys, err := s.gateway.Keys(ctx, tenant)
-	if err != nil {
-		return false
-	}
-	return slices.ContainsFunc(keys, func(k gateway.Key) bool { return k.AK == ak })
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
@@ -226,11 +212,11 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request) {
-	yaml, ok := configBody(w, r)
+	body, ok := configBody(w, r)
 	if !ok {
 		return
 	}
-	result, err := s.gateway.ValidateConfig(r.Context(), yaml)
+	result, err := s.gateway.ValidateConfig(r.Context(), body.YAML)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -239,15 +225,8 @@ func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishConfig(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		YAML            string `json:"yaml"`
-		ExpectedVersion int64  `json:"expected_version"`
-	}
-	if !decodeJSON(w, r, maxConfigBody, &body) {
-		return
-	}
-	if body.YAML == "" {
-		writeError(w, http.StatusBadRequest, "yaml is required")
+	body, ok := configBody(w, r)
+	if !ok {
 		return
 	}
 	version, err := s.gateway.PublishConfig(r.Context(), body.YAML, body.ExpectedVersion)
@@ -314,6 +293,25 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
+// scopedKey answers a tenant admin's cross-tenant key reference with 404, mirroring the gateway's scoped_key.
+func (s *Server) scopedKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	ak := r.PathValue("ak")
+	p := current(r)
+	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r.Context(), ak, p.User.Tenant) {
+		writeError(w, http.StatusNotFound, "key not found")
+		return "", false
+	}
+	return ak, true
+}
+
+func (s *Server) keyBelongsTo(ctx context.Context, ak, tenant string) bool {
+	keys, err := s.gateway.Keys(ctx, tenant)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(keys, func(k gateway.Key) bool { return k.AK == ak })
+}
+
 func writeUserSaveError(w http.ResponseWriter, err error) {
 	if errors.Is(err, user.ErrConflict) {
 		writeError(w, http.StatusConflict, "email already exists")
@@ -322,16 +320,19 @@ func writeUserSaveError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusBadRequest, err.Error())
 }
 
-func configBody(w http.ResponseWriter, r *http.Request) (string, bool) {
-	var body struct {
-		YAML string `json:"yaml"`
-	}
+type configPayload struct {
+	YAML            string `json:"yaml"`
+	ExpectedVersion int64  `json:"expected_version"`
+}
+
+func configBody(w http.ResponseWriter, r *http.Request) (configPayload, bool) {
+	var body configPayload
 	if !decodeJSON(w, r, maxConfigBody, &body) {
-		return "", false
+		return configPayload{}, false
 	}
 	if body.YAML == "" {
 		writeError(w, http.StatusBadRequest, "yaml is required")
-		return "", false
+		return configPayload{}, false
 	}
-	return body.YAML, true
+	return body, true
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -190,7 +190,7 @@ fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
 async fn realtime_ws(
     State(s): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
     // one consistent snapshot for the whole accept decision (cfg + state)
@@ -928,10 +928,7 @@ async fn list_models(State(s): State<AppState>, Authed(ak): Authed) -> Response 
 }
 
 /// Local billing ledger snapshot.
-async fn ledger(
-    State(s): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
-) -> Response {
+async fn ledger(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
@@ -1592,7 +1589,7 @@ async fn admin_config_validate(
 async fn admin_config_versions(
     State(s): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
@@ -1614,7 +1611,7 @@ async fn admin_config_put(
     State(s): State<AppState>,
     headers: HeaderMap,
     AuditSourceIp(source): AuditSourceIp,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
@@ -1742,7 +1739,7 @@ async fn admin_config_rollback(
 async fn admin_key_list(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
@@ -1808,7 +1805,7 @@ async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Re
 async fn admin_usage(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let filter = scope.tenant_filter(&q);
     let usage = match s.handler.state().store.ledger_usage(filter).await {
@@ -1824,7 +1821,7 @@ async fn admin_usage(
 async fn admin_usage_users(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let tenant = scope.tenant_filter(&q);
     let since = q_num(&q, "since", 0);
@@ -1867,7 +1864,7 @@ async fn admin_usage_users(
 async fn admin_usage_series(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let now = gw_state::epoch_secs();
     let bucket_name = q.get("bucket").map(String::as_str).unwrap_or("day");
@@ -1954,7 +1951,7 @@ fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
 async fn admin_security_events(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let tenant = scope.tenant_filter(&q);
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
@@ -1969,7 +1966,7 @@ async fn admin_security_events(
 async fn admin_audit_ops(
     State(s): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
@@ -2029,7 +2026,7 @@ async fn admin_content_erase(
     State(s): State<AppState>,
     scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(user) = q.get("user").filter(|u| !u.is_empty()) else {
         return error_response(400, "user is required");

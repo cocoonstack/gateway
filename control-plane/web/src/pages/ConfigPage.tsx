@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, jsonBody } from "../api";
 import { Card, ErrorNotice, Loading, PageHeader } from "../components/UI";
 import { dateTime } from "../format";
 import { useAPI, useAction } from "../hooks";
@@ -27,13 +27,13 @@ export default function ConfigPage() {
       if (kind === "validate") {
         await api("/api/v1/admin/config/validate", {
           method: "POST",
-          body: JSON.stringify({ yaml }),
+          ...jsonBody({ yaml }),
         });
         setMessage("Configuration is valid and ready to publish.");
       } else {
         const result = await api<{ version: number }>("/api/v1/admin/config", {
           method: "PUT",
-          body: JSON.stringify({ yaml, expected_version: current.data?.version ?? 0 }),
+          ...jsonBody({ yaml, expected_version: current.data?.version ?? 0 }),
         });
         setMessage(`Published as version ${result.version}.`);
         current.reload();

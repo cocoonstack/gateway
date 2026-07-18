@@ -10,18 +10,17 @@ import (
 const (
 	loginWindow      = 5 * time.Minute
 	loginMaxAttempts = 10
-	// sweep stale windows once tracked keys pass this bound
-	throttleSweepAt = 1024
+	throttleSweepAt  = 1024
 )
-
-type loginThrottle struct {
-	mu      sync.Mutex
-	windows map[string]window
-}
 
 type window struct {
 	start    time.Time
 	attempts int
+}
+
+type loginThrottle struct {
+	mu      sync.Mutex
+	windows map[string]window
 }
 
 func newLoginThrottle() *loginThrottle {

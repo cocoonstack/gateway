@@ -20,6 +20,8 @@ type Target struct {
 	URL string
 }
 
+var _ Client = (*HTTPClient)(nil)
+
 type HTTPClient struct {
 	targets    []Target
 	adminToken string
@@ -36,31 +38,6 @@ func NewHTTP(rawTargets, adminToken string) (*HTTPClient, error) {
 		adminToken: adminToken,
 		client:     &http.Client{Timeout: 8 * time.Second},
 	}, nil
-}
-
-func parseTargets(raw string) ([]Target, error) {
-	parts := strings.Split(raw, ",")
-	targets := make([]Target, 0, len(parts))
-	seen := make(map[string]struct{})
-	for _, part := range parts {
-		id, endpoint, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if !ok || id == "" || endpoint == "" {
-			return nil, fmt.Errorf("CP_GATEWAY_TARGETS entries must be id=url")
-		}
-		parsed, err := url.Parse(endpoint)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			return nil, fmt.Errorf("gateway target %s has an invalid URL", id)
-		}
-		if _, ok := seen[id]; ok {
-			return nil, fmt.Errorf("duplicate gateway target %s", id)
-		}
-		seen[id] = struct{}{}
-		targets = append(targets, Target{ID: id, URL: strings.TrimRight(endpoint, "/")})
-	}
-	if len(targets) == 0 {
-		return nil, fmt.Errorf("at least one gateway target is required")
-	}
-	return targets, nil
 }
 
 func (c *HTTPClient) Usage(ctx context.Context, scope Scope, since, until int64) ([]UsageRow, error) {
@@ -133,7 +110,7 @@ func (c *HTTPClient) DeleteKey(ctx context.Context, ak string) error {
 func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 	ch := make(chan Instance, len(c.targets))
 	for _, target := range c.targets {
-		go func(target Target) {
+		go func() {
 			started := time.Now()
 			instance := Instance{ID: target.ID, URL: target.URL, Status: "unavailable", Accounts: []Account{}}
 			var health struct {
@@ -157,7 +134,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 			}
 			instance.LatencyMS = time.Since(started).Milliseconds()
 			ch <- instance
-		}(target)
+		}()
 	}
 	instances := make([]Instance, 0, len(c.targets))
 	for range c.targets {
@@ -231,17 +208,6 @@ func (c *HTTPClient) SecurityEvents(ctx context.Context, tenant string) ([]Secur
 
 func (c *HTTPClient) primary() Target { return c.targets[0] }
 
-func scopeQuery(scope Scope) url.Values {
-	q := make(url.Values)
-	if scope.Tenant != "" {
-		q.Set("tenant", scope.Tenant)
-	}
-	if scope.User != "" {
-		q.Set("user", scope.User)
-	}
-	return q
-}
-
 func (c *HTTPClient) doJSON(ctx context.Context, target Target, method, path string, input, output any, admin bool) error {
 	var body io.Reader
 	if input != nil {
@@ -311,4 +277,38 @@ func (c *HTTPClient) send(req *http.Request, output any) error {
 	return nil
 }
 
-var _ Client = (*HTTPClient)(nil)
+func parseTargets(raw string) ([]Target, error) {
+	parts := strings.Split(raw, ",")
+	targets := make([]Target, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, part := range parts {
+		id, endpoint, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || id == "" || endpoint == "" {
+			return nil, fmt.Errorf("CP_GATEWAY_TARGETS entries must be id=url")
+		}
+		parsed, err := url.Parse(endpoint)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return nil, fmt.Errorf("gateway target %s has an invalid URL", id)
+		}
+		if _, ok := seen[id]; ok {
+			return nil, fmt.Errorf("duplicate gateway target %s", id)
+		}
+		seen[id] = struct{}{}
+		targets = append(targets, Target{ID: id, URL: strings.TrimRight(endpoint, "/")})
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("at least one gateway target is required")
+	}
+	return targets, nil
+}
+
+func scopeQuery(scope Scope) url.Values {
+	q := make(url.Values)
+	if scope.Tenant != "" {
+		q.Set("tenant", scope.Tenant)
+	}
+	if scope.User != "" {
+		q.Set("user", scope.User)
+	}
+	return q
+}

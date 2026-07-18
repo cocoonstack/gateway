@@ -60,10 +60,6 @@ func (u User) Validate() error {
 	return nil
 }
 
-func NormalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
-}
-
 // Store persists human identities. Implementations must enforce unique email.
 type Store interface {
 	Create(context.Context, User) error
@@ -71,4 +67,8 @@ type Store interface {
 	ByEmail(context.Context, string) (User, error)
 	List(context.Context) ([]User, error)
 	Update(context.Context, User) error
+}
+
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }

@@ -3,12 +3,15 @@ package gateway
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 )
+
+var _ Client = (*MockClient)(nil)
 
 type MockClient struct {
 	mu       sync.RWMutex
@@ -179,8 +182,8 @@ func (m *MockClient) ValidateConfig(_ context.Context, yaml string) (map[string]
 	return map[string]any{"valid": true, "models": strings.Count(yaml, "name:")}, nil
 }
 
-func (m *MockClient) PublishConfig(_ context.Context, yaml string, expectedVersion int64) (int64, error) {
-	if _, err := m.ValidateConfig(context.Background(), yaml); err != nil {
+func (m *MockClient) PublishConfig(ctx context.Context, yaml string, expectedVersion int64) (int64, error) {
+	if _, err := m.ValidateConfig(ctx, yaml); err != nil {
 		return 0, err
 	}
 	m.mu.Lock()
@@ -237,4 +240,11 @@ func (m *MockClient) record(action, target string) {
 		CreatedAtEpochSecs: time.Now().Unix(), Actor: "control-plane", Scope: "global",
 		Action: action, Target: target, SourceIP: "127.0.0.1",
 	})
+}
+
+func cloneJSON[T any](value T) T {
+	body, _ := json.Marshal(value)
+	var out T
+	_ = json.Unmarshal(body, &out)
+	return out
 }

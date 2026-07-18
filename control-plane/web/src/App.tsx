@@ -32,16 +32,15 @@ export default function App() {
   const [session, updateSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const applySession = (value: Session | null) => {
+    setCSRF(value?.csrf_token ?? "");
+    updateSession(value);
+  };
+
   useEffect(() => {
-    setUnauthorizedHandler(() => {
-      setCSRF("");
-      updateSession(null);
-    });
+    setUnauthorizedHandler(() => applySession(null));
     api<Session>("/api/v1/session")
-      .then((value) => {
-        setCSRF(value.csrf_token);
-        updateSession(value);
-      })
+      .then(applySession)
       .catch((error: unknown) => {
         if (!(error instanceof APIError) || error.status !== 401) {
           console.error(error);
@@ -54,23 +53,16 @@ export default function App() {
     if (!session) return null;
     return {
       session,
-      setSession(value) {
-        setCSRF(value.csrf_token);
-        updateSession(value);
-      },
+      setSession: applySession,
       async logout() {
         await api<void>("/api/v1/auth/logout", { method: "POST" });
-        setCSRF("");
-        updateSession(null);
+        applySession(null);
       },
     };
   }, [session]);
 
   if (loading) return <Loading label="Opening control plane" />;
-  if (!auth) return <LoginPage onLogin={(value) => {
-    setCSRF(value.csrf_token);
-    updateSession(value);
-  }} />;
+  if (!auth) return <LoginPage onLogin={applySession} />;
 
   return (
     <AuthContext.Provider value={auth}>
@@ -136,8 +128,8 @@ function Shell() {
       </aside>
       <main className="main-content">
         <Routes>
-          {navItems.map((item) => (
-            <Route key={item.to} path={item.to} element={roleRank[role] >= roleRank[item.minRole] ? item.page : <Navigate to="/" />} />
+          {links.map((item) => (
+            <Route key={item.to} path={item.to} element={item.page} />
           ))}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

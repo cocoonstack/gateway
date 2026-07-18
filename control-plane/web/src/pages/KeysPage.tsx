@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../App";
 import { api, jsonBody } from "../api";
 import { compact, dateTime } from "../format";

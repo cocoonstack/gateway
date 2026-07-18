@@ -17,11 +17,11 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
 )
 
-//go:embed migrations/*.sql
-var migrationFiles embed.FS
-
 const userSelect = `SELECT id, email, display_name, password_hash, tenant,
  gateway_user_id, role, disabled, password_changed_at, created_at, updated_at FROM users`
+
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
 
 var _ user.Store = (*Store)(nil)
 
@@ -159,13 +159,13 @@ func (s *Store) Update(ctx context.Context, u user.User) error {
 	return nil
 }
 
-type scanner interface {
-	Scan(...any) error
-}
-
 func isDuplicate(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+type scanner interface {
+	Scan(...any) error
 }
 
 func scanUser(row scanner) (user.User, error) {

@@ -1,7 +1,6 @@
 package memory
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -9,7 +8,7 @@ import (
 )
 
 func TestStoreContract(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := New()
 	alice := user.User{
 		ID: "u1", Email: "ALICE@example.com", DisplayName: "Alice", PasswordHash: "hash",

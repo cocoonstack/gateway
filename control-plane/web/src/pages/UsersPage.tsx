@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { type FormEvent, useState } from "react";
 import { api, jsonBody } from "../api";
 import { dateTime, roleLabel } from "../format";
 import { useAPI, useAction } from "../hooks";
@@ -17,7 +17,18 @@ export default function UsersPage() {
     });
   }
 
-  return <><PageHeader eyebrow="Identity" title="Users & roles" description="Human access to the control plane. Gateway API keys remain a separate credential domain." actions={<button className="button primary" onClick={() => setCreating(true)}>Add user</button>} />{(error || action.error) && <ErrorNotice message={error || action.error} />}{creating && <CreateUser onClose={() => setCreating(false)} onCreated={() => { setCreating(false); reload(); }} />}{!data ? <Loading /> : <Card><div className="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Tenant</th><th>Gateway identity</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>{data.users.map((user) => <tr key={user.id}><td><strong>{user.display_name}</strong><small className="cell-sub">{user.email}</small></td><td>{roleLabel(user.role)}</td><td>{user.tenant || "Global"}</td><td>{user.gateway_user_id || "—"}</td><td><Status value={user.disabled ? "disabled" : "active"} /></td><td>{dateTime(user.created_at)}</td><td><button className="table-button" onClick={() => toggle(user)}>{user.disabled ? "Enable" : "Disable"}</button></td></tr>)}</tbody></table></div></Card>}</>;
+  return (
+    <>
+      <PageHeader eyebrow="Identity" title="Users & roles" description="Human access to the control plane. Gateway API keys remain a separate credential domain." actions={<button className="button primary" onClick={() => setCreating(true)}>Add user</button>} />
+      {(error || action.error) && <ErrorNotice message={error || action.error} />}
+      {creating && <CreateUser onClose={() => setCreating(false)} onCreated={() => { setCreating(false); reload(); }} />}
+      {!data ? <Loading /> : (
+        <Card><div className="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Tenant</th><th>Gateway identity</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>
+          {data.users.map((user) => <tr key={user.id}><td><strong>{user.display_name}</strong><small className="cell-sub">{user.email}</small></td><td>{roleLabel(user.role)}</td><td>{user.tenant || "Global"}</td><td>{user.gateway_user_id || "—"}</td><td><Status value={user.disabled ? "disabled" : "active"} /></td><td>{dateTime(user.created_at)}</td><td><button className="table-button" onClick={() => toggle(user)}>{user.disabled ? "Enable" : "Disable"}</button></td></tr>)}
+        </tbody></table></div></Card>
+      )}
+    </>
+  );
 }
 
 function CreateUser({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {

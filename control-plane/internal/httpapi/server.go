@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -159,16 +158,6 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 	})
 }
 
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(status int) {
-	w.status = status
-	w.ResponseWriter.WriteHeader(status)
-}
-
 func (s *Server) serveWeb(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		writeError(w, http.StatusNotFound, "not found")
@@ -176,9 +165,6 @@ func (s *Server) serveWeb(w http.ResponseWriter, r *http.Request) {
 	}
 	path := filepath.Join(s.webDir, filepath.Clean("/"+r.URL.Path))
 	if info, err := os.Stat(path); err == nil && !info.IsDir() {
-		if contentType := mime.TypeByExtension(filepath.Ext(path)); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
-		}
 		http.ServeFile(w, r, path)
 		return
 	}
@@ -188,6 +174,16 @@ func (s *Server) serveWeb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, index)
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
 }
 
 func current(r *http.Request) principal {
@@ -206,7 +202,6 @@ func scopeFor(u user.User) gateway.Scope {
 	}
 }
 
-// scopedTenant pins a tenant admin to its own tenant; others keep `requested`.
 func scopedTenant(p principal, requested string) string {
 	if p.User.Role == user.RoleTenantAdmin {
 		return p.User.Tenant
@@ -269,8 +264,7 @@ func mutating(method string) bool {
 	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 
-// auditLog records who performed a mutating admin action; the accessLog line
-// carries only the route, not the authenticated principal.
+// auditLog names the principal behind a mutating admin action; accessLog lines carry only the route.
 func auditLog(r *http.Request, action, target string) {
 	p := current(r)
 	log.WithFunc("httpapi.audit").Infof(

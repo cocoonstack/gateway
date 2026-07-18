@@ -41,11 +41,10 @@ func Load() (Config, error) {
 		WebDir:            cmp.Or(os.Getenv("CP_WEB_DIR"), "web/dist"),
 		SessionTTL:        12 * time.Hour,
 		CookieSecure:      envBool("CP_COOKIE_SECURE", false),
+		DevSeed:           envBool("CP_DEV_SEED", false),
 		BootstrapEmail:    os.Getenv("CP_BOOTSTRAP_ADMIN_EMAIL"),
 		BootstrapPassword: os.Getenv("CP_BOOTSTRAP_ADMIN_PASSWORD"),
 		LogLevel:          cmp.Or(os.Getenv("CP_LOG_LEVEL"), "info"),
-		// never inferred: fixed demo credentials only appear on explicit request
-		DevSeed: envBool("CP_DEV_SEED", false),
 	}
 	if raw := os.Getenv("CP_SESSION_TTL"); raw != "" {
 		ttl, err := time.ParseDuration(raw)

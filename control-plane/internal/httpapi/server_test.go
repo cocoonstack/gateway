@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,8 +11,8 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
-	storememory "github.com/cocoonstack/gateway/control-plane/internal/store/memory"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
+	usermemory "github.com/cocoonstack/gateway/control-plane/internal/user/memory"
 )
 
 type loginState struct {
@@ -23,7 +22,7 @@ type loginState struct {
 
 func testServer(t *testing.T) http.Handler {
 	t.Helper()
-	store := storememory.New()
+	store := usermemory.New()
 	for _, seed := range []struct {
 		id, email, tenant, gatewayUserID string
 		role                             user.Role
@@ -37,7 +36,7 @@ func testServer(t *testing.T) http.Handler {
 			t.Fatalf("hash password: %v", err)
 		}
 		now := time.Now().Unix()
-		if err := store.Create(context.Background(), user.User{
+		if err := store.Create(t.Context(), user.User{
 			ID: seed.id, Email: seed.email, DisplayName: seed.id, PasswordHash: hash,
 			Tenant: seed.tenant, GatewayUserID: seed.gatewayUserID, Role: seed.role,
 			CreatedAt: now, UpdatedAt: now,
