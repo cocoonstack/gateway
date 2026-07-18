@@ -1,1 +1,6 @@
 /target
+/control-plane/web/node_modules
+/control-plane/web/dist
+/control-plane/web/playwright-report
+/control-plane/web/test-results
+*.tsbuildinfo
