@@ -144,7 +144,7 @@ regardless.
 | POST | `/admin/reload` | re-read config from source and swap it in atomically (global token only) |
 | GET | `/admin/config` | current fleet config version and raw YAML (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/validate` | validate a config document without publishing it (global token) |
-| PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed (global token; needs `storage.postgres_url`) |
+| PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed; `?expected_version=` publishes only while that is still the head — a moved head answers 409 (global token; needs `storage.postgres_url`) |
 | GET | `/admin/config/versions` | retained config versions, newest first (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/versions/{id}/rollback` | republish a retained document as a new head and reload (global token; needs `storage.postgres_url`) |
 | GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's); `?ak=` exact lookup answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
