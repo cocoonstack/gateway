@@ -1841,6 +1841,92 @@ async fn realtime_entitlement_blocks_unentitled_tenant() {
 }
 
 #[tokio::test]
+async fn realtime_variant_session_serves_canary_bills_public_name() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys:
+  - {ak: ak-rt, product: rt, qps: 100, daily_token_quota: 1000000}
+accounts:
+  - {name: rt-acc, provider: openai, protocols: ["realtime"]}
+models:
+  - {name: rt-pub, protocol: realtime, variants: [{model: rt-canary, weight: 1}]}
+  - {name: rt-canary, protocol: realtime}
+"#;
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let addr = serve_app(application).await;
+
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-pub")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-rt".parse().unwrap());
+    req.headers_mut()
+        .insert("x-gw-user", "alice".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+
+    let first = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(
+        v["session"]["model"], "rt-pub",
+        "clients see the public name"
+    );
+
+    ws.send(Message::text(
+        serde_json::json!({"type":"input_text","text":"canary hello"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut assembled = String::new();
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        match v["type"].as_str().unwrap() {
+            "response.delta" => assembled.push_str(v["delta"].as_str().unwrap()),
+            "response.done" => break,
+            other => panic!("unexpected event {other}"),
+        }
+    }
+    assert!(
+        assembled.contains("[mock-realtime:rt-canary]"),
+        "the variant serves the session: {assembled}"
+    );
+
+    let rec = 'ledger: {
+        for _ in 0..100 {
+            let (_, ledger) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+            if let Some(rec) = ledger.into_iter().next() {
+                break 'ledger rec;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("turn was never billed");
+    };
+    assert_eq!(
+        rec.model, "rt-pub",
+        "quota/billing rows carry the public name"
+    );
+    assert_eq!(rec.served_model, "rt-canary");
+    state.avail.flush().await;
+    let minute = gw_state::epoch_secs() / 60;
+    assert_eq!(
+        state.avail.window("rt-pub", minute - 5, minute).await,
+        (1, 0),
+        "the turn samples availability under the public name"
+    );
+}
+
+#[tokio::test]
 async fn realtime_refuses_ungovernable_provider() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 

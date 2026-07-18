@@ -97,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
     let transport = select_transport()?;
     let postgres_url = cfg.storage.postgres_url.clone();
     let shared = gw_state::SharedConfig::new(cfg, state);
+    let alert_task = gw_task::spawn_alert_dispatch(shared.clone());
+    let avail_alert_task = gw_task::spawn_avail_alerts(shared.clone(), gw_task::AVAIL_ALERT_PERIOD);
     let loader: gw_views::ConfigLoader = match &config_store {
         Some(store) => {
             let store = store.clone();
@@ -206,6 +208,8 @@ async fn main() -> anyhow::Result<()> {
     purge_task.abort();
     rollup_task.abort();
     avail_task.abort();
+    alert_task.abort();
+    avail_alert_task.abort();
     tracing::info!("gw drained and exiting");
     Ok(())
 }

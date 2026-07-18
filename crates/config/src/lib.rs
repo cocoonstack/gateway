@@ -29,7 +29,7 @@ pub enum ConfigError {
     #[error("model `{model}` references unknown protocol `{wire}`")]
     UnknownModelMapping { model: String, wire: String },
     #[error(
-        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter)"
+        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter, moonshot, siliconflow)"
     )]
     UnknownProviderKind { provider: String, kind: String },
     #[error("model `{model}` references unknown provider `{provider}`")]
@@ -141,6 +141,30 @@ impl ModelConf {
 pub struct VariantConf {
     pub model: String,
     pub weight: u32,
+}
+
+/// Cumulative-weight pick over a model's variants, keyed by a stable hash so
+/// every instance (REST DAG and realtime handshake alike) maps the same key
+/// to the same bucket with no shared state.
+pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> &'a VariantConf {
+    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
+    let mut roll = fnv1a(key) % total.max(1);
+    for v in variants {
+        if roll < u64::from(v.weight) {
+            return v;
+        }
+        roll -= u64::from(v.weight);
+    }
+    // unreachable (weights validated >= 1); quiets the type checker
+    &variants[0]
+}
+
+/// FNV-1a 64: deterministic across processes and releases (std's hasher is
+/// neither), which the fleet-consistent sticky mapping depends on.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Per-component billing weights relative to the model's unit prices
@@ -355,6 +379,55 @@ impl Default for StabilityConf {
     }
 }
 
+/// One automatic-suspension tier: this many admission rejections in a day
+/// suspend the key for `suspend_hours`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AbuseTier {
+    pub rejects: i64,
+    pub suspend_hours: u64,
+}
+
+/// Automatic abuse suspension; empty tiers = disabled (no counting at all).
+/// Tiers must ascend in both fields (validated) — the highest reject
+/// threshold met wins. Counts REST admission rejections only: the realtime
+/// gate denies per turn without feeding this counter.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AbuseConf {
+    #[serde(default)]
+    pub tiers: Vec<AbuseTier>,
+}
+
+/// Outbound alert webhook. Advisory: delivery failures are logged and dropped.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlertsConf {
+    /// Env var naming the webhook URL; empty = alerts disabled.
+    #[serde(default)]
+    pub webhook_url_env: String,
+    /// Repeat alerts for the same (kind, subject) are muted this long.
+    #[serde(default = "default_alert_dedup_seconds")]
+    pub dedup_seconds: u64,
+}
+
+impl AlertsConf {
+    /// The webhook target, if configured and the env var is set non-empty.
+    pub fn webhook_url(&self) -> Option<String> {
+        token_from_env(&self.webhook_url_env)
+    }
+}
+
+impl Default for AlertsConf {
+    fn default() -> Self {
+        Self {
+            webhook_url_env: String::new(),
+            dedup_seconds: default_alert_dedup_seconds(),
+        }
+    }
+}
+
+fn default_alert_dedup_seconds() -> u64 {
+    300
+}
+
 /// Durable-record backend selection.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StorageConf {
@@ -515,6 +588,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
                 "responses",
                 "completions",
                 "realtime",
+                "moderations",
             ],
             default_model_wire: "openai-chat",
         },
@@ -537,6 +611,16 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         "openrouter" => ProviderPreset {
             endpoint: "https://openrouter.ai/api",
             wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "moonshot" => ProviderPreset {
+            endpoint: "https://api.moonshot.cn",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "siliconflow" => ProviderPreset {
+            endpoint: "https://api.siliconflow.cn",
+            wires: &["openai-chat", "embeddings", "rerank"],
             default_model_wire: "openai-chat",
         },
         _ => return None,
@@ -568,6 +652,12 @@ pub struct GatewayConfig {
     /// Admin surface gate (dynamic config reload / key management).
     #[serde(default)]
     pub admin: AdminConf,
+    /// Automatic abuse suspension tiers (empty = off).
+    #[serde(default)]
+    pub abuse: AbuseConf,
+    /// Outbound alert webhook (unset = off).
+    #[serde(default)]
+    pub alerts: AlertsConf,
     /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
     /// default: the audit records the real TCP peer, which a client can't forge.
     /// Enable only when a trusted proxy fronts the gateway and sets those headers.
@@ -719,11 +809,6 @@ impl GatewayConfig {
                     variant: v.model.clone(),
                     reason,
                 };
-                // realtime pins its model at handshake, never traversing
-                // VariantSelect — accepting this would silently serve the parent
-                if m.protocol() == Some(Protocol::Realtime) {
-                    return Err(bad("variants are not supported on realtime models"));
-                }
                 if v.weight == 0 {
                     return Err(bad("weight must be >= 1"));
                 }
@@ -792,6 +877,14 @@ impl GatewayConfig {
                 return Err(neg_limit(format!("product {}", p.name)));
             }
         }
+        for (i, t) in self.abuse.tiers.iter().enumerate() {
+            let ascending = self.abuse.tiers[..i]
+                .iter()
+                .all(|p| p.rejects < t.rejects && p.suspend_hours <= t.suspend_hours);
+            if t.rejects <= 0 || t.suspend_hours == 0 || !ascending {
+                return Err(neg_limit("abuse tier (ascending rejects/hours)".to_owned()));
+            }
+        }
         let st = &self.stability;
         let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
         // upper bound mirrors the store's one-hour retention — a longer window
@@ -842,6 +935,16 @@ impl GatewayConfig {
                 return Err(ConfigError::DuplicateName {
                     kind: "tenant (':' not allowed in name)",
                     name: t.name.clone(),
+                });
+            }
+        }
+        // a colon in an ak would collide with the prefixed governance keyspaces
+        // (`abuse:{ak}` above all — a key named `abuse:X` could force-suspend X)
+        for k in &self.access_keys {
+            if k.ak.contains(':') {
+                return Err(ConfigError::DuplicateName {
+                    kind: "access_key (':' not allowed)",
+                    name: k.ak.clone(),
                 });
             }
         }
@@ -1087,9 +1190,12 @@ listen: {host: 127.0.0.1, port: 0}
 providers:
   - {name: deepseek, kind: deepseek, api_key_env: DEEPSEEK_KEY}
   - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_KEY}
+  - {name: kimi, kind: moonshot, api_key_env: MOONSHOT_KEY}
+  - {name: sf, kind: siliconflow, api_key_env: SF_KEY}
 models:
   - {name: deepseek-chat, provider: deepseek}
   - {name: some-model, provider: openrouter}
+  - {name: kimi-k2, provider: kimi}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
         assert_eq!(
@@ -1098,6 +1204,14 @@ models:
         );
         let ds = cfg.accounts.iter().find(|a| a.name == "deepseek").unwrap();
         assert_eq!(ds.endpoint, "https://api.deepseek.com");
+        assert_eq!(
+            cfg.find_model("kimi-k2").unwrap().protocol(),
+            Some(Protocol::OpenaiChat)
+        );
+        let kimi = cfg.accounts.iter().find(|a| a.name == "kimi").unwrap();
+        assert_eq!(kimi.endpoint, "https://api.moonshot.cn");
+        let sf = cfg.accounts.iter().find(|a| a.name == "sf").unwrap();
+        assert!(sf.protocols.iter().any(|w| w == "rerank"));
         let orr = cfg
             .accounts
             .iter()
@@ -1356,11 +1470,30 @@ tenants: [{name: t1}, {name: t1}]
 
         let rt = "listen: {host: h, port: 1}\nmodels: [{name: r1, protocol: realtime, variants: [{model: r2, weight: 1}]}, {name: r2, protocol: realtime}]";
         assert!(
-            matches!(
-                GatewayConfig::from_yaml(rt),
-                Err(ConfigError::BadVariant { .. })
-            ),
-            "realtime variants are rejected at load"
+            GatewayConfig::from_yaml(rt).is_ok(),
+            "realtime variants pick at the session handshake"
+        );
+
+        let variants = [
+            VariantConf {
+                model: "a".into(),
+                weight: 9,
+            },
+            VariantConf {
+                model: "b".into(),
+                weight: 1,
+            },
+        ];
+        let first = pick_variant(&variants, "user-1").model.clone();
+        for _ in 0..10 {
+            assert_eq!(pick_variant(&variants, "user-1").model, first, "sticky");
+        }
+        let hits = (0..1000)
+            .filter(|i| pick_variant(&variants, &format!("user-{i}")).model == "b")
+            .count();
+        assert!(
+            (40..250).contains(&hits),
+            "10% weight took {hits}/1000 keys"
         );
 
         for bad in [
@@ -1380,6 +1513,33 @@ tenants: [{name: t1}, {name: t1}]
         }
         let ok = "listen: {host: h, port: 1}\nstability: {availability_window_minutes: 60}";
         assert!(GatewayConfig::from_yaml(ok).is_ok());
+
+        for bad in [
+            "abuse: {tiers: [{rejects: 0, suspend_hours: 2}]}",
+            "abuse: {tiers: [{rejects: 30, suspend_hours: 2}, {rejects: 20, suspend_hours: 24}]}",
+            "abuse: {tiers: [{rejects: 20, suspend_hours: 24}, {rejects: 30, suspend_hours: 2}]}",
+        ] {
+            let yaml = format!("listen: {{host: h, port: 1}}\n{bad}");
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&yaml),
+                    Err(ConfigError::NegativeLimit { .. })
+                ),
+                "non-ascending or zero abuse tier is rejected: {bad}"
+            );
+        }
+        let colon_ak = "listen: {host: h, port: 1}\naccess_keys: [{ak: 'abuse:x', product: p, qps: 1, daily_token_quota: 1}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(colon_ak),
+                Err(ConfigError::DuplicateName { .. })
+            ),
+            "':' in an ak collides with governance prefixes"
+        );
+        let tiers = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 20, suspend_hours: 2}, {rejects: 30, suspend_hours: 24}]}\nalerts: {webhook_url_env: GW_ALERT_URL}";
+        let cfg = GatewayConfig::from_yaml(tiers).unwrap();
+        assert_eq!(cfg.abuse.tiers.len(), 2);
+        assert_eq!(cfg.alerts.dedup_seconds, 300, "default dedup window");
 
         let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
         assert!(

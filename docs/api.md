@@ -39,7 +39,15 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
 | POST | `/v1/audio/speech` | TTS, returns audio bytes |
 | POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio |
+| POST | `/v1/audio/translations` | STT translated to English (same request shape) |
+| POST | `/v1/moderations` | content moderation; `input` string or array, native results pass through |
 | GET | `/v1/models` | configured public model names |
+
+## Rerank
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/rerank` | Cohere/Jina-compatible: `{model, query, documents, top_n?}` → `{results: [{index, relevance_score}]}` |
 
 ### Chat completions
 
@@ -137,11 +145,11 @@ regardless.
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed (global token; needs `storage.postgres_url`) |
 | GET | `/admin/keys` | list keys, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's) |
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
-| PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` |
+| PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` / `suspended_until_epoch_secs` (null lifts an abuse suspension early) |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped |
-| GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible request outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models are not sampled and not listed; tenant-scoped |
+| GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per billed turn and on session-fatal upstream errors; tenant-scoped |
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
 | GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |

@@ -690,6 +690,7 @@ async fn stt_request_shape() {
         TypedParams::AudioStt(SttParams {
             audio_b64: "TU9DSw==".into(),
             language: Some("en".into()),
+            translate: false,
         }),
     );
     let _ = AudioEngine::new(req, t.clone(), AudioKind::Stt)

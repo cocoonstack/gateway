@@ -115,17 +115,18 @@ models:
 `token_rate` weights scale cost and quota consumption per token component; the
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
 is the weighted platform total. `variants` splits a public name across other
-declared same-protocol models (one level, no realtime): entitlement and the
-per-(AK, model) daily counter judge the public name, billing prices the served
-variant, and the response echoes the requested name. Selection hashes the
-effective user, so a user sticks to one backend across the fleet.
+declared same-protocol models (one level): entitlement and the per-(AK, model)
+daily counter judge the public name, billing prices the served variant, and
+the response echoes the requested name. Selection hashes the effective user,
+so a user sticks to one backend across the fleet; a realtime session picks
+its variant once at the handshake and pins it for the whole session.
 
 ### `providers` — first-class provider presets
 
 ```yaml
 providers:
   - name: openai
-    kind: openai              # openai | anthropic | gemini | deepseek | openrouter
+    kind: openai              # openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
     api_key_env: OPENAI_API_KEY
     # endpoint / timeout_seconds / connect_retries / secret_key_env may be
     # set here too and are inherited by the synthesized account
@@ -177,6 +178,8 @@ security:                      # global default; a tenant may override it whole
   regex_rules:                 # named recognizers, each with its own action
     - {name: ssn, pattern: '\d{3}-\d{2}-\d{4}', action: block}
   moderate: false              # route inbound text through the wired external moderator
+                               # (its verdicts: allow / mask spans / degrade to the
+                               # tenant fallback model / deny)
   moderation_fail_open: false  # on a moderator error: admit (true) or deny (false)
 
 stability:
@@ -190,6 +193,15 @@ stability:
 products:
   - name: myproduct
     qpm: 120                   # product-level request rate
+
+abuse:                         # automatic suspension; omit = off
+  tiers:                       # highest tier at or under the day's reject count wins
+    - {rejects: 20, suspend_hours: 2}
+    - {rejects: 30, suspend_hours: 24}
+
+alerts:                        # outbound webhook; omit = off
+  webhook_url_env: GW_ALERT_WEBHOOK   # env var naming the URL (secrets stay out of config)
+  dedup_seconds: 300           # mute repeats of the same (kind, subject)
 ```
 
 Every rule that fires (block / flag / DLP / moderation) is recorded without the

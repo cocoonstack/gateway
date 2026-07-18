@@ -23,6 +23,17 @@ pub enum AvailState {
     NoData,
 }
 
+impl AvailState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AvailState::Available => "available",
+            AvailState::Unstable => "unstable",
+            AvailState::Unavailable => "unavailable",
+            AvailState::NoData => "no_data",
+        }
+    }
+}
+
 /// Classify a window's counts against the configured error-rate thresholds.
 pub fn classify(
     ok: u64,

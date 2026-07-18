@@ -27,8 +27,8 @@ pub use claude_engine::ClaudeEngine;
 pub use engine::{EngineOutcome, ModelEngine, StreamChunk, vendor_error};
 pub use factory::get_engine;
 pub use families::{
-    AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, PassthroughEngine,
-    ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
+    AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, ModerationsEngine,
+    PassthroughEngine, RerankEngine, ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
 };
 pub use openai_engine::{OpenAiEngine, merge_tool_call_fragments};
 pub use sse::SseDecoder;

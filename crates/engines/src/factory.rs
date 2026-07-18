@@ -10,8 +10,8 @@ use crate::bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, Mi
 use crate::claude_engine::ClaudeEngine;
 use crate::engine::ModelEngine;
 use crate::families::{
-    AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, PassthroughEngine,
-    ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
+    AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, ModerationsEngine,
+    PassthroughEngine, RerankEngine, ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
 };
 use crate::openai_engine::OpenAiEngine;
 use crate::transport::SharedTransport;
@@ -38,6 +38,8 @@ pub fn get_engine(
         Protocol::Audio => Box::new(AudioEngine::new(request, transport, AudioKind::Other)),
         Protocol::Video => Box::new(VideoEngine::new(request, transport)),
         Protocol::Search => Box::new(SearchEngine::new(request, transport)),
+        Protocol::Moderations => Box::new(ModerationsEngine::new(request, transport)),
+        Protocol::Rerank => Box::new(RerankEngine::new(request, transport)),
         Protocol::Passthrough => Box::new(PassthroughEngine::new(request, transport)),
         Protocol::Ernie => Box::new(ErnieEngine::new(request, transport)),
         Protocol::MinimaxV1 => Box::new(MinimaxV1Engine::new(request, transport)),

@@ -467,12 +467,59 @@ impl MockTransport {
         Self::ok_json(json!({"created": MOCK_CREATED, "data": data}))
     }
 
+    fn moderations_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let body = Self::parse(&req.body, "moderations")?;
+        let results: Vec<Value> = body["input"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|i| {
+                // deterministic: the literal token "unsafe" flags
+                let flagged = i.as_str().is_some_and(|s| s.contains("unsafe"));
+                json!({"flagged": flagged, "categories": {"unsafe": flagged}})
+            })
+            .collect();
+        Self::ok_json(json!({"id": "modr-mock", "model": body["model"], "results": results}))
+    }
+
+    fn rerank_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let body = Self::parse(&req.body, "rerank")?;
+        let query = body["query"].as_str().unwrap_or_default().to_lowercase();
+        let mut scored: Vec<(usize, f64)> = body["documents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                // deterministic relevance: shared-word count with the query
+                let doc = d.as_str().unwrap_or_default().to_lowercase();
+                let hits = query.split_whitespace().filter(|w| doc.contains(w)).count();
+                (i, hits as f64)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let top_n = body["top_n"].as_u64().unwrap_or(scored.len() as u64) as usize;
+        let results: Vec<Value> = scored
+            .into_iter()
+            .take(top_n)
+            .map(|(index, relevance_score)| json!({"index": index, "relevance_score": relevance_score}))
+            .collect();
+        Self::ok_json(json!({
+            "results": results,
+            "usage": {"total_tokens": (query.len() as i64 / 4).max(1)}
+        }))
+    }
+
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "audio")?;
         if req.url.ends_with("/audio/transcriptions") {
             Self::ok_json(
                 json!({"text": "[mock-stt] transcribed audio", "language": body["language"]}),
             )
+        } else if req.url.ends_with("/audio/translations") {
+            Self::ok_json(json!({"text": "[mock-stt] translated audio"}))
         } else if req.url.ends_with("/audio/speech") {
             let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
             Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
@@ -626,6 +673,10 @@ impl Transport for MockTransport {
             self.audio_reply(&req)
         } else if u.contains("/videos") {
             self.video_reply(&req)
+        } else if u.contains("/moderations") {
+            self.moderations_reply(&req)
+        } else if u.contains("/rerank") {
+            self.rerank_reply(&req)
         } else if u.contains("/search") {
             self.search_reply(&req)
         } else if u.contains("/responses") {

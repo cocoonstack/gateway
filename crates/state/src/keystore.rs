@@ -82,6 +82,12 @@ impl PostgresKeyStore {
             .execute(&pool)
             .await
             .map_err(|e| crate::sqlx_err("migrate access_keys owner", e))?;
+        sqlx::query(
+            "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS suspended_until_epoch_secs BIGINT",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| crate::sqlx_err("migrate access_keys suspension", e))?;
         Ok(Self {
             pool,
             cache: moka::sync::Cache::builder()
@@ -101,7 +107,7 @@ impl PostgresKeyStore {
     async fn fetch(&self, ak: &str) -> Result<Option<AkInfo>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys WHERE ak = $1",
+             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs FROM access_keys WHERE ak = $1",
         )
         .bind(ak)
         .fetch_optional(&self.pool)
@@ -149,7 +155,7 @@ impl KeyStore for PostgresKeyStore {
             .map_err(|e| crate::sqlx_err("begin patch", e))?;
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys
+             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs FROM access_keys
              WHERE ak = $1 FOR UPDATE",
         )
         .bind(ak)
@@ -161,7 +167,8 @@ impl KeyStore for PostgresKeyStore {
         info.apply_patch(patch);
         sqlx::query(
             "UPDATE access_keys SET qps = $2, daily_token_quota = $3,
-             tokens_per_minute = $4, expires_at_epoch_secs = $5, banned = $6
+             tokens_per_minute = $4, expires_at_epoch_secs = $5, banned = $6,
+             suspended_until_epoch_secs = $7
              WHERE ak = $1",
         )
         .bind(ak)
@@ -170,6 +177,7 @@ impl KeyStore for PostgresKeyStore {
         .bind(info.tokens_per_minute)
         .bind(info.expires_at_epoch_secs)
         .bind(info.banned)
+        .bind(info.suspended_until_epoch_secs)
         .execute(&mut *tx)
         .await
         .map_err(|e| crate::sqlx_err("apply patch", e))?;
@@ -199,7 +207,7 @@ impl KeyStore for PostgresKeyStore {
     ) -> GResult<Vec<AkInfo>> {
         let rows = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys
+             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs FROM access_keys
              WHERE ($1::text IS NULL OR tenant = $1) ORDER BY ak LIMIT $2 OFFSET $3",
         )
         .bind(tenant)
@@ -240,6 +248,8 @@ impl KeyStore for PostgresKeyStore {
 
 /// The one INSERT..ON CONFLICT for the key table. The sticky-source CASE is a
 /// no-op when `source` is Config, so the reload path shares it unchanged.
+/// `suspended_until_epoch_secs` is deliberately absent: an upsert never clears
+/// a runtime suspension — only a patch touches it.
 async fn upsert(
     exec: impl sqlx::PgExecutor<'_>,
     info: &AkInfo,
@@ -290,6 +300,7 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
             serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default(),
         ),
         owner: row.get(9),
+        suspended_until_epoch_secs: row.get(10),
     }
 }
 
@@ -315,6 +326,7 @@ mod tests {
             tokens_per_minute: None,
             expires_at_epoch_secs: None,
             banned: false,
+            suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
         }
     }

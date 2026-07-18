@@ -7,11 +7,16 @@ publish.workspace = true
 description = "Local background tasks: quota reset, content purge, usage rollup."
 
 [dependencies]
+futures = { workspace = true }
+gw-consts = { workspace = true }
 gw-state = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+gw-config = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

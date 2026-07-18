@@ -23,6 +23,10 @@ pub enum TypedParams {
     Video(VideoParams),
     /// bing / brave / serp / google custom search
     Search(SearchParams),
+    /// content moderation (openai moderations shape)
+    Moderation(ModerationParams),
+    /// document rerank (cohere / jina / voyage compatible)
+    Rerank(RerankParams),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -94,6 +98,9 @@ pub struct SttParams {
     pub audio_b64: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// `/v1/audio/translations` (translate-to-English) instead of transcription.
+    #[serde(default)]
+    pub translate: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +117,19 @@ pub struct SearchParams {
     pub query: String,
     #[serde(default = "three")]
     pub count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModerationParams {
+    pub input: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RerankParams {
+    pub query: String,
+    pub documents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<i64>,
 }
 
 fn one() -> i64 {

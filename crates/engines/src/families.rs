@@ -436,13 +436,20 @@ impl ModelEngine for AudioEngine {
                 ("/v1/audio/speech", b)
             }
             AudioKind::Stt => {
-                let (audio, language) = match &param.typed {
-                    Some(TypedParams::AudioStt(p)) => (p.audio_b64.as_str(), p.language.as_deref()),
-                    _ => ("", None),
+                let (audio, language, translate) = match &param.typed {
+                    Some(TypedParams::AudioStt(p)) => {
+                        (p.audio_b64.as_str(), p.language.as_deref(), p.translate)
+                    }
+                    _ => ("", None, false),
                 };
                 require_non_empty(audio, "stt audio_b64")?;
+                let path = if translate {
+                    "/v1/audio/translations"
+                } else {
+                    "/v1/audio/transcriptions"
+                };
                 (
-                    "/v1/audio/transcriptions",
+                    path,
                     json!({"model": param.model_name, "audio_b64": audio, "language": language}),
                 )
             }
@@ -539,6 +546,101 @@ impl ModelEngine for SearchEngine {
             status,
         ))
     }
+}
+
+base_engine!(ModerationsEngine);
+
+#[async_trait::async_trait]
+impl ModelEngine for ModerationsEngine {
+    /// OpenAI moderations shape: `{model, input: [..]}` → per-input verdicts.
+    async fn run(&self) -> GResult<EngineOutcome> {
+        let param = self.base.param()?;
+        let Some(TypedParams::Moderation(p)) = &param.typed else {
+            return Err(GatewayError::bad_request("moderations params are required"));
+        };
+        if p.input.is_empty() {
+            return Err(GatewayError::bad_request(
+                "moderations input must not be empty",
+            ));
+        }
+        let body = json!({"model": param.model_name, "input": p.input});
+        let (status, v) = self
+            .base
+            .round_trip(
+                &format!(
+                    "{}/v1/moderations",
+                    self.base.base_url("mock://api.openai.com")
+                ),
+                body,
+            )
+            .await?;
+        let flagged = v["results"]
+            .as_array()
+            .map(|rs| {
+                rs.iter()
+                    .filter(|r| r["flagged"].as_bool().unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(family_outcome(
+            format!("{flagged} flagged"),
+            &param.model_name,
+            v,
+            status,
+        ))
+    }
+}
+
+base_engine!(RerankEngine);
+
+#[async_trait::async_trait]
+impl ModelEngine for RerankEngine {
+    /// Cohere/Jina-compatible rerank: `{model, query, documents, top_n?}` →
+    /// `{results: [{index, relevance_score}]}`.
+    async fn run(&self) -> GResult<EngineOutcome> {
+        let param = self.base.param()?;
+        let Some(TypedParams::Rerank(p)) = &param.typed else {
+            return Err(GatewayError::bad_request("rerank params are required"));
+        };
+        require_non_empty(&p.query, "rerank query")?;
+        if p.documents.is_empty() {
+            return Err(GatewayError::bad_request(
+                "rerank documents must not be empty",
+            ));
+        }
+        let mut body = json!({
+            "model": param.model_name,
+            "query": p.query,
+            "documents": p.documents,
+        });
+        if let Some(n) = p.top_n {
+            body["top_n"] = json!(n);
+        }
+        let (status, v) = self
+            .base
+            .round_trip(
+                &format!("{}/v1/rerank", self.base.base_url("mock://api.vendor.com")),
+                body,
+            )
+            .await?;
+        let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
+        let tokens = rerank_tokens(&v);
+        let mut out = family_outcome(format!("{n} results"), &param.model_name, v, status);
+        out.response.prompt_tokens = tokens;
+        out.response.total_tokens = tokens;
+        Ok(out)
+    }
+}
+
+/// Rerank usage across the two wire dialects: Jina-style `usage.total_tokens`,
+/// else Cohere/SiliconFlow-style `meta.tokens.{input,output}_tokens`.
+fn rerank_tokens(v: &Value) -> i64 {
+    let total = crate::engine::tok(&v["usage"]["total_tokens"]);
+    if total > 0 {
+        return total;
+    }
+    crate::engine::tok(&v["meta"]["tokens"]["input_tokens"])
+        .saturating_add(crate::engine::tok(&v["meta"]["tokens"]["output_tokens"]))
 }
 
 base_engine!(PassthroughEngine);
@@ -972,6 +1074,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn moderations_flags_and_validates() {
+        let e = ModerationsEngine::new(
+            req(
+                Protocol::Moderations,
+                "text-moderation",
+                Some(TypedParams::Moderation(gw_models::ModerationParams {
+                    input: vec!["fine".into(), "really unsafe".into()],
+                })),
+            ),
+            t(),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(out.response.message, "1 flagged");
+        assert_eq!(
+            out.response.response_v2.unwrap()["results"][1]["flagged"],
+            true
+        );
+
+        for typed in [
+            None,
+            Some(TypedParams::Moderation(gw_models::ModerationParams {
+                input: vec![],
+            })),
+        ] {
+            let e = ModerationsEngine::new(req(Protocol::Moderations, "m", typed), t());
+            assert_eq!(e.run().await.unwrap_err().http_status, 400);
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_orders_and_validates() {
+        let params = |query: &str, documents: Vec<&str>| {
+            Some(TypedParams::Rerank(gw_models::RerankParams {
+                query: query.into(),
+                documents: documents.into_iter().map(str::to_owned).collect(),
+                top_n: Some(1),
+            }))
+        };
+        let e = RerankEngine::new(
+            req(
+                Protocol::Rerank,
+                "rerank-mini",
+                params("rust gateway", vec!["cooking", "a rust gateway"]),
+            ),
+            t(),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(out.response.message, "1 results");
+        let v = out.response.response_v2.unwrap();
+        assert_eq!(v["results"][0]["index"], 1, "the matching doc ranks first");
+        assert!(out.response.total_tokens > 0, "usage flows from the vendor");
+
+        for typed in [None, params("", vec!["doc"]), params("query", vec![])] {
+            let e = RerankEngine::new(req(Protocol::Rerank, "m", typed), t());
+            assert_eq!(e.run().await.unwrap_err().http_status, 400);
+        }
+    }
+
+    #[test]
+    fn rerank_tokens_reads_both_dialects() {
+        assert_eq!(rerank_tokens(&json!({"usage": {"total_tokens": 7}})), 7);
+        assert_eq!(
+            rerank_tokens(&json!({"meta": {"tokens": {"input_tokens": 5, "output_tokens": 2}}})),
+            7,
+            "SiliconFlow/Cohere meta.tokens shape bills too"
+        );
+        assert_eq!(rerank_tokens(&json!({})), 0);
+    }
+
+    #[tokio::test]
     async fn audio_tts_and_stt() {
         let tts = AudioEngine::new(
             req(
@@ -1002,6 +1174,7 @@ mod tests {
                 Some(TypedParams::AudioStt(SttParams {
                     audio_b64: "TU9DSw==".into(),
                     language: Some("en".into()),
+                    translate: false,
                 })),
             ),
             t(),

@@ -55,21 +55,20 @@ impl DagNode for ModelQuotaGate {
         if under {
             return Ok(());
         }
-        let fallback = ctx
-            .cfg
-            .find_tenant(&ctx.ak.tenant)
-            .and_then(|t| t.fallback_model.clone());
-        match fallback {
-            Some(fb) if fb != requested => {
-                ctx.decide(
-                    "model_quota",
-                    format!("{requested} over {limit}, serving {fb}"),
-                );
-                if let Some(param) = ctx.request.model_param_v2.as_mut() {
-                    param.fallback_from = Some(requested);
-                    param.model_name = fb;
-                }
+        let (cfg, tenant) = (&ctx.cfg, &ctx.ak.tenant);
+        let swapped = ctx
+            .request
+            .model_param_v2
+            .as_mut()
+            .map(|p| admission::swap_to_fallback(cfg, tenant, p));
+        match swapped {
+            Some(admission::FallbackSwap::Swapped(from, fb)) => {
+                ctx.decide("model_quota", format!("{from} over {limit}, serving {fb}"))
             }
+            Some(admission::FallbackSwap::AlreadyServing) => ctx.decide(
+                "model_quota",
+                format!("{requested} over {limit}, already the fallback"),
+            ),
             _ => ctx.decide(
                 "model_quota",
                 format!("{requested} over {limit}, no fallback"),
@@ -182,7 +181,7 @@ impl DagNode for VariantSelect {
             "" => ctx.request.request_id.as_str(),
             user => user,
         };
-        let target = pick_variant(&conf.variants, key).model.clone();
+        let target = gw_config::pick_variant(&conf.variants, key).model.clone();
         if target == param.model_name {
             ctx.decide("variant_select", format!("{target} (self)"));
             return Ok(());
@@ -194,32 +193,6 @@ impl DagNode for VariantSelect {
         ctx.decide("variant_select", decision);
         Ok(())
     }
-}
-
-/// Cumulative-weight pick, keyed by a stable hash so every instance maps the
-/// same key to the same bucket with no shared state.
-fn pick_variant<'a>(
-    variants: &'a [gw_config::VariantConf],
-    key: &str,
-) -> &'a gw_config::VariantConf {
-    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
-    let mut roll = fnv1a(key) % total.max(1);
-    for v in variants {
-        if roll < u64::from(v.weight) {
-            return v;
-        }
-        roll -= u64::from(v.weight);
-    }
-    // unreachable (weights validated >= 1); quiets the type checker
-    &variants[0]
-}
-
-/// FNV-1a 64: deterministic across processes and releases (std's hasher is
-/// neither), which the fleet-consistent sticky mapping depends on.
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
 }
 
 /// preprocess/cache_lookup: request-level TTL cache. On a hit the outcome is
@@ -544,20 +517,7 @@ impl DagNode for CallEngine {
                     .account
                     .clone()
                     .ok_or_else(|| GatewayError::internal("call_engine without an account"))?;
-                if ctx
-                    .state
-                    .health
-                    .record_failure(&failed.name, threshold, cooldown)
-                    .await
-                {
-                    ctx.decide(
-                        "account_health",
-                        format!(
-                            "{} entered cooldown ({}s)",
-                            failed.name, ctx.cfg.stability.cooldown_seconds
-                        ),
-                    );
-                }
+                note_failure(ctx, &failed.name, threshold, cooldown).await;
                 let provider = model_provider(ctx);
                 let next = ctx
                     .state
@@ -602,10 +562,7 @@ impl DagNode for CallEngine {
                         ctx.state
                             .avail
                             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-                        ctx.state
-                            .health
-                            .record_failure(&next.name, threshold, cooldown)
-                            .await;
+                        note_failure(ctx, &next.name, threshold, cooldown).await;
                         Err(e)
                     }
                 }
@@ -613,6 +570,35 @@ impl DagNode for CallEngine {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Record an account failure; on the cooldown transition, alert and note the
+/// decision — one implementation for both engine attempts, so the fleet-backed
+/// `record_failure` call and its alerting can't drift apart.
+async fn note_failure(
+    ctx: &mut DagContext,
+    account: &str,
+    threshold: usize,
+    cooldown: std::time::Duration,
+) {
+    if !ctx
+        .state
+        .health
+        .record_failure(account, threshold, cooldown)
+        .await
+    {
+        return;
+    }
+    let secs = ctx.cfg.stability.cooldown_seconds;
+    ctx.state.alerts.emit(
+        "account_cooldown",
+        account.to_owned(),
+        format!("{threshold} consecutive failures; cooling {secs}s"),
+    );
+    ctx.decide(
+        "account_health",
+        format!("{account} entered cooldown ({secs}s)"),
+    );
 }
 
 /// post_process/common_usage: RawUsageJSON -> CommonUsage.
@@ -921,31 +907,6 @@ mod tests {
         assert_eq!((t.prompt, t.completion), (100, 50));
         assert_eq!((t.billable_prompt, t.billable_completion), (50, 50));
         assert_eq!(t.total(), 100);
-    }
-
-    #[test]
-    fn variant_pick_is_sticky_and_weighted() {
-        let variants = vec![
-            gw_config::VariantConf {
-                model: "a".into(),
-                weight: 9,
-            },
-            gw_config::VariantConf {
-                model: "b".into(),
-                weight: 1,
-            },
-        ];
-        let first = super::pick_variant(&variants, "user-1").model.clone();
-        for _ in 0..10 {
-            assert_eq!(super::pick_variant(&variants, "user-1").model, first);
-        }
-        let hits = (0..1000)
-            .filter(|i| super::pick_variant(&variants, &format!("user-{i}")).model == "b")
-            .count();
-        assert!(
-            (40..250).contains(&hits),
-            "10% weight took {hits}/1000 keys"
-        );
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub enum Protocol {
     AwsLlama,
     /// Alibaba DashScope native (input.messages/parameters/output.choices)
     Dashscope,
+    /// content moderation (OpenAI moderations shape)
+    Moderations,
+    /// document rerank (Cohere/Jina-compatible shape)
+    Rerank,
 }
 
 impl Protocol {
@@ -70,6 +74,8 @@ impl Protocol {
         Protocol::AwsCohere,
         Protocol::AwsLlama,
         Protocol::Dashscope,
+        Protocol::Moderations,
+        Protocol::Rerank,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -93,6 +99,8 @@ impl Protocol {
             Protocol::AwsCohere => "aws-cohere",
             Protocol::AwsLlama => "aws-llama",
             Protocol::Dashscope => "dashscope",
+            Protocol::Moderations => "moderations",
+            Protocol::Rerank => "rerank",
         }
     }
 
@@ -116,7 +124,7 @@ mod tests {
         for &p in Protocol::ALL {
             assert_eq!(Protocol::from_wire(p.as_str()), Some(p));
         }
-        assert_eq!(Protocol::ALL.len(), 19);
+        assert_eq!(Protocol::ALL.len(), 21);
         assert!(Protocol::from_wire("nope").is_none());
     }
 }

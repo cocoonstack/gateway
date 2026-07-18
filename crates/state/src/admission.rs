@@ -85,6 +85,38 @@ pub fn model_quota_limit(cfg: &GatewayConfig, ak: &AkInfo, model: &str) -> Optio
     })
 }
 
+/// Outcome of a tenant-fallback swap attempt. `AlreadyServing` is distinct
+/// from `Unconfigured`: a request already on the fallback has nowhere further
+/// to degrade but IS degraded — callers must not deny it as unconfigured.
+pub enum FallbackSwap {
+    /// Swapped; carries `(requested, fallback)` for the decision trail.
+    Swapped(String, String),
+    AlreadyServing,
+    Unconfigured,
+}
+
+/// Swap `param` to the tenant's fallback model, threading `fallback_from` so
+/// billing/echo semantics follow. The one fallback swap the quota gate and
+/// moderation degrade share.
+pub fn swap_to_fallback(
+    cfg: &GatewayConfig,
+    tenant: &str,
+    param: &mut gw_models::ModelParamV2,
+) -> FallbackSwap {
+    let Some(fb) = cfg
+        .find_tenant(tenant)
+        .and_then(|t| t.fallback_model.clone())
+    else {
+        return FallbackSwap::Unconfigured;
+    };
+    if fb == param.model_name {
+        return FallbackSwap::AlreadyServing;
+    }
+    let from = std::mem::replace(&mut param.model_name, fb.clone());
+    param.fallback_from = Some(from.clone());
+    FallbackSwap::Swapped(from, fb)
+}
+
 /// Pooled tenant QPS, when the tenant configures one.
 pub async fn check_tenant_rate(
     gov: &dyn Governance,

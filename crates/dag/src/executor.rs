@@ -143,6 +143,7 @@ mod tests {
                 tokens_per_minute: None,
                 expires_at_epoch_secs: None,
                 banned: false,
+                suspended_until_epoch_secs: None,
                 model_quotas: Default::default(),
             },
         )

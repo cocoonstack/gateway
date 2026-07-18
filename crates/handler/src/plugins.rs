@@ -126,6 +126,100 @@ fn push_text(out: &mut String, s: &str) {
     }
 }
 
+/// Apply moderator mask spans (byte ranges into the reviewed text) back onto
+/// the request's text slots. Returns the number of replaced ranges.
+pub fn apply_mask_spans(request: &mut GatewayRequest, spans: &[std::ops::Range<usize>]) -> usize {
+    let mut masker = SpanMasker::new(spans);
+    for msg in &mut request.message {
+        for_each_message_text(msg, &mut |s| masker.apply(s));
+    }
+    if let Some(param) = request.model_param_v2.as_mut() {
+        for_each_param_text(param, &mut |s| masker.apply(s));
+    }
+    masker.hits
+}
+
+/// [`apply_mask_spans`] for one realtime frame (spans address the frame's
+/// collected text).
+pub fn apply_mask_spans_frame(
+    frame: &mut serde_json::Value,
+    spans: &[std::ops::Range<usize>],
+) -> usize {
+    let mut masker = SpanMasker::new(spans);
+    gw_engines::realtime::visit_frame_text(frame, &mut |s| masker.apply(s))
+}
+
+/// Replays the `push_text` walk (empty slots skipped, '\n' joiners) to map
+/// global byte spans back onto individual slots. Spans are merged up front and
+/// snapped to char boundaries so a sloppy external service can't split UTF-8.
+struct SpanMasker {
+    spans: Vec<std::ops::Range<usize>>,
+    base: usize,
+    seen_any: bool,
+    hits: usize,
+}
+
+impl SpanMasker {
+    fn new(spans: &[std::ops::Range<usize>]) -> Self {
+        let mut spans: Vec<_> = spans.iter().filter(|r| r.start < r.end).cloned().collect();
+        spans.sort_by_key(|r| r.start);
+        spans.dedup_by(|next, prev| {
+            if next.start <= prev.end {
+                prev.end = prev.end.max(next.end);
+                true
+            } else {
+                false
+            }
+        });
+        Self {
+            spans,
+            base: 0,
+            seen_any: false,
+            hits: 0,
+        }
+    }
+
+    fn apply(&mut self, s: &mut String) -> usize {
+        if s.is_empty() {
+            return 0;
+        }
+        if self.seen_any {
+            self.base += 1;
+        }
+        self.seen_any = true;
+        let (start, end) = (self.base, self.base + s.len());
+        self.base = end;
+        let mut replaced = 0;
+        for span in self.spans.iter().rev() {
+            if span.start >= end || span.end <= start {
+                continue;
+            }
+            let lo = snap_floor(s, span.start.saturating_sub(start));
+            let hi = snap_ceil(s, span.end.saturating_sub(start).min(s.len()));
+            s.replace_range(lo..hi, "[MASKED]");
+            replaced += 1;
+        }
+        self.hits += replaced;
+        replaced
+    }
+}
+
+fn snap_floor(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn snap_ceil(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 /// Case-insensitive blocklist test; terms are pre-lowercased at config load.
 /// ASCII text matches without allocating; non-ASCII falls back to a lowercase copy.
 fn blocklist_hit(sec: &SecurityConf, text: &str) -> bool {
@@ -219,6 +313,8 @@ fn for_each_typed_text(
         T::Image(p) => f(&mut p.prompt),
         T::Video(p) => f(&mut p.prompt),
         T::Search(p) => f(&mut p.query),
+        T::Moderation(p) => p.input.iter_mut().map(&mut *f).sum(),
+        T::Rerank(p) => f(&mut p.query) + p.documents.iter_mut().map(&mut *f).sum::<usize>(),
         T::AudioStt(_) => 0,
     }
 }
@@ -507,6 +603,36 @@ fn redact(text: &str) -> Option<(String, usize)> {
 mod tests {
     use super::*;
     use gw_models::ChatMsg;
+
+    #[test]
+    fn mask_spans_map_across_slots_like_inbound_text() {
+        let mut req = GatewayRequest {
+            message: vec![
+                ChatMsg::text("user", "first part"),
+                ChatMsg::text("user", "the secret word"),
+            ],
+            ..Default::default()
+        };
+        let joined = inbound_text(&mut req.clone());
+        let i = joined.find("secret").unwrap();
+        let span = i..i + "secret".len();
+        let hits = apply_mask_spans(&mut req, std::slice::from_ref(&span));
+        assert_eq!(hits, 1);
+        assert_eq!(req.message[0].content, "first part", "untouched slot");
+        assert_eq!(req.message[1].content, "the [MASKED] word");
+    }
+
+    #[test]
+    fn mask_spans_snap_to_char_boundaries_and_merge() {
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "码字abc")],
+            ..Default::default()
+        };
+        // splits the second CJK char and overlaps a second range — must not panic
+        let hits = apply_mask_spans(&mut req, &[2..4, 4..7]);
+        assert_eq!(hits, 1, "overlapping ranges merge to one replacement");
+        assert!(req.message[0].content.contains("[MASKED]"));
+    }
 
     fn sec() -> SecurityConf {
         SecurityConf {

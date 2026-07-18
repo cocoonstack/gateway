@@ -142,6 +142,13 @@ models:
     protocol: ernie
     input_price_per_1k_micros: 300
     output_price_per_1k_micros: 900
+  - name: text-moderation # content moderation (OpenAI moderations shape)
+    protocol: moderations
+    provider: openai
+  - name: rerank-mini # document rerank (Cohere/Jina-compatible shape)
+    protocol: rerank
+    provider: openai
+    input_price_per_1k_micros: 20
   - name: qpm-mini # e2e: model-level QPM limit (2 per minute)
     protocol: openai-chat
     provider: openai
@@ -188,7 +195,7 @@ accounts:
     priority: 1
     cost_input_price_per_1k_micros: 100 # e2e: margin accounting (vendor cost)
     cost_output_price_per_1k_micros: 400
-    protocols: ["openai-chat", "completions"]
+    protocols: ["openai-chat", "completions", "moderations", "rerank"]
   - name: mock-openai-2
     provider: openai
     priority: 2
@@ -276,3 +283,10 @@ stability:
 products:
   - name: qpmprod
     qpm: 2
+
+# Abuse auto-suspension and the alert webhook (uncomment to enable):
+# abuse:
+#   tiers: [{rejects: 20, suspend_hours: 2}, {rejects: 30, suspend_hours: 24}]
+# alerts:
+#   webhook_url_env: GW_ALERT_WEBHOOK
+#   dedup_seconds: 300
