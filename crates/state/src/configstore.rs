@@ -91,10 +91,7 @@ impl PostgresConfigStore {
     pub async fn publish(&self, yaml: &str) -> GResult<i64> {
         let mut tx = self.begin_locked().await?;
         let id = Self::insert_notify(&mut tx, yaml).await?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::sqlx_err("commit config publish", e))?;
-        self.prune().await?;
+        Self::prune_commit(tx).await?;
         Ok(id)
     }
 
@@ -111,10 +108,7 @@ impl PostgresConfigStore {
             return Ok(None);
         }
         let id = Self::insert_notify(&mut tx, yaml).await?;
-        tx.commit()
-            .await
-            .map_err(|e| crate::sqlx_err("commit config publish", e))?;
-        self.prune().await?;
+        Self::prune_commit(tx).await?;
         Ok(Some(id))
     }
 
@@ -147,13 +141,16 @@ impl PostgresConfigStore {
         .map_err(|e| crate::sqlx_err("publish config", e))
     }
 
-    async fn prune(&self) -> GResult<()> {
+    // one transaction: a publish lands with its retention applied, or not at all
+    async fn prune_commit(mut tx: sqlx::Transaction<'_, sqlx::Postgres>) -> GResult<()> {
         sqlx::query("DELETE FROM gw_config WHERE id <= (SELECT MAX(id) FROM gw_config) - $1")
             .bind(KEEP_VERSIONS)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("prune config versions", e))?;
-        Ok(())
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit config publish", e))
     }
 }
 
@@ -170,15 +167,10 @@ pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
         .map_err(|e| crate::sqlx_err("listen on config channel", e))?;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
-        loop {
-            match listener.recv().await {
-                Ok(n) => {
-                    let version = n.payload().parse().unwrap_or(0);
-                    if tx.send(version).await.is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return, // closing tx signals resubscribe
+        while let Ok(n) = listener.recv().await {
+            let version = n.payload().parse().unwrap_or(0);
+            if tx.send(version).await.is_err() {
+                return;
             }
         }
     });
