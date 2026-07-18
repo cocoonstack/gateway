@@ -461,6 +461,103 @@ mod tests {
         }
     }
 
+    /// MockTransport with the usage rewritten to 100 prompt tokens, 80 cached.
+    #[derive(Debug)]
+    struct CachedUsageTransport;
+
+    #[async_trait::async_trait]
+    impl gw_engines::Transport for CachedUsageTransport {
+        async fn send(
+            &self,
+            req: gw_engines::UpstreamRequest,
+        ) -> GResult<gw_engines::UpstreamResponse> {
+            let mut resp = gw_engines::MockTransport.send(req).await?;
+            if let gw_engines::UpstreamBody::Json(b) = &mut resp.body {
+                let mut v: serde_json::Value = serde_json::from_slice(b).unwrap();
+                v["usage"]["prompt_tokens"] = 100.into();
+                v["usage"]["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 80});
+                *b = serde_json::to_vec(&v).unwrap();
+            }
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn token_rate_discounts_cached_prompt_cost() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m-cache, protocol: openai-chat, input_price_per_1k_micros: 1000, token_rate: {read_cache: 0.1}}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(CachedUsageTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        h.run(chat_req("m-cache", "hi"), key).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let rec = &ledger[0];
+        assert_eq!(rec.prompt_tokens, 100, "raw column: 20 fresh + 80 cached");
+        assert_eq!(
+            rec.cost_micros, 28,
+            "20 + 80*0.1 billable at 1000 micros/1k"
+        );
+        assert_eq!(rec.total_tokens, 28 + rec.completion_tokens);
+    }
+
+    #[tokio::test]
+    async fn failover_recovery_records_one_availability_success() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: ['openai-chat']}, {name: a-up, provider: p, priority: 2, protocols: ['openai-chat']}]\nstability: {failure_threshold: 100}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("m", "hi"), key).await.unwrap();
+        assert!(
+            ctx.decisions
+                .iter()
+                .any(|(_, w)| w.contains("failover a-down -> a-up")),
+            "request must have gone through failover: {:?}",
+            ctx.decisions
+        );
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(avail.window("m", minute - 5, minute).await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn variant_split_bills_requested_serves_target() {
+        // tenant entitled only to the public name: entitlement precedes the swap
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
+        assert_eq!(
+            ctx.outcome.expect("outcome").response.model,
+            "pub-m",
+            "response echoes the requested public name"
+        );
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger[0].model, "pub-m");
+        assert_eq!(ledger[0].served_model, "canary-m");
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(
+            avail.window("pub-m", minute - 5, minute).await,
+            (1, 0),
+            "availability attributes to the requested public name"
+        );
+        assert_eq!(avail.window("canary-m", minute - 5, minute).await, (0, 0));
+    }
+
     #[derive(Debug)]
     struct DenyModerator;
 

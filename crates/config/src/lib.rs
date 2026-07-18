@@ -50,6 +50,16 @@ pub enum ConfigError {
     BadFallbackModel { tenant: String, model: String },
     #[error("`{owner}` sets a negative price")]
     NegativePrice { owner: String },
+    #[error("model `{model}` token_rate `{field}` must be finite and >= 0")]
+    BadTokenRate { model: String, field: &'static str },
+    #[error("stability: bad {field}")]
+    BadStability { field: &'static str },
+    #[error("model `{model}` variant `{variant}`: {reason}")]
+    BadVariant {
+        model: String,
+        variant: String,
+        reason: &'static str,
+    },
     #[error("`{owner}` sets a negative or non-finite limit")]
     NegativeLimit { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
@@ -109,12 +119,61 @@ pub struct ModelConf {
     /// Request-level cache TTL; None = this model isn't cached.
     #[serde(default)]
     pub cache_ttl_seconds: Option<u64>,
+    /// Billing weights per token component; None = every component at 1.0.
+    #[serde(default)]
+    pub token_rate: Option<TokenRateConf>,
+    /// Weighted routing split across other declared models (canary/gray);
+    /// empty = this name serves itself. A self-referencing entry keeps a
+    /// share on this model. Once routed, the variant's own qpm/cache/
+    /// token_rate apply — model-level limits guard backend capacity.
+    #[serde(default)]
+    pub variants: Vec<VariantConf>,
 }
 
 impl ModelConf {
     pub fn protocol(&self) -> Option<Protocol> {
         Protocol::from_wire(&self.protocol)
     }
+}
+
+/// One weighted routing target of a public model name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VariantConf {
+    pub model: String,
+    pub weight: u32,
+}
+
+/// Per-component billing weights relative to the model's unit prices
+/// (e.g. cache reads at 0.1, cache writes at 1.25). Missing fields stay 1.0.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct TokenRateConf {
+    #[serde(default = "weight_one")]
+    pub prompt: f64,
+    #[serde(default = "weight_one")]
+    pub read_cache: f64,
+    #[serde(default = "weight_one")]
+    pub write_cache: f64,
+    #[serde(default = "weight_one")]
+    pub completion: f64,
+    #[serde(default = "weight_one")]
+    pub reasoning: f64,
+}
+
+impl TokenRateConf {
+    /// `(field name, value)` pairs for validation.
+    fn fields(&self) -> [(&'static str, f64); 5] {
+        [
+            ("prompt", self.prompt),
+            ("read_cache", self.read_cache),
+            ("write_cache", self.write_cache),
+            ("completion", self.completion),
+            ("reasoning", self.reasoning),
+        ]
+    }
+}
+
+fn weight_one() -> f64 {
+    1.0
 }
 
 /// Upstream account slot (mock credentials unless a live endpoint is configured).
@@ -249,10 +308,35 @@ pub struct StabilityConf {
     /// Cooldown duration (seconds); auto-recovers on expiry.
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
+    /// Minutes of per-model success/error counts the status API judges over.
+    /// Capped at 60: the availability store retains one hour of buckets.
+    #[serde(default = "default_availability_window_minutes")]
+    pub availability_window_minutes: i64,
+    /// Window error rate at or above which a model reports `unstable`.
+    #[serde(default = "default_unstable_error_rate")]
+    pub unstable_error_rate: f64,
+    /// Window error rate at or above which a model reports `unavailable`.
+    #[serde(default = "default_unavailable_error_rate")]
+    pub unavailable_error_rate: f64,
+    /// Below this many window samples the verdict is `no_data`.
+    #[serde(default = "default_availability_min_samples")]
+    pub availability_min_samples: u64,
 }
 
 fn default_failure_threshold() -> usize {
     3
+}
+fn default_availability_window_minutes() -> i64 {
+    5
+}
+fn default_unstable_error_rate() -> f64 {
+    0.1
+}
+fn default_unavailable_error_rate() -> f64 {
+    0.5
+}
+fn default_availability_min_samples() -> u64 {
+    20
 }
 fn default_cooldown_seconds() -> u64 {
     30
@@ -263,6 +347,10 @@ impl Default for StabilityConf {
         Self {
             failure_threshold: default_failure_threshold(),
             cooldown_seconds: default_cooldown_seconds(),
+            availability_window_minutes: default_availability_window_minutes(),
+            unstable_error_rate: default_unstable_error_rate(),
+            unavailable_error_rate: default_unavailable_error_rate(),
+            availability_min_samples: default_availability_min_samples(),
         }
     }
 }
@@ -607,11 +695,52 @@ impl GatewayConfig {
         // negative prices would make cost accounting non-monotonic (the usage
         // rollup's max-upsert relies on per-column monotone sums)
         let neg = |i: i64, o: i64| i < 0 || o < 0;
+        let neg_or_nan = |v: f64| !v.is_finite() || v < 0.0;
         for m in &self.models {
             if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros) {
                 return Err(ConfigError::NegativePrice {
                     owner: format!("model {}", m.name),
                 });
+            }
+            // a NaN weight would poison every downstream cost computation
+            if let Some(rate) = &m.token_rate {
+                for (field, v) in rate.fields() {
+                    if neg_or_nan(v) {
+                        return Err(ConfigError::BadTokenRate {
+                            model: m.name.clone(),
+                            field,
+                        });
+                    }
+                }
+            }
+            for (i, v) in m.variants.iter().enumerate() {
+                let bad = |reason| ConfigError::BadVariant {
+                    model: m.name.clone(),
+                    variant: v.model.clone(),
+                    reason,
+                };
+                // realtime pins its model at handshake, never traversing
+                // VariantSelect — accepting this would silently serve the parent
+                if m.protocol() == Some(Protocol::Realtime) {
+                    return Err(bad("variants are not supported on realtime models"));
+                }
+                if v.weight == 0 {
+                    return Err(bad("weight must be >= 1"));
+                }
+                // a duplicate would silently double the target's share
+                if m.variants[..i].iter().any(|p| p.model == v.model) {
+                    return Err(bad("duplicate target"));
+                }
+                let Some(target) = self.models.iter().find(|t| t.name == v.model) else {
+                    return Err(bad("unknown model"));
+                };
+                if target.protocol() != m.protocol() {
+                    return Err(bad("protocol differs from the parent"));
+                }
+                // one level only: nested splits would make routing unauditable
+                if target.name != m.name && !target.variants.is_empty() {
+                    return Err(bad("variant target declares variants itself"));
+                }
             }
         }
         for a in &self.accounts {
@@ -636,9 +765,8 @@ impl GatewayConfig {
         // a negative quota/qps is a typo that would silently deny (or never
         // limit); a NaN qps would bypass the rate bucket — reject both at load
         let neg_limit = |owner: String| ConfigError::NegativeLimit { owner };
-        let bad_qps = |v: f64| !v.is_finite() || v < 0.0;
         for k in &self.access_keys {
-            if bad_qps(k.qps)
+            if neg_or_nan(k.qps)
                 || k.daily_token_quota < 0
                 || k.tokens_per_minute.is_some_and(|v| v < 0)
                 || k.model_quotas.values().any(|v| *v < 0)
@@ -647,7 +775,7 @@ impl GatewayConfig {
             }
         }
         for t in &self.tenants {
-            if t.qps.is_some_and(bad_qps)
+            if t.qps.is_some_and(neg_or_nan)
                 || t.user_daily_token_quota.is_some_and(|v| v < 0)
                 || t.model_quotas.values().any(|v| *v < 0)
             {
@@ -663,6 +791,25 @@ impl GatewayConfig {
             if p.qpm.is_some_and(|v| v < 0) {
                 return Err(neg_limit(format!("product {}", p.name)));
             }
+        }
+        let st = &self.stability;
+        let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
+        // upper bound mirrors the store's one-hour retention — a longer window
+        // would silently judge over already-evicted buckets
+        if !(1..=60).contains(&st.availability_window_minutes) {
+            return Err(ConfigError::BadStability {
+                field: "availability_window_minutes (1..=60)",
+            });
+        }
+        if bad_rate(st.unstable_error_rate) || bad_rate(st.unavailable_error_rate) {
+            return Err(ConfigError::BadStability {
+                field: "error rates (must be finite, within [0, 1])",
+            });
+        }
+        if st.unstable_error_rate > st.unavailable_error_rate {
+            return Err(ConfigError::BadStability {
+                field: "unstable_error_rate above unavailable_error_rate",
+            });
         }
         for m in &self.models {
             if m.protocol().is_none() {
@@ -1159,6 +1306,80 @@ tenants: [{name: t1}, {name: t1}]
             ),
             "negative prices are rejected at load"
         );
+
+        for bad in [".nan", "-0.5"] {
+            let bad_rate = format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: m1, protocol: openai-chat, token_rate: {{read_cache: {bad}}}}}]"
+            );
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&bad_rate),
+                    Err(ConfigError::BadTokenRate {
+                        field: "read_cache",
+                        ..
+                    })
+                ),
+                "token_rate `{bad}` is rejected at load"
+            );
+        }
+
+        let rate = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, token_rate: {read_cache: 0.1, write_cache: 1.25}}]";
+        let cfg = GatewayConfig::from_yaml(rate).unwrap();
+        let tr = cfg.find_model("m1").unwrap().token_rate.unwrap();
+        assert_eq!((tr.read_cache, tr.write_cache), (0.1, 1.25));
+        assert_eq!((tr.prompt, tr.completion, tr.reasoning), (1.0, 1.0, 1.0));
+
+        for (variants, reason) in [
+            ("[{model: nope, weight: 1}]", "unknown target"),
+            ("[{model: m2, weight: 0}]", "zero weight"),
+            ("[{model: emb, weight: 1}]", "cross-protocol"),
+            ("[{model: nested, weight: 1}]", "nested variants"),
+            (
+                "[{model: m2, weight: 5}, {model: m2, weight: 5}]",
+                "duplicate target",
+            ),
+        ] {
+            let bad = format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: m1, protocol: openai-chat, variants: {variants}}}, {{name: m2, protocol: openai-chat}}, {{name: emb, protocol: embeddings}}, {{name: nested, protocol: openai-chat, variants: [{{model: m2, weight: 1}}]}}]"
+            );
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&bad),
+                    Err(ConfigError::BadVariant { .. })
+                ),
+                "{reason} is rejected at load"
+            );
+        }
+        let split = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, variants: [{model: m1, weight: 9}, {model: m2, weight: 1}]}, {name: m2, protocol: openai-chat}]";
+        let cfg = GatewayConfig::from_yaml(split).unwrap();
+        assert_eq!(cfg.find_model("m1").unwrap().variants.len(), 2);
+
+        let rt = "listen: {host: h, port: 1}\nmodels: [{name: r1, protocol: realtime, variants: [{model: r2, weight: 1}]}, {name: r2, protocol: realtime}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(rt),
+                Err(ConfigError::BadVariant { .. })
+            ),
+            "realtime variants are rejected at load"
+        );
+
+        for bad in [
+            "availability_window_minutes: 0",
+            "availability_window_minutes: 61",
+            "unstable_error_rate: 1.5",
+            "unstable_error_rate: 0.6, unavailable_error_rate: 0.5",
+        ] {
+            let yaml = format!("listen: {{host: h, port: 1}}\nstability: {{{bad}}}");
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&yaml),
+                    Err(ConfigError::BadStability { .. })
+                ),
+                "stability `{bad}` is rejected at load"
+            );
+        }
+        let ok = "listen: {host: h, port: 1}\nstability: {availability_window_minutes: 60}";
+        assert!(GatewayConfig::from_yaml(ok).is_ok());
 
         let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
         assert!(

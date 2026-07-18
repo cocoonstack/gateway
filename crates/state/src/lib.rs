@@ -14,6 +14,7 @@ use gw_consts::Protocol;
 use gw_models::Account;
 
 pub mod admission;
+pub mod avail;
 pub mod configstore;
 pub mod content;
 pub mod governance;
@@ -21,6 +22,7 @@ pub mod health;
 pub mod keystore;
 pub mod store;
 
+pub use avail::{AvailState, AvailStore, classify};
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
 pub use content::{ContentRecord, sealing_available};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
@@ -663,6 +665,8 @@ pub struct GatewayState {
     pub health: Arc<dyn HealthStore>,
     /// Request-level response cache: in-process by default, Redis when shared.
     pub cache: Arc<dyn ResponseCache>,
+    /// Per-model availability counters; Redis for fleet-wide aggregation.
+    pub avail: Arc<dyn avail::AvailStore>,
 }
 
 impl Default for GatewayState {
@@ -674,6 +678,7 @@ impl Default for GatewayState {
             store: Arc::new(MemoryStore::default()),
             health: Arc::new(AccountHealth::default()),
             cache: Arc::new(MemoryResponseCache::default()),
+            avail: Arc::new(avail::MemoryAvail::default()),
         }
     }
 }
@@ -752,6 +757,15 @@ impl GatewayState {
                     tracing::error!(error = %e, "redis health connect failed; staying in-process")
                 }
             }
+            match avail::RedisAvail::connect(&cfg.storage.redis_url).await {
+                Ok(a) => {
+                    state.avail = Arc::new(a);
+                    tracing::info!("model availability = redis (fleet-wide counts)");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "redis avail connect failed; staying in-process")
+                }
+            }
         }
         Ok(state)
     }
@@ -768,6 +782,7 @@ impl GatewayState {
             store: prev.store.clone(),
             health: prev.health.clone(),
             cache: prev.cache.clone(),
+            avail: prev.avail.clone(),
         })
     }
 }

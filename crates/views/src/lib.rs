@@ -124,6 +124,7 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/keys", post(admin_key_create).get(admin_key_list))
         .route("/admin/usage", get(admin_usage))
         .route("/admin/usage/users", get(admin_usage_users))
+        .route("/admin/models/status", get(admin_models_status))
         .route("/admin/audit/events", get(admin_security_events))
         .route("/admin/audit/ops", get(admin_audit_ops))
         .route("/admin/audit/content/{request_id}", get(admin_content_get))
@@ -358,12 +359,15 @@ async fn bill_realtime_turn(
     let ak = &admit.ak;
     // clamp parts and total so a hostile count can't overflow shared counters
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
-    let total = gw_state::clamp_tokens(it.saturating_add(ot));
-    if total == 0 {
+    if it.saturating_add(ot) == 0 {
         admit.refund().await;
         return;
     }
     let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
+    // pipeline parity: the same shared weighting the DAG estimate paths use
+    let rate = gw_state::model_token_rate(cfg, model);
+    let (bp, bc) = gw_models::weighted_pair(it, ot, &rate);
+    let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, model)
         .map(|_| admission::model_quota_key(&ak.ak, model));
     admission::settle_and_bill(
@@ -383,6 +387,8 @@ async fn bill_realtime_turn(
                 account,
                 prompt: it,
                 completion: ot,
+                billable_prompt: bp,
+                billable_completion: bc,
                 total,
                 ptu_spillover: false,
                 estimated: false,
@@ -1522,6 +1528,50 @@ async fn admin_key_list(
     let mut resp = json!({ "count": keys.len(), "offset": offset });
     resp["keys"] = Value::Array(keys);
     Json(resp).into_response()
+}
+
+/// GET /admin/models/status — per-model availability over the configured
+/// window, judged from minute-bucketed success/error counts. A tenant admin
+/// sees only its entitled models. Realtime models are excluded: never
+/// sampled, listing them would read as a permanent no_data.
+async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Response {
+    let cfg = s.handler.cfg();
+    let st = &cfg.stability;
+    let until = gw_state::epoch_secs() / 60;
+    let since = until - (st.availability_window_minutes - 1);
+    let state = s.handler.state();
+    let entitled = cfg.models.iter().filter(|m| {
+        m.protocol() != Some(gw_consts::Protocol::Realtime)
+            && match &scope {
+                AdminScope::Tenant(t) => cfg.tenant_allows_model(t, &m.name),
+                AdminScope::Global => true,
+            }
+    });
+    let avail = &state.avail;
+    let counts = futures::future::join_all(
+        entitled.map(|m| async move { (&m.name, avail.window(&m.name, since, until).await) }),
+    )
+    .await;
+    let rows: Vec<Value> = counts
+        .into_iter()
+        .map(|(name, (ok, err))| {
+            let verdict = gw_state::classify(
+                ok,
+                err,
+                st.availability_min_samples,
+                st.unstable_error_rate,
+                st.unavailable_error_rate,
+            );
+            json!({
+                "model": name,
+                "state": verdict,
+                "requests": ok + err,
+                "errors": err,
+                "window_minutes": st.availability_window_minutes,
+            })
+        })
+        .collect();
+    Json(json!({ "models": rows })).into_response()
 }
 
 /// GET /admin/usage — ledger rollup by (tenant, requested model). A tenant
@@ -3340,6 +3390,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_status_classifies_and_scopes() {
+        // high threshold + disjoint providers: cooldown/round-robin must not skew samples
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_AVAIL_ADMIN}\nmodels: [{name: m-ok, protocol: openai-chat, provider: openai}, {name: m-bad, protocol: openai-chat, provider: downp}, {name: rt-m, protocol: realtime}]\naccounts: [{name: a-up, provider: openai, protocols: ['openai-chat']}, {name: a-down, provider: downp, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m-ok], admin_token_env: GW_TEST_AVAIL_T1}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {availability_min_samples: 3, failure_threshold: 100}";
+        // SAFETY: unique var names for this test; no concurrent reader of them.
+        unsafe {
+            std::env::set_var("GW_TEST_AVAIL_ADMIN", "root-tok");
+            std::env::set_var("GW_TEST_AVAIL_T1", "t1-tok");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let avail = app_state.handler.state().avail.clone();
+        let router = app(app_state);
+        let chat = |model: &str| {
+            chat_req(
+                Some("k1"),
+                &format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"x"}}]}}"#),
+            )
+        };
+        for _ in 0..4 {
+            let ok = router.clone().oneshot(chat("m-ok")).await.unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            let bad = router.clone().oneshot(chat("m-bad")).await.unwrap();
+            assert_eq!(bad.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        avail.flush().await;
+
+        let status = |token: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri("/admin/models/status")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router.clone().oneshot(status("root-tok")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        let rows = j["models"].as_array().unwrap();
+        let of = |name: &str| {
+            rows.iter()
+                .find(|r| r["model"] == name)
+                .unwrap_or_else(|| panic!("row for {name}"))
+                .clone()
+        };
+        assert_eq!(of("m-ok")["state"], "available");
+        assert_eq!(of("m-ok")["requests"], 4);
+        assert_eq!(of("m-bad")["state"], "unavailable");
+        assert_eq!(of("m-bad")["errors"], 4);
+        assert!(
+            !rows.iter().any(|r| r["model"] == "rt-m"),
+            "realtime models are not listed (never sampled)"
+        );
+
+        let resp = router.clone().oneshot(status("t1-tok")).await.unwrap();
+        let j = body_json(resp).await;
+        let names: Vec<_> = j["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["model"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["m-ok"], "tenant admin sees only entitled models");
+    }
+
+    #[tokio::test]
+    async fn sustained_pool_exhaustion_converges_to_unavailable() {
+        // past the 2nd request the pool is cooling: those 503s must sample too
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_OUT_ADMIN}\nmodels: [{name: m-out, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-down, provider: downp, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {failure_threshold: 2, cooldown_seconds: 300, availability_min_samples: 5}";
+        // SAFETY: unique var name for this test; no concurrent reader of it.
+        unsafe {
+            std::env::set_var("GW_TEST_OUT_ADMIN", "out-tok");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let avail = app_state.handler.state().avail.clone();
+        let router = app(app_state);
+        for _ in 0..6 {
+            let resp = router
+                .clone()
+                .oneshot(chat_req(
+                    Some("k1"),
+                    r#"{"model":"m-out","messages":[{"role":"user","content":"x"}]}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        avail.flush().await;
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/models/status")
+                    .header("authorization", "Bearer out-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j = body_json(resp).await;
+        let row = &j["models"][0];
+        assert_eq!(row["model"], "m-out");
+        assert_eq!(row["errors"], 6, "cooldown-era 503s sample too");
+        assert_eq!(row["state"], "unavailable");
+    }
+
+    #[tokio::test]
     async fn content_erase_is_tenant_scoped_and_audited() {
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_ERASE_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\ntenants: [{name: t1}, {name: t2, admin_token_env: GW_TEST_ERASE_T2}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 10, daily_token_quota: 1000}]";
         // SAFETY: unique var names for this test; no concurrent reader of them.
@@ -3629,6 +3788,34 @@ mod tests {
         assert_eq!(
             ledger_before, ledger_after,
             "zero-usage turn writes no ledger row"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_billing_applies_token_rate() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: rt-m, protocol: realtime, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 1000, token_rate: {completion: 0.5}}]\naccounts: [{name: a1, provider: openai, protocols: ['realtime']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let ak = s.handler.state().auth.authenticate("k1").await.unwrap();
+        let a = realtime_gate(&s, &ak, "rt-m", "").await.expect("admit");
+        bill_realtime_turn(&a, "rt-m", gw_consts::Protocol::Realtime, "acc", 100, 100).await;
+        let (_, ledger) = s
+            .handler
+            .state()
+            .store
+            .ledger_snapshot(usize::MAX)
+            .await
+            .unwrap();
+        let rec = &ledger[0];
+        assert_eq!(rec.prompt_tokens, 100);
+        assert_eq!(rec.completion_tokens, 100);
+        assert_eq!(rec.total_tokens, 150, "100 + 100*0.5 weighted");
+        assert_eq!(rec.cost_micros, 150, "billable 100+50 at 1000/1k each");
+        assert_eq!(
+            s.handler.state().governance.quota_used(&ak.ak).await,
+            150,
+            "quota settles the weighted total"
         );
     }
 

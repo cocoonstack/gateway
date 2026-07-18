@@ -152,6 +152,11 @@ models:
     input_price_per_1k_micros: 150
     output_price_per_1k_micros: 600
     cache_ttl_seconds: 60
+    # Optional per-model knobs (uncomment to use):
+    #   billing weights per token component (cache reads cheaper, writes dearer)
+    # token_rate: {read_cache: 0.1, write_cache: 1.25}
+    #   weighted canary split across declared same-protocol models, sticky per user
+    # variants: [{model: cached-mini, weight: 90}, {model: qpm-mini, weight: 10}]
   - name: spark-lite # e2e: account cooldown (sole account stays down -> cooldown -> recovers on expiry)
     protocol: openai-chat
     provider: iflytek
@@ -257,10 +262,15 @@ security:
   blocklist:
     - forbiddenword
 
-# Account stability: 3 consecutive failures enter a 2s cooldown (e2e uses a short cooldown)
+# Account stability: 3 consecutive failures enter a 2s cooldown (e2e uses a short cooldown).
+# The availability_* fields drive /admin/models/status (defaults shown; window max 60).
 stability:
   failure_threshold: 3
   cooldown_seconds: 2
+  availability_window_minutes: 5
+  unstable_error_rate: 0.1
+  unavailable_error_rate: 0.5
+  availability_min_samples: 20
 
 # Product-level governance
 products:

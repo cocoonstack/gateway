@@ -62,8 +62,8 @@ pub mod domain {
         pub protocol: gw_consts::Protocol,
         /// public model name from the caller; empty if a wire type was sent directly.
         pub model_name: String,
-        /// original caller model when a quota fallback swapped `model_name`;
-        /// the response echoes it and the ledger records both.
+        /// original caller model when a quota fallback or variant split swapped
+        /// `model_name`; the response echoes it and the ledger records both.
         pub fallback_from: Option<String>,
         pub typed: Option<TypedParams>,
         /// untyped vendor extras, passed through verbatim.

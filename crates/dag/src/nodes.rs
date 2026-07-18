@@ -150,6 +150,78 @@ impl DagNode for TenantEntitlement {
     }
 }
 
+/// preprocess/variant_select: weighted split of a public model name across its
+/// configured variant targets, sticky by effective user (per-request spread
+/// when anonymous). Runs after entitlement — the public name is what a tenant
+/// is entitled to — and before the cache, so each variant caches separately.
+/// A request the quota gate already degraded is left alone.
+pub struct VariantSelect;
+
+#[async_trait::async_trait]
+impl DagNode for VariantSelect {
+    fn name(&self) -> &'static str {
+        "variant_select"
+    }
+    fn deps(&self) -> &'static [&'static str] {
+        &["tenant_entitlement"]
+    }
+    async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        let Some(param) = ctx.request.model_param_v2.as_ref() else {
+            return Ok(());
+        };
+        if param.fallback_from.is_some() {
+            return Ok(());
+        }
+        let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
+            return Ok(());
+        };
+        if conf.variants.is_empty() {
+            return Ok(());
+        }
+        let key = match ctx.effective_user_id() {
+            "" => ctx.request.request_id.as_str(),
+            user => user,
+        };
+        let target = pick_variant(&conf.variants, key).model.clone();
+        if target == param.model_name {
+            ctx.decide("variant_select", format!("{target} (self)"));
+            return Ok(());
+        }
+        let decision = format!("{} -> {target}", param.model_name);
+        if let Some(param) = ctx.request.model_param_v2.as_mut() {
+            param.fallback_from = Some(std::mem::replace(&mut param.model_name, target));
+        }
+        ctx.decide("variant_select", decision);
+        Ok(())
+    }
+}
+
+/// Cumulative-weight pick, keyed by a stable hash so every instance maps the
+/// same key to the same bucket with no shared state.
+fn pick_variant<'a>(
+    variants: &'a [gw_config::VariantConf],
+    key: &str,
+) -> &'a gw_config::VariantConf {
+    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
+    let mut roll = fnv1a(key) % total.max(1);
+    for v in variants {
+        if roll < u64::from(v.weight) {
+            return v;
+        }
+        roll -= u64::from(v.weight);
+    }
+    // unreachable (weights validated >= 1); quiets the type checker
+    &variants[0]
+}
+
+/// FNV-1a 64: deterministic across processes and releases (std's hasher is
+/// neither), which the fleet-consistent sticky mapping depends on.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// preprocess/cache_lookup: request-level TTL cache. On a hit the outcome is
 /// produced directly and the downstream nodes all short-circuit.
 pub struct CacheLookup;
@@ -160,7 +232,7 @@ impl DagNode for CacheLookup {
         "cache_lookup"
     }
     fn deps(&self) -> &'static [&'static str] {
-        &["tenant_entitlement"]
+        &["variant_select"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let param = match ctx.request.model_param_v2.as_ref() {
@@ -278,14 +350,19 @@ impl DagNode for SelectAccount {
             .state
             .pool
             .select_healthy(mt, provider, &[], ctx.state.health.as_ref())
-            .await
-            .ok_or_else(|| {
-                GatewayError::new(
-                    ErrCode::SYSTEM_ERROR,
-                    503,
-                    format!("no healthy upstream account serves model type `{mt}`"),
-                )
-            })?;
+            .await;
+        let Some(account) = account else {
+            // an exhausted pool is a client-visible model failure; unsampled,
+            // a sustained outage would sit below min_samples as no_data forever
+            ctx.state
+                .avail
+                .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
+            return Err(GatewayError::new(
+                ErrCode::SYSTEM_ERROR,
+                503,
+                format!("no healthy upstream account serves model type `{mt}`"),
+            ));
+        };
         ctx.decide("select_account", account.name.clone());
         ctx.request.account = Some(account);
         Ok(())
@@ -417,6 +494,10 @@ impl DagNode for UserBudgetGate {
 /// model_access/call_engine: factory dispatch + engine execution + failover.
 /// On an upstream 5xx the failed account is excluded and reselected once (a
 /// PTU → paygo spill sets `ptu_spillover`); a second failure propagates as-is.
+/// Availability samples record the client-visible terminal outcome only — an
+/// attempt recovered by failover is the account health layer's business, not
+/// a model error — and attribute to the requested public name, so a variant
+/// split doesn't scatter a model's health across backend names.
 pub struct CallEngine;
 
 #[async_trait::async_trait]
@@ -434,10 +515,13 @@ impl DagNode for CallEngine {
         match engine.run().await {
             Ok(outcome) => {
                 // an aborted stream is neither a success nor an account fault
-                if !outcome.response.aborted
-                    && let Some(a) = ctx.request.account.as_ref()
-                {
-                    ctx.state.health.record_success(&a.name).await;
+                if !outcome.response.aborted {
+                    ctx.state
+                        .avail
+                        .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
+                    if let Some(a) = ctx.request.account.as_ref() {
+                        ctx.state.health.record_success(&a.name).await;
+                    }
                 }
                 ctx.decide(
                     "call_engine",
@@ -486,6 +570,9 @@ impl DagNode for CallEngine {
                     )
                     .await;
                 let Some(next) = next else {
+                    ctx.state
+                        .avail
+                        .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
                     return Err(first_err);
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
@@ -500,12 +587,21 @@ impl DagNode for CallEngine {
                 let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        ctx.state.health.record_success(&next.name).await;
+                        // same aborted-stream exclusion as the first attempt
+                        if !outcome.response.aborted {
+                            ctx.state
+                                .avail
+                                .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
+                            ctx.state.health.record_success(&next.name).await;
+                        }
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
                     }
                     Err(e) => {
+                        ctx.state
+                            .avail
+                            .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
                         ctx.state
                             .health
                             .record_failure(&next.name, threshold, cooldown)
@@ -572,12 +668,18 @@ impl DagNode for CostCalc {
                 gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
             };
             let ct = enc.encode_len(&resp.message) as i64;
+            let rate = gw_state::model_token_rate(
+                &ctx.cfg,
+                served_model(ctx.request.model_param_v2.as_ref()),
+            );
+            let tokens = BillTokens::weighted(pt, ct, &rate);
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, pt, ct, pt.saturating_add(ct), true).await;
+            return bill(ctx, tokens, true).await;
         }
-        // default rate is 1:1; the formula carries future weighted rates.
+        let rate =
+            gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
         // saturating sums so a malformed usage subtree can't overflow the totals
-        let (prompt, completion, total) = match &resp.common_usage {
+        let tokens = match &resp.common_usage {
             Some(u) => {
                 let ti = gw_models::TokenInput {
                     prompt: u.platform_input,
@@ -586,33 +688,54 @@ impl DagNode for CostCalc {
                     completion: u.completion,
                     reasoning: u.reason,
                 };
-                let rate = gw_models::TokenRate::default();
-                (
-                    u.prompt_total(),
-                    u.completion_total(),
-                    gw_models::platform_total(&ti, &rate),
-                )
+                BillTokens {
+                    prompt: u.prompt_total(),
+                    completion: u.completion_total(),
+                    billable_prompt: gw_models::weighted_prompt(&ti, &rate),
+                    billable_completion: gw_models::weighted_completion(&ti, &rate),
+                }
             }
-            None => (
-                resp.prompt_tokens,
-                resp.completion_tokens,
-                resp.prompt_tokens.saturating_add(resp.completion_tokens),
-            ),
+            None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
         };
-        bill(ctx, prompt, completion, total, false).await
+        bill(ctx, tokens, false).await
+    }
+}
+
+/// Token counts for one bill: vendor-reported sides plus the weighted billable
+/// sides; the platform total is always the billable sum, so quota consumption
+/// and cost cannot drift.
+struct BillTokens {
+    prompt: i64,
+    completion: i64,
+    billable_prompt: i64,
+    billable_completion: i64,
+}
+
+impl BillTokens {
+    /// Prompt/completion-only counts with the model's weights applied — the
+    /// paths without a usage payload (estimates, malformed usage) must price
+    /// identically to the happy path or a cut stream changes effective pricing.
+    fn weighted(prompt: i64, completion: i64, rate: &gw_models::TokenRate) -> Self {
+        let (billable_prompt, billable_completion) =
+            gw_models::weighted_pair(prompt, completion, rate);
+        Self {
+            prompt,
+            completion,
+            billable_prompt,
+            billable_completion,
+        }
+    }
+
+    fn total(&self) -> i64 {
+        self.billable_prompt
+            .saturating_add(self.billable_completion)
     }
 }
 
 /// Settle reserves and write the ledger for one served request via the shared
 /// [`admission::settle_and_bill`] orchestration. `estimated` marks a bill from
 /// an aborted stream's estimated counts rather than a vendor usage payload.
-async fn bill(
-    ctx: &mut DagContext,
-    prompt: i64,
-    completion: i64,
-    total: i64,
-    estimated: bool,
-) -> GResult<()> {
+async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GResult<()> {
     let ptu_spillover = ctx
         .outcome
         .as_ref()
@@ -621,10 +744,8 @@ async fn bill(
     let param = ctx.request.model_param_v2.as_ref();
     // cost bills at the served (post-fallback) model's price; the (AK, model)
     // counter accrues against the requested name
-    let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-    let requested = param
-        .and_then(|p| p.fallback_from.as_deref())
-        .unwrap_or(served);
+    let served = served_model(param);
+    let requested = requested_model(param);
     // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
     let (reserved, tpm_reserved, model_quota_key) = (
         ctx.quota_reserved.take().unwrap_or(0),
@@ -646,9 +767,11 @@ async fn bill(
                 served_model: served,
                 protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
                 account: ctx.request.account_name(),
-                prompt,
-                completion,
-                total,
+                prompt: tokens.prompt,
+                completion: tokens.completion,
+                billable_prompt: tokens.billable_prompt,
+                billable_completion: tokens.billable_completion,
+                total: tokens.total(),
                 ptu_spillover,
                 estimated,
             },
@@ -733,6 +856,7 @@ pub fn default_layers() -> Vec<Layer> {
                 Box::new(ModelQuotaGate),
                 Box::new(ResolveModel),
                 Box::new(TenantEntitlement),
+                Box::new(VariantSelect),
                 Box::new(CacheLookup),
                 Box::new(QuotaCheck),
             ],
@@ -770,8 +894,60 @@ fn model_provider(ctx: &DagContext) -> Option<&str> {
     ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())
 }
 
+/// The model name the request currently targets (post-fallback). Takes the
+/// param, not the whole context, so `bill` can call it across its ctx takes.
+fn served_model(param: Option<&gw_models::ModelParamV2>) -> &str {
+    param.map(|p| p.model_name.as_str()).unwrap_or_default()
+}
+
+/// The public name the caller requested (pre-fallback/variant) — availability
+/// attributes here: callers and the tenant status view know this name, not the
+/// backend the split routed to.
+fn requested_model(param: Option<&gw_models::ModelParamV2>) -> &str {
+    param
+        .map(|p| p.fallback_from.as_deref().unwrap_or(p.model_name.as_str()))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bill_tokens_weighted_prices_estimate_paths() {
+        let rate = gw_models::TokenRate {
+            prompt_weight: 0.5,
+            ..Default::default()
+        };
+        let t = super::BillTokens::weighted(100, 50, &rate);
+        assert_eq!((t.prompt, t.completion), (100, 50));
+        assert_eq!((t.billable_prompt, t.billable_completion), (50, 50));
+        assert_eq!(t.total(), 100);
+    }
+
+    #[test]
+    fn variant_pick_is_sticky_and_weighted() {
+        let variants = vec![
+            gw_config::VariantConf {
+                model: "a".into(),
+                weight: 9,
+            },
+            gw_config::VariantConf {
+                model: "b".into(),
+                weight: 1,
+            },
+        ];
+        let first = super::pick_variant(&variants, "user-1").model.clone();
+        for _ in 0..10 {
+            assert_eq!(super::pick_variant(&variants, "user-1").model, first);
+        }
+        let hits = (0..1000)
+            .filter(|i| super::pick_variant(&variants, &format!("user-{i}")).model == "b")
+            .count();
+        assert!(
+            (40..250).contains(&hits),
+            "10% weight took {hits}/1000 keys"
+        );
+    }
+
     #[test]
     fn reserve_estimate_saturates_on_hostile_max_tokens() {
         use gw_models::params::ChatParams;

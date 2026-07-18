@@ -13,6 +13,8 @@ pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
 pub const PURGE_PERIOD: Duration = Duration::from_secs(60 * 60);
 /// Ledger minutes are rolled into the durable usage buckets this often.
 pub const ROLLUP_PERIOD: Duration = Duration::from_secs(60);
+/// Buffered per-model availability counts are flushed to the store this often.
+pub const AVAIL_FLUSH_PERIOD: Duration = Duration::from_secs(2);
 
 /// Spawn the daily quota reset loop. Returns the join handle (abort to stop).
 /// `period` is configurable so tests don't wait 24h.
@@ -74,6 +76,23 @@ pub fn spawn_usage_rollup(
             {
                 tracing::warn!(error = %e, "usage rollup failed");
             }
+        }
+    })
+}
+
+/// Spawn the availability flush loop: drains the in-process per-model counters
+/// into the minute-bucket store, keeping the claim path free of network hops.
+pub fn spawn_avail_flush(
+    state: Arc<GatewayState>,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            state.avail.flush().await;
         }
     })
 }

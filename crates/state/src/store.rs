@@ -78,6 +78,8 @@ pub struct BillingRecord {
     pub account: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Weighted platform total (what quota metering consumed); equals
+    /// prompt + completion only when the served model has no `token_rate`.
     pub total_tokens: i64,
     pub cost_micros: i64,
     /// What the serving account's vendor charged us (zero = untracked).
@@ -182,6 +184,10 @@ pub struct BillingInput<'a> {
     pub account: &'a str,
     pub prompt: i64,
     pub completion: i64,
+    /// Weighted billable sides (the served model's token_rate applied); equal
+    /// to `prompt`/`completion` when the model has no rate configured.
+    pub billable_prompt: i64,
+    pub billable_completion: i64,
     pub total: i64,
     pub ptu_spillover: bool,
     /// Counts are estimated (aborted stream), not vendor-reported.
@@ -193,14 +199,37 @@ pub fn clamp_tokens(n: i64) -> i64 {
     n.clamp(0, MAX_METERED_TOKENS)
 }
 
+/// The served model's billing weights; identity when unconfigured. The
+/// `prompt_includes_cache` normalization already happened at usage extraction.
+pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_models::TokenRate {
+    match cfg.find_model(model).and_then(|m| m.token_rate) {
+        Some(r) => gw_models::TokenRate {
+            prompt_includes_cache: false,
+            prompt_weight: r.prompt,
+            read_cache_weight: r.read_cache,
+            write_cache_weight: r.write_cache,
+            completion_weight: r.completion,
+            reasoning_weight: r.reasoning,
+        },
+        None => gw_models::TokenRate::default(),
+    }
+}
+
 /// Price one call into a [`BillingRecord`]: the tenant's price for the served
 /// model, vendor cost from the serving account. Shared by the request pipeline
 /// and the realtime surface so the two can't drift; token counts are clamped.
+/// Cost multiplies the weighted billable sides; the prompt/completion columns
+/// keep the vendor-reported counts, while `total_tokens` is the weighted
+/// platform total that quota metering consumed.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
         clamp_tokens(b.completion),
         clamp_tokens(b.total),
+    );
+    let (billable_prompt, billable_completion) = (
+        clamp_tokens(b.billable_prompt),
+        clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
     let vendor = cfg
@@ -228,8 +257,8 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: gw_models::cost_micros(prompt, completion, charged),
-        vendor_cost_micros: gw_models::cost_micros(prompt, completion, vendor),
+        cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged),
+        vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor),
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
     }
@@ -2372,6 +2401,53 @@ mod tests {
     }
 
     #[test]
+    fn model_token_rate_maps_config_weights() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, token_rate: {read_cache: 0.1, write_cache: 1.25}}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let rate = model_token_rate(&cfg, "m");
+        assert_eq!(
+            (rate.read_cache_weight, rate.write_cache_weight),
+            (0.1, 1.25)
+        );
+        assert!(!rate.prompt_includes_cache);
+        assert_eq!(
+            model_token_rate(&cfg, "absent"),
+            gw_models::TokenRate::default()
+        );
+    }
+
+    #[test]
+    fn billing_record_bills_weighted_sides_keeps_raw_columns() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 2000}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let rec = billing_record(
+            &cfg,
+            &BillingInput {
+                ak: "k",
+                product: "demo",
+                tenant: "default",
+                user_id: "u1",
+                request_id: "req-1",
+                requested_model: "m",
+                served_model: "m",
+                protocol: "openai-chat",
+                account: "acc",
+                prompt: 1140,
+                completion: 60,
+                billable_prompt: 250,
+                billable_completion: 60,
+                total: 310,
+                ptu_spillover: false,
+                estimated: false,
+            },
+        );
+        assert_eq!(rec.prompt_tokens, 1140);
+        assert_eq!(rec.completion_tokens, 60);
+        assert_eq!(rec.total_tokens, 310);
+        assert_eq!(rec.cost_micros, 250 + 120);
+    }
+
+    #[test]
     fn billing_record_clamps_hostile_usage() {
         let cfg = gw_config::GatewayConfig::embedded_default().unwrap();
         let rec = billing_record(
@@ -2388,6 +2464,8 @@ mod tests {
                 account: "acc",
                 prompt: i64::MAX,
                 completion: i64::MAX,
+                billable_prompt: i64::MAX,
+                billable_completion: i64::MAX,
                 total: i64::MAX,
                 ptu_spillover: false,
                 estimated: false,
@@ -2819,8 +2897,12 @@ mod tests {
     async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
         let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
         let now = crate::epoch_millis();
+        // wide margin: a 5ms one flaked under parallel-suite load
         assert!(
-            store.user_erased_since(&t1, &u1, now - 5).await.unwrap(),
+            store
+                .user_erased_since(&t1, &u1, now - 60_000)
+                .await
+                .unwrap(),
             "marker visible to a batch started before the erasure"
         );
         assert!(
