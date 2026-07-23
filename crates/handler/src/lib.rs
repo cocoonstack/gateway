@@ -348,10 +348,7 @@ pub enum RtModeration {
 /// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
 /// unique within the process (the seq disambiguates same-millisecond requests).
 pub fn new_request_id() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ms = gw_state::epoch_millis();
     format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
