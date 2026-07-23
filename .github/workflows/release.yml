@@ -18,7 +18,7 @@ jobs:
           - {runner: macos-latest, os: darwin, arch: arm64}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build and package gw
@@ -27,7 +27,7 @@ jobs:
           mkdir -p dist-gw
           tar -czf "dist-gw/gw_${GITHUB_REF_NAME#v}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" \
             -C target/release gw
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gw-${{ matrix.os }}-${{ matrix.arch }}
           path: dist-gw/*.tar.gz
@@ -36,14 +36,14 @@ jobs:
     needs: gw
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: control-plane/go.mod
           cache-dependency-path: control-plane/go.sum
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -55,7 +55,7 @@ jobs:
           npm run build
           mkdir -p ../../dist-web
           tar -czf "../../dist-web/control-plane-web-dist_${GITHUB_REF_NAME#v}.tar.gz" -C . dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist-gw
           merge-multiple: true
