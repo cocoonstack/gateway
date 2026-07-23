@@ -5,13 +5,9 @@ import { dateTime } from "../format";
 import { useAPI, useAction } from "../hooks";
 import type { ConfigDocument, ConfigVersion } from "../types";
 
-interface VersionList {
-  versions: ConfigVersion[];
-}
-
 export default function ConfigPage() {
   const current = useAPI<ConfigDocument>("/api/v1/admin/config");
-  const history = useAPI<VersionList>("/api/v1/admin/config/versions");
+  const history = useAPI<{ versions: ConfigVersion[] }>("/api/v1/admin/config/versions");
   const [yaml, setYAML] = useState("");
   const [message, setMessage] = useState("");
   const { run, busy, error } = useAction();

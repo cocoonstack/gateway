@@ -661,21 +661,20 @@ impl MemoryStore {
     }
 }
 
+/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
         // watermark first: rollup-then-records is the lock order advance uses
-        let watermark = self
-            .rollup
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let watermark = lock(&self.rollup)
             .keys()
             .next_back()
             .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
-        let mut records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut records = lock(&self.records);
         records.push(r.clone());
         if self.ledger_max_rows > 0 && records.len() > self.ledger_max_rows {
             // spare rows the rollup hasn't folded yet — lost here means lost
@@ -696,20 +695,14 @@ impl Store for MemoryStore {
     }
 
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
-        let records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let records = lock(&self.records);
         let total = records.len();
         let page = records[total.saturating_sub(limit)..].to_vec();
         Ok((total, page))
     }
 
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
-        let records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let records = lock(&self.records);
         let mut rollup: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
         for r in records.iter() {
             if tenant.is_some_and(|t| t != r.tenant) {
@@ -750,10 +743,7 @@ impl Store for MemoryStore {
         let (since, until) = align_bounds(since, until);
         let mut map = BTreeMap::new();
         let watermark = {
-            let rollup = self
-                .rollup
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rollup = lock(&self.rollup);
             for ((minute, t, u, _), row) in rollup.iter() {
                 if *minute >= bucket_floor(since)
                     && *minute <= bucket_floor(until)
@@ -770,10 +760,7 @@ impl Store for MemoryStore {
                 .next_back()
                 .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
         };
-        let records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let records = lock(&self.records);
         let tail = records.iter().filter(|r| {
             r.created_at_epoch_secs >= since.max(watermark)
                 && r.created_at_epoch_secs <= until
@@ -796,10 +783,7 @@ impl Store for MemoryStore {
         let (since, until) = align_bounds(since, until);
         let mut map: BTreeMap<i64, UserUsageRow> = BTreeMap::new();
         let watermark = {
-            let rollup = self
-                .rollup
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rollup = lock(&self.rollup);
             for ((minute, t, u, _), row) in rollup.iter() {
                 if *minute >= bucket_floor(since)
                     && *minute <= bucket_floor(until)
@@ -816,10 +800,7 @@ impl Store for MemoryStore {
                 .next_back()
                 .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
         };
-        let records = self
-            .records
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let records = lock(&self.records);
         for r in records.iter().filter(|r| {
             r.created_at_epoch_secs >= since.max(watermark)
                 && r.created_at_epoch_secs <= until
@@ -835,10 +816,7 @@ impl Store for MemoryStore {
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
-        let mut rollup = self
-            .rollup
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rollup = lock(&self.rollup);
         let watermark = rollup
             .keys()
             .next_back()
@@ -846,10 +824,7 @@ impl Store for MemoryStore {
         let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
         let mut fresh = BTreeMap::new();
         {
-            let records = self
-                .records
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let records = lock(&self.records);
             for r in records
                 .iter()
                 .filter(|r| r.created_at_epoch_secs >= lo && r.created_at_epoch_secs < hi)
@@ -873,10 +848,7 @@ impl Store for MemoryStore {
     }
 
     async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
-        self.sec_events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(e.clone());
+        lock(&self.sec_events).push(e.clone());
         Ok(())
     }
 
@@ -885,10 +857,7 @@ impl Store for MemoryStore {
         tenant: Option<&str>,
         limit: usize,
     ) -> GResult<Vec<SecurityEvent>> {
-        let events = self
-            .sec_events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events = lock(&self.sec_events);
         Ok(events
             .iter()
             .rev()
@@ -899,34 +868,22 @@ impl Store for MemoryStore {
     }
 
     async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
-        self.audit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(e.clone());
+        lock(&self.audit).push(e.clone());
         Ok(())
     }
 
     async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
-        let audit = self
-            .audit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let audit = lock(&self.audit);
         Ok(audit.iter().rev().take(limit).cloned().collect())
     }
 
     async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
-        self.content
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(r.clone());
+        lock(&self.content).push(r.clone());
         Ok(())
     }
 
     async fn content_purge(&self, now: i64) -> GResult<u64> {
-        let mut content = self
-            .content
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut content = lock(&self.content);
         let before = content.len();
         content.retain(|r| r.expires_at_epoch_secs == 0 || r.expires_at_epoch_secs > now);
         Ok((before - content.len()) as u64)
@@ -939,10 +896,7 @@ impl Store for MemoryStore {
         mut audit: AdminAudit,
     ) -> GResult<u64> {
         let mut erased = {
-            let mut content = self
-                .content
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut content = lock(&self.content);
             let before = content.len();
             content.retain(|r| r.user_id != user || tenant.is_some_and(|t| t != r.tenant));
             (before - content.len()) as u64
@@ -958,26 +912,17 @@ impl Store for MemoryStore {
                 }
             }
         }
-        self.erasures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                (tenant.unwrap_or_default().to_owned(), user.to_owned()),
-                crate::epoch_millis(),
-            );
+        lock(&self.erasures).insert(
+            (tenant.unwrap_or_default().to_owned(), user.to_owned()),
+            crate::epoch_millis(),
+        );
         audit.summary = format!("rows={erased}");
-        self.audit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(audit);
+        lock(&self.audit).push(audit);
         Ok(erased)
     }
 
     async fn user_erased_since(&self, tenant: &str, user: &str, since: i64) -> GResult<bool> {
-        let erasures = self
-            .erasures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let erasures = lock(&self.erasures);
         let hit = |t: &str| {
             erasures
                 .get(&(t.to_owned(), user.to_owned()))
@@ -987,10 +932,7 @@ impl Store for MemoryStore {
     }
 
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
-        let content = self
-            .content
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let content = lock(&self.content);
         Ok(content
             .iter()
             .filter(|r| r.request_id == request_id)

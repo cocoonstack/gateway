@@ -2126,10 +2126,6 @@ fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn anthropic_gateway_error(e: GatewayError) -> Response {
-    anthropic_error(e.http_status, e.message)
-}
-
 /// Run the pipeline on its own task so a client disconnect can't cancel it
 /// mid-billing: once admitted, quota/ledger accounting runs to completion.
 async fn run_pipeline(s: &AppState, request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
@@ -2645,7 +2641,7 @@ async fn messages(
 
     let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
-        Err(e) => return anthropic_gateway_error(e),
+        Err(e) => return anthropic_error(e.http_status, e.message),
     };
     log_access("messages", &ctx, started);
     let Some(mut outcome) = ctx.outcome else {

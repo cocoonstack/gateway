@@ -83,13 +83,6 @@ impl HttpTransport {
         let p = self.policies.load();
         p.per_account.get(account).copied().unwrap_or(p.default)
     }
-
-    fn set_policies(&self, default: UpstreamPolicy, per_account: HashMap<String, UpstreamPolicy>) {
-        self.policies.store(std::sync::Arc::new(Policies {
-            default,
-            per_account,
-        }));
-    }
 }
 
 #[async_trait::async_trait]
@@ -99,7 +92,10 @@ impl Transport for HttpTransport {
         default: UpstreamPolicy,
         per_account: HashMap<String, UpstreamPolicy>,
     ) {
-        self.set_policies(default, per_account);
+        self.policies.store(std::sync::Arc::new(Policies {
+            default,
+            per_account,
+        }));
     }
 
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {

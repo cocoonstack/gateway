@@ -33,13 +33,7 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
         return ScanOutcome::default();
     }
     let mut counts = ScanCounts::new(sec);
-    let mut visit = |s: &mut String| counts.visit(s);
-    for msg in &mut request.message {
-        for_each_message_text(msg, &mut visit);
-    }
-    if let Some(param) = request.model_param_v2.as_mut() {
-        for_each_param_text(param, &mut visit);
-    }
+    for_each_request_text(request, &mut |s| counts.visit(s));
     counts.outcome()
 }
 
@@ -98,22 +92,16 @@ impl<'a> ScanCounts<'a> {
 
 /// All inbound text a request carries — message content, multimodal text
 /// parts, assistant tool_calls, the Responses raw body, and the family typed
-/// params — collected via the same traversals the blocklist scan and DLP run,
+/// params — collected via the same traversal the blocklist scan and DLP run,
 /// so the field lists cannot drift apart. The one text view moderation and
-/// content retention operate on. `&mut` only to share those traversals;
-/// nothing is rewritten.
+/// content retention operate on. `&mut` only to share that traversal; nothing
+/// is rewritten.
 pub fn inbound_text(request: &mut GatewayRequest) -> String {
     let mut out = String::new();
-    let mut collect = |s: &mut String| {
+    for_each_request_text(request, &mut |s| {
         push_text(&mut out, s);
         0
-    };
-    for m in &mut request.message {
-        for_each_message_text(m, &mut collect);
-    }
-    if let Some(param) = request.model_param_v2.as_mut() {
-        for_each_param_text(param, &mut collect);
-    }
+    });
     out
 }
 
@@ -130,12 +118,7 @@ fn push_text(out: &mut String, s: &str) {
 /// the request's text slots. Returns the number of replaced ranges.
 pub fn apply_mask_spans(request: &mut GatewayRequest, spans: &[std::ops::Range<usize>]) -> usize {
     let mut masker = SpanMasker::new(spans);
-    for msg in &mut request.message {
-        for_each_message_text(msg, &mut |s| masker.apply(s));
-    }
-    if let Some(param) = request.model_param_v2.as_mut() {
-        for_each_param_text(param, &mut |s| masker.apply(s));
-    }
+    for_each_request_text(request, &mut |s| masker.apply(s));
     masker.hits
 }
 
@@ -250,6 +233,24 @@ fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) 
         serde_json::Value::Object(o) => o.values_mut().map(|x| walk_json_strings(x, f)).sum(),
         _ => 0,
     }
+}
+
+/// Every text-bearing field of a whole request — each message plus the tail
+/// params — the ONE per-request traversal the blocklist scan, inbound-text
+/// view, mask application, and DLP redaction all share, so they can't drift
+/// apart field by field.
+fn for_each_request_text(
+    request: &mut GatewayRequest,
+    f: &mut impl FnMut(&mut String) -> usize,
+) -> usize {
+    let mut n = 0;
+    for msg in &mut request.message {
+        n += for_each_message_text(msg, f);
+    }
+    if let Some(param) = request.model_param_v2.as_mut() {
+        n += for_each_param_text(param, f);
+    }
+    n
 }
 
 /// The text-bearing fields of one chat turn — flat content, multimodal parts,
@@ -431,17 +432,8 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
     }
-    let secrets = sec.detect_secrets;
-    let pii = sec.dlp_redact;
-    let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
-    let mut hits = 0;
-    for msg in &mut request.message {
-        hits += for_each_message_text(msg, &mut redact_field);
-    }
-    if let Some(param) = request.model_param_v2.as_mut() {
-        hits += for_each_param_text(param, &mut redact_field);
-    }
-    hits
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    for_each_request_text(request, &mut |s| redact_in_place(s, pii, secrets))
 }
 
 /// A privacy-safe copy of `text` for content retention: PII and secrets are
