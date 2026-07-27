@@ -74,7 +74,7 @@ func run(ctx context.Context, cfg config.Config) error {
 	go func() {
 		defer close(done)
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.WithFunc("main.run").Error(shutdownCtx, err, "drain HTTP server")
