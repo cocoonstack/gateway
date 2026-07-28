@@ -12,7 +12,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use gw_consts::Protocol;
 use gw_engines::http_transport::{DispatchTransport, HttpTransport};
-use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest};
+use gw_engines::transport::{StreamFault, Transport, UpstreamBody, UpstreamRequest};
 use gw_engines::{ModelEngine, OpenAiEngine};
 use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use serde_json::{Value, json};
@@ -377,11 +377,14 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     #[async_trait::async_trait]
     impl Transport for FlakyStream {
         async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
                 )),
-                Err("connection reset".to_string()),
+                Err(StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_string(),
+                }),
             ];
             Ok(UpstreamResponse {
                 status: 200,
@@ -391,7 +394,13 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let collect = tokio::spawn(async move {
+        let mut got = Vec::new();
+        while let Some(c) = rx.recv().await {
+            got.push(c);
+        }
+        got
+    });
     let mut request = GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
         model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
@@ -407,6 +416,14 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     assert!(out.response.aborted, "post-send break must mark aborted");
     assert!(out.streamed_live);
     assert_eq!(out.response.message, "partial");
+    let got = collect.await.unwrap();
+    let err = got
+        .iter()
+        .find_map(|c| c.error.as_ref())
+        .expect("committed abort must deliver a terminal error frame");
+    assert_eq!(err.class, gw_consts::ErrClass::ModelStreamError);
+    assert!(err.message.contains("connection reset"));
+    assert_eq!(err.original_status, None);
 }
 
 #[tokio::test]
@@ -419,7 +436,7 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
     #[async_trait::async_trait]
     impl Transport for ErrorFrameStream {
         async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
                 )),

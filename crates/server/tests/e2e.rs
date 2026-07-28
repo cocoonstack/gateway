@@ -1971,7 +1971,7 @@ async fn dlp_redacts_streaming_output_from_the_vendor() {
             &self,
             _req: gw_engines::transport::UpstreamRequest,
         ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"reach me at leak@evil.com now\"},\"finish_reason\":null}]}\n\n",
                 )),

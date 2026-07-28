@@ -45,6 +45,33 @@ pub struct GatewayResponse {
     pub raw_usage_json: Vec<u8>,
 }
 
+/// A mid-stream failure as rendered to the client: the contract
+/// classification, a human-readable message (no internal numeric codes), and
+/// the upstream's original status when an upstream HTTP response was received.
+#[derive(Debug, Clone)]
+pub struct StreamError {
+    pub class: gw_consts::ErrClass,
+    pub message: String,
+    pub original_status: Option<u16>,
+}
+
+impl StreamError {
+    /// Build from an internal error. `None` for client-closed (499): the
+    /// peer is gone and no frame is rendered.
+    pub fn from_error(e: &crate::GatewayError) -> Option<Self> {
+        let class = gw_consts::ErrClass::classify(e.code, e.http_status)?;
+        // FED_RESP_STATUS_NOT_ZERO is the one code whose status is the real
+        // upstream reply; the rest never received one.
+        let original_status =
+            (e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO).then_some(e.http_status);
+        Some(Self {
+            class,
+            message: e.message.clone(),
+            original_status,
+        })
+    }
+}
+
 /// One streamed response fragment, forwarded to the client as it arrives.
 #[derive(Debug, Default, Clone)]
 pub struct StreamChunk {
@@ -57,7 +84,7 @@ pub struct StreamChunk {
     /// cache/reasoning detail riding with `usage_totals` when the vendor sent it.
     pub common_usage: Option<CommonUsage>,
     /// set when the pipeline failed mid-stream; views emit it as an error frame.
-    pub error: Option<String>,
+    pub error: Option<StreamError>,
 }
 
 #[cfg(test)]

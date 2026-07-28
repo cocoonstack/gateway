@@ -2384,12 +2384,16 @@ fn spawn_stream_pipeline(
                 }
             }
             Err(e) => {
-                let _ = tx
-                    .send(gw_engines::StreamChunk {
-                        error: Some(e.to_string()),
-                        ..Default::default()
-                    })
-                    .await;
+                // 499 client-closed classifies to None: the peer is gone and
+                // no frame is rendered.
+                if let Some(error) = gw_models::StreamError::from_error(&e) {
+                    let _ = tx
+                        .send(gw_engines::StreamChunk {
+                            error: Some(error),
+                            ..Default::default()
+                        })
+                        .await;
+                }
             }
         }
     });
@@ -2449,11 +2453,14 @@ fn chat_stream_response(
         fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
             match chunk {
                 Some(gw_engines::StreamChunk {
-                    error: Some(msg), ..
+                    error: Some(err), ..
                 }) => {
-                    self.queue.push_back(Event::default().data(
-                        json!({"error": {"message": msg, "type": "gateway_error"}}).to_string(),
-                    ));
+                    self.queue.push_back(
+                        Event::default().data(
+                            json!({"error": {"message": err.message, "type": "gateway_error"}})
+                                .to_string(),
+                        ),
+                    );
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
@@ -2816,11 +2823,11 @@ fn messages_stream_response(
         fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
             match chunk {
                 Some(gw_engines::StreamChunk {
-                    error: Some(msg), ..
+                    error: Some(err), ..
                 }) => {
                     self.queue.push_back(St::ev(
                         "error",
-                        json!({"type":"error","error":{"type":"api_error","message":msg}}),
+                        json!({"type":"error","error":{"type":"api_error","message":err.message}}),
                     ));
                     true
                 }
@@ -3080,12 +3087,12 @@ fn responses_stream_response(
         fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
             match chunk {
                 Some(gw_engines::StreamChunk {
-                    error: Some(msg), ..
+                    error: Some(err), ..
                 }) => {
                     self.ensure_created();
                     self.queue.push_back(
                         Event::default().data(
-                            json!({"type":"error","error":{"type":"gateway_error","message":msg}})
+                            json!({"type":"error","error":{"type":"gateway_error","message":err.message}})
                                 .to_string(),
                         ),
                     );

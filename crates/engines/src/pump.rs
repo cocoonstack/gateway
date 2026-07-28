@@ -1,7 +1,7 @@
 //! Shared SSE pump: the one buffered/live decode loop every streaming engine
 //! drives its vendor frames through.
 
-use gw_models::{GResult, GatewayError, StreamChunk};
+use gw_models::{GResult, GatewayError, StreamChunk, StreamError};
 use serde_json::Value;
 
 use crate::sse::SseDecoder;
@@ -41,20 +41,25 @@ pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) ->
     Ok(())
 }
 
-/// A mid-stream transport/decode fault: after bytes reached the client it is a
-/// committed abort — keep what was delivered, no failover (`None`); before
-/// that it is a plain upstream failure (`Some(err)`).
-fn stream_fault(vendor: &'static str, e: &str, sent_any: bool) -> Option<GatewayError> {
-    if sent_any {
-        tracing::warn!(vendor, error = %e, "upstream stream failed mid-response");
-        None
-    } else {
-        Some(GatewayError::new(
-            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-            502,
-            format!("upstream stream failed: {e}"),
-        ))
+/// Deliver the terminal error frame for a committed abort (best effort — the
+/// client may already be gone) and mark the pump result aborted. A buffered
+/// run keeps the frame in `chunks` so the replay tail carries it.
+async fn abort_frame(
+    tx: &Option<tokio::sync::mpsc::Sender<StreamChunk>>,
+    out: &mut PumpResult,
+    error: StreamError,
+) {
+    let chunk = StreamChunk {
+        error: Some(error),
+        ..Default::default()
+    };
+    match tx {
+        Some(sender) => {
+            let _ = sender.send(chunk).await;
+        }
+        None => out.chunks.push(chunk),
     }
+    out.aborted = true;
 }
 
 pub async fn pump_sse<F>(
@@ -88,23 +93,37 @@ where
             let mut dec = SseDecoder::default();
             let mut sent_any = false;
             while let Some(item) = s.next().await {
-                let bytes = match item.map_err(|e| stream_fault(vendor, &e, sent_any)) {
+                // A fault after bytes reached the client is a committed abort,
+                // not a failover signal: emit the terminal error frame and keep
+                // what was delivered. Before commit it is a plain upstream
+                // failure, eligible for failover.
+                let bytes = match item {
                     Ok(b) => b,
-                    Err(Some(err)) => return Err(err),
-                    Err(None) => {
-                        out.aborted = true;
+                    Err(fault) if sent_any => {
+                        tracing::warn!(vendor, error = %fault.message, "upstream stream failed mid-response");
+                        abort_frame(&tx, &mut out, fault.stream_error()).await;
                         break;
                     }
+                    Err(fault) => return Err(fault.into_error()),
                 };
-                let events = match dec
-                    .feed(&bytes)
-                    .map_err(|e| stream_fault(vendor, &e, sent_any))
-                {
+                let events = match dec.feed(&bytes) {
                     Ok(events) => events,
-                    Err(Some(err)) => return Err(err),
-                    Err(None) => {
-                        out.aborted = true;
+                    Err(e) if sent_any => {
+                        tracing::warn!(vendor, error = %e, "upstream stream failed mid-response");
+                        let error = StreamError {
+                            class: gw_consts::ErrClass::ModelStreamError,
+                            message: format!("upstream stream failed: {e}"),
+                            original_status: None,
+                        };
+                        abort_frame(&tx, &mut out, error).await;
                         break;
+                    }
+                    Err(e) => {
+                        return Err(GatewayError::new(
+                            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                            502,
+                            format!("upstream stream failed: {e}"),
+                        ));
                     }
                 };
                 for data in events {
@@ -119,7 +138,11 @@ where
                         Ok(c) => c,
                         Err(e) if sent_any => {
                             tracing::warn!(vendor, error = %e, "vendor error frame after commit");
-                            out.aborted = true;
+                            if let Some(error) = StreamError::from_error(&e) {
+                                abort_frame(&tx, &mut out, error).await;
+                            } else {
+                                out.aborted = true;
+                            }
                             out.streamed_live = tx.is_some();
                             return Ok(out);
                         }

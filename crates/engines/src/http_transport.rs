@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use gw_models::{GResult, GatewayError};
 
-use crate::transport::{MockTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use crate::transport::{
+    MockTransport, StreamFault, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
+};
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // A hung connect (black-holed SYN) must surface as a connect error — which the
@@ -121,7 +123,7 @@ impl Transport for HttpTransport {
                     Ok(r) => r,
                     Err(_) => {
                         return Err(GatewayError::new(
-                            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                            gw_consts::ErrCode::FED_RESP_TIMEOUT,
                             502,
                             format!(
                                 "upstream request failed: no response headers within {:?}",
@@ -145,8 +147,13 @@ impl Transport for HttpTransport {
                     tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 }
                 Err(e) => {
+                    let code = if e.is_timeout() {
+                        gw_consts::ErrCode::FED_RESP_TIMEOUT
+                    } else {
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED
+                    };
                     return Err(GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        code,
                         502,
                         format!("upstream request failed: {e}"),
                     ));
@@ -162,7 +169,10 @@ impl Transport for HttpTransport {
             .unwrap_or(false);
         if is_sse {
             use futures::TryStreamExt;
-            let stream = Box::pin(resp.bytes_stream().map_err(|e| e.to_string()));
+            let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
+                timeout: e.is_timeout(),
+                message: e.to_string(),
+            }));
             return Ok(UpstreamResponse {
                 status,
                 body: idle_capped(stream, policy.timeout),
@@ -174,7 +184,7 @@ impl Transport for HttpTransport {
                 .await
                 .map_err(|_| {
                     GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        gw_consts::ErrCode::FED_RESP_TIMEOUT,
                         502,
                         format!("upstream body not read within {:?}", policy.timeout),
                     )
@@ -195,7 +205,7 @@ impl Transport for HttpTransport {
 /// one terminal error item — no gap between chunks may exceed the policy
 /// timeout, but an actively flowing stream lives as long as the generation.
 fn idle_capped(
-    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
     gap: Duration,
 ) -> UpstreamBody {
     use futures::StreamExt;
@@ -206,7 +216,13 @@ fn idle_capped(
             match tokio::time::timeout(gap, s.next()).await {
                 Ok(Some(item)) => Some((item, Some(s))),
                 Ok(None) => None,
-                Err(_) => Some((Err(format!("stream idle for {gap:?}")), None)),
+                Err(_) => Some((
+                    Err(StreamFault {
+                        timeout: true,
+                        message: format!("stream idle for {gap:?}"),
+                    }),
+                    None,
+                )),
             }
         },
     )))

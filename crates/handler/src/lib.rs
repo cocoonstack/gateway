@@ -1092,11 +1092,14 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
                 )),
-                Err("connection reset".to_owned()),
+                Err(gw_engines::transport::StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_owned(),
+                }),
             ];
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
@@ -1153,14 +1156,17 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":100}}}\n\n",
                 )),
                 Ok(bytes::Bytes::from(
                     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"delivered words here\"}}\n\n",
                 )),
-                Err("connection reset".to_owned()),
+                Err(gw_engines::transport::StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_owned(),
+                }),
             ];
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
@@ -1210,7 +1216,7 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"reach me at jane@corp.com now\"}}]}\n\n",
                 )),
@@ -1268,7 +1274,7 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"key sk-abcdefghijklmnopqrstuvwxyz012345 ok\"}}]}\n\n",
                 )),

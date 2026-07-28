@@ -91,9 +91,12 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     let err = v.get("error").filter(|e| e.is_object());
     let message = match (err, http_status >= 400) {
         (Some(e), _) => e["message"].as_str().unwrap_or("upstream error"),
+        // `Message`: the AWS auth layer capitalizes where modeled Bedrock
+        // errors use lowercase `message`.
         (None, true) => v["message"]
             .as_str()
             .or_else(|| v["msg"].as_str())
+            .or_else(|| v["Message"].as_str())
             .unwrap_or("upstream error"),
         (None, false) => return None,
     }
@@ -146,6 +149,9 @@ mod tests {
         let e = vendor_error(403, &bedrock).unwrap();
         assert_eq!(e.http_status, 403);
         assert_eq!(e.message, "The security token is invalid.");
+        let aws_auth = json!({"Message": "Invalid API Key format"});
+        let e = vendor_error(403, &aws_auth).unwrap();
+        assert_eq!(e.message, "Invalid API Key format");
         let dashscope =
             json!({"code": "Throttling", "message": "rate exceeded", "request_id": "r"});
         let e = vendor_error(429, &dashscope).unwrap();
