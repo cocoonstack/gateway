@@ -58,15 +58,12 @@ pub struct StreamError {
 impl StreamError {
     /// Build from an internal error. `None` for client-closed (499): the
     /// peer is gone and no frame is rendered.
-    pub fn from_error(e: &crate::GatewayError) -> Option<Self> {
+    pub fn from_error(e: crate::GatewayError) -> Option<Self> {
         let class = gw_consts::ErrClass::classify(e.code, e.http_status)?;
-        // FED_RESP_STATUS_NOT_ZERO is the one code whose status is the real
-        // upstream reply; the rest never received one.
-        let original_status =
-            (e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO).then_some(e.http_status);
+        let original_status = e.original_status();
         Some(Self {
             class,
-            message: e.message.clone(),
+            message: e.message,
             original_status,
         })
     }

@@ -9,6 +9,8 @@ use crate::ErrCode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrClass {
     Validation,
+    /// Reserved by the contract for hard quota/balance exhaustion; no
+    /// construction site classifies into it yet (billing wires it later).
     ServiceQuotaExceeded,
     UnrecognizedClient,
     AccessDenied,
@@ -72,7 +74,7 @@ impl ErrClass {
             ErrClass::ModelTimeout => 408,
             ErrClass::Conflict => 409,
             ErrClass::RequestEntityTooLarge => 413,
-            // in-stream only; the HTTP status never reaches a client
+            // ModelStreamError never renders at the HTTP phase; 424 nominal
             ErrClass::ModelError | ErrClass::ModelStreamError => 424,
             ErrClass::Throttling => 429,
             ErrClass::InternalServer => 500,

@@ -360,7 +360,10 @@ impl RealtimeAdmit {
 
 /// The REST admission chain applied per realtime generation via the shared
 /// [`admission`] checks, with the key re-fetched each turn so mid-session
-/// bans/de-entitlements take effect. Two deliberate divergences from the DAG:
+/// bans/de-entitlements take effect. Denials carry the rendering class
+/// directly ((ErrClass, message), no ErrCode): the WS surface is deliberately
+/// outside the ErrCode-keyed hooks (abuse noting stays a REST-pipeline
+/// concern). Two deliberate divergences from the DAG:
 /// over-quota denies instead of degrading (a session can't swap models
 /// mid-stream), and the reserve is a fixed turn estimate. Reserves are taken
 /// last so a denial never leaves one behind; a failed TPM reserve rolls back
@@ -650,8 +653,6 @@ async fn realtime_bridge(
     use tokio_tungstenite::tungstenite::Message as UMsg;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let send_err = rt_error;
-
     let base = account.endpoint.trim_end_matches('/');
     let ws_base = base
         .replacen("https://", "wss://", 1)
@@ -663,7 +664,7 @@ async fn realtime_bridge(
             s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
                 .send(CMsg::Text(
-                    send_err(ErrClass::InternalServer, format!("bad upstream url: {e}"))
+                    rt_error(ErrClass::InternalServer, format!("bad upstream url: {e}"))
                         .to_string()
                         .into(),
                 ))
@@ -681,7 +682,7 @@ async fn realtime_bridge(
             s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
                 .send(CMsg::Text(
-                    send_err(
+                    rt_error(
                         ErrClass::ModelError,
                         format!("upstream realtime connect failed: {e}"),
                     )
@@ -721,7 +722,7 @@ async fn realtime_bridge(
                     match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
                         Err(reason) => {
                             if cl_tx
-                                .send(CMsg::Text(send_err(ErrClass::AccessDenied, reason).to_string().into()))
+                                .send(CMsg::Text(rt_error(ErrClass::AccessDenied, reason).to_string().into()))
                                 .await
                                 .is_err()
                             {
@@ -747,7 +748,7 @@ async fn realtime_bridge(
                             }
                             Err((class, denied)) => {
                                 if cl_tx
-                                    .send(CMsg::Text(send_err(class, denied).to_string().into()))
+                                    .send(CMsg::Text(rt_error(class, denied).to_string().into()))
                                     .await
                                     .is_err()
                                 {
@@ -802,7 +803,7 @@ async fn realtime_bridge(
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
                                         .await;
                                     let _ = cl_tx
-                                        .send(CMsg::Text(send_err(class, denied).to_string().into()))
+                                        .send(CMsg::Text(rt_error(class, denied).to_string().into()))
                                         .await;
                                     suppress = true;
                                     relay = false;
@@ -1082,8 +1083,26 @@ impl axum::extract::FromRequestParts<AppState> for Authed {
     }
 }
 
-/// `axum::Json` with rejections rendered in the OpenAI envelope, so a
+/// The shared body behind [`ApiJson`]/[`AnthJson`]: delegate to `axum::Json`
+/// and render the rejection through the surface's own envelope, so a
 /// malformed body (400/413/415/422) cannot escape the contract.
+async fn extract_json<T, S>(
+    req: axum::extract::Request,
+    state: &S,
+    render: fn(u16, String) -> Response,
+) -> Result<T, Response>
+where
+    axum::Json<T>:
+        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    match <axum::Json<T> as axum::extract::FromRequest<S>>::from_request(req, state).await {
+        Ok(axum::Json(v)) => Ok(v),
+        Err(rej) => Err(render(rej.status().as_u16(), rej.body_text())),
+    }
+}
+
+/// `axum::Json` with rejections in the OpenAI envelope.
 struct ApiJson<T>(T);
 
 impl<T, S> axum::extract::FromRequest<S> for ApiJson<T>
@@ -1095,10 +1114,7 @@ where
     type Rejection = Response;
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Json::<T>::from_request(req, state).await {
-            Ok(axum::Json(v)) => Ok(ApiJson(v)),
-            Err(rej) => Err(error_response(rej.status().as_u16(), rej.body_text())),
-        }
+        extract_json(req, state, error_response).await.map(ApiJson)
     }
 }
 
@@ -1114,10 +1130,9 @@ where
     type Rejection = Response;
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Json::<T>::from_request(req, state).await {
-            Ok(axum::Json(v)) => Ok(AnthJson(v)),
-            Err(rej) => Err(anthropic_error(rej.status().as_u16(), rej.body_text())),
-        }
+        extract_json(req, state, anthropic_error)
+            .await
+            .map(AnthJson)
     }
 }
 
@@ -1146,13 +1161,24 @@ fn openai_error_body(class: ErrClass, message: String) -> Value {
     }})
 }
 
+/// A body-less status passthrough: the 499 client-closed case, where the
+/// peer is gone and nothing is rendered.
+fn bare_status(status: u16) -> Response {
+    StatusCode::from_u16(status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        .into_response()
+}
+
+/// Status + machine headers + JSON body: the one seam every envelope
+/// renders through.
+fn class_response(class: ErrClass, body: Value) -> Response {
+    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    with_error_headers(class, (status, Json(body)).into_response())
+}
+
 /// OpenAI-envelope error at the class's external status.
 fn class_error(class: ErrClass, message: impl Into<String>) -> Response {
-    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    with_error_headers(
-        class,
-        (status, Json(openai_error_body(class, message.into()))).into_response(),
-    )
+    class_response(class, openai_error_body(class, message.into()))
 }
 
 /// OpenAI-envelope error from an ad-hoc (status, message) site; the external
@@ -1160,10 +1186,7 @@ fn class_error(class: ErrClass, message: impl Into<String>) -> Response {
 fn error_response(status: u16, message: impl Into<String>) -> Response {
     match ErrClass::from_status(status) {
         Some(class) => class_error(class, message),
-        // 499 client-closed: the peer is gone; nothing to render
-        None => StatusCode::from_u16(status)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-            .into_response(),
+        None => bare_status(status),
     }
 }
 
@@ -2219,44 +2242,35 @@ async fn admin_content_erase(
 /// as the client's own 401.
 fn gateway_error(e: GatewayError) -> Response {
     let Some(class) = ErrClass::classify(e.code, e.http_status) else {
-        // 499 client-closed: the peer is gone; nothing to render
-        return StatusCode::from_u16(e.http_status)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-            .into_response();
+        return bare_status(e.http_status);
     };
-    let original_status =
-        (e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO).then_some(e.http_status);
+    let original_status = e.original_status();
+    let resource = e.resource;
     let mut body = openai_error_body(class, e.message);
     if class == ErrClass::ModelError {
         if let Some(os) = original_status {
             body["error"]["original_status_code"] = os.into();
         }
-        if let Some(r) = e.resource {
+        if let Some(r) = resource {
             body["error"]["resource_name"] = r.into();
         }
     }
-    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    with_error_headers(class, (status, Json(body)).into_response())
+    class_response(class, body)
 }
 
 /// Anthropic-shaped error body (spec 4.3) — `error.type` is the discriminator
 /// the Anthropic SDKs key their exception dispatch on; `code` is additive.
 fn anthropic_error_with(class: ErrClass, message: impl Into<String>) -> Response {
-    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    with_error_headers(
+    class_response(
         class,
-        (
-            status,
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "type": class.anthropic_type(),
-                    "code": class.code(),
-                    "message": message.into(),
-                },
-            })),
-        )
-            .into_response(),
+        json!({
+            "type": "error",
+            "error": {
+                "type": class.anthropic_type(),
+                "code": class.code(),
+                "message": message.into(),
+            },
+        }),
     )
 }
 
@@ -2264,9 +2278,7 @@ fn anthropic_error_with(class: ErrClass, message: impl Into<String>) -> Response
 fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
     match ErrClass::from_status(status) {
         Some(class) => anthropic_error_with(class, message),
-        None => StatusCode::from_u16(status)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-            .into_response(),
+        None => bare_status(status),
     }
 }
 
@@ -2274,9 +2286,7 @@ fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
 fn anthropic_gateway_error(e: GatewayError) -> Response {
     match ErrClass::classify(e.code, e.http_status) {
         Some(class) => anthropic_error_with(class, e.message),
-        None => StatusCode::from_u16(e.http_status)
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-            .into_response(),
+        None => bare_status(e.http_status),
     }
 }
 
@@ -2540,7 +2550,7 @@ fn spawn_stream_pipeline(
             Err(e) => {
                 // 499 client-closed classifies to None: the peer is gone and
                 // no frame is rendered.
-                if let Some(error) = gw_models::StreamError::from_error(&e) {
+                if let Some(error) = gw_models::StreamError::from_error(e) {
                     let _ = tx
                         .send(gw_engines::StreamChunk {
                             error: Some(error),
@@ -2585,17 +2595,12 @@ fn sse_stream<S: SseEncodeState>(
 
 /// Chat/legacy SSE error frame (spec 4.5): the OpenAI envelope plus the
 /// upstream's original status when one was received.
-fn stream_error_body(err: &gw_models::StreamError) -> Value {
-    let mut e = json!({
-        "message": err.message,
-        "type": err.class.openai_type(),
-        "param": null,
-        "code": err.class.code(),
-    });
+fn stream_error_body(err: gw_models::StreamError) -> Value {
+    let mut body = openai_error_body(err.class, err.message);
     if let Some(os) = err.original_status {
-        e["original_status_code"] = os.into();
+        body["error"]["original_status_code"] = os.into();
     }
-    json!({ "error": e })
+    body
 }
 
 /// Streaming chat: pipeline chunks re-emitted as OpenAI SSE.
@@ -2625,7 +2630,7 @@ fn chat_stream_response(
                     error: Some(err), ..
                 }) => {
                     self.queue
-                        .push_back(Event::default().data(stream_error_body(&err).to_string()));
+                        .push_back(Event::default().data(stream_error_body(err).to_string()));
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }

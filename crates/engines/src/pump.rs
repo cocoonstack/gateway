@@ -5,7 +5,7 @@ use gw_models::{GResult, GatewayError, StreamChunk, StreamError};
 use serde_json::Value;
 
 use crate::sse::SseDecoder;
-use crate::transport::UpstreamBody;
+use crate::transport::{StreamFault, UpstreamBody};
 
 /// What a pump run produced.
 #[derive(Debug, Default)]
@@ -49,6 +49,7 @@ async fn abort_frame(
     out: &mut PumpResult,
     error: StreamError,
 ) {
+    debug_assert!(tx.is_some(), "committed abort implies a live channel");
     if let Some(sender) = tx {
         let _ = sender
             .send(StreamChunk {
@@ -108,20 +109,19 @@ where
                     Ok(events) => events,
                     Err(e) if sent_any => {
                         tracing::warn!(vendor, error = %e, "upstream stream failed mid-response");
-                        let error = StreamError {
-                            class: gw_consts::ErrClass::ModelStreamError,
-                            message: format!("upstream stream failed: {e}"),
-                            original_status: None,
+                        let fault = StreamFault {
+                            timeout: false,
+                            message: e,
                         };
-                        abort_frame(&tx, &mut out, error).await;
+                        abort_frame(&tx, &mut out, fault.stream_error()).await;
                         break;
                     }
                     Err(e) => {
-                        return Err(GatewayError::new(
-                            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-                            502,
-                            format!("upstream stream failed: {e}"),
-                        ));
+                        return Err(StreamFault {
+                            timeout: false,
+                            message: e,
+                        }
+                        .into_error());
                     }
                 };
                 for data in events {
@@ -136,7 +136,7 @@ where
                         Ok(c) => c,
                         Err(e) if sent_any => {
                             tracing::warn!(vendor, error = %e, "vendor error frame after commit");
-                            if let Some(error) = StreamError::from_error(&e) {
+                            if let Some(error) = StreamError::from_error(e) {
                                 abort_frame(&tx, &mut out, error).await;
                             } else {
                                 out.aborted = true;

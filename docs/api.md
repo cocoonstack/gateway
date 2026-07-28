@@ -7,20 +7,30 @@ Authorization: Bearer <ak>
 x-api-key: <ak>
 ```
 
-A missing or unknown key is `401`. Errors use a consistent envelope; the
-numeric `code` appears only on pipeline-originated errors (routing, quota,
-upstream) — auth and validation errors carry just `message` and `type`:
+A missing or unknown key is `401`. Every error carries one classification
+from a closed, Bedrock-derived set, on two machine channels: the
+`x-amzn-errortype` response header (PascalCase name, e.g.
+`ThrottlingException`) and the body's `code` field (snake_case, e.g.
+`throttling_exception`). The envelope shape follows the surface — OpenAI
+surfaces use the OpenAI error object:
 
 ```json
-{"error": {"message": "...", "code": "3002", "type": "gateway_error"}}
+{"error": {"message": "...", "type": "rate_limit_error", "param": null, "code": "throttling_exception"}}
 ```
 
-The Anthropic-compatible surface (`/v1/messages`) instead emits Anthropic's
-error shape, so its SDKs can dispatch on it:
+The Anthropic-compatible surface (`/v1/messages`) emits Anthropic's error
+shape, so its SDKs can dispatch on it (`code` is additive):
 
 ```json
-{"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}
+{"type": "error", "error": {"type": "rate_limit_error", "code": "throttling_exception", "message": "..."}}
 ```
+
+A terminal upstream failure (failover exhausted) is `424` with
+`code: "model_error_exception"`, plus `original_status_code` (when the
+upstream returned a status) and `resource_name` (the requested model) inside
+the error object. Retry on 408/429/500/503 with backoff (honor
+`retry-after`); never on the rest. Mid-stream failures arrive as a terminal
+SSE error frame carrying the same `code` field.
 
 For per-user attribution on a shared key, send `x-gw-user: <id>` (it also reads
 OpenAI's body `user` field and Anthropic's `metadata.user_id`). A key's own

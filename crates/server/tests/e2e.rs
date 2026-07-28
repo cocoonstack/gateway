@@ -926,6 +926,11 @@ async fn model_failure_modes_404_503_unsupported() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"]["code"],
+        "validation_exception",
+        "wrong-surface model must classify as validation"
+    );
 }
 
 #[tokio::test]

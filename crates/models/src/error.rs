@@ -57,6 +57,12 @@ impl GatewayError {
         self.source = Some(Box::new(source));
         self
     }
+
+    /// The real upstream status behind this error, when one was received:
+    /// only FED_RESP_STATUS_NOT_ZERO carries the vendor's actual reply status.
+    pub fn original_status(&self) -> Option<u16> {
+        (self.code == ErrCode::FED_RESP_STATUS_NOT_ZERO).then_some(self.http_status)
+    }
 }
 
 impl fmt::Display for GatewayError {
