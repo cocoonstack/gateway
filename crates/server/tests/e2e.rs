@@ -497,16 +497,16 @@ async fn concurrent_requests_cannot_blow_past_quota() {
         }));
     }
     let mut ok = 0;
-    let mut limited = 0;
+    let mut exhausted = 0;
     for h in handles {
         match h.await.unwrap() {
             StatusCode::OK => ok += 1,
-            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            StatusCode::BAD_REQUEST => exhausted += 1,
             other => panic!("unexpected status {other}"),
         }
     }
     assert_eq!(
-        (ok, limited),
+        (ok, exhausted),
         (1, 9),
         "reservation admits exactly one in-flight request on a quota of 1"
     );
@@ -1445,7 +1445,7 @@ async fn rate_limit_qps1_second_call_429() {
 }
 
 #[tokio::test]
-async fn quota_exhaustion_second_call_429() {
+async fn quota_exhaustion_second_call_is_non_retryable_400() {
     let app = app();
     let first = app
         .clone()
@@ -1465,9 +1465,10 @@ async fn quota_exhaustion_second_call_429() {
         ))
         .await
         .unwrap();
-    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
     let j = body_json(second).await;
     assert!(j["error"]["message"].as_str().unwrap().contains("quota"));
+    assert_eq!(j["error"]["code"], "service_quota_exceeded_exception");
 }
 
 #[tokio::test]

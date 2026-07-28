@@ -20,6 +20,7 @@ pub struct GatewayError {
     /// the client-requested model, attached on the engine-call error path for
     /// the 424 `resource_name` extra; never set on the success path.
     pub resource: Option<String>,
+    original_status: Option<u16>,
     pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -30,6 +31,7 @@ impl GatewayError {
             http_status,
             message: message.into(),
             resource: None,
+            original_status: None,
             source: None,
         }
     }
@@ -58,10 +60,16 @@ impl GatewayError {
         self
     }
 
+    /// Record a status actually received from the upstream.
+    pub fn with_original_status(mut self, status: u16) -> Self {
+        self.original_status = Some(status);
+        self
+    }
+
     /// The real upstream status behind this error, when one was received:
-    /// only FED_RESP_STATUS_NOT_ZERO carries the vendor's actual reply status.
+    /// synthetic statuses used for failover are never returned.
     pub fn original_status(&self) -> Option<u16> {
-        (self.code == ErrCode::FED_RESP_STATUS_NOT_ZERO).then_some(self.http_status)
+        self.original_status
     }
 }
 

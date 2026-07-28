@@ -43,6 +43,7 @@ impl ErrCode {
 
     pub const EMPTY_RESP: ErrCode = ErrCode(4003);
     pub const STOP_LIMIT_MSG: ErrCode = ErrCode(4004);
+    pub const QUOTA_EXHAUSTED: ErrCode = ErrCode(4005);
 
     #[inline]
     pub const fn value(self) -> i64 {

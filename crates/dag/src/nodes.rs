@@ -20,6 +20,10 @@ fn limit_denied(msg: String) -> GatewayError {
     GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
 }
 
+fn quota_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::QUOTA_EXHAUSTED, 400, msg)
+}
+
 /// preprocess/model_quota: per-(AK, model) daily token cap — AK override, else
 /// tenant default, else unmetered (the per-AK daily cap backstops). Over-quota
 /// degrades to the tenant's fallback model when one is configured. Runs before
@@ -298,7 +302,7 @@ impl DagNode for QuotaCheck {
         let at = gw_state::epoch_secs();
         admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
-            .map_err(limit_denied)?;
+            .map_err(quota_denied)?;
         ctx.quota_reserved = Some(est);
         ctx.quota_at = at;
         ctx.decide("quota_check", format!("reserved {est}"));
@@ -461,7 +465,7 @@ impl DagNode for UserBudgetGate {
             ctx.effective_user_id(),
         )
         .await
-        .map_err(limit_denied)
+        .map_err(quota_denied)
     }
 }
 

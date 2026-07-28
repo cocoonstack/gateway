@@ -53,7 +53,7 @@ async fn abort_frame(
     if let Some(sender) = tx {
         let _ = sender
             .send(StreamChunk {
-                error: Some(error),
+                error: Some(Box::new(error)),
                 ..Default::default()
             })
             .await;
@@ -136,7 +136,7 @@ where
                         Ok(c) => c,
                         Err(e) if sent_any => {
                             tracing::warn!(vendor, error = %e, "vendor error frame after commit");
-                            if let Some(error) = StreamError::from_error(e) {
+                            if let Some(error) = StreamError::from_committed_error(e) {
                                 abort_frame(&tx, &mut out, error).await;
                             } else {
                                 out.aborted = true;

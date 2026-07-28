@@ -422,21 +422,21 @@ async fn realtime_gate(
         .map_err(throttled)?;
     admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint))
         .await
-        .map_err(throttled)?;
+        .map_err(|m| (ErrClass::ServiceQuotaExceeded, m))?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak, &m.requested), limit)
             .await
     {
         return Err((
-            ErrClass::Throttling,
+            ErrClass::ServiceQuotaExceeded,
             format!("model quota exhausted for `{}`", m.requested),
         ));
     }
     let at = gw_state::epoch_secs();
     admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
         .await
-        .map_err(throttled)?;
+        .map_err(|m| (ErrClass::ServiceQuotaExceeded, m))?;
     let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
         Ok(reserved) => reserved,
         Err(denied) => {
@@ -2553,7 +2553,7 @@ fn spawn_stream_pipeline(
                 if let Some(error) = gw_models::StreamError::from_error(e) {
                     let _ = tx
                         .send(gw_engines::StreamChunk {
-                            error: Some(error),
+                            error: Some(Box::new(error)),
                             ..Default::default()
                         })
                         .await;
@@ -2630,7 +2630,7 @@ fn chat_stream_response(
                     error: Some(err), ..
                 }) => {
                     self.queue
-                        .push_back(Event::default().data(stream_error_body(err).to_string()));
+                        .push_back(Event::default().data(stream_error_body(*err).to_string()));
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
@@ -2995,6 +2995,7 @@ fn messages_stream_response(
                 Some(gw_engines::StreamChunk {
                     error: Some(err), ..
                 }) => {
+                    let err = *err;
                     self.queue.push_back(St::ev(
                         "error",
                         json!({"type":"error","error":{
@@ -3265,6 +3266,7 @@ fn responses_stream_response(
                 Some(gw_engines::StreamChunk {
                     error: Some(err), ..
                 }) => {
+                    let err = *err;
                     self.ensure_created();
                     // the official Responses error event is flat: no nested
                     // `error` object, sequence_number continues the stream
@@ -4736,6 +4738,13 @@ mod tests {
             ledger_before, ledger_after,
             "zero-usage turn writes no ledger row"
         );
+
+        gov().quota_consume(&ak.ak, ak.daily_token_quota).await;
+        let denied = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
+            .await
+            .err()
+            .expect("exhausted daily quota must deny");
+        assert_eq!(denied.0, ErrClass::ServiceQuotaExceeded);
     }
 
     #[tokio::test]

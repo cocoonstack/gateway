@@ -67,6 +67,17 @@ impl StreamError {
             original_status,
         })
     }
+
+    /// Build the terminal frame for an already-committed stream. A generic
+    /// upstream failure becomes the stream-specific class; known transient
+    /// statuses keep their more actionable classification.
+    pub fn from_committed_error(e: crate::GatewayError) -> Option<Self> {
+        let mut error = Self::from_error(e)?;
+        if error.class == gw_consts::ErrClass::ModelError {
+            error.class = gw_consts::ErrClass::ModelStreamError;
+        }
+        Some(error)
+    }
 }
 
 /// One streamed response fragment, forwarded to the client as it arrives.
@@ -81,7 +92,7 @@ pub struct StreamChunk {
     /// cache/reasoning detail riding with `usage_totals` when the vendor sent it.
     pub common_usage: Option<CommonUsage>,
     /// set when the pipeline failed mid-stream; views emit it as an error frame.
-    pub error: Option<StreamError>,
+    pub error: Option<Box<StreamError>>,
 }
 
 #[cfg(test)]
@@ -101,5 +112,30 @@ mod tests {
         let r = GatewayResponse::default();
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("step").is_none());
+    }
+
+    #[test]
+    fn committed_generic_vendor_error_is_stream_specific() {
+        let e = crate::GatewayError::new(
+            gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+            502,
+            "upstream error",
+        );
+        let e = StreamError::from_committed_error(e).unwrap();
+        assert_eq!(e.class, gw_consts::ErrClass::ModelStreamError);
+        assert_eq!(e.original_status, None);
+    }
+
+    #[test]
+    fn committed_known_throttle_stays_actionable() {
+        let e = crate::GatewayError::new(
+            gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+            429,
+            "rate limited",
+        )
+        .with_original_status(429);
+        let e = StreamError::from_committed_error(e).unwrap();
+        assert_eq!(e.class, gw_consts::ErrClass::Throttling);
+        assert_eq!(e.original_status, Some(429));
     }
 }

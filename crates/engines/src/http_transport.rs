@@ -192,8 +192,18 @@ impl Transport for HttpTransport {
         } else {
             read.await
         };
-        let bytes =
-            bytes.map_err(|e| GatewayError::internal("read upstream body").with_source(e))?;
+        let bytes = bytes.map_err(|e| {
+            if e.is_timeout() {
+                GatewayError::new(
+                    gw_consts::ErrCode::FED_RESP_TIMEOUT,
+                    502,
+                    "read upstream body timed out",
+                )
+                .with_source(e)
+            } else {
+                GatewayError::internal("read upstream body").with_source(e)
+            }
+        })?;
         Ok(UpstreamResponse {
             status,
             body: UpstreamBody::Json(bytes),

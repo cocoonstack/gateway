@@ -9,8 +9,7 @@ use crate::ErrCode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrClass {
     Validation,
-    /// Reserved by the contract for hard quota/balance exhaustion; no
-    /// construction site classifies into it yet (billing wires it later).
+    /// Hard quota or balance exhaustion; retry only after quota becomes available.
     ServiceQuotaExceeded,
     UnrecognizedClient,
     AccessDenied,
@@ -146,6 +145,7 @@ impl ErrClass {
                 _ => ErrClass::ModelError,
             },
             ErrCode::STOP_LIMIT_MSG => ErrClass::Throttling,
+            ErrCode::QUOTA_EXHAUSTED => ErrClass::ServiceQuotaExceeded,
             ErrCode::PERMISSION_CHECK => ErrClass::AccessDenied,
             ErrCode::REQ_JSON | ErrCode::REQ_NON_CHAT => ErrClass::Validation,
             _ => return Self::from_status(status),
@@ -226,6 +226,8 @@ mod tests {
         // deadline family
         let c = ErrClass::classify(ErrCode::FED_RESP_TIMEOUT, 502).unwrap();
         assert_eq!((c, c.status()), (ErrClass::ModelTimeout, 408));
+        let c = ErrClass::classify(ErrCode::QUOTA_EXHAUSTED, 400).unwrap();
+        assert_eq!(c, ErrClass::ServiceQuotaExceeded);
     }
 
     #[test]
