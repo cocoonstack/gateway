@@ -13,6 +13,7 @@ use gw_models::{GResult, GatewayError};
 
 use crate::transport::{
     MockTransport, StreamFault, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
+    upstream_fault_code,
 };
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
@@ -147,13 +148,8 @@ impl Transport for HttpTransport {
                     tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 }
                 Err(e) => {
-                    let code = if e.is_timeout() {
-                        gw_consts::ErrCode::FED_RESP_TIMEOUT
-                    } else {
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED
-                    };
                     return Err(GatewayError::new(
-                        code,
+                        upstream_fault_code(e.is_timeout()),
                         502,
                         format!("upstream request failed: {e}"),
                     ));
@@ -193,16 +189,14 @@ impl Transport for HttpTransport {
             read.await
         };
         let bytes = bytes.map_err(|e| {
-            if e.is_timeout() {
-                GatewayError::new(
-                    gw_consts::ErrCode::FED_RESP_TIMEOUT,
-                    502,
-                    "read upstream body timed out",
-                )
-                .with_source(e)
+            // both stay 502 (failover-eligible); the code split preserves the
+            // external 408-vs-424 classification
+            let what = if e.is_timeout() {
+                "read upstream body timed out"
             } else {
-                GatewayError::internal("read upstream body").with_source(e)
-            }
+                "read upstream body failed"
+            };
+            GatewayError::new(upstream_fault_code(e.is_timeout()), 502, what).with_source(e)
         })?;
         Ok(UpstreamResponse {
             status,

@@ -17,6 +17,15 @@ use gw_engines::{ModelEngine, OpenAiEngine};
 use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use serde_json::{Value, json};
 
+async fn serve_router(app: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
 async fn spawn_vendor() -> String {
     let app = Router::new().route(
         "/v1/chat/completions",
@@ -52,11 +61,7 @@ async fn spawn_vendor() -> String {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr = serve_router(app).await;
     format!("http://{addr}")
 }
 
@@ -107,11 +112,7 @@ async fn spawn_stalled_json_vendor() -> String {
                 .unwrap()
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr = serve_router(app).await;
     format!("http://{addr}/slow-json")
 }
 
@@ -137,6 +138,47 @@ async fn non_stream_body_timeout_classifies_as_model_timeout() {
         Some(gw_consts::ErrClass::ModelTimeout)
     );
     assert!(err.message.contains("read upstream body"));
+}
+
+async fn spawn_breaking_json_vendor() -> String {
+    let app = Router::new().route(
+        "/broken-json",
+        post(|| async {
+            let body = futures::stream::iter(vec![
+                Ok(bytes::Bytes::from_static(b"{\"partial\":")),
+                Err(std::io::Error::other("mid-body reset")),
+            ]);
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap()
+        }),
+    );
+    let addr = serve_router(app).await;
+    format!("http://{addr}/broken-json")
+}
+
+#[tokio::test]
+async fn non_stream_body_break_classifies_as_model_error() {
+    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let err = transport
+        .send(UpstreamRequest {
+            protocol: Protocol::OpenaiChat,
+            method: "POST".into(),
+            url: spawn_breaking_json_vendor().await,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b"{}".to_vec(),
+            stream: false,
+            account: "broken-body".into(),
+        })
+        .await
+        .expect_err("a mid-body break must surface as an error");
+    assert_eq!(err.code, gw_consts::ErrCode::FED_RESP_RPC_FAILED);
+    assert_eq!(err.http_status, 502, "failover-eligible upstream fault");
+    assert_eq!(
+        gw_consts::ErrClass::classify(err.code, err.http_status),
+        Some(gw_consts::ErrClass::ModelError)
+    );
 }
 
 #[tokio::test]
@@ -321,11 +363,7 @@ async fn spawn_paced_vendor(frames: usize, gap: Duration) -> String {
                 .unwrap()
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr = serve_router(app).await;
     format!("http://{addr}/paced")
 }
 

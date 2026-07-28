@@ -408,6 +408,7 @@ async fn realtime_gate(
     }
     let gov = state.governance.as_ref();
     let throttled = |m: String| (ErrClass::Throttling, m);
+    let quota_exceeded = |m: String| (ErrClass::ServiceQuotaExceeded, m);
     admission::check_tenant_rate(gov, cfg, &ak.tenant)
         .await
         .map_err(throttled)?;
@@ -422,7 +423,7 @@ async fn realtime_gate(
         .map_err(throttled)?;
     admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint))
         .await
-        .map_err(|m| (ErrClass::ServiceQuotaExceeded, m))?;
+        .map_err(quota_exceeded)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak, &m.requested), limit)
@@ -436,7 +437,7 @@ async fn realtime_gate(
     let at = gw_state::epoch_secs();
     admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
         .await
-        .map_err(|m| (ErrClass::ServiceQuotaExceeded, m))?;
+        .map_err(quota_exceeded)?;
     let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
         Ok(reserved) => reserved,
         Err(denied) => {
@@ -2260,18 +2261,19 @@ fn gateway_error(e: GatewayError) -> Response {
 
 /// Anthropic-shaped error body — `error.type` is the discriminator the
 /// Anthropic SDKs key their exception dispatch on; `code` is additive.
+fn anthropic_error_body(class: ErrClass, message: String) -> Value {
+    json!({
+        "type": "error",
+        "error": {
+            "type": class.anthropic_type(),
+            "code": class.code(),
+            "message": message,
+        },
+    })
+}
+
 fn anthropic_error_with(class: ErrClass, message: impl Into<String>) -> Response {
-    class_response(
-        class,
-        json!({
-            "type": "error",
-            "error": {
-                "type": class.anthropic_type(),
-                "code": class.code(),
-                "message": message.into(),
-            },
-        }),
-    )
+    class_response(class, anthropic_error_body(class, message.into()))
 }
 
 /// Anthropic-shaped error from an ad-hoc (status, message) site.
@@ -2411,14 +2413,14 @@ async fn chat_completions(
         .messages
         .into_iter()
         .map(|m| {
-            let content = m.content_text();
+            let (content, parts) = m
+                .content
+                .map(|c| c.into_text_and_parts())
+                .unwrap_or_default();
             ChatMsg {
                 role: m.role,
                 content,
-                parts: m.content.and_then(|c| match c {
-                    gw_protocol::openai::MessageContent::Parts(p) => Some(Value::Array(p)),
-                    _ => None,
-                }),
+                parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
                 tool_call_id: m.tool_call_id,
             }
@@ -2798,13 +2800,15 @@ async fn messages(
         message: body
             .messages
             .into_iter()
-            .map(|m| {
-                let text = m.text();
-                let mut msg = ChatMsg::text(m.role, text);
-                if m.content.is_array() {
-                    msg.parts = Some(m.content);
+            .map(|m| match m.content {
+                Value::String(s) => ChatMsg::text(m.role, s),
+                Value::Array(blocks) => {
+                    let text = gw_protocol::anthropic::blocks_text(&blocks);
+                    let mut msg = ChatMsg::text(m.role, text);
+                    msg.parts = Some(Value::Array(blocks));
+                    msg
                 }
-                msg
+                _ => ChatMsg::text(m.role, String::new()),
             })
             .collect(),
         model_param_v2: Some(param),
@@ -2998,11 +3002,7 @@ fn messages_stream_response(
                     let err = *err;
                     self.queue.push_back(St::ev(
                         "error",
-                        json!({"type":"error","error":{
-                            "type": err.class.anthropic_type(),
-                            "code": err.class.code(),
-                            "message": err.message,
-                        }}),
+                        anthropic_error_body(err.class, err.message),
                     ));
                     true
                 }

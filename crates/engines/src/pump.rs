@@ -107,21 +107,17 @@ where
                 };
                 let events = match dec.feed(&bytes) {
                     Ok(events) => events,
-                    Err(e) if sent_any => {
-                        tracing::warn!(vendor, error = %e, "upstream stream failed mid-response");
+                    Err(e) => {
                         let fault = StreamFault {
                             timeout: false,
                             message: e,
                         };
-                        abort_frame(&tx, &mut out, fault.stream_error()).await;
-                        break;
-                    }
-                    Err(e) => {
-                        return Err(StreamFault {
-                            timeout: false,
-                            message: e,
+                        if sent_any {
+                            tracing::warn!(vendor, error = %fault.message, "upstream stream failed mid-response");
+                            abort_frame(&tx, &mut out, fault.stream_error()).await;
+                            break;
                         }
-                        .into_error());
+                        return Err(fault.into_error());
                     }
                 };
                 for data in events {

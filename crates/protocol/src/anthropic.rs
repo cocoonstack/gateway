@@ -59,15 +59,20 @@ impl InMessage {
     pub fn text(&self) -> String {
         match &self.content {
             Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter(|b| b["type"] == "text" || b.get("type").is_none())
-                .filter_map(|b| b["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(""),
+            Value::Array(blocks) => blocks_text(blocks),
             _ => String::new(),
         }
     }
+}
+
+/// Joined text of the `text`/untyped blocks in an Anthropic content array.
+pub fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b["type"] == "text" || b.get("type").is_none())
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Output content block: text or tool_use.

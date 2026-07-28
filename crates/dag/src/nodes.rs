@@ -15,7 +15,8 @@ const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
 const MAX_RESERVE: i64 = 1_000_000;
 
-/// A shared admission denial as the wire error every limit answers with.
+/// The shared 429 for throttling-style denials (rate/QPM/TPM); hard quota
+/// exhaustion answers with [`quota_denied`] instead.
 fn limit_denied(msg: String) -> GatewayError {
     GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
 }

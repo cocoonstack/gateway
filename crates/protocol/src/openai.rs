@@ -22,13 +22,26 @@ impl MessageContent {
     pub fn text(&self) -> String {
         match self {
             MessageContent::Text(s) => s.clone(),
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter(|p| p["type"] == "text")
-                .filter_map(|p| p["text"].as_str())
-                .collect(),
+            MessageContent::Parts(parts) => parts_text(parts),
         }
     }
+
+    /// [`text`](Self::text) plus the surrendered raw parts; the Text form
+    /// moves its string out instead of cloning.
+    pub fn into_text_and_parts(self) -> (String, Option<Vec<Value>>) {
+        match self {
+            MessageContent::Text(s) => (s, None),
+            MessageContent::Parts(parts) => (parts_text(&parts), Some(parts)),
+        }
+    }
+}
+
+fn parts_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|p| p["type"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .collect()
 }
 
 impl Default for MessageContent {

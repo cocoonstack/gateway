@@ -68,9 +68,8 @@ impl StreamError {
         })
     }
 
-    /// Build the terminal frame for an already-committed stream. A generic
-    /// upstream failure becomes the stream-specific class; known transient
-    /// statuses keep their more actionable classification.
+    /// Terminal frame for an already-committed stream: a generic upstream
+    /// failure becomes ModelStreamError; transient classes stay sharper.
     pub fn from_committed_error(e: crate::GatewayError) -> Option<Self> {
         let mut error = Self::from_error(e)?;
         if error.class == gw_consts::ErrClass::ModelError {

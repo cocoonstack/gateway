@@ -40,13 +40,8 @@ impl StreamFault {
     /// The pre-commit form: an ordinary upstream failure eligible for
     /// failover (internal 502 keeps it above the 5xx threshold).
     pub fn into_error(self) -> GatewayError {
-        let code = if self.timeout {
-            gw_consts::ErrCode::FED_RESP_TIMEOUT
-        } else {
-            gw_consts::ErrCode::FED_RESP_RPC_FAILED
-        };
         GatewayError::new(
-            code,
+            upstream_fault_code(self.timeout),
             502,
             format!("upstream stream failed: {}", self.message),
         )
@@ -63,6 +58,16 @@ impl StreamFault {
             message: format!("upstream stream failed: {}", self.message),
             original_status: None,
         }
+    }
+}
+
+/// The upstream-fault code: deadlines classify as ModelTimeout downstream,
+/// everything else as the generic RPC failure.
+pub(crate) fn upstream_fault_code(timeout: bool) -> gw_consts::ErrCode {
+    if timeout {
+        gw_consts::ErrCode::FED_RESP_TIMEOUT
+    } else {
+        gw_consts::ErrCode::FED_RESP_RPC_FAILED
     }
 }
 
