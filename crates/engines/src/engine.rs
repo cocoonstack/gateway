@@ -91,15 +91,18 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     let err = v.get("error").filter(|e| e.is_object());
     let message = match (err, http_status >= 400) {
         (Some(e), _) => e["message"].as_str().unwrap_or("upstream error"),
+        // `Message`: the AWS auth layer capitalizes where modeled Bedrock
+        // errors use lowercase `message`.
         (None, true) => v["message"]
             .as_str()
             .or_else(|| v["msg"].as_str())
+            .or_else(|| v["Message"].as_str())
             .unwrap_or("upstream error"),
         (None, false) => return None,
     }
     .to_owned();
-    let status = if http_status >= 400 {
-        http_status
+    let original_status = if http_status >= 400 {
+        Some(http_status)
     } else {
         err.and_then(|e| {
             e["http_code"]
@@ -109,13 +112,16 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
                 .or_else(|| e["code"].as_str().and_then(|s| s.parse::<u16>().ok()))
         })
         .filter(|c| *c >= 400)
-        .unwrap_or(502)
     };
-    Some(GatewayError::new(
+    let error = GatewayError::new(
         ErrCode::FED_RESP_STATUS_NOT_ZERO,
-        status,
+        original_status.unwrap_or(502),
         message,
-    ))
+    );
+    Some(match original_status {
+        Some(status) => error.with_original_status(status),
+        None => error,
+    })
 }
 
 /// Fill `total_tokens` from prompt + completion when the vendor omitted it.
@@ -136,8 +142,13 @@ mod tests {
         let v = json!({"error": {"message": "overloaded", "code": "529"}});
         let e = vendor_error(200, &v).unwrap();
         assert_eq!((e.http_status, e.message.as_str()), (529, "overloaded"));
+        assert_eq!(e.original_status(), Some(529));
         let e = vendor_error(503, &v).unwrap();
         assert_eq!(e.http_status, 503);
+        assert_eq!(e.original_status(), Some(503));
+        let e = vendor_error(200, &json!({"error": {"message": "overloaded"}})).unwrap();
+        assert_eq!(e.http_status, 502);
+        assert_eq!(e.original_status(), None);
     }
 
     #[test]
@@ -146,6 +157,9 @@ mod tests {
         let e = vendor_error(403, &bedrock).unwrap();
         assert_eq!(e.http_status, 403);
         assert_eq!(e.message, "The security token is invalid.");
+        let aws_auth = json!({"Message": "Invalid API Key format"});
+        let e = vendor_error(403, &aws_auth).unwrap();
+        assert_eq!(e.message, "Invalid API Key format");
         let dashscope =
             json!({"code": "Throttling", "message": "rate exceeded", "request_id": "r"});
         let e = vendor_error(429, &dashscope).unwrap();

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use gw_consts::Protocol;
-use gw_models::{GResult, GatewayError};
+use gw_models::{GResult, GatewayError, StreamError};
 use serde_json::{Value, json};
 
 /// Fixed "created" timestamp for deterministic mock payloads.
@@ -28,12 +28,55 @@ pub struct UpstreamRequest {
     pub account: String,
 }
 
+/// A live-stream item failure: a transport fault or one of our deadlines.
+/// `timeout` selects the ModelTimeout classification downstream.
+#[derive(Debug)]
+pub struct StreamFault {
+    pub timeout: bool,
+    pub message: String,
+}
+
+impl StreamFault {
+    /// The pre-commit form: an ordinary upstream failure eligible for
+    /// failover (internal 502 keeps it above the 5xx threshold).
+    pub fn into_error(self) -> GatewayError {
+        GatewayError::new(
+            upstream_fault_code(self.timeout),
+            502,
+            format!("upstream stream failed: {}", self.message),
+        )
+    }
+
+    /// The post-commit form: the terminal in-stream error frame.
+    pub fn stream_error(&self) -> StreamError {
+        StreamError {
+            class: if self.timeout {
+                gw_consts::ErrClass::ModelTimeout
+            } else {
+                gw_consts::ErrClass::ModelStreamError
+            },
+            message: format!("upstream stream failed: {}", self.message),
+            original_status: None,
+        }
+    }
+}
+
+/// The upstream-fault code: deadlines classify as ModelTimeout downstream,
+/// everything else as the generic RPC failure.
+pub(crate) fn upstream_fault_code(timeout: bool) -> gw_consts::ErrCode {
+    if timeout {
+        gw_consts::ErrCode::FED_RESP_TIMEOUT
+    } else {
+        gw_consts::ErrCode::FED_RESP_RPC_FAILED
+    }
+}
+
 /// Body of an upstream response: buffered JSON, buffered SSE bytes, or live
 /// SSE bytes yielded as the vendor sends them.
 pub enum UpstreamBody {
     Json(bytes::Bytes),
     Sse(Vec<u8>),
-    SseStream(futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>),
+    SseStream(futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>),
 }
 
 impl std::fmt::Debug for UpstreamBody {
@@ -62,13 +105,7 @@ impl UpstreamResponse {
             use futures::StreamExt;
             let mut buf = Vec::new();
             while let Some(item) = s.next().await {
-                let bytes = item.map_err(|e| {
-                    GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
-                        502,
-                        format!("upstream stream failed: {e}"),
-                    )
-                })?;
+                let bytes = item.map_err(StreamFault::into_error)?;
                 buf.extend_from_slice(&bytes);
                 if buf.len() > MAX_BUFFERED_SSE {
                     return Err(GatewayError::new(

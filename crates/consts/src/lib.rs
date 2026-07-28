@@ -3,9 +3,11 @@
 //! Layer L0: depends on nothing internal. Holds the error-code model and the
 //! `Protocol` enum the engine factory dispatches on.
 
+pub mod error_class;
 pub mod error_code;
 pub mod protocol;
 
+pub use error_class::ErrClass;
 pub use error_code::ErrCode;
 pub use protocol::Protocol;
 

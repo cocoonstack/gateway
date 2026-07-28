@@ -45,6 +45,40 @@ pub struct GatewayResponse {
     pub raw_usage_json: Vec<u8>,
 }
 
+/// A mid-stream failure as rendered to the client: the contract
+/// classification, a human-readable message (no internal numeric codes), and
+/// the upstream's original status when an upstream HTTP response was received.
+#[derive(Debug, Clone)]
+pub struct StreamError {
+    pub class: gw_consts::ErrClass,
+    pub message: String,
+    pub original_status: Option<u16>,
+}
+
+impl StreamError {
+    /// Build from an internal error. `None` for client-closed (499): the
+    /// peer is gone and no frame is rendered.
+    pub fn from_error(e: crate::GatewayError) -> Option<Self> {
+        let class = gw_consts::ErrClass::classify(e.code, e.http_status)?;
+        let original_status = e.original_status();
+        Some(Self {
+            class,
+            message: e.message,
+            original_status,
+        })
+    }
+
+    /// Terminal frame for an already-committed stream: a generic upstream
+    /// failure becomes ModelStreamError; transient classes stay sharper.
+    pub fn from_committed_error(e: crate::GatewayError) -> Option<Self> {
+        let mut error = Self::from_error(e)?;
+        if error.class == gw_consts::ErrClass::ModelError {
+            error.class = gw_consts::ErrClass::ModelStreamError;
+        }
+        Some(error)
+    }
+}
+
 /// One streamed response fragment, forwarded to the client as it arrives.
 #[derive(Debug, Default, Clone)]
 pub struct StreamChunk {
@@ -57,7 +91,7 @@ pub struct StreamChunk {
     /// cache/reasoning detail riding with `usage_totals` when the vendor sent it.
     pub common_usage: Option<CommonUsage>,
     /// set when the pipeline failed mid-stream; views emit it as an error frame.
-    pub error: Option<String>,
+    pub error: Option<Box<StreamError>>,
 }
 
 #[cfg(test)]
@@ -77,5 +111,30 @@ mod tests {
         let r = GatewayResponse::default();
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("step").is_none());
+    }
+
+    #[test]
+    fn committed_generic_vendor_error_is_stream_specific() {
+        let e = crate::GatewayError::new(
+            gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+            502,
+            "upstream error",
+        );
+        let e = StreamError::from_committed_error(e).unwrap();
+        assert_eq!(e.class, gw_consts::ErrClass::ModelStreamError);
+        assert_eq!(e.original_status, None);
+    }
+
+    #[test]
+    fn committed_known_throttle_stays_actionable() {
+        let e = crate::GatewayError::new(
+            gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+            429,
+            "rate limited",
+        )
+        .with_original_status(429);
+        let e = StreamError::from_committed_error(e).unwrap();
+        assert_eq!(e.class, gw_consts::ErrClass::Throttling);
+        assert_eq!(e.original_status, Some(429));
     }
 }

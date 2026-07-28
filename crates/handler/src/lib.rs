@@ -889,8 +889,8 @@ mod tests {
 
     #[tokio::test]
     async fn abuse_tiers_suspend_after_repeated_rejections() {
-        // daily_token_quota 1: every request rejects at reserve time (429)
-        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 2, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 1}]";
+        // qps 0: every request is a true throttling rejection.
+        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 2, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(
@@ -900,10 +900,6 @@ mod tests {
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let key = h.state().auth.authenticate("k1").await.unwrap();
         let reject = |k: AkInfo| h.run(chat_req("gpt-4o", "hi"), k);
-        assert!(
-            reject(key.clone()).await.is_ok(),
-            "first request admits and burns the 1-token quota"
-        );
         assert_eq!(
             reject(key.clone()).await.err().map(|e| e.http_status),
             Some(429)
@@ -936,6 +932,30 @@ mod tests {
         );
         let ev = alerts.recv().await.expect("alert emitted");
         assert_eq!((ev.kind, ev.subject.as_str()), ("abuse_suspend", "k1"));
+    }
+
+    #[tokio::test]
+    async fn hard_quota_rejection_does_not_trip_abuse_tier() {
+        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 1}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        assert!(h.run(chat_req("gpt-4o", "hi"), key.clone()).await.is_ok());
+        let err = h
+            .run(chat_req("gpt-4o", "hi"), key)
+            .await
+            .err()
+            .expect("hard quota must reject");
+        assert_eq!(err.code, gw_consts::ErrCode::QUOTA_EXHAUSTED);
+        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            fresh.status_at(gw_state::epoch_secs()),
+            gw_state::KeyStatus::Active
+        );
     }
 
     #[tokio::test]
@@ -997,7 +1017,8 @@ mod tests {
             .await
             .err()
             .expect("second denied by the per-user budget");
-        assert_eq!(err.http_status, 429);
+        assert_eq!(err.http_status, 400);
+        assert_eq!(err.code, gw_consts::ErrCode::QUOTA_EXHAUSTED);
     }
 
     #[tokio::test]
@@ -1092,11 +1113,14 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
                 )),
-                Err("connection reset".to_owned()),
+                Err(gw_engines::transport::StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_owned(),
+                }),
             ];
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
@@ -1153,14 +1177,17 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":100}}}\n\n",
                 )),
                 Ok(bytes::Bytes::from(
                     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"delivered words here\"}}\n\n",
                 )),
-                Err("connection reset".to_owned()),
+                Err(gw_engines::transport::StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_owned(),
+                }),
             ];
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
@@ -1210,7 +1237,7 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"reach me at jane@corp.com now\"}}]}\n\n",
                 )),
@@ -1268,7 +1295,7 @@ mod tests {
             _req: gw_engines::transport::UpstreamRequest,
         ) -> GResult<gw_engines::transport::UpstreamResponse> {
             use futures::StreamExt;
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"key sk-abcdefghijklmnopqrstuvwxyz012345 ok\"}}]}\n\n",
                 )),

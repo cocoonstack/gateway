@@ -15,9 +15,14 @@ const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
 const MAX_RESERVE: i64 = 1_000_000;
 
-/// A shared admission denial as the wire error every limit answers with.
+/// The shared 429 for throttling-style denials (rate/QPM/TPM); hard quota
+/// exhaustion answers with [`quota_denied`] instead.
 fn limit_denied(msg: String) -> GatewayError {
     GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
+}
+
+fn quota_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::QUOTA_EXHAUSTED, 400, msg)
 }
 
 /// preprocess/model_quota: per-(AK, model) daily token cap — AK override, else
@@ -298,7 +303,7 @@ impl DagNode for QuotaCheck {
         let at = gw_state::epoch_secs();
         admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
-            .map_err(limit_denied)?;
+            .map_err(quota_denied)?;
         ctx.quota_reserved = Some(est);
         ctx.quota_at = at;
         ctx.decide("quota_check", format!("reserved {est}"));
@@ -461,7 +466,7 @@ impl DagNode for UserBudgetGate {
             ctx.effective_user_id(),
         )
         .await
-        .map_err(limit_denied)
+        .map_err(quota_denied)
     }
 }
 
@@ -534,7 +539,7 @@ impl DagNode for CallEngine {
                     ctx.state
                         .avail
                         .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-                    return Err(first_err);
+                    return Err(named(first_err, ctx));
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
                 ctx.decide(
@@ -564,13 +569,22 @@ impl DagNode for CallEngine {
                             .avail
                             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
                         note_failure(ctx, &next.name, threshold, cooldown).await;
-                        Err(e)
+                        Err(named(e, ctx))
                     }
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(named(e, ctx)),
         }
     }
+}
+
+/// Attach the requested model to a terminal engine-call error, for the
+/// contract's 424 `resource_name` extra. Error path only.
+fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
+    if e.resource.is_none() {
+        e.resource = Some(requested_model(ctx.request.model_param_v2.as_ref()).to_owned());
+    }
+    e
 }
 
 /// Record an account failure; on the cooldown transition, alert and note the

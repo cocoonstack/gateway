@@ -32,6 +32,9 @@ impl ErrCode {
     pub const FED_RESP_STATUS_NOT_ZERO: ErrCode = ErrCode(2008);
     pub const PARSE_FED_RESP: ErrCode = ErrCode(2009);
     pub const GEN_RES_NOT_NULL: ErrCode = ErrCode(2010);
+    /// Upstream deadline exceeded (header, body, or stream-idle); kept at an
+    /// internal 5xx status so failover still runs, rendered externally as 408.
+    pub const FED_RESP_TIMEOUT: ErrCode = ErrCode(2012);
 
     pub const REQ_JSON: ErrCode = ErrCode(3001);
     pub const REQ_PARAM: ErrCode = ErrCode(3002);
@@ -40,6 +43,7 @@ impl ErrCode {
 
     pub const EMPTY_RESP: ErrCode = ErrCode(4003);
     pub const STOP_LIMIT_MSG: ErrCode = ErrCode(4004);
+    pub const QUOTA_EXHAUSTED: ErrCode = ErrCode(4005);
 
     #[inline]
     pub const fn value(self) -> i64 {

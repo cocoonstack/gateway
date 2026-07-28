@@ -12,10 +12,19 @@ use axum::routing::post;
 use axum::{Json, Router};
 use gw_consts::Protocol;
 use gw_engines::http_transport::{DispatchTransport, HttpTransport};
-use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest};
+use gw_engines::transport::{StreamFault, Transport, UpstreamBody, UpstreamRequest};
 use gw_engines::{ModelEngine, OpenAiEngine};
 use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use serde_json::{Value, json};
+
+async fn serve_router(app: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
 
 async fn spawn_vendor() -> String {
     let app = Router::new().route(
@@ -52,11 +61,7 @@ async fn spawn_vendor() -> String {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr = serve_router(app).await;
     format!("http://{addr}")
 }
 
@@ -82,6 +87,98 @@ async fn http_transport_json_over_real_socket() {
     };
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "srv:wire");
+}
+
+async fn spawn_stalled_json_vendor() -> String {
+    let app = Router::new().route(
+        "/slow-json",
+        post(|| async {
+            let body = futures::stream::unfold(0, |step| async move {
+                match step {
+                    0 => Some((
+                        Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{")),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        Some((Ok(bytes::Bytes::from_static(b"}")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap()
+        }),
+    );
+    let addr = serve_router(app).await;
+    format!("http://{addr}/slow-json")
+}
+
+#[tokio::test]
+async fn non_stream_body_timeout_classifies_as_model_timeout() {
+    let transport = HttpTransport::new(Duration::from_millis(300)).unwrap();
+    let err = transport
+        .send(UpstreamRequest {
+            protocol: Protocol::OpenaiChat,
+            method: "POST".into(),
+            url: spawn_stalled_json_vendor().await,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b"{}".to_vec(),
+            stream: false,
+            account: "slow-body".into(),
+        })
+        .await
+        .expect_err("the non-stream body must share the request deadline");
+    assert_eq!(err.code, gw_consts::ErrCode::FED_RESP_TIMEOUT);
+    assert_eq!(err.http_status, 502);
+    assert_eq!(
+        gw_consts::ErrClass::classify(err.code, err.http_status),
+        Some(gw_consts::ErrClass::ModelTimeout)
+    );
+    assert!(err.message.contains("read upstream body"));
+}
+
+async fn spawn_breaking_json_vendor() -> String {
+    let app = Router::new().route(
+        "/broken-json",
+        post(|| async {
+            let body = futures::stream::iter(vec![
+                Ok(bytes::Bytes::from_static(b"{\"partial\":")),
+                Err(std::io::Error::other("mid-body reset")),
+            ]);
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap()
+        }),
+    );
+    let addr = serve_router(app).await;
+    format!("http://{addr}/broken-json")
+}
+
+#[tokio::test]
+async fn non_stream_body_break_classifies_as_model_error() {
+    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let err = transport
+        .send(UpstreamRequest {
+            protocol: Protocol::OpenaiChat,
+            method: "POST".into(),
+            url: spawn_breaking_json_vendor().await,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b"{}".to_vec(),
+            stream: false,
+            account: "broken-body".into(),
+        })
+        .await
+        .expect_err("a mid-body break must surface as an error");
+    assert_eq!(err.code, gw_consts::ErrCode::FED_RESP_RPC_FAILED);
+    assert_eq!(err.http_status, 502, "failover-eligible upstream fault");
+    assert_eq!(
+        gw_consts::ErrClass::classify(err.code, err.http_status),
+        Some(gw_consts::ErrClass::ModelError)
+    );
 }
 
 #[tokio::test]
@@ -266,11 +363,7 @@ async fn spawn_paced_vendor(frames: usize, gap: Duration) -> String {
                 .unwrap()
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr = serve_router(app).await;
     format!("http://{addr}/paced")
 }
 
@@ -318,6 +411,11 @@ async fn stalled_stream_errors_at_the_idle_gap_instead_of_hanging() {
         Err(e) => e,
     };
     assert_eq!(err.http_status, 502);
+    assert_eq!(
+        err.code,
+        gw_consts::ErrCode::FED_RESP_TIMEOUT,
+        "idle gap must carry the timeout code so it classifies as ModelTimeout"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "must fail at the idle gap, not wait out the vendor: {:?}",
@@ -377,11 +475,14 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     #[async_trait::async_trait]
     impl Transport for FlakyStream {
         async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
                 )),
-                Err("connection reset".to_string()),
+                Err(StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_string(),
+                }),
             ];
             Ok(UpstreamResponse {
                 status: 200,
@@ -391,7 +492,13 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let collect = tokio::spawn(async move {
+        let mut got = Vec::new();
+        while let Some(c) = rx.recv().await {
+            got.push(c);
+        }
+        got
+    });
     let mut request = GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
         model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
@@ -407,6 +514,14 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     assert!(out.response.aborted, "post-send break must mark aborted");
     assert!(out.streamed_live);
     assert_eq!(out.response.message, "partial");
+    let got = collect.await.unwrap();
+    let err = got
+        .iter()
+        .find_map(|c| c.error.as_ref())
+        .expect("committed abort must deliver a terminal error frame");
+    assert_eq!(err.class, gw_consts::ErrClass::ModelStreamError);
+    assert!(err.message.contains("connection reset"));
+    assert_eq!(err.original_status, None);
 }
 
 #[tokio::test]
@@ -419,7 +534,7 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
     #[async_trait::async_trait]
     impl Transport for ErrorFrameStream {
         async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
-            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+            let frames: Vec<Result<bytes::Bytes, StreamFault>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
                 )),
@@ -435,7 +550,13 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let collect = tokio::spawn(async move {
+        let mut got = Vec::new();
+        while let Some(c) = rx.recv().await {
+            got.push(c);
+        }
+        got
+    });
     let mut request = GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],
         model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
@@ -451,4 +572,12 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
     assert!(out.response.aborted, "vendor error after send must abort");
     assert!(out.streamed_live);
     assert_eq!(out.response.message, "partial");
+    let got = collect.await.unwrap();
+    let err = got
+        .iter()
+        .find_map(|c| c.error.as_ref())
+        .expect("committed vendor error must deliver a terminal error frame");
+    assert_eq!(err.class, gw_consts::ErrClass::ModelStreamError);
+    assert_eq!(err.message, "overloaded");
+    assert_eq!(err.original_status, None);
 }

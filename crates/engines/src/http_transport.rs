@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use gw_models::{GResult, GatewayError};
 
-use crate::transport::{MockTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use crate::transport::{
+    MockTransport, StreamFault, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
+    upstream_fault_code,
+};
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // A hung connect (black-holed SYN) must surface as a connect error — which the
@@ -121,7 +124,7 @@ impl Transport for HttpTransport {
                     Ok(r) => r,
                     Err(_) => {
                         return Err(GatewayError::new(
-                            gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                            gw_consts::ErrCode::FED_RESP_TIMEOUT,
                             502,
                             format!(
                                 "upstream request failed: no response headers within {:?}",
@@ -146,7 +149,7 @@ impl Transport for HttpTransport {
                 }
                 Err(e) => {
                     return Err(GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        upstream_fault_code(e.is_timeout()),
                         502,
                         format!("upstream request failed: {e}"),
                     ));
@@ -162,7 +165,10 @@ impl Transport for HttpTransport {
             .unwrap_or(false);
         if is_sse {
             use futures::TryStreamExt;
-            let stream = Box::pin(resp.bytes_stream().map_err(|e| e.to_string()));
+            let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
+                timeout: e.is_timeout(),
+                message: e.to_string(),
+            }));
             return Ok(UpstreamResponse {
                 status,
                 body: idle_capped(stream, policy.timeout),
@@ -174,7 +180,7 @@ impl Transport for HttpTransport {
                 .await
                 .map_err(|_| {
                     GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        gw_consts::ErrCode::FED_RESP_TIMEOUT,
                         502,
                         format!("upstream body not read within {:?}", policy.timeout),
                     )
@@ -182,8 +188,16 @@ impl Transport for HttpTransport {
         } else {
             read.await
         };
-        let bytes =
-            bytes.map_err(|e| GatewayError::internal("read upstream body").with_source(e))?;
+        let bytes = bytes.map_err(|e| {
+            // both stay 502 (failover-eligible); the code split preserves the
+            // external 408-vs-424 classification
+            let what = if e.is_timeout() {
+                "read upstream body timed out"
+            } else {
+                "read upstream body failed"
+            };
+            GatewayError::new(upstream_fault_code(e.is_timeout()), 502, what).with_source(e)
+        })?;
         Ok(UpstreamResponse {
             status,
             body: UpstreamBody::Json(bytes),
@@ -195,7 +209,7 @@ impl Transport for HttpTransport {
 /// one terminal error item — no gap between chunks may exceed the policy
 /// timeout, but an actively flowing stream lives as long as the generation.
 fn idle_capped(
-    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
     gap: Duration,
 ) -> UpstreamBody {
     use futures::StreamExt;
@@ -206,7 +220,13 @@ fn idle_capped(
             match tokio::time::timeout(gap, s.next()).await {
                 Ok(Some(item)) => Some((item, Some(s))),
                 Ok(None) => None,
-                Err(_) => Some((Err(format!("stream idle for {gap:?}")), None)),
+                Err(_) => Some((
+                    Err(StreamFault {
+                        timeout: true,
+                        message: format!("stream idle for {gap:?}"),
+                    }),
+                    None,
+                )),
             }
         },
     )))
