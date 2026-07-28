@@ -17,6 +17,9 @@ pub struct GatewayError {
     pub code: ErrCode,
     pub http_status: u16,
     pub message: String,
+    /// the client-requested model, attached on the engine-call error path for
+    /// the 424 `resource_name` extra; never set on the success path.
+    pub resource: Option<String>,
     pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -26,6 +29,7 @@ impl GatewayError {
             code,
             http_status,
             message: message.into(),
+            resource: None,
             source: None,
         }
     }

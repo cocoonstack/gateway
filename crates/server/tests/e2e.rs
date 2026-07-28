@@ -524,7 +524,11 @@ async fn failed_request_refunds_its_reservation() {
         ))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "vendor error surfaces");
+    assert_eq!(
+        r.status(),
+        StatusCode::FAILED_DEPENDENCY,
+        "vendor error surfaces as 424 ModelError"
+    );
     let r = app
         .oneshot(post(
             "/v1/chat/completions",
@@ -889,7 +893,7 @@ async fn auth_is_enforced() {
 }
 
 #[tokio::test]
-async fn model_failure_modes_404_503_501() {
+async fn model_failure_modes_404_503_unsupported() {
     let app = app();
     let resp = app
         .clone()
@@ -921,7 +925,7 @@ async fn model_failure_modes_404_503_501() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -3073,7 +3077,13 @@ async fn realtime_turns_are_rate_limited() {
     let msg = ws.next().await.unwrap().unwrap();
     let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(v["type"], "error", "second turn must be rate limited: {v}");
-    assert!(v["message"].as_str().unwrap().contains("rate limit"));
+    assert_eq!(v["error"]["code"], "throttling_exception");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rate limit")
+    );
 }
 
 #[tokio::test]
@@ -3132,7 +3142,13 @@ async fn vendor_error_envelope_propagates_to_client() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+    assert_eq!(
+        resp.headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok()),
+        Some("ModelErrorException")
+    );
     let j = body_json(resp).await;
     assert!(
         j["error"]["message"]
@@ -3140,6 +3156,77 @@ async fn vendor_error_envelope_propagates_to_client() {
             .unwrap()
             .contains("mock vendor rejected")
     );
+    assert_eq!(j["error"]["code"], "model_error_exception");
+    assert_eq!(j["error"]["type"], "model_error");
+    assert_eq!(j["error"]["original_status_code"], 400);
+    assert_eq!(j["error"]["resource_name"], "erroring-model");
+}
+
+#[tokio::test]
+async fn error_contract_machine_channel() {
+    let app = app();
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", None, CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        r.headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok()),
+        Some("UnrecognizedClientException")
+    );
+    assert_eq!(
+        r.headers()
+            .get("access-control-expose-headers")
+            .and_then(|v| v.to_str().ok()),
+        Some("x-amzn-errortype, retry-after")
+    );
+    let j = body_json(r).await;
+    assert_eq!(j["error"]["code"], "unrecognized_client_exception");
+    assert_eq!(j["error"]["type"], "authentication_error");
+
+    let r = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            "{not json",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "rejection stays in the envelope"
+    );
+    let j = body_json(r).await;
+    assert_eq!(j["error"]["code"], "validation_exception");
+
+    let r = app.clone().oneshot(get("/v1/nope")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let j = body_json(r).await;
+    assert_eq!(j["error"]["code"], "resource_not_found_exception");
+
+    let r = app
+        .clone()
+        .oneshot(get("/v1/chat/completions"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "405 normalizes to 400");
+    let j = body_json(r).await;
+    assert_eq!(j["error"]["code"], "validation_exception");
+
+    let r = app
+        .oneshot(post("/v1/messages", None, r#"{"model":"m","messages":[]}"#))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let j = body_json(r).await;
+    assert_eq!(j["type"], "error");
+    assert_eq!(j["error"]["type"], "authentication_error");
+    assert_eq!(j["error"]["code"], "unrecognized_client_exception");
 }
 
 #[tokio::test]

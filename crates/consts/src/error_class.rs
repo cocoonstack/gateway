@@ -134,9 +134,12 @@ impl ErrClass {
             | ErrCode::FED_RESP_STATUS_NOT_ZERO
             | ErrCode::PARSE_FED_RESP
             | ErrCode::GEN_RES_NOT_NULL
+            // a terminal upstream 429/503 keeps its transient retry
+            // semantics instead of collapsing into the 424 "don't retry"
             | ErrCode::EMPTY_RESP => match status {
                 408 => ErrClass::ModelTimeout,
                 429 => ErrClass::Throttling,
+                503 => ErrClass::ServiceUnavailable,
                 _ => ErrClass::ModelError,
             },
             ErrCode::STOP_LIMIT_MSG => ErrClass::Throttling,
@@ -212,9 +215,11 @@ mod tests {
         let c = ErrClass::classify(ErrCode::FED_RESP_STATUS_NOT_ZERO, 401).unwrap();
         assert_eq!(c, ErrClass::ModelError);
         assert_eq!(c.status(), 424);
-        // terminal vendor throttle keeps 429 semantics
+        // terminal vendor throttle/capacity keep their transient semantics
         let c = ErrClass::classify(ErrCode::FED_RESP_STATUS_NOT_ZERO, 429).unwrap();
         assert_eq!(c, ErrClass::Throttling);
+        let c = ErrClass::classify(ErrCode::FED_RESP_STATUS_NOT_ZERO, 503).unwrap();
+        assert_eq!(c, ErrClass::ServiceUnavailable);
         // deadline family
         let c = ErrClass::classify(ErrCode::FED_RESP_TIMEOUT, 502).unwrap();
         assert_eq!((c, c.status()), (ErrClass::ModelTimeout, 408));

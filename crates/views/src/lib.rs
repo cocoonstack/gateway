@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use gw_config::GatewayConfig;
+use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{is_response_create, realtime_turn_started, realtime_usage};
@@ -148,8 +149,20 @@ pub fn app(state: AppState) -> Router {
             "/admin/keys/{ak}",
             axum::routing::patch(admin_key_patch).delete(admin_key_delete),
         )
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(wrong_method)
         .layer(axum::middleware::from_fn(track_requests))
         .with_state(state)
+}
+
+/// Route fallback: the envelope's 404 instead of axum's bare one.
+async fn unknown_route() -> Response {
+    error_response(404, "unknown route")
+}
+
+/// Method fallback: the framework 405 normalized to the contract's 400.
+async fn wrong_method() -> Response {
+    error_response(405, "method not allowed for this route")
 }
 
 /// Counts every response with bounded labels: route template and status code.
@@ -170,6 +183,16 @@ async fn track_requests(
     metrics::histogram!("gateway_request_duration_seconds", "route" => route)
         .record(started.elapsed().as_secs_f64());
     resp
+}
+
+/// In-band realtime error event (spec 4.4). Never terminal: the session
+/// stays open, and only a Close frame or disconnect ends it.
+fn rt_error(class: ErrClass, message: impl Into<String>) -> Value {
+    json!({"type":"error","error":{
+        "type": class.openai_type(),
+        "code": class.code(),
+        "message": message.into(),
+    }})
 }
 
 /// The AK carried as `gw-api-key.<ak>` in `Sec-WebSocket-Protocol` — the one
@@ -347,19 +370,27 @@ async fn realtime_gate(
     ak: &AkInfo,
     m: &RtModel,
     hint: &str,
-) -> Result<RealtimeAdmit, String> {
+) -> Result<RealtimeAdmit, (ErrClass, String)> {
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
     let ak = match state.auth.authenticate(&ak.ak).await {
         Some(fresh) if fresh.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active => {
             fresh
         }
-        _ => return Err(format!("access key {} is no longer valid", ak.ak)),
+        _ => {
+            return Err((
+                ErrClass::AccessDenied,
+                format!("access key {} is no longer valid", ak.ak),
+            ));
+        }
     };
     if !cfg.tenant_allows_model(&ak.tenant, &m.requested) {
-        return Err(format!(
-            "model `{}` is not entitled for tenant `{}`",
-            m.requested, ak.tenant
+        return Err((
+            ErrClass::AccessDenied,
+            format!(
+                "model `{}` is not entitled for tenant `{}`",
+                m.requested, ak.tenant
+            ),
         ));
     }
     // the session pinned `served` at handshake; a reload may have removed it,
@@ -367,31 +398,47 @@ async fn realtime_gate(
     // reconnects and picks against the live config. Wire-direct sessions
     // (`?model=realtime`, never in config) are exempt: nothing to vanish.
     if m.from_config && cfg.find_model(&m.served).is_none() {
-        return Err(format!(
-            "model `{}` is no longer configured; reconnect",
-            m.served
+        return Err((
+            ErrClass::ResourceNotFound,
+            format!("model `{}` is no longer configured; reconnect", m.served),
         ));
     }
     let gov = state.governance.as_ref();
-    admission::check_tenant_rate(gov, cfg, &ak.tenant).await?;
-    admission::check_ak_rate(gov, &ak).await?;
-    admission::check_product_qpm(gov, cfg, &ak.product).await?;
-    admission::check_model_qpm(gov, cfg, &m.served).await?;
-    admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint)).await?;
+    let throttled = |m: String| (ErrClass::Throttling, m);
+    admission::check_tenant_rate(gov, cfg, &ak.tenant)
+        .await
+        .map_err(throttled)?;
+    admission::check_ak_rate(gov, &ak)
+        .await
+        .map_err(throttled)?;
+    admission::check_product_qpm(gov, cfg, &ak.product)
+        .await
+        .map_err(throttled)?;
+    admission::check_model_qpm(gov, cfg, &m.served)
+        .await
+        .map_err(throttled)?;
+    admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint))
+        .await
+        .map_err(throttled)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak, &m.requested), limit)
             .await
     {
-        return Err(format!("model quota exhausted for `{}`", m.requested));
+        return Err((
+            ErrClass::Throttling,
+            format!("model quota exhausted for `{}`", m.requested),
+        ));
     }
     let at = gw_state::epoch_secs();
-    admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at).await?;
+    admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
+        .await
+        .map_err(throttled)?;
     let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
         Ok(reserved) => reserved,
         Err(denied) => {
             gov.quota_settle(&ak.ak, -REALTIME_TURN_RESERVE, at).await;
-            return Err(denied);
+            return Err((ErrClass::Throttling, denied));
         }
     };
     let user = ak.attributed_user(hint).to_owned();
@@ -500,13 +547,13 @@ async fn realtime_session(
         };
         let Ok(mut ev) = serde_json::from_str::<Value>(&text) else {
             let _ = socket
-                .send(send(json!({"type":"error","message":"invalid json event"})))
+                .send(send(rt_error(ErrClass::Validation, "invalid json event")))
                 .await;
             continue;
         };
         if let Err(reason) = rt_inbound_policy(&s, &ak, &hint, &mut ev).await {
             let _ = socket
-                .send(send(json!({"type":"error","message": reason})))
+                .send(send(rt_error(ErrClass::AccessDenied, reason)))
                 .await;
             continue;
         }
@@ -514,10 +561,8 @@ async fn realtime_session(
             "input_text" => {
                 let admit = match realtime_gate(&s, &ak, &rtm, &hint).await {
                     Ok(a) => a,
-                    Err(denied) => {
-                        let _ = socket
-                            .send(send(json!({"type":"error","message": denied})))
-                            .await;
+                    Err((class, denied)) => {
+                        let _ = socket.send(send(rt_error(class, denied))).await;
                         continue;
                     }
                 };
@@ -550,8 +595,10 @@ async fn realtime_session(
             }
             other => {
                 let _ = socket
-                    .send(send(json!({"type":"error",
-                        "message": format!("unsupported event type `{other}`")})))
+                    .send(send(rt_error(
+                        ErrClass::Validation,
+                        format!("unsupported event type `{other}`"),
+                    )))
                     .await;
             }
         }
@@ -603,7 +650,7 @@ async fn realtime_bridge(
     use tokio_tungstenite::tungstenite::Message as UMsg;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let send_err = |m: String| json!({"type":"error","error":{"type":"gateway_error","message":m}});
+    let send_err = rt_error;
 
     let base = account.endpoint.trim_end_matches('/');
     let ws_base = base
@@ -616,7 +663,7 @@ async fn realtime_bridge(
             s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
                 .send(CMsg::Text(
-                    send_err(format!("bad upstream url: {e}"))
+                    send_err(ErrClass::InternalServer, format!("bad upstream url: {e}"))
                         .to_string()
                         .into(),
                 ))
@@ -634,9 +681,12 @@ async fn realtime_bridge(
             s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
                 .send(CMsg::Text(
-                    send_err(format!("upstream realtime connect failed: {e}"))
-                        .to_string()
-                        .into(),
+                    send_err(
+                        ErrClass::ModelError,
+                        format!("upstream realtime connect failed: {e}"),
+                    )
+                    .to_string()
+                    .into(),
                 ))
                 .await;
             return;
@@ -671,7 +721,7 @@ async fn realtime_bridge(
                     match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
                         Err(reason) => {
                             if cl_tx
-                                .send(CMsg::Text(send_err(reason).to_string().into()))
+                                .send(CMsg::Text(send_err(ErrClass::AccessDenied, reason).to_string().into()))
                                 .await
                                 .is_err()
                             {
@@ -695,9 +745,9 @@ async fn realtime_bridge(
                                 pending = Some(admit);
                                 generations += 1;
                             }
-                            Err(denied) => {
+                            Err((class, denied)) => {
                                 if cl_tx
-                                    .send(CMsg::Text(send_err(denied).to_string().into()))
+                                    .send(CMsg::Text(send_err(class, denied).to_string().into()))
                                     .await
                                     .is_err()
                                 {
@@ -747,12 +797,12 @@ async fn realtime_bridge(
                         else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(admit),
-                                Err(denied) => {
+                                Err((class, denied)) => {
                                     let _ = up_tx
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
                                         .await;
                                     let _ = cl_tx
-                                        .send(CMsg::Text(send_err(denied).to_string().into()))
+                                        .send(CMsg::Text(send_err(class, denied).to_string().into()))
                                         .await;
                                     suppress = true;
                                     relay = false;
@@ -1032,13 +1082,89 @@ impl axum::extract::FromRequestParts<AppState> for Authed {
     }
 }
 
-fn error_response(status: u16, message: impl Into<String>) -> Response {
-    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        code,
-        Json(json!({ "error": { "message": message.into(), "type": "gateway_error" } })),
+/// `axum::Json` with rejections rendered in the OpenAI envelope, so a
+/// malformed body (400/413/415/422) cannot escape the contract.
+struct ApiJson<T>(T);
+
+impl<T, S> axum::extract::FromRequest<S> for ApiJson<T>
+where
+    axum::Json<T>:
+        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(v)) => Ok(ApiJson(v)),
+            Err(rej) => Err(error_response(rej.status().as_u16(), rej.body_text())),
+        }
+    }
+}
+
+/// [`ApiJson`] in the Anthropic envelope, for `/v1/messages`.
+struct AnthJson<T>(T);
+
+impl<T, S> axum::extract::FromRequest<S> for AnthJson<T>
+where
+    axum::Json<T>:
+        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(v)) => Ok(AnthJson(v)),
+            Err(rej) => Err(anthropic_error(rej.status().as_u16(), rej.body_text())),
+        }
+    }
+}
+
+/// The contract's machine channel on every HTTP error response (spec 4.1):
+/// the classification header plus the CORS exposure both channels need.
+fn with_error_headers(class: ErrClass, mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        "x-amzn-errortype",
+        axum::http::HeaderValue::from_static(class.name()),
+    );
+    headers.insert(
+        "access-control-expose-headers",
+        axum::http::HeaderValue::from_static("x-amzn-errortype, retry-after"),
+    );
+    resp
+}
+
+/// OpenAI-shaped error body (spec 4.2): coarse `type`, precise `code`.
+fn openai_error_body(class: ErrClass, message: String) -> Value {
+    json!({ "error": {
+        "message": message,
+        "type": class.openai_type(),
+        "param": null,
+        "code": class.code(),
+    }})
+}
+
+/// OpenAI-envelope error at the class's external status.
+fn class_error(class: ErrClass, message: impl Into<String>) -> Response {
+    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    with_error_headers(
+        class,
+        (status, Json(openai_error_body(class, message.into()))).into_response(),
     )
-        .into_response()
+}
+
+/// OpenAI-envelope error from an ad-hoc (status, message) site; the external
+/// status is the classification's, not the caller's literal.
+fn error_response(status: u16, message: impl Into<String>) -> Response {
+    match ErrClass::from_status(status) {
+        Some(class) => class_error(class, message),
+        // 499 client-closed: the peer is gone; nothing to render
+        None => StatusCode::from_u16(status)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response(),
+    }
 }
 
 /// Who an admin bearer token speaks for: the global operator or one tenant.
@@ -1415,7 +1541,7 @@ async fn admin_key_create(
     State(s): State<AppState>,
     scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
@@ -1496,7 +1622,7 @@ async fn admin_key_patch(
     scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
@@ -2088,42 +2214,70 @@ async fn admin_content_erase(
     }
 }
 
+/// OpenAI-envelope rendering of an internal error: classified, never a
+/// status passthrough — a terminal vendor 401 lands as 424 ModelError, not
+/// as the client's own 401.
 fn gateway_error(e: GatewayError) -> Response {
-    let code = StatusCode::from_u16(e.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    // OpenAI's error schema types `code` as string-or-null, never a number.
-    (
-        code,
-        Json(json!({ "error": { "message": e.message, "code": e.code.value().to_string(), "type": "gateway_error" } })),
-    )
-        .into_response()
+    let Some(class) = ErrClass::classify(e.code, e.http_status) else {
+        // 499 client-closed: the peer is gone; nothing to render
+        return StatusCode::from_u16(e.http_status)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response();
+    };
+    let original_status =
+        (e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO).then_some(e.http_status);
+    let mut body = openai_error_body(class, e.message);
+    if class == ErrClass::ModelError {
+        if let Some(os) = original_status {
+            body["error"]["original_status_code"] = os.into();
+        }
+        if let Some(r) = e.resource {
+            body["error"]["resource_name"] = r.into();
+        }
+    }
+    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    with_error_headers(class, (status, Json(body)).into_response())
 }
 
-/// Anthropic's error type string for an HTTP status.
-fn anthropic_error_type(status: u16) -> &'static str {
-    match status {
-        400 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        529 => "overloaded_error",
-        _ => "api_error",
+/// Anthropic-shaped error body (spec 4.3) — `error.type` is the discriminator
+/// the Anthropic SDKs key their exception dispatch on; `code` is additive.
+fn anthropic_error_with(class: ErrClass, message: impl Into<String>) -> Response {
+    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    with_error_headers(
+        class,
+        (
+            status,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": class.anthropic_type(),
+                    "code": class.code(),
+                    "message": message.into(),
+                },
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// Anthropic-shaped error from an ad-hoc (status, message) site.
+fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
+    match ErrClass::from_status(status) {
+        Some(class) => anthropic_error_with(class, message),
+        None => StatusCode::from_u16(status)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response(),
     }
 }
 
-/// Anthropic-shaped error body: `{"type":"error","error":{"type","message"}}` —
-/// the discriminator the Anthropic SDKs key their exception dispatch on.
-fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
-    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        code,
-        Json(json!({
-            "type": "error",
-            "error": { "type": anthropic_error_type(status), "message": message.into() },
-        })),
-    )
-        .into_response()
+/// [`gateway_error`]'s classification, rendered in the Anthropic shape.
+fn anthropic_gateway_error(e: GatewayError) -> Response {
+    match ErrClass::classify(e.code, e.http_status) {
+        Some(class) => anthropic_error_with(class, e.message),
+        None => StatusCode::from_u16(e.http_status)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response(),
+    }
 }
 
 /// Run the pipeline on its own task so a client disconnect can't cancel it
@@ -2236,7 +2390,7 @@ async fn chat_completions(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<ChatCompletionRequest>,
+    ApiJson(body): ApiJson<ChatCompletionRequest>,
 ) -> Response {
     let started = Instant::now();
     if body.messages.is_empty() {
@@ -2429,6 +2583,21 @@ fn sse_stream<S: SseEncodeState>(
     Sse::new(stream)
 }
 
+/// Chat/legacy SSE error frame (spec 4.5): the OpenAI envelope plus the
+/// upstream's original status when one was received.
+fn stream_error_body(err: &gw_models::StreamError) -> Value {
+    let mut e = json!({
+        "message": err.message,
+        "type": err.class.openai_type(),
+        "param": null,
+        "code": err.class.code(),
+    });
+    if let Some(os) = err.original_status {
+        e["original_status_code"] = os.into();
+    }
+    json!({ "error": e })
+}
+
 /// Streaming chat: pipeline chunks re-emitted as OpenAI SSE.
 fn chat_stream_response(
     s: AppState,
@@ -2455,12 +2624,8 @@ fn chat_stream_response(
                 Some(gw_engines::StreamChunk {
                     error: Some(err), ..
                 }) => {
-                    self.queue.push_back(
-                        Event::default().data(
-                            json!({"error": {"message": err.message, "type": "gateway_error"}})
-                                .to_string(),
-                        ),
-                    );
+                    self.queue
+                        .push_back(Event::default().data(stream_error_body(&err).to_string()));
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
@@ -2591,7 +2756,7 @@ fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::S
 async fn messages(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<MessagesRequest>,
+    AnthJson(body): AnthJson<MessagesRequest>,
 ) -> Response {
     let started = Instant::now();
     let ak = match authenticate(&s, &headers).await {
@@ -2648,7 +2813,7 @@ async fn messages(
 
     let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
-        Err(e) => return anthropic_error(e.http_status, e.message),
+        Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
     let Some(mut outcome) = ctx.outcome else {
@@ -2827,7 +2992,11 @@ fn messages_stream_response(
                 }) => {
                     self.queue.push_back(St::ev(
                         "error",
-                        json!({"type":"error","error":{"type":"api_error","message":err.message}}),
+                        json!({"type":"error","error":{
+                            "type": err.class.anthropic_type(),
+                            "code": err.class.code(),
+                            "message": err.message,
+                        }}),
                     ));
                     true
                 }
@@ -2951,7 +3120,7 @@ async fn completions(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(mut body): Json<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3015,7 +3184,7 @@ async fn responses(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3067,6 +3236,7 @@ fn responses_stream_response(
         model: String,
         created: bool,
         status: String,
+        seq: u64,
     }
     impl St {
         fn ensure_created(&mut self) {
@@ -3074,6 +3244,7 @@ fn responses_stream_response(
                 return;
             }
             self.created = true;
+            self.seq += 1;
             self.queue.push_back(Event::default().data(
                 json!({"type":"response.created","response":{"model":self.model,"status":"in_progress"}})
                     .to_string(),
@@ -3090,10 +3261,18 @@ fn responses_stream_response(
                     error: Some(err), ..
                 }) => {
                     self.ensure_created();
+                    // the official Responses error event is flat: no nested
+                    // `error` object, sequence_number continues the stream
                     self.queue.push_back(
                         Event::default().data(
-                            json!({"type":"error","error":{"type":"gateway_error","message":err.message}})
-                                .to_string(),
+                            json!({
+                                "type": "error",
+                                "code": err.class.code(),
+                                "message": err.message,
+                                "param": null,
+                                "sequence_number": self.seq,
+                            })
+                            .to_string(),
                         ),
                     );
                     self.queue.push_back(Event::default().data("[DONE]"));
@@ -3102,6 +3281,7 @@ fn responses_stream_response(
                 Some(c) => {
                     self.ensure_created();
                     if !c.delta.is_empty() {
+                        self.seq += 1;
                         self.queue.push_back(
                             Event::default().data(
                                 json!({"type":"response.output_text.delta","delta":c.delta})
@@ -3115,6 +3295,7 @@ fn responses_stream_response(
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
                     };
+                    self.seq += 1;
                     self.queue.push_back(
                         Event::default().data(
                             json!({"type":"response.completed","response":{
@@ -3141,6 +3322,7 @@ fn responses_stream_response(
             queue: VecDeque::new(),
             model,
             created: false,
+            seq: 0,
             status: "completed".to_owned(),
         },
     )
@@ -3151,7 +3333,7 @@ async fn embeddings(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(mut body): Json<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3186,7 +3368,7 @@ async fn images_generations(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3224,7 +3406,7 @@ async fn images_edits(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3263,7 +3445,7 @@ async fn audio_speech(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3321,7 +3503,7 @@ async fn audio_transcriptions(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     audio_transcribe(s, headers, ak, body, false).await
 }
@@ -3332,7 +3514,7 @@ async fn audio_translations(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     audio_transcribe(s, headers, ak, body, true).await
 }
@@ -3390,7 +3572,7 @@ async fn moderations(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(mut body): Json<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3422,7 +3604,7 @@ async fn rerank(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(mut body): Json<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -3484,7 +3666,7 @@ async fn batches_submit(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
@@ -3557,7 +3739,7 @@ async fn batches_submit(
 async fn files_upload(
     State(s): State<AppState>,
     Authed(ak): Authed,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
     let Some(content) = body["file"].as_str() else {
@@ -4611,8 +4793,9 @@ mod tests {
         let denied = realtime_gate(&s, &ak, &pinned, "").await.err();
         assert!(
             denied
-                .as_deref()
-                .is_some_and(|e| e.contains("no longer configured")),
+                .as_ref()
+                .is_some_and(|(class, e)| *class == ErrClass::ResourceNotFound
+                    && e.contains("no longer configured")),
             "a pinned variant removed by reload must deny the turn, not bill zero: {denied:?}"
         );
     }

@@ -42,22 +42,20 @@ pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) ->
 }
 
 /// Deliver the terminal error frame for a committed abort (best effort — the
-/// client may already be gone) and mark the pump result aborted. A buffered
-/// run keeps the frame in `chunks` so the replay tail carries it.
+/// client may already be gone) and mark the pump result aborted. Committed
+/// implies a live channel: `sent_any` only ever turns true with `tx` attached.
 async fn abort_frame(
     tx: &Option<tokio::sync::mpsc::Sender<StreamChunk>>,
     out: &mut PumpResult,
     error: StreamError,
 ) {
-    let chunk = StreamChunk {
-        error: Some(error),
-        ..Default::default()
-    };
-    match tx {
-        Some(sender) => {
-            let _ = sender.send(chunk).await;
-        }
-        None => out.chunks.push(chunk),
+    if let Some(sender) = tx {
+        let _ = sender
+            .send(StreamChunk {
+                error: Some(error),
+                ..Default::default()
+            })
+            .await;
     }
     out.aborted = true;
 }

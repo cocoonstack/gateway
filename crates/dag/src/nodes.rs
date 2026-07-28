@@ -534,7 +534,7 @@ impl DagNode for CallEngine {
                     ctx.state
                         .avail
                         .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-                    return Err(first_err);
+                    return Err(named(first_err, ctx));
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
                 ctx.decide(
@@ -564,13 +564,22 @@ impl DagNode for CallEngine {
                             .avail
                             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
                         note_failure(ctx, &next.name, threshold, cooldown).await;
-                        Err(e)
+                        Err(named(e, ctx))
                     }
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(named(e, ctx)),
         }
     }
+}
+
+/// Attach the requested model to a terminal engine-call error, for the
+/// contract's 424 `resource_name` extra. Error path only.
+fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
+    if e.resource.is_none() {
+        e.resource = Some(requested_model(ctx.request.model_param_v2.as_ref()).to_owned());
+    }
+    e
 }
 
 /// Record an account failure; on the cooldown transition, alert and note the

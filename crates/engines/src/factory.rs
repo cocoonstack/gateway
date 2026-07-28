@@ -1,6 +1,6 @@
 //! Engine factory: one engine per [`Protocol`], matched exhaustively at
 //! compile time. Realtime is not a chat-pipeline engine — it is served on the
-//! /v1/realtime WebSocket surface, so the factory answers 501-with-pointer for
+//! /v1/realtime WebSocket surface, so the factory answers 400-with-pointer for
 //! it on the chat path.
 
 use gw_consts::{ErrCode, Protocol};
@@ -48,8 +48,8 @@ pub fn get_engine(
         Protocol::Dashscope => Box::new(DashScopeEngine::new(request, transport)),
         Protocol::Realtime => {
             return Err(GatewayError::new(
-                ErrCode::INTERNAL_UNKNOWN,
-                501,
+                ErrCode::REQ_NON_CHAT,
+                400,
                 format!(
                     "realtime model `{}` is served on the /v1/realtime websocket surface, not the chat surface",
                     p.as_str()
@@ -82,7 +82,7 @@ mod tests {
         for &p in Protocol::ALL {
             let got = get_engine(req(p), t.clone());
             if p == Protocol::Realtime {
-                assert_eq!(got.err().map(|e| e.http_status), Some(501), "{p}");
+                assert_eq!(got.err().map(|e| e.http_status), Some(400), "{p}");
             } else {
                 assert!(got.is_ok(), "no engine for {p}");
                 dispatched += 1;
