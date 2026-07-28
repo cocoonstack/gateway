@@ -82,7 +82,7 @@ impl ErrClass {
         }
     }
 
-    /// Coarse `type` for the OpenAI envelope (contract §4.2).
+    /// Coarse `type` for the OpenAI envelope, for SDKs that key on it.
     pub const fn openai_type(self) -> &'static str {
         match self {
             ErrClass::Validation
@@ -99,7 +99,8 @@ impl ErrClass {
         }
     }
 
-    /// `type` for the Anthropic envelope (contract §4.3).
+    /// `type` for the Anthropic envelope — the discriminator its SDKs
+    /// dispatch exceptions on.
     pub const fn anthropic_type(self) -> &'static str {
         match self {
             ErrClass::Validation | ErrClass::ServiceQuotaExceeded | ErrClass::Conflict => {

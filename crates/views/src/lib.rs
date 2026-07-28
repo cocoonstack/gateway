@@ -185,7 +185,7 @@ async fn track_requests(
     resp
 }
 
-/// In-band realtime error event (spec 4.4). Never terminal: the session
+/// In-band realtime error event. Never terminal: the session
 /// stays open, and only a Close frame or disconnect ends it.
 fn rt_error(class: ErrClass, message: impl Into<String>) -> Value {
     json!({"type":"error","error":{
@@ -1136,8 +1136,8 @@ where
     }
 }
 
-/// The contract's machine channel on every HTTP error response (spec 4.1):
-/// the classification header plus the CORS exposure both channels need.
+/// The contract's machine channel on every HTTP error response: the
+/// classification header plus the CORS exposure browser clients need.
 fn with_error_headers(class: ErrClass, mut resp: Response) -> Response {
     let headers = resp.headers_mut();
     headers.insert(
@@ -1151,7 +1151,7 @@ fn with_error_headers(class: ErrClass, mut resp: Response) -> Response {
     resp
 }
 
-/// OpenAI-shaped error body (spec 4.2): coarse `type`, precise `code`.
+/// OpenAI-shaped error body: coarse `type`, precise `code`.
 fn openai_error_body(class: ErrClass, message: String) -> Value {
     json!({ "error": {
         "message": message,
@@ -2258,8 +2258,8 @@ fn gateway_error(e: GatewayError) -> Response {
     class_response(class, body)
 }
 
-/// Anthropic-shaped error body (spec 4.3) — `error.type` is the discriminator
-/// the Anthropic SDKs key their exception dispatch on; `code` is additive.
+/// Anthropic-shaped error body — `error.type` is the discriminator the
+/// Anthropic SDKs key their exception dispatch on; `code` is additive.
 fn anthropic_error_with(class: ErrClass, message: impl Into<String>) -> Response {
     class_response(
         class,
@@ -2593,8 +2593,8 @@ fn sse_stream<S: SseEncodeState>(
     Sse::new(stream)
 }
 
-/// Chat/legacy SSE error frame (spec 4.5): the OpenAI envelope plus the
-/// upstream's original status when one was received.
+/// Chat/legacy SSE error frame: the OpenAI envelope plus the upstream's
+/// original status when one was received.
 fn stream_error_body(err: gw_models::StreamError) -> Value {
     let mut body = openai_error_body(err.class, err.message);
     if let Some(os) = err.original_status {

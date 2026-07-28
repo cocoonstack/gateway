@@ -2593,6 +2593,13 @@ async fn realtime_websocket_mock_session() {
     assert_eq!(v["type"], "session.created");
     assert_eq!(v["session"]["account"], "mock-realtime-1");
 
+    ws.send(Message::text("not json")).await.unwrap();
+    let err = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(err.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["code"], "validation_exception");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+
     ws.send(Message::text(
         serde_json::json!({"type":"input_text","text":"realtime hello"}).to_string(),
     ))
@@ -3224,6 +3231,7 @@ async fn error_contract_machine_channel() {
     assert_eq!(j["error"]["code"], "validation_exception");
 
     let r = app
+        .clone()
         .oneshot(post("/v1/messages", None, r#"{"model":"m","messages":[]}"#))
         .await
         .unwrap();
@@ -3232,6 +3240,22 @@ async fn error_contract_machine_channel() {
     assert_eq!(j["type"], "error");
     assert_eq!(j["error"]["type"], "authentication_error");
     assert_eq!(j["error"]["code"], "unrecognized_client_exception");
+
+    let oversized = format!(
+        r#"{{"model":"m-chat","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(3 * 1024 * 1024)
+    );
+    let r = app
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            &oversized,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let j = body_json(r).await;
+    assert_eq!(j["error"]["code"], "request_entity_too_large_exception");
 }
 
 #[tokio::test]

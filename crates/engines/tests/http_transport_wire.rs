@@ -318,6 +318,11 @@ async fn stalled_stream_errors_at_the_idle_gap_instead_of_hanging() {
         Err(e) => e,
     };
     assert_eq!(err.http_status, 502);
+    assert_eq!(
+        err.code,
+        gw_consts::ErrCode::FED_RESP_TIMEOUT,
+        "idle gap must carry the timeout code so it classifies as ModelTimeout"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "must fail at the idle gap, not wait out the vendor: {:?}",
