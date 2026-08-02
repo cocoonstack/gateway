@@ -24,7 +24,7 @@ mod base;
 
 pub use bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
 pub use claude_engine::ClaudeEngine;
-pub use engine::{EngineOutcome, ModelEngine, StreamChunk, vendor_error};
+pub use engine::{EngineOutcome, ModelEngine, StreamChunk};
 pub use factory::get_engine;
 pub use families::{
     AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, ModerationsEngine,

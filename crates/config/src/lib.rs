@@ -16,12 +16,6 @@ pub const DEFAULT_YAML: &str = include_str!("../../../conf/gateway.yaml");
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("read config file {path}: {source}")]
-    Io {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("parse config: {0}")]
     Parse(#[from] serde_saphyr::Error),
     #[error("account `{account}` references unknown protocol `{wire}`")]
@@ -763,14 +757,6 @@ impl GatewayConfig {
         Ok(())
     }
 
-    pub fn load(path: &str) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::from_yaml(&text)
-    }
-
     /// The embedded conf/gateway.yaml.
     pub fn embedded_default() -> Result<Self, ConfigError> {
         Self::from_yaml(DEFAULT_YAML)
@@ -1060,7 +1046,7 @@ impl GatewayConfig {
     }
 
     /// Pricing for a public model name; zero if unlisted.
-    pub fn prices_for(&self, name: &str) -> (i64, i64) {
+    fn prices_for(&self, name: &str) -> (i64, i64) {
         self.find_model(name)
             .map(|m| (m.input_price_per_1k_micros, m.output_price_per_1k_micros))
             .unwrap_or((0, 0))

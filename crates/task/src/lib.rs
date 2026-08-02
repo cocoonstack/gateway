@@ -27,9 +27,7 @@ pub fn spawn_quota_reset(
     period: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await; // first tick fires immediately; skip it
+        let mut tick = ticker(period).await;
         loop {
             tick.tick().await;
             state.governance.quota_reset_all().await;
@@ -45,9 +43,7 @@ pub fn spawn_content_purge(
     period: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await;
+        let mut tick = ticker(period).await;
         loop {
             tick.tick().await;
             match state.store.content_purge(gw_state::epoch_secs()).await {
@@ -68,9 +64,7 @@ pub fn spawn_usage_rollup(
     period: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await;
+        let mut tick = ticker(period).await;
         loop {
             tick.tick().await;
             if let Err(e) = state
@@ -91,9 +85,7 @@ pub fn spawn_avail_flush(
     period: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await;
+        let mut tick = ticker(period).await;
         loop {
             tick.tick().await;
             state.avail.flush().await;
@@ -148,9 +140,7 @@ pub fn spawn_alert_dispatch(shared: SharedConfig) -> tokio::task::JoinHandle<()>
 /// and emit an alert on a state transition.
 pub fn spawn_avail_alerts(shared: SharedConfig, period: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await;
+        let mut tick = ticker(period).await;
         let mut last = HashMap::new();
         loop {
             tick.tick().await;
@@ -215,6 +205,14 @@ fn should_send(sent: &mut HashMap<String, Instant>, key: String, window: Duratio
             true
         }
     }
+}
+
+/// A skip-behavior interval with the immediate first tick already consumed.
+async fn ticker(period: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+    tick
 }
 
 #[cfg(test)]

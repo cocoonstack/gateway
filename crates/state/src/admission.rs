@@ -9,15 +9,19 @@ use gw_config::GatewayConfig;
 use crate::store::{BillingInput, BillingRecord, Store, billing_record};
 use crate::{AkInfo, Governance, clamp_tokens};
 
-pub fn tenant_rate_key(tenant: &str) -> String {
+fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
+    if ok { Ok(()) } else { Err(deny()) }
+}
+
+fn tenant_rate_key(tenant: &str) -> String {
     format!("tenant:{tenant}")
 }
 
-pub fn product_qpm_key(product: &str) -> String {
+fn product_qpm_key(product: &str) -> String {
     format!("product:{product}")
 }
 
-pub fn model_qpm_key(model: &str) -> String {
+fn model_qpm_key(model: &str) -> String {
     format!("model:{model}")
 }
 
@@ -27,12 +31,12 @@ pub fn model_quota_key(ak: &str, model: &str) -> String {
 
 /// The per-user daily-budget counter key, namespaced by tenant so the same
 /// user id under two tenants meters separately.
-pub fn user_budget_key(tenant: &str, user: &str) -> String {
+fn user_budget_key(tenant: &str, user: &str) -> String {
     format!("ub:{tenant}:{user}")
 }
 
 /// The tenant's per-user daily token budget, if it configured one.
-pub fn user_budget_limit(cfg: &GatewayConfig, tenant: &str) -> Option<i64> {
+fn user_budget_limit(cfg: &GatewayConfig, tenant: &str) -> Option<i64> {
     cfg.find_tenant(tenant)
         .and_then(|t| t.user_daily_token_quota)
 }
@@ -52,11 +56,10 @@ pub async fn check_user_budget(
     let Some(limit) = user_budget_limit(cfg, tenant) else {
         return Ok(());
     };
-    if gov.quota_check(&user_budget_key(tenant, user), limit).await {
-        Ok(())
-    } else {
-        Err(format!("daily token budget exhausted for user `{user}`"))
-    }
+    admit(
+        gov.quota_check(&user_budget_key(tenant, user), limit).await,
+        || format!("daily token budget exhausted for user `{user}`"),
+    )
 }
 
 /// Accrue actual usage to the per-user daily budget (no-op without a limit or
@@ -126,25 +129,16 @@ pub async fn check_tenant_rate(
     let Some(qps) = cfg.find_tenant(tenant).and_then(|t| t.qps) else {
         return Ok(());
     };
-    if gov.rate_allow(&tenant_rate_key(tenant), qps).await {
-        Ok(())
-    } else {
-        Err(format!(
-            "tenant rate limit exceeded for `{tenant}` (qps {qps})"
-        ))
-    }
+    admit(gov.rate_allow(&tenant_rate_key(tenant), qps).await, || {
+        format!("tenant rate limit exceeded for `{tenant}` (qps {qps})")
+    })
 }
 
 /// Per-AK QPS.
 pub async fn check_ak_rate(gov: &dyn Governance, ak: &AkInfo) -> Result<(), String> {
-    if gov.rate_allow(&ak.ak, ak.qps).await {
-        Ok(())
-    } else {
-        Err(format!(
-            "rate limit exceeded for ak {} (qps {})",
-            ak.ak, ak.qps
-        ))
-    }
+    admit(gov.rate_allow(&ak.ak, ak.qps).await, || {
+        format!("rate limit exceeded for ak {} (qps {})", ak.ak, ak.qps)
+    })
 }
 
 /// Product-level QPM, when the product configures one.
@@ -156,16 +150,11 @@ pub async fn check_product_qpm(
     let Some(qpm) = cfg.find_product(product).and_then(|p| p.qpm) else {
         return Ok(());
     };
-    if gov
-        .window_allow(&product_qpm_key(product), qpm, gw_consts::MINUTE)
-        .await
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "product qpm limit exceeded for `{product}` (qpm {qpm})"
-        ))
-    }
+    admit(
+        gov.window_allow(&product_qpm_key(product), qpm, gw_consts::MINUTE)
+            .await,
+        || format!("product qpm limit exceeded for `{product}` (qpm {qpm})"),
+    )
 }
 
 /// Model-level QPM, when the model configures one.
@@ -177,16 +166,11 @@ pub async fn check_model_qpm(
     let Some(qpm) = cfg.find_model(model).and_then(|m| m.qpm) else {
         return Ok(());
     };
-    if gov
-        .window_allow(&model_qpm_key(model), qpm, gw_consts::MINUTE)
-        .await
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "model qpm limit exceeded for `{model}` (qpm {qpm})"
-        ))
-    }
+    admit(
+        gov.window_allow(&model_qpm_key(model), qpm, gw_consts::MINUTE)
+            .await,
+        || format!("model qpm limit exceeded for `{model}` (qpm {qpm})"),
+    )
 }
 
 /// Reserve `amount` against the AK daily quota on the `at` day bucket.
@@ -196,14 +180,11 @@ pub async fn reserve_daily(
     amount: i64,
     at: i64,
 ) -> Result<(), String> {
-    if gov
-        .quota_reserve(&ak.ak, amount, ak.daily_token_quota, at)
-        .await
-    {
-        Ok(())
-    } else {
-        Err(format!("daily token quota exhausted for ak {}", ak.ak))
-    }
+    admit(
+        gov.quota_reserve(&ak.ak, amount, ak.daily_token_quota, at)
+            .await,
+        || format!("daily token quota exhausted for ak {}", ak.ak),
+    )
 }
 
 /// Reserve `amount` in the AK TPM window; `Ok(None)` when the key has no TPM cap.

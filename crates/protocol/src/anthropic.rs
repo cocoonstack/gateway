@@ -71,8 +71,7 @@ pub fn blocks_text(blocks: &[Value]) -> String {
         .iter()
         .filter(|b| b["type"] == "text" || b.get("type").is_none())
         .filter_map(|b| b["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("")
+        .collect()
 }
 
 /// Output content block: text or tool_use.
