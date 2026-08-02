@@ -15,78 +15,6 @@ import (
 	usermemory "github.com/cocoonstack/gateway/control-plane/internal/user/memory"
 )
 
-type loginState struct {
-	cookie *http.Cookie
-	csrf   string
-}
-
-func testServer(t *testing.T) http.Handler {
-	t.Helper()
-	store := usermemory.New()
-	for _, seed := range []struct {
-		id, email, tenant, gatewayUserID string
-		role                             user.Role
-	}{
-		{"admin", "admin@example.com", "", "", user.RoleSystemAdmin},
-		{"manager", "manager@example.com", "acme", "", user.RoleTenantAdmin},
-		{"member", "user@example.com", "acme", "alice", user.RoleMember},
-	} {
-		hash, err := auth.HashPassword("password123!")
-		if err != nil {
-			t.Fatalf("hash password: %v", err)
-		}
-		now := time.Now().Unix()
-		if err := store.Create(t.Context(), user.User{
-			ID: seed.id, Email: seed.email, DisplayName: seed.id, PasswordHash: hash,
-			Tenant: seed.tenant, GatewayUserID: seed.gatewayUserID, Role: seed.role,
-			CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("seed user: %v", err)
-		}
-	}
-	return New(store, kvmemory.New(), gateway.NewMock(), time.Hour, false, t.TempDir()).Handler()
-}
-
-func loginAs(t *testing.T, handler http.Handler, email string) loginState {
-	t.Helper()
-	body, _ := json.Marshal(map[string]string{"email": email, "password": "password123!"})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("login status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	var response struct {
-		CSRF string `json:"csrf_token"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode login: %v", err)
-	}
-	return loginState{cookie: rec.Result().Cookies()[0], csrf: response.CSRF}
-}
-
-func request(t *testing.T, handler http.Handler, state loginState, method, path string, body any, csrf bool) *httptest.ResponseRecorder {
-	t.Helper()
-	var payload bytes.Buffer
-	if body != nil {
-		if err := json.NewEncoder(&payload).Encode(body); err != nil {
-			t.Fatalf("encode request: %v", err)
-		}
-	}
-	req := httptest.NewRequest(method, path, &payload)
-	req.AddCookie(state.cookie)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if csrf {
-		req.Header.Set("X-CSRF-Token", state.csrf)
-	}
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	return rec
-}
-
 func TestMemberIsScopedAndCannotReadAdminSurfaces(t *testing.T) {
 	handler := testServer(t)
 	member := loginAs(t, handler, "user@example.com")
@@ -247,4 +175,76 @@ func TestPasswordResetEvictsExistingSessions(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("post-reset session status = %d, want 401", rec.Code)
 	}
+}
+
+type loginState struct {
+	cookie *http.Cookie
+	csrf   string
+}
+
+func testServer(t *testing.T) http.Handler {
+	t.Helper()
+	store := usermemory.New()
+	for _, seed := range []struct {
+		id, email, tenant, gatewayUserID string
+		role                             user.Role
+	}{
+		{"admin", "admin@example.com", "", "", user.RoleSystemAdmin},
+		{"manager", "manager@example.com", "acme", "", user.RoleTenantAdmin},
+		{"member", "user@example.com", "acme", "alice", user.RoleMember},
+	} {
+		hash, err := auth.HashPassword("password123!")
+		if err != nil {
+			t.Fatalf("hash password: %v", err)
+		}
+		now := time.Now().Unix()
+		if err := store.Create(t.Context(), user.User{
+			ID: seed.id, Email: seed.email, DisplayName: seed.id, PasswordHash: hash,
+			Tenant: seed.tenant, GatewayUserID: seed.gatewayUserID, Role: seed.role,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	return New(store, kvmemory.New(), gateway.NewMock(), time.Hour, false, t.TempDir()).Handler()
+}
+
+func loginAs(t *testing.T, handler http.Handler, email string) loginState {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"email": email, "password": "password123!"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		CSRF string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode login: %v", err)
+	}
+	return loginState{cookie: rec.Result().Cookies()[0], csrf: response.CSRF}
+}
+
+func request(t *testing.T, handler http.Handler, state loginState, method, path string, body any, csrf bool) *httptest.ResponseRecorder {
+	t.Helper()
+	var payload bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&payload).Encode(body); err != nil {
+			t.Fatalf("encode request: %v", err)
+		}
+	}
+	req := httptest.NewRequest(method, path, &payload)
+	req.AddCookie(state.cookie)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if csrf {
+		req.Header.Set("X-CSRF-Token", state.csrf)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
 }
