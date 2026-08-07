@@ -36,18 +36,18 @@ impl MessageContent {
     }
 }
 
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
+}
+
 fn parts_text(parts: &[Value]) -> String {
     parts
         .iter()
         .filter(|p| p["type"] == "text")
         .filter_map(|p| p["text"].as_str())
         .collect()
-}
-
-impl Default for MessageContent {
-    fn default() -> Self {
-        MessageContent::Text(String::new())
-    }
 }
 
 /// One function call requested by the model.

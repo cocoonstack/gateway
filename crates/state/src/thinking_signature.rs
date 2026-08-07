@@ -67,29 +67,6 @@ impl fmt::Debug for ThinkingSignatureAudit {
     }
 }
 
-struct AuditInner {
-    key: Digest,
-    ttl: Duration,
-    max_entries: usize,
-    cache: Mutex<AuditCache>,
-}
-
-struct AuditCache {
-    entries: HashMap<Digest, CacheEntry>,
-    next_sweep: Instant,
-}
-
-struct CacheEntry {
-    fingerprints: Vec<SequenceFingerprint>,
-    expires_at: Instant,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SequenceFingerprint {
-    opaque: Digest,
-    strict: Option<Digest>,
-}
-
 impl Default for ThinkingSignatureAudit {
     fn default() -> Self {
         Self::new()
@@ -419,6 +396,29 @@ impl ThinkingSignatureAudit {
         }
         finalize_digest(mac)
     }
+}
+
+struct AuditInner {
+    key: Digest,
+    ttl: Duration,
+    max_entries: usize,
+    cache: Mutex<AuditCache>,
+}
+
+struct AuditCache {
+    entries: HashMap<Digest, CacheEntry>,
+    next_sweep: Instant,
+}
+
+struct CacheEntry {
+    fingerprints: Vec<SequenceFingerprint>,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SequenceFingerprint {
+    opaque: Digest,
+    strict: Option<Digest>,
 }
 
 fn new_mac(key: &Digest) -> HmacSha256 {
