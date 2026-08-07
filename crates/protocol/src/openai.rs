@@ -89,10 +89,6 @@ impl ChatMessage {
             ..Default::default()
         }
     }
-
-    pub fn content_text(&self) -> String {
-        self.content.as_ref().map(|c| c.text()).unwrap_or_default()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -329,7 +325,7 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
         assert_eq!(req.model, "gpt-4o");
         assert!(!req.stream);
-        assert_eq!(req.messages[0].content_text(), "hi");
+        assert_eq!(req.messages[0].content.as_ref().unwrap().text(), "hi");
         assert_eq!(req.extra.get("seed").unwrap().as_i64().unwrap(), 7);
     }
 

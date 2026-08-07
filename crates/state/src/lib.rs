@@ -22,6 +22,7 @@ pub mod governance;
 pub mod health;
 pub mod keystore;
 pub mod store;
+pub mod thinking_signature;
 
 pub use alerts::{AlertBus, AlertEvent};
 pub use avail::{AvailState, AvailStore, classify};
@@ -31,6 +32,9 @@ pub use governance::{Governance, MemoryGovernance, RedisGovernance};
 pub use health::{HealthStore, RedisHealth};
 pub use keystore::{KeyStore, PostgresKeyStore};
 pub use store::*;
+pub use thinking_signature::{
+    AuditContext, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture,
+};
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
 /// Postgres `IF NOT EXISTS` DDL can still race in `pg_class` when replicas
@@ -690,7 +694,7 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
 }
 
 /// All gateway state. `auth` and `pool` are config-derived and rebuilt on a
-/// live reload; the other four are runtime seams preserved across reloads.
+/// live reload; the remaining fields are runtime seams preserved across reloads.
 #[derive(Debug)]
 pub struct GatewayState {
     /// Live key table (admin edits survive a reload); Postgres for fleet-shared.
@@ -707,6 +711,8 @@ pub struct GatewayState {
     pub avail: Arc<dyn avail::AvailStore>,
     /// Advisory alert bus; the server's dispatch task drains it.
     pub alerts: Arc<alerts::AlertBus>,
+    /// Ten-minute, fail-open replay consistency cache for Anthropic thinking.
+    pub thinking_signatures: ThinkingSignatureAudit,
 }
 
 impl Default for GatewayState {
@@ -720,6 +726,7 @@ impl Default for GatewayState {
             cache: Arc::new(MemoryResponseCache::default()),
             avail: Arc::new(avail::MemoryAvail::default()),
             alerts: Arc::new(alerts::AlertBus::default()),
+            thinking_signatures: ThinkingSignatureAudit::new(),
         }
     }
 }
@@ -769,6 +776,10 @@ impl GatewayState {
                     .await?,
             );
             tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
+        } else if cfg.storage.postgres_url.is_empty() && cfg.storage.ledger_max_rows > 0 {
+            state.store = Arc::new(MemoryStore::with_ledger_cap(
+                cfg.storage.ledger_max_rows as usize,
+            ));
         }
         if !cfg.storage.redis_url.is_empty() {
             if cfg.storage.shared_cache {
@@ -825,6 +836,7 @@ impl GatewayState {
             cache: prev.cache.clone(),
             avail: prev.avail.clone(),
             alerts: prev.alerts.clone(),
+            thinking_signatures: prev.thinking_signatures.clone(),
         })
     }
 }

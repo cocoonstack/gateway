@@ -25,6 +25,10 @@ pub struct GatewayResponse {
 
     /// v2 typed response payload (dynamic for now).
     pub response_v2: Option<Value>,
+    /// Native Anthropic content blocks. Anthropic views use this to preserve
+    /// signed thinking and redacted-thinking blocks in their original order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_content: Option<Value>,
     pub finish_reason: String,
 
     /// PTU spilled over to pay-go account.
@@ -43,6 +47,22 @@ pub struct GatewayResponse {
     /// raw usage sub-tree bytes from the vendor body/last SSE frame.
     #[serde(skip)]
     pub raw_usage_json: Vec<u8>,
+}
+
+impl GatewayResponse {
+    /// Whether the native response contains opaque Anthropic thinking proof.
+    /// Such responses must not enter the general response cache, which can
+    /// outlive the ten-minute consistency cache or be shared through Redis.
+    pub fn has_protected_anthropic_content(&self) -> bool {
+        self.anthropic_content
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(crate::request::is_protected_anthropic_block)
+            })
+    }
 }
 
 /// A mid-stream failure as rendered to the client: the contract
@@ -90,6 +110,9 @@ pub struct StreamChunk {
     pub usage_totals: Option<(i64, i64, i64)>,
     /// cache/reasoning detail riding with `usage_totals` when the vendor sent it.
     pub common_usage: Option<CommonUsage>,
+    /// Original Anthropic SSE event. Anthropic views forward it without
+    /// rebuilding signed thinking blocks; other protocol views ignore it.
+    pub anthropic_event: Option<Value>,
     /// set when the pipeline failed mid-stream; views emit it as an error frame.
     pub error: Option<Box<StreamError>>,
 }
@@ -111,6 +134,24 @@ mod tests {
         let r = GatewayResponse::default();
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("step").is_none());
+    }
+
+    #[test]
+    fn detects_protected_anthropic_content() {
+        let protected = GatewayResponse {
+            anthropic_content: Some(serde_json::json!([
+                {"type":"thinking","thinking":"","signature":"opaque"},
+                {"type":"text","text":"answer"}
+            ])),
+            ..Default::default()
+        };
+        assert!(protected.has_protected_anthropic_content());
+
+        let plain = GatewayResponse {
+            anthropic_content: Some(serde_json::json!([{"type":"text","text":"answer"}])),
+            ..Default::default()
+        };
+        assert!(!plain.has_protected_anthropic_content());
     }
 
     #[test]

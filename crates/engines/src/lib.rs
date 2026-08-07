@@ -23,7 +23,7 @@ pub mod usage_extract;
 mod base;
 
 pub use bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
-pub use claude_engine::ClaudeEngine;
+pub use claude_engine::{ClaudeEngine, anthropic_native_chunks};
 pub use engine::{EngineOutcome, ModelEngine, StreamChunk};
 pub use factory::get_engine;
 pub use families::{

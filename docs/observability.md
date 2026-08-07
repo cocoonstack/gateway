@@ -13,6 +13,8 @@
 | `gateway_cache_hits_total` | counter | — |
 | `gateway_ledger_write_failures_total` | counter | — |
 | `gateway_upstream_connect_retries_total` | counter | `account` |
+| `gateway_thinking_signature_review_total` | counter | `result` (match/mismatch/miss/no_evidence) |
+| `gateway_thinking_signature_cache_events_total` | counter | `event` |
 
 `gateway_requests_total` is recorded by router middleware, so every response —
 including error statuses and the realtime WebSocket upgrade — is counted, which
@@ -24,7 +26,9 @@ status codes, protocol/stage names) — no per-key or per-model cardinality.
 One structured line per successfully served request goes to stdout (via
 `tracing`; control level with `RUST_LOG`), carrying `surface`, `request_id`,
 `ak`, `product`, `user_id`, `model`, `protocol`, `account`, `prompt_tokens`,
-`completion_tokens`, `total_tokens`, and `latency_ms`. Errored requests are
+`completion_tokens`, `total_tokens`, `latency_ms`, and `decisions` — the
+pipeline's routing trail for that request (quota fallback, variant pick,
+degrade, DLP/moderation outcomes). Errored requests are
 counted by `gateway_requests_total{status}` rather than logged. `request_id`
 joins the access log to the ledger row and the audit events for the same
 request.

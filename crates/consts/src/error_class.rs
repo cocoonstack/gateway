@@ -214,16 +214,13 @@ mod tests {
 
     #[test]
     fn upstream_family_classifies_by_code_not_status() {
-        // a vendor 401 is the upstream's failure, not the client's
         let c = ErrClass::classify(ErrCode::FED_RESP_STATUS_NOT_ZERO, 401).unwrap();
         assert_eq!(c, ErrClass::ModelError);
         assert_eq!(c.status(), 424);
-        // terminal vendor throttle/capacity keep their transient semantics
         let c = ErrClass::classify(ErrCode::FED_RESP_STATUS_NOT_ZERO, 429).unwrap();
         assert_eq!(c, ErrClass::Throttling);
         let c = ErrClass::classify(ErrCode::FED_RESP_STATUS_NOT_ZERO, 503).unwrap();
         assert_eq!(c, ErrClass::ServiceUnavailable);
-        // deadline family
         let c = ErrClass::classify(ErrCode::FED_RESP_TIMEOUT, 502).unwrap();
         assert_eq!((c, c.status()), (ErrClass::ModelTimeout, 408));
         let c = ErrClass::classify(ErrCode::QUOTA_EXHAUSTED, 400).unwrap();

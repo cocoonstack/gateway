@@ -2824,7 +2824,6 @@ mod tests {
         exercise_audit(&store).await;
     }
 
-    /// `ns` isolates shared-database (PG) runs from parallel tests.
     async fn exercise_rollup(store: &dyn Store, ns: &str) {
         let tenant = format!("tr{ns}");
         let mut a = record("m1");
@@ -3055,11 +3054,9 @@ mod tests {
         );
     }
 
-    /// Local backends only: item-persisting stores re-read rows at dispatch.
     async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
         let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
         let now = crate::epoch_millis();
-        // wide margin: a 5ms one flaked under parallel-suite load
         assert!(
             store
                 .user_erased_since(&t1, &u1, now - 60_000)
@@ -3089,7 +3086,6 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        // a private database: the watermark is global per db, so shared-db leftovers would shadow the fixtures
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -83,6 +83,27 @@ models — the gateway converts between the two, including the streaming event
 sequence (`message_start` → `content_block_*` → `message_delta` →
 `message_stop`) and `stop_reason`/`finish_reason` mapping.
 
+### Extended thinking
+
+On an `anthropic-messages` model, `/v1/messages` preserves signed
+`thinking`/`redacted_thinking` blocks natively — non-streaming content and the
+streaming event sequence (`thinking_delta`/`signature_delta`) pass through
+unmodified, including from compatible upstreams that ignore `stream: true`.
+
+Requests that engage thinking (`thinking: {"type": "enabled" | "adaptive"}`,
+or a continuation carrying signed blocks) are pinned to their requested model:
+variant splits, over-quota fallback, and moderation degrade will not move them,
+because a signature only replays against the model that produced it. Pinned
+thinking on a model that does not resolve to `anthropic-messages` is a 400.
+
+Tool-loop continuations are audited against what the gateway served for the
+same key, model, and tool id within the last ten minutes: a modified protected
+sequence is rejected locally (400) before reaching the vendor; unknown or
+expired anchors fail open. Disabling thinking on a continuation and stripping
+the blocks — as the Anthropic API requires — is accepted. Signed thinking
+whose prose the tenant's policy cannot serve (blocklist or DLP hits) is
+stripped from the response; the visible turn still serves.
+
 ## Batch & files
 
 | Method | Path | Notes |

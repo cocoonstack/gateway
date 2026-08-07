@@ -136,13 +136,37 @@ impl OnlineHandler {
             {
                 Moderation::Allow => {}
                 Moderation::Mask(spans) => {
-                    let masked = plugins::apply_mask_spans(&mut ctx.request, &spans);
+                    let masked = match plugins::apply_moderation_mask(&mut ctx.request, &spans) {
+                        Ok(masked) => masked,
+                        Err(protected) => {
+                            emit_security_event(
+                                &ctx,
+                                "moderation",
+                                "block_protected",
+                                protected as i64,
+                            )
+                            .await;
+                            return Err(GatewayError::bad_request(
+                                "moderation cannot rewrite signed thinking content",
+                            ));
+                        }
+                    };
                     if masked > 0 {
                         ctx.decide("moderation", format!("masked {masked} span(s)"));
                         emit_security_event(&ctx, "moderation", "mask", masked as i64).await;
                     }
                 }
                 Moderation::Degrade => {
+                    if ctx.request.pins_anthropic_thinking_route() {
+                        emit_security_event(&ctx, "moderation", "block_pinned_thinking", 1).await;
+                        deny_moderation(
+                            &mut ctx,
+                            "degrade would change a pinned thinking model: denied",
+                            "content requires degraded serving, but signed thinking pins the requested model",
+                            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                        );
+                        return Ok(ctx);
+                    }
                     let tenant = &ctx.ak.tenant;
                     let swapped = ctx
                         .request
@@ -190,6 +214,18 @@ impl OnlineHandler {
                     return Ok(ctx);
                 }
             }
+        }
+
+        let protected_dlp = plugins::protected_thinking_dlp_hits(sec, &mut ctx.request);
+        if protected_dlp > 0 {
+            ctx.decide(
+                "dlp",
+                format!("rejected {protected_dlp} protected thinking span(s)"),
+            );
+            emit_security_event(&ctx, "dlp", "block_protected", protected_dlp as i64).await;
+            return Err(GatewayError::bad_request(
+                "signed thinking contains sensitive data and cannot be safely redacted",
+            ));
         }
 
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
@@ -240,14 +276,36 @@ impl OnlineHandler {
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
 
+        let stripped = ctx
+            .outcome
+            .as_mut()
+            .map(|outcome| {
+                let stripped = plugins::strip_unservable_thinking(sec, &mut outcome.response);
+                if stripped > 0 {
+                    // the buffered raw events still carry the unservable prose
+                    outcome.chunks.clear();
+                }
+                stripped
+            })
+            .unwrap_or(0);
+        if stripped > 0 {
+            ctx.decide(
+                "dlp",
+                format!("stripped signed thinking ({stripped} hit(s))"),
+            );
+            emit_security_event(&ctx, "dlp", "strip_protected_out", stripped as i64).await;
+        }
+
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
+            let native_event_hits = plugins::anthropic_event_dlp_hits(sec, &mut outcome.chunks);
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
-            // raw decoded deltas are pre-redaction; drop them so no downstream
-            // reconstruction can replay unmasked text past the boundary
-            if dlp {
+            // Raw decoded deltas are pre-redaction. Drop them when either the
+            // normalized response was rewritten or a native-only payload
+            // (for example a citation) hit DLP. Clean native events survive.
+            if dlp && (n > 0 || native_event_hits > 0) {
                 outcome.chunks.clear();
             }
-            n
+            n.max(native_event_hits)
         } else {
             0
         };
@@ -570,7 +628,22 @@ mod tests {
         }
     }
 
-    /// MockTransport with the usage rewritten to 100 prompt tokens, 80 cached.
+    fn thinking_req(name: &str, content: &str, thinking_type: &str) -> GatewayRequest {
+        let mut request = chat_req(name, content);
+        request.preserve_anthropic_wire = true;
+        if let Some(param) = request.model_param_v2.as_mut() {
+            let thinking = if thinking_type == "enabled" {
+                serde_json::json!({"type":"enabled","budget_tokens":1024})
+            } else {
+                serde_json::json!({"type":thinking_type})
+            };
+            param.raw = serde_json::json!({
+                "thinking":thinking
+            });
+        }
+        request
+    }
+
     #[derive(Debug)]
     struct CachedUsageTransport;
 
@@ -638,7 +711,6 @@ mod tests {
 
     #[tokio::test]
     async fn variant_split_bills_requested_serves_target() {
-        // tenant entitled only to the public name: entitlement precedes the swap
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
@@ -840,6 +912,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn moderation_degrade_denies_instead_of_moving_a_thinking_request() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, fb-m], fallback_model: fb-m}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DegradeModerator));
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h
+            .run(thinking_req("pub-m", "hi", "enabled"), key)
+            .await
+            .unwrap();
+        let out = ctx.outcome.expect("moderation denial outcome");
+
+        assert_eq!(out.response.finish_reason, "content_filter");
+        assert!(out.response.message.contains("pins the requested model"));
+        assert!(
+            h.state()
+                .store
+                .ledger_snapshot(usize::MAX)
+                .await
+                .unwrap()
+                .1
+                .is_empty(),
+            "the pinned request must not reach a fallback model"
+        );
+    }
+
+    #[tokio::test]
     async fn moderation_degrade_serves_when_already_on_the_fallback() {
         let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: openai-chat}, {name: fb-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m, fb-m], fallback_model: fb-m}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -889,7 +992,6 @@ mod tests {
 
     #[tokio::test]
     async fn abuse_tiers_suspend_after_repeated_rejections() {
-        // qps 0: every request is a true throttling rejection.
         let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 2, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
@@ -990,6 +1092,70 @@ mod tests {
         let rec = ledger.last().expect("two billed requests");
         assert_eq!(rec.model, "pub-m");
         assert_eq!(rec.served_model, "fb-m");
+    }
+
+    async fn assert_thinking_route_pinned(thinking_type: &str) {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+
+        let seed = h
+            .run(
+                thinking_req("pub-m", "start thinking", thinking_type),
+                key.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !seed
+                .decisions
+                .iter()
+                .any(|(node, _)| *node == "variant_select"),
+            "{thinking_type} thinking must stay on the requested model"
+        );
+
+        let mut assistant = ChatMsg::text("assistant", String::new());
+        assistant.parts = Some(serde_json::json!([
+            {"type":"thinking","thinking":"summary","signature":"opaque"},
+            {"type":"tool_use","id":"tool-1","name":"probe","input":{}}
+        ]));
+        let mut tool_result = ChatMsg::text("user", String::new());
+        tool_result.parts = Some(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"tool-1","content":"done"}
+        ]));
+        let mut continuation = chat_req("pub-m", "");
+        continuation.preserve_anthropic_wire = true;
+        continuation.message = vec![assistant, tool_result];
+        let continued = h.run(continuation, key).await.unwrap();
+        assert!(
+            continued.decisions.iter().any(|(node, decision)| {
+                *node == "model_quota" && decision.contains("thinking route pinned")
+            }),
+            "over-quota continuation must not fall back: {:?}",
+            continued.decisions
+        );
+        assert!(
+            !continued
+                .decisions
+                .iter()
+                .any(|(node, _)| *node == "variant_select")
+        );
+
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.iter().all(|record| record.served_model == "pub-m"));
+    }
+
+    #[tokio::test]
+    async fn thinking_modes_stay_off_variants_and_quota_fallbacks() {
+        for thinking_type in ["enabled", "adaptive"] {
+            assert_thinking_route_pinned(thinking_type).await;
+        }
     }
 
     #[tokio::test]
@@ -1282,6 +1448,124 @@ mod tests {
             !out.response.message.contains("jane@corp.com"),
             "email must be redacted: {}",
             out.response.message
+        );
+    }
+
+    #[tokio::test]
+    async fn dlp_buffer_keeps_clean_native_chunks_for_lossless_replay() {
+        let h = handler();
+        assert!(h.cfg().security.dlp_redact, "default config has DLP on");
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("outcome");
+
+        assert!(
+            !outcome.chunks.is_empty(),
+            "clean buffered events must survive outbound DLP"
+        );
+        assert!(
+            outcome
+                .chunks
+                .iter()
+                .any(|chunk| chunk.anthropic_event.is_some()),
+            "native Anthropic events must remain available to the view"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ClaudePiiStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ClaudePiiStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            let sse = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"clean\",\"signature\":\"opaque\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail jane@corp.com\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClaudePiiThinkingStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ClaudePiiThinkingStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            let sse = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"mail jane@corp.com\",\"signature\":\"opaque\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pii_inside_thinking_prose_strips_the_thinking_and_still_serves() {
+        let base = handler();
+        let h = OnlineHandler::new(base.config.clone(), Arc::new(ClaudePiiThinkingStream));
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("a served outcome, not a failure");
+
+        assert!(outcome.chunks.is_empty(), "raw events must be dropped");
+        let content = outcome.response.anthropic_content.unwrap();
+        assert!(
+            content
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "thinking"),
+            "unservable thinking is stripped, not failed: {content}"
+        );
+        assert_eq!(content[0]["text"], "answer");
+    }
+
+    #[tokio::test]
+    async fn dlp_redacts_native_text_without_dropping_thinking_proof() {
+        let base = handler();
+        let h = OnlineHandler::new(base.config.clone(), Arc::new(ClaudePiiStream));
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("outcome");
+
+        assert!(outcome.chunks.is_empty(), "raw events must be dropped");
+        let content = outcome.response.anthropic_content.unwrap();
+        assert_eq!(content[0]["signature"], "opaque");
+        assert!(
+            content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_EMAIL]")
         );
     }
 

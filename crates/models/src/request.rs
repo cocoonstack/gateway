@@ -11,6 +11,10 @@ pub struct GatewayRequest {
     pub account: Option<std::sync::Arc<Account>>,
     pub message: Vec<ChatMsg>,
     pub stream: bool,
+    /// The request originated on `/v1/messages`; Anthropic engines may forward
+    /// native SSE events only on that same-protocol surface. This survives
+    /// model resolution, unlike `model_param_v2.protocol`.
+    pub preserve_anthropic_wire: bool,
     pub model_param_v2: Option<ModelParamV2>,
     pub ak: String,
     pub is_online: bool,
@@ -36,6 +40,51 @@ impl GatewayRequest {
     pub fn account_name(&self) -> &str {
         self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")
     }
+
+    /// Whether any message carries a top-level Anthropic protected-thinking
+    /// block. These blocks are valid only on the native `/v1/messages`
+    /// surface routed to an Anthropic-messages engine.
+    pub fn has_anthropic_thinking_blocks(&self) -> bool {
+        self.message.iter().any(|message| {
+            message
+                .parts
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
+        })
+    }
+
+    /// Whether the request explicitly enables thinking. A `thinking` key with
+    /// `{"type":"disabled"}` is a routine SDK serialization and must not
+    /// trigger thinking handling.
+    pub fn anthropic_thinking_enabled(&self) -> bool {
+        matches!(
+            self.model_param_v2
+                .as_ref()
+                .and_then(|param| param.raw.pointer("/thinking/type"))
+                .and_then(serde_json::Value::as_str),
+            Some("enabled" | "adaptive")
+        )
+    }
+
+    /// Whether this native Messages request must stay on its requested model.
+    /// The initial extended-thinking request enables the `thinking` option;
+    /// tool continuations carry protected thinking blocks. Pinning both sides
+    /// prevents variants or fallback policy from moving a signed continuation
+    /// to a different model.
+    pub fn pins_anthropic_thinking_route(&self) -> bool {
+        self.preserve_anthropic_wire
+            && (self.has_anthropic_thinking_blocks() || self.anthropic_thinking_enabled())
+    }
+}
+
+/// Whether a content block is Anthropic protected thinking
+/// (`thinking` / `redacted_thinking`).
+pub(crate) fn is_protected_anthropic_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(serde_json::Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 /// One queued batch item: a message list plus the client-supplied end-user

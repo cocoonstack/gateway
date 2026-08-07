@@ -147,6 +147,13 @@ redactions (which stream token-by-token) are summed across the turn and recorded
 as one event at the turn boundary — the redaction still applies to every frame,
 only its audit is aggregated (a store write per token would be too hot).
 
+Signed Anthropic thinking blocks get the same coverage without breaking their
+signatures: inbound scans read every field of a signed block — opaque
+signature/data included, so no field is a smuggling channel — but rewrites
+skip them. A moderation mask that would land inside signed prose denies the
+request instead, and a response whose signed prose trips the blocklist or DLP
+is served with the protected blocks stripped rather than failed.
+
 ## Audit trails
 
 - **Content-safety events** (`/admin/audit/events`): who/which-rule/what-action,
