@@ -171,7 +171,7 @@ async fn family_and_bespoke_engines_surface_errors() {
     use gw_engines::{EmbeddingsEngine, ErnieEngine, VertexEngine};
     let err_body = r#"{"error":{"code":"429","message":"vendor rate limited"}}"#;
 
-    async fn expect_err<E: ModelEngine>(engine: E) -> u16 {
+    async fn expect_err<E: ModelEngine>(mut engine: E) -> u16 {
         engine.run().await.expect_err("error surfaced").http_status
     }
 

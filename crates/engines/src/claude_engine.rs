@@ -12,11 +12,10 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 base_engine!(ClaudeEngine);
 
 impl ClaudeEngine {
-    fn build_upstream(&self) -> GResult<UpstreamRequest> {
-        let param = self.base.param()?;
+    fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let system_text = self.base.system_text();
         let mut messages: Vec<Value> = Vec::new();
-        for m in &self.base.request.message {
+        for m in std::mem::take(&mut self.base.request.message) {
             if m.role == gw_consts::role::SYSTEM {
                 continue;
             }
@@ -26,13 +25,19 @@ impl ClaudeEngine {
                 "user"
             };
             // preserve multimodal content blocks, mirroring the OpenAI path's `parts`
-            let content = match &m.parts {
-                Some(parts) => parts.clone(),
-                None => Value::String(m.content.clone()),
+            let content = match m.parts {
+                Some(parts) => parts,
+                None => Value::String(m.content),
             };
-            messages.push(json!({"role": role, "content": content}));
+            // built by hand — json! interpolation would deep-copy the moved content
+            let mut msg = Map::new();
+            msg.insert("role".into(), role.into());
+            msg.insert("content".into(), content);
+            messages.push(Value::Object(msg));
         }
 
+        let param = self.base.param()?;
+        let protocol = param.protocol;
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), Value::Array(messages));
@@ -63,10 +68,11 @@ impl ClaudeEngine {
         if !system_text.is_empty() {
             body.insert("system".into(), system_text.into());
         }
-        crate::base::merge_raw_extras(&mut body, &param.raw);
+        let raw = self.base.take_raw();
+        crate::base::merge_raw_extras_owned(&mut body, raw);
 
         Ok(UpstreamRequest {
-            protocol: param.protocol,
+            protocol,
             method: "POST".to_owned(),
             url: format!(
                 "{}/v1/messages",
@@ -167,7 +173,7 @@ impl ClaudeEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for ClaudeEngine {
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
         let reply = self.base.transport.send(up).await?;
         match reply.body {
@@ -503,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn parses_messages_reply() {
-        let e = ClaudeEngine::new(base_req(), Arc::new(MockTransport));
+        let mut e = ClaudeEngine::new(base_req(), Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said: ping"));
         assert!(out.response.is_messages_protocol);
@@ -515,7 +521,7 @@ mod tests {
     async fn stream_decodes_anthropic_event_sequence() {
         let mut r = base_req();
         r.stream = true;
-        let e = ClaudeEngine::new(r, Arc::new(MockTransport));
+        let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.chunks.len() >= 2, "chunks: {:?}", out.chunks);
         assert!(out.response.message.contains("you said: ping"));
@@ -573,7 +579,7 @@ mod tests {
         }"#;
         let mut request = base_req();
         request.preserve_anthropic_wire = true;
-        let engine = ClaudeEngine::new(request, Arc::new(JsonReply(body)));
+        let mut engine = ClaudeEngine::new(request, Arc::new(JsonReply(body)));
         let outcome = engine.run().await.unwrap();
 
         assert_eq!(outcome.response.message, "answer");
@@ -637,7 +643,7 @@ mod tests {
         let mut request = base_req();
         request.stream = true;
         request.preserve_anthropic_wire = true;
-        let engine = ClaudeEngine::new(request, Arc::new(SseReply(sse)));
+        let mut engine = ClaudeEngine::new(request, Arc::new(SseReply(sse)));
         let outcome = engine.run().await.unwrap();
 
         assert_eq!(
@@ -745,7 +751,7 @@ mod tests {
         );
         let mut r = base_req();
         r.stream = true;
-        let e = ClaudeEngine::new(r, Arc::new(SseReply(sse)));
+        let mut e = ClaudeEngine::new(r, Arc::new(SseReply(sse)));
         let out = e.run().await.unwrap();
         assert_eq!(out.response.finish_reason, "tool_use");
         let tc = out.response.tool_calls.expect("tool_use blocks");
@@ -766,7 +772,7 @@ mod tests {
                 ..Default::default()
             }));
         }
-        let e = ClaudeEngine::new(r, Arc::new(MockTransport));
+        let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert_eq!(out.response.finish_reason, "tool_use");
         let tc = out.response.tool_calls.expect("tool_use blocks");

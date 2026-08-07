@@ -271,7 +271,7 @@ async fn engine_through_real_http_transport_end_to_end() {
         model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "srv")),
         ..Default::default()
     };
-    let engine = OpenAiEngine::new(request, transport);
+    let mut engine = OpenAiEngine::new(request, transport);
     let out = engine.run().await.expect("engine over real http");
     assert_eq!(out.http_code, 200);
     assert_eq!(out.response.message, "srv:over the wire");

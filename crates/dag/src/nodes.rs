@@ -511,7 +511,7 @@ impl DagNode for CallEngine {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let threshold = ctx.cfg.stability.failure_threshold;
         let cooldown = std::time::Duration::from_secs(ctx.cfg.stability.cooldown_seconds);
-        let engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
+        let mut engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
         match engine.run().await {
             Ok(outcome) => {
                 // an aborted stream is neither a success nor an account fault
@@ -571,7 +571,7 @@ impl DagNode for CallEngine {
                     ),
                 );
                 ctx.request.account = Some(next.clone());
-                let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
+                let mut retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
                         // same aborted-stream exclusion as the first attempt

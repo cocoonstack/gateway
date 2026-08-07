@@ -59,8 +59,10 @@ impl EngineOutcome {
 /// error mapping, quota, billing, retries) belongs to DAG nodes.
 #[async_trait::async_trait]
 pub trait ModelEngine: Send + Sync {
-    /// Perform the upstream call.
-    async fn run(&self) -> GResult<EngineOutcome>;
+    /// Perform the upstream call. `&mut self`: the engine owns its request
+    /// (cloned once at dispatch, used exactly once), so body building may move
+    /// the single-use payloads out instead of cloning them again.
+    async fn run(&mut self) -> GResult<EngineOutcome>;
 }
 
 /// One upstream usage count, floored at 0 — a vendor must never drive a negative

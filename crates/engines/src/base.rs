@@ -49,6 +49,15 @@ impl Base {
             .and_then(|a| a.aws_credentials())
     }
 
+    /// Move the raw passthrough bag out (single-use — the run(&mut self) contract).
+    pub fn take_raw(&mut self) -> Value {
+        self.request
+            .model_param_v2
+            .as_mut()
+            .map(|p| p.raw.take())
+            .unwrap_or(Value::Null)
+    }
+
     pub fn param(&self) -> GResult<&gw_models::ModelParamV2> {
         self.request
             .model_param_v2
@@ -234,6 +243,15 @@ fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
         .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
     {
         headers.insert(0, ("content-type".into(), "application/json".into()));
+    }
+}
+
+/// [`merge_raw_extras`] over an owned bag: the extras move in.
+pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, raw: Value) {
+    if let Value::Object(extra) = raw {
+        for (k, v) in extra {
+            body.entry(k).or_insert(v);
+        }
     }
 }
 
