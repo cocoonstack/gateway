@@ -79,6 +79,20 @@ impl GatewayRequest {
                     })
         })
     }
+
+    /// Whether this native Messages request must stay on its requested model.
+    /// The initial extended-thinking request carries the top-level `thinking`
+    /// option; tool continuations carry protected thinking blocks. Pinning
+    /// both sides prevents variants or fallback policy from moving a signed
+    /// continuation to a different model.
+    pub fn pins_anthropic_thinking_route(&self) -> bool {
+        self.preserve_anthropic_wire
+            && (self.has_anthropic_thinking_blocks()
+                || self
+                    .model_param_v2
+                    .as_ref()
+                    .is_some_and(|param| param.raw.get("thinking").is_some()))
+    }
 }
 
 /// One queued batch item: a message list plus the client-supplied end-user

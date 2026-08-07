@@ -60,6 +60,16 @@ impl DagNode for ModelQuotaGate {
         if under {
             return Ok(());
         }
+        // Extended-thinking responses and their signed continuations must use
+        // one model. The model quota is a soft routing trigger, so preserve the
+        // requested route just as we do when no fallback is configured.
+        if ctx.request.pins_anthropic_thinking_route() {
+            ctx.decide(
+                "model_quota",
+                format!("{requested} over {limit}, thinking route pinned"),
+            );
+            return Ok(());
+        }
         let (cfg, tenant) = (&ctx.cfg, &ctx.ak.tenant);
         let swapped = ctx
             .request
@@ -180,6 +190,9 @@ impl DagNode for VariantSelect {
         &["tenant_entitlement"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        if ctx.request.pins_anthropic_thinking_route() {
+            return Ok(());
+        }
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };

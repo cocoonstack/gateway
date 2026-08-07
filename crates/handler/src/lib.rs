@@ -160,6 +160,16 @@ impl OnlineHandler {
                     }
                 }
                 Moderation::Degrade => {
+                    if ctx.request.pins_anthropic_thinking_route() {
+                        emit_security_event(&ctx, "moderation", "block_pinned_thinking", 1).await;
+                        deny_moderation(
+                            &mut ctx,
+                            "degrade would change a pinned thinking model: denied",
+                            "content requires degraded serving, but signed thinking pins the requested model",
+                            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                        );
+                        return Ok(ctx);
+                    }
                     let tenant = &ctx.ak.tenant;
                     let swapped = ctx
                         .request
@@ -613,6 +623,17 @@ mod tests {
         }
     }
 
+    fn thinking_req(name: &str, content: &str) -> GatewayRequest {
+        let mut request = chat_req(name, content);
+        request.preserve_anthropic_wire = true;
+        if let Some(param) = request.model_param_v2.as_mut() {
+            param.raw = serde_json::json!({
+                "thinking":{"type":"enabled","budget_tokens":1024}
+            });
+        }
+        request
+    }
+
     /// MockTransport with the usage rewritten to 100 prompt tokens, 80 cached.
     #[derive(Debug)]
     struct CachedUsageTransport;
@@ -883,6 +904,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn moderation_degrade_denies_instead_of_moving_a_thinking_request() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, fb-m], fallback_model: fb-m}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DegradeModerator));
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(thinking_req("pub-m", "hi"), key).await.unwrap();
+        let out = ctx.outcome.expect("moderation denial outcome");
+
+        assert_eq!(out.response.finish_reason, "content_filter");
+        assert!(out.response.message.contains("pins the requested model"));
+        assert!(
+            h.state()
+                .store
+                .ledger_snapshot(usize::MAX)
+                .await
+                .unwrap()
+                .1
+                .is_empty(),
+            "the pinned request must not reach a fallback model"
+        );
+    }
+
+    #[tokio::test]
     async fn moderation_degrade_serves_when_already_on_the_fallback() {
         let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: openai-chat}, {name: fb-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m, fb-m], fallback_model: fb-m}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -1033,6 +1082,61 @@ mod tests {
         let rec = ledger.last().expect("two billed requests");
         assert_eq!(rec.model, "pub-m");
         assert_eq!(rec.served_model, "fb-m");
+    }
+
+    #[tokio::test]
+    async fn thinking_seed_and_continuation_stay_off_variants_and_quota_fallbacks() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+
+        let seed = h
+            .run(thinking_req("pub-m", "start thinking"), key.clone())
+            .await
+            .unwrap();
+        assert!(
+            !seed
+                .decisions
+                .iter()
+                .any(|(node, _)| *node == "variant_select"),
+            "the initial thinking request must stay on the requested model"
+        );
+
+        let mut assistant = ChatMsg::text("assistant", String::new());
+        assistant.parts = Some(serde_json::json!([
+            {"type":"thinking","thinking":"summary","signature":"opaque"},
+            {"type":"tool_use","id":"tool-1","name":"probe","input":{}}
+        ]));
+        let mut tool_result = ChatMsg::text("user", String::new());
+        tool_result.parts = Some(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"tool-1","content":"done"}
+        ]));
+        let mut continuation = chat_req("pub-m", "");
+        continuation.preserve_anthropic_wire = true;
+        continuation.message = vec![assistant, tool_result];
+        let continued = h.run(continuation, key).await.unwrap();
+        assert!(
+            continued.decisions.iter().any(|(node, decision)| {
+                *node == "model_quota" && decision.contains("thinking route pinned")
+            }),
+            "over-quota continuation must not fall back: {:?}",
+            continued.decisions
+        );
+        assert!(
+            !continued
+                .decisions
+                .iter()
+                .any(|(node, _)| *node == "variant_select")
+        );
+
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.iter().all(|record| record.served_model == "pub-m"));
     }
 
     #[tokio::test]
