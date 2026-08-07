@@ -50,14 +50,7 @@ impl GatewayRequest {
                 .parts
                 .as_ref()
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|block| {
-                        matches!(
-                            block.get("type").and_then(serde_json::Value::as_str),
-                            Some("thinking" | "redacted_thinking")
-                        )
-                    })
-                })
+                .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
         })
     }
 
@@ -83,6 +76,15 @@ impl GatewayRequest {
         self.preserve_anthropic_wire
             && (self.has_anthropic_thinking_blocks() || self.anthropic_thinking_enabled())
     }
+}
+
+/// Whether a content block is Anthropic protected thinking
+/// (`thinking` / `redacted_thinking`).
+pub(crate) fn is_protected_anthropic_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(serde_json::Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 /// One queued batch item: a message list plus the client-supplied end-user

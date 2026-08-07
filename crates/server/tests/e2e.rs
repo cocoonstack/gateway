@@ -465,8 +465,6 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         "mismatch is rejected locally"
     );
 
-    // A non-standard role forwards as it always did (the vendor arbitrates);
-    // without a trailing user turn the audit has no evidence and fails open.
     let nonstandard_role = json!({
         "model":"claude-test",
         "max_tokens":128,
@@ -489,7 +487,11 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         ))
         .await
         .unwrap();
-    assert_eq!(nonstandard_role_response.status(), StatusCode::OK);
+    assert_eq!(
+        nonstandard_role_response.status(),
+        StatusCode::OK,
+        "non-standard roles forward as before; without a trailing user turn the audit fails open"
+    );
     assert_eq!(hits.load(Ordering::Relaxed), 3);
 
     let mut unknown = original_content;

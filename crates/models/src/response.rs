@@ -58,12 +58,9 @@ impl GatewayResponse {
             .as_ref()
             .and_then(Value::as_array)
             .is_some_and(|blocks| {
-                blocks.iter().any(|block| {
-                    matches!(
-                        block.get("type").and_then(Value::as_str),
-                        Some("thinking" | "redacted_thinking")
-                    )
-                })
+                blocks
+                    .iter()
+                    .any(crate::request::is_protected_anthropic_block)
             })
     }
 }

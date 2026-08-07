@@ -297,7 +297,7 @@ impl OnlineHandler {
         }
 
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
-            let native_event_hits = plugins::anthropic_event_dlp_hits(sec, &outcome.chunks);
+            let native_event_hits = plugins::anthropic_event_dlp_hits(sec, &mut outcome.chunks);
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
             // Raw decoded deltas are pre-redaction. Drop them when either the
             // normalized response was rewritten or a native-only payload

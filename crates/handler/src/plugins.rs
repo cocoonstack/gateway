@@ -525,71 +525,6 @@ fn walk_part_value(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) ->
     }
 }
 
-fn scan_part_value(v: &serde_json::Value, f: &mut impl FnMut(&str) -> usize) -> usize {
-    match v {
-        serde_json::Value::String(s) => f(s),
-        serde_json::Value::Array(a) => a.iter().map(|value| scan_part_value(value, f)).sum(),
-        serde_json::Value::Object(o) => {
-            let media = o
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(is_media_block);
-            o.iter()
-                .map(|(key, value)| {
-                    if media && is_media_payload_key(key) {
-                        0
-                    } else {
-                        scan_part_value(value, f)
-                    }
-                })
-                .sum()
-        }
-        _ => 0,
-    }
-}
-
-/// Read-only DLP scan of native Anthropic response content. The opaque
-/// exceptions apply only to direct content blocks, never nested tool input.
-fn scan_native_anthropic_text(v: &serde_json::Value, f: &mut impl FnMut(&str) -> usize) -> usize {
-    match v {
-        serde_json::Value::Array(blocks) => blocks
-            .iter()
-            .map(|block| scan_native_anthropic_block(block, f))
-            .sum(),
-        _ => scan_native_anthropic_block(v, f),
-    }
-}
-
-fn scan_native_anthropic_block(
-    block: &serde_json::Value,
-    f: &mut impl FnMut(&str) -> usize,
-) -> usize {
-    match block.get("type").and_then(serde_json::Value::as_str) {
-        Some("thinking" | "redacted_thinking") => scan_protected_anthropic_block(block, f),
-        _ => scan_part_value(block, f),
-    }
-}
-
-fn scan_protected_anthropic_block(
-    block: &serde_json::Value,
-    f: &mut impl FnMut(&str) -> usize,
-) -> usize {
-    let Some(object) = block.as_object() else {
-        return 0;
-    };
-    let block_type = object.get("type").and_then(serde_json::Value::as_str);
-    object
-        .iter()
-        .map(|(key, value)| {
-            let opaque = matches!(
-                (block_type, key.as_str()),
-                (Some("thinking"), "signature") | (Some("redacted_thinking"), "data")
-            );
-            if opaque { 0 } else { scan_part_value(value, f) }
-        })
-        .sum()
-}
-
 /// Scan a realtime frame's text-bearing fields against the blocklist AND the
 /// regex recognizers, honoring their actions — the same policy every REST
 /// surface runs, so the WebSocket surface is not a bypass. A block-action hit
@@ -730,20 +665,24 @@ fn redact_secrets(text: &str) -> Option<(String, usize)> {
     (count > 0).then(|| (out.into_owned(), count))
 }
 
-/// Read-only DLP scan of native Anthropic SSE events before buffered replay.
-/// Signature deltas and encrypted redacted-thinking data are opaque; text,
-/// tool JSON, citations, and forward-compatible delta payloads remain covered.
-pub fn anthropic_event_dlp_hits(sec: &SecurityConf, chunks: &[gw_models::StreamChunk]) -> usize {
+/// DLP probe of native Anthropic SSE events before buffered replay. Signature
+/// deltas and encrypted redacted-thinking data are opaque; text, tool JSON,
+/// citations, and forward-compatible delta payloads remain covered. `&mut`
+/// only to share the walk family; nothing is rewritten.
+pub fn anthropic_event_dlp_hits(
+    sec: &SecurityConf,
+    chunks: &mut [gw_models::StreamChunk],
+) -> usize {
     if !sec.redacts_output() {
         return 0;
     }
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
     let mut fragments = EventFragments::default();
-    let mut scan = |text: &str| redaction_hits(text, pii, secrets);
+    let mut scan = |text: &mut String| redaction_hits(text, pii, secrets);
     let mut hits: usize = chunks
-        .iter()
-        .filter_map(|chunk| chunk.anthropic_event.as_ref())
-        .map(|event| scan_anthropic_event(event, &mut fragments, &mut scan))
+        .iter_mut()
+        .filter_map(|chunk| chunk.anthropic_event.as_mut())
+        .map(|event| walk_anthropic_event(event, &mut fragments, &mut scan))
         .sum();
     if fragments.overflowed {
         return hits.max(1);
@@ -751,7 +690,7 @@ pub fn anthropic_event_dlp_hits(sec: &SecurityConf, chunks: &[gw_models::StreamC
     hits += fragments
         .values
         .values()
-        .map(|text| scan(text))
+        .map(|text| redaction_hits(text, pii, secrets))
         .sum::<usize>();
     hits
 }
@@ -785,67 +724,68 @@ impl EventFragments {
     }
 }
 
-fn scan_anthropic_event(
-    event: &serde_json::Value,
+fn walk_anthropic_event(
+    event: &mut serde_json::Value,
     fragments: &mut EventFragments,
-    f: &mut impl FnMut(&str) -> usize,
+    f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
-    match event.get("type").and_then(serde_json::Value::as_str) {
-        Some("message_start") => {
-            let mut hits = scan_object_excluding(event, &["message"], f);
-            if let Some(message) = event.get("message") {
-                hits += scan_object_excluding(message, &["content"], f);
-                hits += message
-                    .get("content")
-                    .map(|content| scan_native_anthropic_text(content, f))
-                    .unwrap_or(0);
+    if event["type"] == "message_start" {
+        let mut hits = walk_object_excluding(event, &["message"], f);
+        if let Some(message) = event.get_mut("message") {
+            hits += walk_object_excluding(message, &["content"], f);
+            if let Some(content) = message.get_mut("content") {
+                hits += walk_part_text(content, SignedThinking::Prose, &mut |s, _| f(s));
             }
-            hits
         }
-        Some("content_block_start") => {
-            scan_object_excluding(event, &["content_block"], f)
-                + event
-                    .get("content_block")
-                    .map(|block| scan_native_anthropic_block(block, f))
-                    .unwrap_or(0)
+        return hits;
+    }
+    if event["type"] == "content_block_start" {
+        let mut hits = walk_object_excluding(event, &["content_block"], f);
+        if let Some(block) = event.get_mut("content_block") {
+            hits += if block.as_object().is_some_and(is_signed_thinking_block) {
+                walk_signed_prose(block, &mut |s, _| f(s))
+            } else {
+                walk_part_value(block, f)
+            };
         }
-        Some("content_block_delta") => {
-            let Some(delta) = event.get("delta") else {
-                return scan_part_value(event, f);
-            };
-            let opaque_key = match delta.get("type").and_then(serde_json::Value::as_str) {
-                Some("signature_delta") => Some("signature"),
-                Some("redacted_thinking_delta") => Some("data"),
-                _ => None,
-            };
-            let mut hits = scan_object_excluding(event, &["delta"], f);
-            match event.get("index").and_then(serde_json::Value::as_u64) {
+        return hits;
+    }
+    if event["type"] == "content_block_delta" && event.get("delta").is_some() {
+        let opaque_key: Option<&'static str> = match event["delta"]["type"].as_str() {
+            Some("signature_delta") => Some("signature"),
+            Some("redacted_thinking_delta") => Some("data"),
+            _ => None,
+        };
+        let index = event.get("index").and_then(serde_json::Value::as_u64);
+        let mut hits = walk_object_excluding(event, &["delta"], f);
+        if let Some(delta) = event.get_mut("delta") {
+            match index {
                 Some(index) => collect_delta_payload(delta, index, opaque_key, fragments),
                 None => {
                     hits += match opaque_key {
-                        Some(key) => scan_object_excluding(delta, &["type", key], f),
-                        None => scan_object_excluding(delta, &["type"], f),
+                        Some(key) => walk_object_excluding(delta, &["type", key], f),
+                        None => walk_object_excluding(delta, &["type"], f),
                     };
                 }
             }
-            hits
         }
-        _ => scan_part_value(event, f),
+        return hits;
     }
+    walk_part_value(event, f)
 }
 
-fn scan_object_excluding(
-    value: &serde_json::Value,
+fn walk_object_excluding(
+    value: &mut serde_json::Value,
     excluded: &[&str],
-    f: &mut impl FnMut(&str) -> usize,
+    f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
-    let Some(object) = value.as_object() else {
-        return scan_part_value(value, f);
+    let Some(object) = value.as_object_mut() else {
+        return walk_part_value(value, f);
     };
     object
-        .iter()
+        .iter_mut()
         .filter(|(key, _)| !excluded.contains(&key.as_str()))
-        .map(|(_, value)| scan_part_value(value, f))
+        .map(|(_, value)| walk_part_value(value, f))
         .sum()
 }
 
@@ -933,12 +873,12 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     hits
 }
 
-/// Signed thinking whose prose the tenant's policy cannot serve — blocklist
-/// or DLP hits that a rewrite would invalidate the signature over — is
-/// stripped from the native content instead: the client still gets the
-/// redacted normalized turn (main never surfaced thinking at all), rather
-/// than a hard failure after the upstream tokens are already spent. Returns
-/// the number of hits; the caller drops the buffered raw events.
+/// Strip signed thinking the tenant's policy cannot serve — a block-action
+/// rule hit (the same [`ScanCounts`] verdict a replay would meet inbound) or
+/// a DLP hit nothing can redact without breaking the signature. The client
+/// still gets the redacted normalized turn instead of a hard failure after
+/// the upstream tokens are spent. Returns the hit count; the caller drops
+/// the buffered raw events.
 pub fn strip_unservable_thinking(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
     let dlp = sec.redacts_output();
     if !dlp && sec.blocklist.is_empty() && sec.regexes.is_empty() {
@@ -952,33 +892,33 @@ pub fn strip_unservable_thinking(sec: &SecurityConf, response: &mut GatewayRespo
         return 0;
     };
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut counts = ScanCounts::new(sec);
     let mut hits = 0;
     for block in &mut *blocks {
         if !block.as_object().is_some_and(is_signed_thinking_block) {
             continue;
         }
-        hits += walk_signed_prose(block, &mut |text, _| {
-            usize::from(would_block_inbound(sec, text))
-                + if dlp {
-                    redaction_hits(text, pii, secrets)
-                } else {
-                    0
-                }
+        walk_signed_prose(block, &mut |text, _| {
+            counts.visit(text);
+            if dlp {
+                hits += redaction_hits(text, pii, secrets);
+            }
+            0
         });
+    }
+    let rules = counts.outcome();
+    if rules.block.is_some() {
+        hits += rules
+            .hits
+            .iter()
+            .filter(|h| h.action == Action::Block)
+            .map(|h| h.count as usize)
+            .sum::<usize>();
     }
     if hits > 0 {
         blocks.retain(|block| !block.as_object().is_some_and(is_signed_thinking_block));
     }
     hits
-}
-
-/// Whether the inbound scanners would deny a continuation replaying this text.
-fn would_block_inbound(sec: &SecurityConf, text: &str) -> bool {
-    (sec.blocklist_action == Action::Block && blocklist_hit(sec, text))
-        || sec
-            .regexes
-            .iter()
-            .any(|r| r.action == Action::Block && r.re.is_match(text))
 }
 
 /// Cheap byte scan gating the full scanner: an email needs an '@', a phone
@@ -1357,7 +1297,7 @@ mod tests {
             anthropic_event: Some(value),
             ..Default::default()
         };
-        let chunks = vec![
+        let mut chunks = vec![
             event(serde_json::json!({
                 "type":"content_block_delta","index":1,
                 "delta":{"type":"input_json_delta","partial_json":"{not-json:sk-abcdefghij"}
@@ -1367,15 +1307,15 @@ mod tests {
                 "delta":{"type":"input_json_delta","partial_json":"klmnopqrstuvwxyz012345"}
             })),
         ];
-        assert!(anthropic_event_dlp_hits(&security, &chunks) >= 1);
+        assert!(anthropic_event_dlp_hits(&security, &mut chunks) >= 1);
 
-        let opaque = vec![event(serde_json::json!({
+        let mut opaque = vec![event(serde_json::json!({
             "type":"content_block_delta","index":0,
             "delta":{"type":"signature_delta","signature":"sk-abcdefghijklmnopqrstuvwxyz012345"}
         }))];
-        assert_eq!(anthropic_event_dlp_hits(&security, &opaque), 0);
+        assert_eq!(anthropic_event_dlp_hits(&security, &mut opaque), 0);
 
-        let opaque_with_extra = vec![event(serde_json::json!({
+        let mut opaque_with_extra = vec![event(serde_json::json!({
             "type":"content_block_delta","index":0,
             "delta":{
                 "type":"signature_delta",
@@ -1384,7 +1324,7 @@ mod tests {
             }
         }))];
         assert_eq!(
-            anthropic_event_dlp_hits(&security, &opaque_with_extra),
+            anthropic_event_dlp_hits(&security, &mut opaque_with_extra),
             1,
             "only the signature field itself is opaque"
         );
@@ -1501,9 +1441,11 @@ mod tests {
             security_check(&sec(), &mut request).block.is_some(),
             "plaintext thinking remains subject to blocklist policy"
         );
-        // prose email + `extra` email + email inside the opaque `data` — the
-        // opaque fields are probed too, so they are no smuggling channel
-        assert_eq!(protected_thinking_dlp_hits(&sec(), &mut request), 3);
+        assert_eq!(
+            protected_thinking_dlp_hits(&sec(), &mut request),
+            3,
+            "prose + extra + opaque data emails all counted"
+        );
         let hits = dlp_redact_request(&sec(), &mut request);
         let parts = request.message[0].parts.as_ref().unwrap();
         assert_eq!(&parts[0], &signed[0]);

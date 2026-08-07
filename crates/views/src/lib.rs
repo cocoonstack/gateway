@@ -3042,18 +3042,16 @@ fn messages_stream_response(
                         if let Some(capture) = self.thinking_capture.as_mut() {
                             capture.observe(&event);
                         }
-                        // The event name is upstream-controlled: a missing or
-                        // CR/LF-bearing type cannot become an SSE event name
-                        // (axum asserts on newlines) — drop the frame, keep
-                        // the stream alive.
-                        let Some(kind) = event["type"]
+                        // Upstream-controlled name: a missing or CR/LF-bearing
+                        // type cannot become an SSE event name (axum asserts)
+                        // — drop the frame, keep the stream alive.
+                        let valid = event["type"]
                             .as_str()
-                            .filter(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']))
-                            .map(str::to_owned)
-                        else {
+                            .is_some_and(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']));
+                        if !valid {
                             return false;
-                        };
-                        if kind == "message_start" {
+                        }
+                        if event["type"] == "message_start" {
                             self.started_msg = true;
                             if let Some(message) =
                                 event.get_mut("message").and_then(Value::as_object_mut)
@@ -3061,8 +3059,11 @@ fn messages_stream_response(
                                 message.insert("id".to_owned(), self.id.clone().into());
                             }
                         }
-                        let done = kind == "message_stop";
-                        self.queue.push_back(St::ev(&kind, event));
+                        let done = event["type"] == "message_stop";
+                        let data = event.to_string();
+                        let kind = event["type"].as_str().unwrap_or_default();
+                        self.queue
+                            .push_back(Event::default().event(kind).data(data));
                         return done;
                     }
                     if !c.delta.is_empty() {

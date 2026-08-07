@@ -301,21 +301,19 @@ impl ThinkingSignatureAudit {
             .increment(1);
             return;
         };
-        let additional = anchors
-            .iter()
-            .filter(|anchor| !cache.entries.contains_key(*anchor))
-            .count();
-        if cache.entries.len().saturating_add(additional) > self.inner.max_entries
+        let additional = |cache: &AuditCache| {
+            anchors
+                .iter()
+                .filter(|anchor| !cache.entries.contains_key(*anchor))
+                .count()
+        };
+        if cache.entries.len().saturating_add(additional(&cache)) > self.inner.max_entries
             && now >= cache.next_sweep
         {
             cache.entries.retain(|_, entry| entry.expires_at > now);
             cache.next_sweep = now + self.inner.ttl;
         }
-        let additional = anchors
-            .iter()
-            .filter(|anchor| !cache.entries.contains_key(*anchor))
-            .count();
-        if cache.entries.len().saturating_add(additional) > self.inner.max_entries {
+        if cache.entries.len().saturating_add(additional(&cache)) > self.inner.max_entries {
             metrics::counter!(
                 "gateway_thinking_signature_cache_events_total",
                 "event" => "capacity_drop",
@@ -381,9 +379,7 @@ impl ThinkingSignatureAudit {
         blocks: &[ProtectedBlock],
         include_visible_thinking: bool,
     ) -> Digest {
-        let Ok(mut mac) = HmacSha256::new_from_slice(&self.inner.key) else {
-            return [0; 32];
-        };
+        let mut mac = new_mac(&self.inner.key);
         update_field(
             &mut mac,
             if include_visible_thinking {
@@ -424,15 +420,18 @@ impl ThinkingSignatureAudit {
     }
 
     fn digest(&self, domain: &[u8], fields: &[&[u8]]) -> Digest {
-        let Ok(mut mac) = HmacSha256::new_from_slice(&self.inner.key) else {
-            return [0; 32];
-        };
+        let mut mac = new_mac(&self.inner.key);
         update_field(&mut mac, domain);
         for field in fields {
             update_field(&mut mac, field);
         }
         finalize_digest(mac)
     }
+}
+
+fn new_mac(key: &Digest) -> HmacSha256 {
+    #[allow(clippy::expect_used)] // HMAC-SHA256 accepts any key length
+    HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length")
 }
 
 fn random_key() -> Digest {
@@ -783,7 +782,8 @@ impl ThinkingStreamCapture {
             return;
         }
         let mut sequence = ProtectedSequence::default();
-        for block in self.blocks.values() {
+        // registration is terminal — move the captured strings, don't copy them
+        for block in std::mem::take(&mut self.blocks).into_values() {
             match block {
                 CapturedBlock::Thinking {
                     thinking,
@@ -792,18 +792,18 @@ impl ThinkingStreamCapture {
                 } => {
                     sequence.has_opaque_proof |= !signature.is_empty();
                     sequence.blocks.push(ProtectedBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
+                        thinking,
+                        signature,
                     });
                 }
                 CapturedBlock::RedactedThinking { data, .. } => {
                     sequence.has_opaque_proof |= !data.is_empty();
                     sequence
                         .blocks
-                        .push(ProtectedBlock::RedactedThinking { data: data.clone() });
+                        .push(ProtectedBlock::RedactedThinking { data });
                 }
                 CapturedBlock::ToolUse { id, .. } if !id.is_empty() => {
-                    sequence.tool_ids.push(id.clone());
+                    sequence.tool_ids.push(id);
                 }
                 CapturedBlock::Fallback {
                     from_model,
@@ -814,8 +814,8 @@ impl ThinkingStreamCapture {
                     sequence.tool_ids.clear();
                     sequence.has_opaque_proof = false;
                     sequence.blocks.push(ProtectedBlock::Fallback {
-                        from_model: from_model.clone(),
-                        to_model: to_model.clone(),
+                        from_model,
+                        to_model,
                     });
                 }
                 CapturedBlock::ToolUse { .. } | CapturedBlock::Ignored => {}

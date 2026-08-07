@@ -356,31 +356,19 @@ impl SseState {
         }
     }
 
-    /// Apply one decoded event; returns the chunks it yields.
+    /// Apply one decoded event; returns the chunks it yields. Takes the event
+    /// by value so the native forward is a move, not a per-event deep clone.
     fn apply(
         &mut self,
-        v: &Value,
+        v: Value,
         status: u16,
         resp: &mut GatewayResponse,
     ) -> GResult<Vec<StreamChunk>> {
-        if let Some(err) = crate::engine::vendor_error(status, v) {
+        if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
         let mut chunks = Vec::new();
-        let mut native_event = self.preserve_native.then(|| v.clone());
-        if v.get("type").and_then(Value::as_str) == Some("message_start")
-            && let Some(model) = self.model_override.as_ref()
-            && let Some(message) = native_event
-                .as_mut()
-                .and_then(|event| event.get_mut("message"))
-                .and_then(Value::as_object_mut)
-        {
-            message.insert("model".to_owned(), model.clone().into());
-        }
-        let mut native_chunk = StreamChunk {
-            anthropic_event: native_event,
-            ..Default::default()
-        };
+        let mut native_chunk = StreamChunk::default();
         match v["type"].as_str().unwrap_or_default() {
             "message_start" => {
                 resp.model = v["message"]["model"]
@@ -388,7 +376,6 @@ impl SseState {
                     .unwrap_or_default()
                     .to_owned();
                 self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
-                Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_start" => {
                 if self.preserve_native {
@@ -398,7 +385,6 @@ impl SseState {
                 if v["content_block"]["type"] == "tool_use" {
                     self.open_tool = Some((v["content_block"].clone(), String::new()));
                 }
-                Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_delta" => {
                 if let Some(t) = v["delta"]["text"].as_str() {
@@ -429,7 +415,6 @@ impl SseState {
                         self.open_native_input.push_str(pj);
                     }
                 }
-                Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_stop" => {
                 if let Some(mut block) = self.open_native.take() {
@@ -448,7 +433,6 @@ impl SseState {
                     native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
                     self.tool_blocks.push(block);
                 }
-                Self::push_visible(&mut chunks, native_chunk);
             }
             "message_delta" => {
                 if let Some(sr) = v["delta"]["stop_reason"].as_str() {
@@ -461,12 +445,22 @@ impl SseState {
                 if let Some(it) = v["usage"]["input_tokens"].as_i64() {
                     self.input = it;
                 }
-                Self::push_visible(&mut chunks, native_chunk);
             }
-            // message_stop and forward-compatible events are visible only on
-            // the native Anthropic surface.
-            _ => Self::push_visible(&mut chunks, native_chunk),
+            // message_stop and forward-compatible events carry no normalized
+            // fields; they reach the client only via the native event below.
+            _ => {}
         }
+        if self.preserve_native {
+            let mut event = v;
+            if event["type"] == "message_start"
+                && let Some(model) = self.model_override.as_ref()
+                && let Some(message) = event.get_mut("message").and_then(Value::as_object_mut)
+            {
+                message.insert("model".to_owned(), model.clone().into());
+            }
+            native_chunk.anthropic_event = Some(event);
+        }
+        Self::push_visible(&mut chunks, native_chunk);
         Ok(chunks)
     }
 
@@ -696,7 +690,7 @@ mod tests {
             json!({"type":"message_stop"}),
         ] {
             assert!(
-                state.apply(&event, 200, &mut response).unwrap().is_empty(),
+                state.apply(event, 200, &mut response).unwrap().is_empty(),
                 "native-only events must not commit a non-Anthropic stream"
             );
         }

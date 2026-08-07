@@ -386,7 +386,7 @@ impl DashScopeEngine {
             "dashscope",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| dashscope_apply_frame(v, status, &mut resp, &mut full),
+            |v| dashscope_apply_frame(&v, status, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;

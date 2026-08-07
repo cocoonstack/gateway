@@ -133,7 +133,7 @@ impl VertexEngine {
             "gemini",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| vertex_apply_frame(v, status, &mut resp, &mut full),
+            |v| vertex_apply_frame(&v, status, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;
@@ -795,7 +795,7 @@ impl ResponsesEngine {
             "responses",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| responses_apply_frame(v, status, &mut resp, &mut full),
+            |v| responses_apply_frame(&v, status, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;

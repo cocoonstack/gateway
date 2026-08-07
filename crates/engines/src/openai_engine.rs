@@ -139,7 +139,7 @@ impl OpenAiEngine {
         let mut resp = GatewayResponse::default();
         let mut full = String::new();
         let r = crate::pump::pump_sse("openai", body, self.base.request.stream_tx.clone(), |v| {
-            apply_sse_event(v, status, &mut resp, &mut full)
+            apply_sse_event(&v, status, &mut resp, &mut full)
         })
         .await?;
         resp.message = full;

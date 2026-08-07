@@ -68,7 +68,7 @@ pub async fn pump_sse<F>(
     mut apply: F,
 ) -> GResult<PumpResult>
 where
-    F: FnMut(&Value) -> GResult<Vec<StreamChunk>>,
+    F: FnMut(Value) -> GResult<Vec<StreamChunk>>,
 {
     use futures::StreamExt;
     let mut out = PumpResult::default();
@@ -85,7 +85,7 @@ where
                 let v: Value = serde_json::from_slice(ev.as_bytes()).map_err(|e| {
                     GatewayError::internal(format!("parse {vendor} sse frame")).with_source(e)
                 })?;
-                out.chunks.extend(apply(&v)?);
+                out.chunks.extend(apply(v)?);
             }
         }
         UpstreamBody::SseStream(mut s) => {
@@ -128,7 +128,7 @@ where
                     // reached the client is a committed abort, NOT a failover
                     // signal — replaying would splice a second generation onto
                     // the same stream.
-                    let chunks = match apply(&v) {
+                    let chunks = match apply(v) {
                         Ok(c) => c,
                         Err(e) if sent_any => {
                             tracing::warn!(vendor, error = %e, "vendor error frame after commit");
