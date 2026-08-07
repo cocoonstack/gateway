@@ -84,7 +84,7 @@ fn common_usage_matches_go_struct_semantics() {
     let raw = serde_json::json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
         "prompt_tokens_details":{"cached_tokens":4},
         "completion_tokens_details":{"reasoning_tokens":2}});
-    let u = extract_common_usage(&raw, false);
+    let u = extract_common_usage(&raw, false).unwrap();
     assert_eq!(u.platform_input, 6);
     assert_eq!(u.read_cache, 4);
     assert_eq!(u.write_cache, 0);
@@ -95,7 +95,7 @@ fn common_usage_matches_go_struct_semantics() {
 #[test]
 fn anthropic_common_usage_matches_semantics() {
     let raw = serde_json::json!({"input_tokens":8,"output_tokens":6,"cache_read_input_tokens":1});
-    let u = extract_common_usage(&raw, true);
+    let u = extract_common_usage(&raw, true).unwrap();
     assert_eq!(u.platform_input, 8);
     assert_eq!(u.read_cache, 1);
     assert_eq!(u.completion, 6);
@@ -159,7 +159,7 @@ async fn anthropic_no_stop_reason_matches_go() {
 #[test]
 fn anthropic_cache_usage_matches_go_recorded() {
     let raw = serde_json::json!({"input_tokens":12,"cache_creation_input_tokens":3,"cache_read_input_tokens":2});
-    let u = extract_common_usage(&raw, true);
+    let u = extract_common_usage(&raw, true).unwrap();
     assert_eq!(u.platform_input, 12);
     assert_eq!(u.read_cache, 2);
     assert_eq!(u.write_cache, 3);

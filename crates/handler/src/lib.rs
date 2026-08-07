@@ -1037,6 +1037,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn total_only_vendor_usage_meters_instead_of_zeroing() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: abab, protocol: minimax-v1}]\naccounts: [{name: a1, provider: minimax, protocols: ['minimax-v1']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("abab", "hello minimax"), key).await.unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert!(out.response.total_tokens > 0, "engine carries the total");
+        assert!(
+            out.response.common_usage.is_none(),
+            "a total-only usage must not fabricate a zeroed parts view: {:?}",
+            out.response.common_usage
+        );
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert!(
+            ledger[0].total_tokens > 0,
+            "total-only vendor usage must meter, not bill zero: {:?}",
+            ledger[0]
+        );
+        assert!(ledger[0].cost_micros >= 0);
+    }
+
+    #[tokio::test]
     async fn hard_quota_rejection_does_not_trip_abuse_tier() {
         let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 1}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());

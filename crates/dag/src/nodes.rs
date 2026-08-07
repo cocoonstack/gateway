@@ -649,7 +649,7 @@ impl DagNode for CommonUsageNode {
         if let Some(outcome) = ctx.outcome.as_mut() {
             let resp = &mut outcome.response;
             if resp.common_usage.is_none() {
-                resp.common_usage = resp.raw_usage.as_ref().map(|usage| {
+                resp.common_usage = resp.raw_usage.as_ref().and_then(|usage| {
                     gw_engines::extract_common_usage(usage, resp.is_messages_protocol)
                 });
             }
@@ -719,6 +719,11 @@ impl DagNode for CostCalc {
                     billable_prompt: gw_models::weighted_prompt(&ti, &rate),
                     billable_completion: gw_models::weighted_completion(&ti, &rate),
                 }
+            }
+            // total-only vendors (MiniMax v1) report no sides; meter the
+            // total as completion so served traffic isn't billed zero
+            None if resp.prompt_tokens == 0 && resp.completion_tokens == 0 => {
+                BillTokens::weighted(0, resp.total_tokens, &rate)
             }
             None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
         };

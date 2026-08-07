@@ -9,7 +9,10 @@ use serde_json::Value;
 
 /// Extract a normalized usage view from the vendor's usage subtree.
 /// `messages_protocol` selects the Anthropic field map; otherwise OpenAI's.
-pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> CommonUsage {
+/// `None` when the subtree carries none of the mapped part fields (a
+/// total-only vendor) — callers fall back to the top-level token counts,
+/// which a fabricated all-zero view would otherwise override into billing 0.
+pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<CommonUsage> {
     fn get(v: &Value, path: &[&str]) -> i64 {
         let mut cur = v;
         for p in path {
@@ -21,7 +24,15 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> CommonUsage {
         cur.as_i64().unwrap_or(0)
     }
 
-    if messages_protocol {
+    let keys: &[&str] = if messages_protocol {
+        &["input_tokens", "output_tokens"]
+    } else {
+        &["prompt_tokens", "completion_tokens"]
+    };
+    if keys.iter().all(|k| v.get(k).is_none()) {
+        return None;
+    }
+    Some(if messages_protocol {
         // Anthropic: input/output (+ cache fields). Never trust upstream — floor
         // each part at 0 and sum saturating, so a malformed/hostile usage can't
         // go negative (which would refund quota) or overflow the total.
@@ -43,7 +54,7 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> CommonUsage {
             get(v, &["prompt_tokens_details", "cached_tokens"]),
             get(v, &["completion_tokens_details", "reasoning_tokens"]),
         )
-    }
+    })
 }
 
 #[cfg(test)]
@@ -55,7 +66,7 @@ mod tests {
         let raw = serde_json::json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
             "prompt_tokens_details":{"cached_tokens":4},
             "completion_tokens_details":{"reasoning_tokens":2}});
-        let u = extract_common_usage(&raw, false);
+        let u = extract_common_usage(&raw, false).unwrap();
         assert_eq!(u.platform_input, 6);
         assert_eq!(u.read_cache, 4);
         assert_eq!(u.completion, 3);
@@ -67,7 +78,7 @@ mod tests {
         let raw = serde_json::json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,
             "prompt_tokens_details":{"cached_tokens":9},
             "completion_tokens_details":{"reasoning_tokens":9}});
-        let u = extract_common_usage(&raw, false);
+        let u = extract_common_usage(&raw, false).unwrap();
         assert_eq!(u.platform_input, 0, "clamped, not negative");
         assert_eq!(u.completion, 0, "clamped, not negative");
         assert_eq!(u.read_cache, 3, "capped at prompt_tokens");
@@ -83,7 +94,7 @@ mod tests {
     fn anthropic_map() {
         let raw =
             serde_json::json!({"input_tokens":8,"output_tokens":6,"cache_read_input_tokens":2});
-        let u = extract_common_usage(&raw, true);
+        let u = extract_common_usage(&raw, true).unwrap();
         assert_eq!(u.platform_input, 8);
         assert_eq!(u.completion, 6);
         assert_eq!(u.read_cache, 2);
@@ -93,15 +104,26 @@ mod tests {
     fn anthropic_negative_usage_is_floored() {
         let raw =
             serde_json::json!({"input_tokens":-5,"output_tokens":-3,"cache_read_input_tokens":-1});
-        let u = extract_common_usage(&raw, true);
+        let u = extract_common_usage(&raw, true).unwrap();
         assert_eq!(u.platform_input, 0, "negative floored, no quota refund");
         assert_eq!(u.completion, 0);
         assert_eq!(u.read_cache, 0);
     }
 
     #[test]
-    fn null_usage_maps_to_zeros() {
-        let u = extract_common_usage(&Value::Null, false);
-        assert_eq!(u, CommonUsage::default());
+    fn partless_usage_is_none_not_zeros() {
+        assert!(extract_common_usage(&Value::Null, false).is_none());
+        let total_only = serde_json::json!({"total_tokens": 9});
+        assert!(
+            extract_common_usage(&total_only, false).is_none(),
+            "a total-only vendor must fall back to top-level counts"
+        );
+        assert!(extract_common_usage(&total_only, true).is_none());
+        let zeroed = serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0});
+        assert_eq!(
+            extract_common_usage(&zeroed, false),
+            Some(CommonUsage::default()),
+            "explicitly-zero parts stay a real view"
+        );
     }
 }
