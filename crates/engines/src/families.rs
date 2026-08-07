@@ -147,7 +147,7 @@ impl VertexEngine {
 impl ModelEngine for VertexEngine {
     /// Gemini generateContent: contents/parts request, candidates/usageMetadata
     /// response; `:streamGenerateContent?alt=sse` when the request streams.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         if self.base.request.stream {
             return self.run_stream().await;
         }
@@ -263,7 +263,7 @@ base_engine!(EmbeddingsEngine);
 #[async_trait::async_trait]
 impl ModelEngine for EmbeddingsEngine {
     /// Merges the openai/ali/vertex embedding engines to the openai shape.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let input = match &param.typed {
             Some(TypedParams::Embeddings(p)) => json!(p.input),
@@ -346,7 +346,7 @@ base_engine!(ImageEngine);
 #[async_trait::async_trait]
 impl ModelEngine for ImageEngine {
     /// Merges the dalle/wanx/flux/stability/... engines to the images/generations shape.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (prompt, n, size, image, mask) = match &param.typed {
             Some(TypedParams::Image(p)) => (
@@ -410,7 +410,7 @@ impl AudioEngine {
 #[async_trait::async_trait]
 impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (path, body) = match self.kind {
             AudioKind::Tts => {
@@ -474,7 +474,7 @@ base_engine!(VideoEngine);
 impl ModelEngine for VideoEngine {
     /// Merges the sora/veo/kling/runway/vidu/minimax_video engines (async-task
     /// type; mock completes immediately).
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let prompt = match &param.typed {
             Some(TypedParams::Video(p)) => p.prompt.as_str(),
@@ -513,7 +513,7 @@ base_engine!(SearchEngine);
 #[async_trait::async_trait]
 impl ModelEngine for SearchEngine {
     /// Merges the bingsearch/brave/serp/google_custom_search engines.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {
             Some(TypedParams::Search(p)) => (p.query.as_str(), p.count),
@@ -550,7 +550,7 @@ base_engine!(ModerationsEngine);
 #[async_trait::async_trait]
 impl ModelEngine for ModerationsEngine {
     /// OpenAI moderations shape: `{model, input: [..]}` → per-input verdicts.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let Some(TypedParams::Moderation(p)) = &param.typed else {
             return Err(GatewayError::bad_request("moderations params are required"));
@@ -594,7 +594,7 @@ base_engine!(RerankEngine);
 impl ModelEngine for RerankEngine {
     /// Cohere/Jina-compatible rerank: `{model, query, documents, top_n?}` →
     /// `{results: [{index, relevance_score}]}`.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let Some(TypedParams::Rerank(p)) = &param.typed else {
             return Err(GatewayError::bad_request("rerank params are required"));
@@ -646,7 +646,7 @@ base_engine!(PassthroughEngine);
 impl ModelEngine for PassthroughEngine {
     /// Dedicated integration surfaces: request body passed through as-is,
     /// placeholder protocol (byte-level alignment deferred).
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let body = json!({"model": param.model_name, "payload": param.raw});
         let (status, v) = self
@@ -679,7 +679,7 @@ base_engine!(CompletionsEngine);
 impl ModelEngine for CompletionsEngine {
     /// The legacy openai text-completions endpoint: `{model, prompt}` request
     /// (not chat messages), `{choices:[{text}]}` response.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let prompt: String = self
             .base
@@ -742,17 +742,17 @@ impl ResponsesEngine {
         self.base.model_name().unwrap_or_default().to_owned()
     }
 
-    /// Native passthrough: forward the client's Responses-shaped body verbatim,
-    /// ensuring `model` is present.
-    fn build_body(&self) -> GResult<Value> {
-        let param = self.base.param()?;
-        let mut body = match &param.raw {
-            Value::Object(_) => param.raw.clone(),
+    /// Native passthrough: the client's Responses-shaped body moves through
+    /// verbatim, with `model` ensured.
+    fn build_body(&mut self) -> GResult<Value> {
+        let model_name = self.base.param()?.model_name.clone();
+        let mut body = match self.base.take_raw() {
+            raw @ Value::Object(_) => raw,
             _ => json!({}),
         };
         if let Some(map) = body.as_object_mut() {
             map.entry("model".to_owned())
-                .or_insert_with(|| json!(param.model_name));
+                .or_insert_with(|| json!(model_name));
         }
         Ok(body)
     }
@@ -766,15 +766,11 @@ impl ResponsesEngine {
 
     /// Streaming Responses pumped live: delta frames forwarded through
     /// `stream_tx` as they arrive; `response.completed` carries final usage.
-    async fn run_stream(&self) -> GResult<EngineOutcome> {
+    async fn run_stream(&mut self) -> GResult<EngineOutcome> {
+        let body = self.build_body()?;
         let reply = self
             .base
-            .send_upstream_raw(
-                &self.url(),
-                self.base.bearer_headers(),
-                self.build_body()?,
-                true,
-            )
+            .send_upstream_raw(&self.url(), self.base.bearer_headers(), body, true)
             .await?;
         let status = reply.status;
         let mut resp = GatewayResponse {
@@ -857,18 +853,14 @@ impl ResponsesEngine {
 impl ModelEngine for ResponsesEngine {
     /// OpenAI Responses API (POST /v1/responses): native body passthrough with
     /// the `model` field ensured; usage normalized to the openai shape.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         if self.base.request.stream {
             return self.run_stream().await;
         }
+        let body = self.build_body()?;
         let reply = self
             .base
-            .send_upstream(
-                &self.url(),
-                self.base.bearer_headers(),
-                self.build_body()?,
-                false,
-            )
+            .send_upstream(&self.url(), self.base.bearer_headers(), body, false)
             .await?;
         match &reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, b),
@@ -998,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_round_trip() {
-        let e = VertexEngine::new(req(Protocol::Gemini, "gemini-pro", None), t());
+        let mut e = VertexEngine::new(req(Protocol::Gemini, "gemini-pro", None), t());
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said: hello families"));
         assert!(out.response.total_tokens > 0);
@@ -1009,7 +1001,7 @@ mod tests {
     async fn vertex_stream_decodes_frames() {
         let mut r = req(Protocol::Gemini, "gemini-pro", None);
         r.stream = true;
-        let e = VertexEngine::new(r, t());
+        let mut e = VertexEngine::new(r, t());
         let out = e.run().await.unwrap();
         assert!(out.chunks.len() >= 3, "chunks: {:?}", out.chunks);
         assert!(out.response.message.contains("you said: hello families"));
@@ -1020,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn embeddings_round_trip() {
-        let e = EmbeddingsEngine::new(
+        let mut e = EmbeddingsEngine::new(
             req(
                 Protocol::Embeddings,
                 "text-embedding-mock",
@@ -1042,7 +1034,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_round_trip() {
-        let e = ImageEngine::new(
+        let mut e = ImageEngine::new(
             req(
                 Protocol::Image,
                 "img-mock",
@@ -1062,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn moderations_flags_and_validates() {
-        let e = ModerationsEngine::new(
+        let mut e = ModerationsEngine::new(
             req(
                 Protocol::Moderations,
                 "text-moderation",
@@ -1085,7 +1077,7 @@ mod tests {
                 input: vec![],
             })),
         ] {
-            let e = ModerationsEngine::new(req(Protocol::Moderations, "m", typed), t());
+            let mut e = ModerationsEngine::new(req(Protocol::Moderations, "m", typed), t());
             assert_eq!(e.run().await.unwrap_err().http_status, 400);
         }
     }
@@ -1099,7 +1091,7 @@ mod tests {
                 top_n: Some(1),
             }))
         };
-        let e = RerankEngine::new(
+        let mut e = RerankEngine::new(
             req(
                 Protocol::Rerank,
                 "rerank-mini",
@@ -1114,7 +1106,7 @@ mod tests {
         assert!(out.response.total_tokens > 0, "usage flows from the vendor");
 
         for typed in [None, params("", vec!["doc"]), params("query", vec![])] {
-            let e = RerankEngine::new(req(Protocol::Rerank, "m", typed), t());
+            let mut e = RerankEngine::new(req(Protocol::Rerank, "m", typed), t());
             assert_eq!(e.run().await.unwrap_err().http_status, 400);
         }
     }
@@ -1132,7 +1124,7 @@ mod tests {
 
     #[tokio::test]
     async fn audio_tts_and_stt() {
-        let tts = AudioEngine::new(
+        let mut tts = AudioEngine::new(
             req(
                 Protocol::Tts,
                 "tts-mock",
@@ -1154,7 +1146,7 @@ mod tests {
                 .contains("audio payload")
         );
 
-        let stt = AudioEngine::new(
+        let mut stt = AudioEngine::new(
             req(
                 Protocol::Stt,
                 "whisper-mock",
@@ -1179,7 +1171,7 @@ mod tests {
 
     #[tokio::test]
     async fn video_and_search_and_passthrough() {
-        let v = VideoEngine::new(
+        let mut v = VideoEngine::new(
             req(
                 Protocol::Video,
                 "kling-mock",
@@ -1195,7 +1187,7 @@ mod tests {
         assert_eq!(out.response.message, "mock://videos/out.mp4");
         assert_eq!(out.response.step, "succeeded");
 
-        let s = SearchEngine::new(
+        let mut s = SearchEngine::new(
             req(
                 Protocol::Search,
                 "brave-mock",
@@ -1209,7 +1201,7 @@ mod tests {
         let out = s.run().await.unwrap();
         assert!(out.response.message.contains("result 1 for rust dag"));
 
-        let p = PassthroughEngine::new(req(Protocol::Passthrough, "e2b", None), t());
+        let mut p = PassthroughEngine::new(req(Protocol::Passthrough, "e2b", None), t());
         assert_eq!(p.run().await.unwrap().response.message, "ok");
     }
 
@@ -1220,7 +1212,7 @@ mod tests {
             name: "mock-vertex-down".into(),
             ..Default::default()
         }));
-        let e = VertexEngine::new(r, t());
+        let mut e = VertexEngine::new(r, t());
         let err = e.run().await.err().unwrap();
         assert_eq!(err.http_status, 503);
     }

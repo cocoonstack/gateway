@@ -78,7 +78,7 @@ base_engine!(ErnieEngine);
 impl ModelEngine for ErnieEngine {
     /// Baidu Ernie (Wenxin): /wenxinworkshop/chat/{model}?access_token=…
     /// Request {messages,[temperature]}; response {result, usage{...}, is_truncated}.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let messages: Vec<Value> = self
             .base
@@ -140,7 +140,7 @@ base_engine!(MinimaxV1Engine);
 impl ModelEngine for MinimaxV1Engine {
     /// MiniMax v1: messages use sender_type USER/BOT + text;
     /// response {reply, usage{total_tokens}, base_resp{status_code,status_msg}}.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let messages: Vec<Value> = self
             .base
@@ -197,7 +197,7 @@ base_engine!(CohereEngine);
 impl ModelEngine for CohereEngine {
     /// AWS Bedrock Cohere Command: {message, chat_history[{role USER/CHATBOT, message}]};
     /// response {text, finish_reason, meta{tokens{input_tokens,output_tokens}}}.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let mut history: Vec<Value> = self
             .base
@@ -261,7 +261,7 @@ base_engine!(LlamaEngine);
 impl ModelEngine for LlamaEngine {
     /// AWS Bedrock Llama: {prompt, max_gen_len, temperature};
     /// response {generation, prompt_token_count, generation_token_count, stop_reason}.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         // llama is completion-style: collapse the conversation into a prompt
         let prompt: String = self
@@ -401,7 +401,7 @@ impl ModelEngine for DashScopeEngine {
     /// {model, input:{messages}, parameters:{result_format:"message",…}};
     /// response {output:{choices:[{message,finish_reason}]}, usage{input/output/total_tokens}}.
     /// Streaming: `X-DashScope-SSE: enable` + `incremental_output`.
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         if self.base.request.stream {
             return self.run_stream().await;
         }
@@ -513,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn ernie_wire_shape() {
-        let e = ErnieEngine::new(req(Protocol::Ernie, "ernie-4.0"), t());
+        let mut e = ErnieEngine::new(req(Protocol::Ernie, "ernie-4.0"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -526,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn minimax_v1_wire_shape() {
-        let e = MinimaxV1Engine::new(req(Protocol::MinimaxV1, "abab6.5"), t());
+        let mut e = MinimaxV1Engine::new(req(Protocol::MinimaxV1, "abab6.5"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -538,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn cohere_wire_shape() {
-        let e = CohereEngine::new(req(Protocol::AwsCohere, "command-r"), t());
+        let mut e = CohereEngine::new(req(Protocol::AwsCohere, "command-r"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -550,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn llama_wire_shape() {
-        let e = LlamaEngine::new(req(Protocol::AwsLlama, "llama3-70b"), t());
+        let mut e = LlamaEngine::new(req(Protocol::AwsLlama, "llama3-70b"), t());
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("[mock-llama]"));
         assert!(out.response.total_tokens > 0);
@@ -559,7 +559,7 @@ mod tests {
     async fn dashscope_stream_decodes_frames() {
         let mut r = req(Protocol::Dashscope, "qwen-max");
         r.stream = true;
-        let e = DashScopeEngine::new(r, t());
+        let mut e = DashScopeEngine::new(r, t());
         let out = e.run().await.unwrap();
         assert!(out.chunks.len() >= 3, "chunks: {:?}", out.chunks);
         assert!(
@@ -574,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashscope_wire_shape() {
-        let e = DashScopeEngine::new(req(Protocol::Dashscope, "qwen-max"), t());
+        let mut e = DashScopeEngine::new(req(Protocol::Dashscope, "qwen-max"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response

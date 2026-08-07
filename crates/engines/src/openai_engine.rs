@@ -13,44 +13,40 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 base_engine!(OpenAiEngine);
 
 impl OpenAiEngine {
-    /// Rebuild the OpenAI wire message: multimodal parts win over flat text;
-    /// assistant tool_calls and tool results pass through losslessly.
-    fn wire_messages(&self) -> Vec<Value> {
-        self.base
-            .request
-            .message
-            .iter()
+    /// Rebuild the OpenAI wire message, moving each turn's payload out:
+    /// multimodal parts win over flat text; assistant tool_calls and tool
+    /// results pass through losslessly.
+    fn wire_messages(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.base.request.message)
+            .into_iter()
             .map(|m| {
                 let mut msg = Map::new();
-                msg.insert("role".into(), m.role.clone().into());
-                match &m.parts {
-                    Some(parts) => {
-                        msg.insert("content".into(), parts.clone());
-                    }
-                    None => {
-                        msg.insert("content".into(), m.content.clone().into());
-                    }
+                msg.insert("role".into(), m.role.into());
+                // OpenAI: assistant tool-call turns carry content: null
+                let content = match (m.parts, m.content) {
+                    (Some(parts), _) => parts,
+                    (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
+                    (None, c) => c.into(),
+                };
+                msg.insert("content".into(), content);
+                if let Some(tc) = m.tool_calls {
+                    msg.insert("tool_calls".into(), tc);
                 }
-                if let Some(tc) = &m.tool_calls {
-                    msg.insert("tool_calls".into(), tc.clone());
-                    // OpenAI: assistant tool-call turns carry content: null
-                    if m.content.is_empty() && m.parts.is_none() {
-                        msg.insert("content".into(), Value::Null);
-                    }
-                }
-                if let Some(id) = &m.tool_call_id {
-                    msg.insert("tool_call_id".into(), id.clone().into());
+                if let Some(id) = m.tool_call_id {
+                    msg.insert("tool_call_id".into(), id.into());
                 }
                 Value::Object(msg)
             })
             .collect()
     }
 
-    fn build_upstream(&self) -> GResult<UpstreamRequest> {
+    fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
+        let messages = Value::Array(self.wire_messages());
         let param = self.base.param()?;
+        let protocol = param.protocol;
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
-        body.insert("messages".into(), Value::Array(self.wire_messages()));
+        body.insert("messages".into(), messages);
         body.insert("stream".into(), self.base.request.stream.into());
         // OpenAI omits usage from streamed responses UNLESS this is set — without
         // it every streaming call would bill 0 tokens.
@@ -95,10 +91,11 @@ impl OpenAiEngine {
                 body.insert("messages".into(), Value::Array(msgs));
             }
         }
-        crate::base::merge_raw_extras(&mut body, &param.raw);
+        let raw = self.base.take_raw();
+        crate::base::merge_raw_extras_owned(&mut body, raw);
 
         Ok(UpstreamRequest {
-            protocol: param.protocol,
+            protocol,
             method: "POST".to_owned(),
             url: format!(
                 "{}/v1/chat/completions",
@@ -149,7 +146,7 @@ impl OpenAiEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for OpenAiEngine {
-    async fn run(&self) -> GResult<EngineOutcome> {
+    async fn run(&mut self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
         let reply = self.base.transport.send(up).await?;
         match reply.body {
@@ -306,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_stream_parses_message_and_usage() {
-        let e = OpenAiEngine::new(req(false), Arc::new(MockTransport));
+        let mut e = OpenAiEngine::new(req(false), Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said: hello world"));
         assert_eq!(out.response.model, "gpt-4o");
@@ -321,7 +318,7 @@ mod tests {
             let text = "界".repeat(n);
             let mut r = req(true);
             r.message = vec![ChatMsg::text("user", text.as_str())];
-            let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+            let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
             let out = e.run().await.unwrap();
             assert!(out.response.message.contains(&text), "n={n}");
             assert!(out.chunks.len() >= 3, "n={n}");
@@ -330,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_decodes_chunks_and_final_usage() {
-        let e = OpenAiEngine::new(req(true), Arc::new(MockTransport));
+        let mut e = OpenAiEngine::new(req(true), Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.chunks.len() >= 3);
         assert!(out.response.message.contains("you said: hello world"));
@@ -348,7 +345,7 @@ mod tests {
                 ..Default::default()
             }));
         }
-        let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+        let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert_eq!(out.response.finish_reason, "tool_calls");
         let tc = out.response.tool_calls.expect("tool calls");
@@ -365,7 +362,7 @@ mod tests {
                 ..Default::default()
             }));
         }
-        let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+        let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(
             out.chunks.iter().any(|c| c.tool_calls.is_some()),
@@ -405,7 +402,7 @@ mod tests {
             ])),
             ..Default::default()
         }];
-        let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+        let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(
             out.response.message.contains("[saw 1 image(s)]"),
@@ -425,7 +422,7 @@ mod tests {
             }));
             p.raw = json!({"seed": 42});
         }
-        let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+        let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said:"));
     }
