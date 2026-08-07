@@ -1206,6 +1206,7 @@ impl SqliteStore {
                 sealed INTEGER NOT NULL DEFAULT 0, expires_at_epoch_secs INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
             "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
+            "CREATE INDEX IF NOT EXISTS content_user_n_idx ON request_content (user_id, n DESC)",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -1967,6 +1968,7 @@ impl PostgresStore {
                 sealed BOOLEAN NOT NULL DEFAULT FALSE, expires_at_epoch_secs BIGINT NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
             "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
+            "CREATE INDEX IF NOT EXISTS content_user_n_idx ON request_content (user_id, n DESC)",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -3290,6 +3292,34 @@ mod tests {
         exercise_erase(&store, "").await;
         exercise_erasure_markers(&store, "").await;
         exercise_content_list(&store, "").await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_content_user_query_uses_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("content-index.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '',
+                    sealed, expires_at_epoch_secs FROM request_content
+             WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
+             ORDER BY n DESC LIMIT ?3",
+        )
+        .bind("u1")
+        .bind(Some("t1"))
+        .bind(200_i64)
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let details: Vec<String> = plan.iter().map(|row| row.get(3)).collect();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("content_user_n_idx")),
+            "query plan must use the user ordering index: {details:?}"
+        );
     }
 
     #[tokio::test]
