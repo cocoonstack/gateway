@@ -44,9 +44,9 @@ pub struct GatewayResponse {
     /// holds what was delivered (billing estimates from it when usage is absent).
     #[serde(skip)]
     pub aborted: bool,
-    /// raw usage sub-tree bytes from the vendor body/last SSE frame.
+    /// raw usage sub-tree from the vendor body/last SSE frame.
     #[serde(skip)]
-    pub raw_usage_json: Vec<u8>,
+    pub raw_usage: Option<Value>,
 }
 
 impl GatewayResponse {

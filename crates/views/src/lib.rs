@@ -3191,6 +3191,29 @@ async fn run_family(
     }
 }
 
+/// The shared tail of the message-less typed-param families (embeddings,
+/// images, moderations, rerank): pipeline, access log, native payload.
+#[allow(clippy::too_many_arguments)] // mirrors run_family; all call sites are literal
+async fn family_response(
+    s: &AppState,
+    ak: AkInfo,
+    model: String,
+    mt: gw_consts::Protocol,
+    typed: TypedParams,
+    user_id: Option<String>,
+    surface: &'static str,
+    engine: &str,
+    started: Instant,
+) -> Response {
+    match run_family(s, ak, model, mt, typed, vec![], user_id).await {
+        Ok(ctx) => {
+            log_access(surface, &ctx, started);
+            response_v2_or_500(ctx.outcome, engine)
+        }
+        Err(resp) => resp,
+    }
+}
+
 /// An `input`-style field that may be a string or an array of strings
 /// (the OpenAI embeddings/moderations shape).
 fn string_or_string_array(v: Option<Value>) -> Vec<String> {
@@ -3454,22 +3477,18 @@ async fn embeddings(
         input,
         dimensions: body["dimensions"].as_i64(),
     });
-    let ctx = match run_family(
+    family_response(
         &s,
         ak,
         model,
         gw_consts::Protocol::Embeddings,
         typed,
-        vec![],
         user_hint(&headers, &body["user"]),
+        "embeddings",
+        "embeddings",
+        started,
     )
     .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
-    log_access("embeddings", &ctx, started);
-    response_v2_or_500(ctx.outcome, "embeddings")
 }
 
 /// POST /v1/images/generations (OpenAI-compatible image generation surface)
@@ -3477,11 +3496,11 @@ async fn images_generations(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    ApiJson(body): ApiJson<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let prompt = body["prompt"].as_str().unwrap_or_default().to_owned();
+    let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() {
         return error_response(400, "model and prompt are required");
     }
@@ -3491,22 +3510,18 @@ async fn images_generations(
         size: body["size"].as_str().map(str::to_owned),
         ..Default::default()
     });
-    let ctx = match run_family(
+    family_response(
         &s,
         ak,
         model,
         gw_consts::Protocol::Image,
         typed,
-        vec![],
         user_hint(&headers, &body["user"]),
+        "images",
+        "image",
+        started,
     )
     .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
-    log_access("images", &ctx, started);
-    response_v2_or_500(ctx.outcome, "image")
 }
 
 /// POST /v1/images/edits — same engine as generations; presence of `image`
@@ -3515,12 +3530,13 @@ async fn images_edits(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    ApiJson(body): ApiJson<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let prompt = body["prompt"].as_str().unwrap_or_default().to_owned();
-    let image = body["image"].as_str().unwrap_or_default().to_owned();
+    // move the blobs out — cloning a multi-MB base64 image doubles peak memory
+    let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
+    let image = gw_engines::engine::take_string(&mut body, "/image").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() || image.is_empty() {
         return error_response(400, "model, prompt and image are required");
     }
@@ -3529,24 +3545,20 @@ async fn images_edits(
         n: body["n"].as_i64().unwrap_or(1),
         size: body["size"].as_str().map(str::to_owned),
         image: Some(image),
-        mask: body["mask"].as_str().map(str::to_owned),
+        mask: gw_engines::engine::take_string(&mut body, "/mask"),
     });
-    let ctx = match run_family(
+    family_response(
         &s,
         ak,
         model,
         gw_consts::Protocol::Image,
         typed,
-        vec![],
         user_hint(&headers, &body["user"]),
+        "images_edits",
+        "image",
+        started,
     )
     .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
-    log_access("images_edits", &ctx, started);
-    response_v2_or_500(ctx.outcome, "image")
 }
 
 /// POST /v1/audio/speech (TTS, returns audio bytes; OpenAI-compatible surface)
@@ -3554,11 +3566,11 @@ async fn audio_speech(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    ApiJson(body): ApiJson<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let input = body["input"].as_str().unwrap_or_default().to_owned();
+    let input = gw_engines::engine::take_string(&mut body, "/input").unwrap_or_default();
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
     }
@@ -3634,12 +3646,13 @@ async fn audio_transcribe(
     s: AppState,
     headers: HeaderMap,
     ak: AkInfo,
-    body: Value,
+    mut body: Value,
     translate: bool,
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let audio = body["audio_b64"].as_str().unwrap_or_default().to_owned();
+    // move the blob out — cloning multi-MB base64 audio doubles peak memory
+    let audio = gw_engines::engine::take_string(&mut body, "/audio_b64").unwrap_or_default();
     if model.is_empty() || audio.is_empty() {
         return error_response(400, "model and audio_b64 are required");
     }
@@ -3690,22 +3703,18 @@ async fn moderations(
         return error_response(400, "model and input are required");
     }
     let typed = TypedParams::Moderation(gw_models::ModerationParams { input });
-    let ctx = match run_family(
+    family_response(
         &s,
         ak,
         model,
         gw_consts::Protocol::Moderations,
         typed,
-        vec![],
         user_hint(&headers, &body["user"]),
+        "moderations",
+        "moderations",
+        started,
     )
     .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
-    log_access("moderations", &ctx, started);
-    response_v2_or_500(ctx.outcome, "moderations")
 }
 
 /// POST /v1/rerank — Cohere/Jina-compatible: `{model, query, documents, top_n?}`.
@@ -3736,22 +3745,18 @@ async fn rerank(
         documents,
         top_n: body["top_n"].as_i64(),
     });
-    let ctx = match run_family(
+    family_response(
         &s,
         ak,
         model,
         gw_consts::Protocol::Rerank,
         typed,
-        vec![],
         user_hint(&headers, &body["user"]),
+        "rerank",
+        "rerank",
+        started,
     )
     .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
-    log_access("rerank", &ctx, started);
-    response_v2_or_500(ctx.outcome, "rerank")
 }
 
 fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
@@ -3848,10 +3853,11 @@ async fn batches_submit(
 async fn files_upload(
     State(s): State<AppState>,
     Authed(ak): Authed,
-    ApiJson(body): ApiJson<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
-    let Some(content) = body["file"].as_str() else {
+    // move the content out — cloning a large upload doubles peak memory
+    let Some(content) = gw_engines::engine::take_string(&mut body, "/file") else {
         return error_response(400, "file content (string) is required");
     };
     if content.is_empty() {
@@ -3861,7 +3867,7 @@ async fn files_upload(
         .handler
         .state()
         .store
-        .file_put(&ak.tenant, &purpose, content.to_owned())
+        .file_put(&ak.tenant, &purpose, content)
         .await
     {
         Ok(f) => f,

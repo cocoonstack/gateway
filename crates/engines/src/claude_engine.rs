@@ -109,11 +109,7 @@ impl ClaudeEngine {
         let usage = &v["usage"];
         let input = crate::engine::tok(&usage["input_tokens"]);
         let output = crate::engine::tok(&usage["output_tokens"]);
-        let raw_usage_json = if usage.is_null() {
-            vec![]
-        } else {
-            serde_json::to_vec(usage).unwrap_or_default()
-        };
+        let raw_usage = v.get_mut("usage").map(Value::take).filter(|u| !u.is_null());
         let resp = GatewayResponse {
             message: text,
             tool_calls: if tool_use.is_empty() {
@@ -127,7 +123,7 @@ impl ClaudeEngine {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            raw_usage_json,
+            raw_usage,
             anthropic_content: if preserve_native { content } else { None },
             ..Default::default()
         };
@@ -191,8 +187,9 @@ pub fn anthropic_native_chunks(
     let stream_model = model_override.unwrap_or(&response.model);
     // Replay the upstream's own usage object so cache-token detail survives;
     // it is not on GatewayResponse yet (common_usage is a later DAG step).
-    let start_usage = serde_json::from_slice::<Value>(&response.raw_usage_json)
-        .ok()
+    let start_usage = response
+        .raw_usage
+        .clone()
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({"input_tokens":response.prompt_tokens,"output_tokens":0}));
     let mut events = vec![json!({
@@ -706,8 +703,9 @@ mod tests {
             model: "claude-sonnet".to_owned(),
             prompt_tokens: 11,
             completion_tokens: 7,
-            raw_usage_json: br#"{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":8}"#
-                .to_vec(),
+            raw_usage: Some(
+                json!({"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":8}),
+            ),
             anthropic_content: Some(json!([{"type":"text","text":"answer"}])),
             ..Default::default()
         };

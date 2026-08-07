@@ -649,10 +649,9 @@ impl DagNode for CommonUsageNode {
         if let Some(outcome) = ctx.outcome.as_mut() {
             let resp = &mut outcome.response;
             if resp.common_usage.is_none() {
-                resp.common_usage = gw_engines::extract_common_usage(
-                    &resp.raw_usage_json,
-                    resp.is_messages_protocol,
-                );
+                resp.common_usage = resp.raw_usage.as_ref().map(|usage| {
+                    gw_engines::extract_common_usage(usage, resp.is_messages_protocol)
+                });
             }
         }
         Ok(())

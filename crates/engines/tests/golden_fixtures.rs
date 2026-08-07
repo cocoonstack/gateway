@@ -59,7 +59,7 @@ async fn openai_chat_matches_go_recorded_response() {
     assert_eq!(out.response.prompt_tokens, 5);
     assert_eq!(out.response.completion_tokens, 3);
     assert_eq!(out.response.total_tokens, 8);
-    let usage: serde_json::Value = serde_json::from_slice(&out.response.raw_usage_json).unwrap();
+    let usage: serde_json::Value = out.response.raw_usage.clone().unwrap();
     assert_eq!(
         usage,
         serde_json::json!({"completion_tokens": 3, "prompt_tokens": 5, "total_tokens": 8})
@@ -81,10 +81,10 @@ async fn openai_sse_decodes_go_recorded_stream() {
 
 #[test]
 fn common_usage_matches_go_struct_semantics() {
-    let raw = br#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
+    let raw = serde_json::json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
         "prompt_tokens_details":{"cached_tokens":4},
-        "completion_tokens_details":{"reasoning_tokens":2}}"#;
-    let u = extract_common_usage(raw, false).unwrap();
+        "completion_tokens_details":{"reasoning_tokens":2}});
+    let u = extract_common_usage(&raw, false);
     assert_eq!(u.platform_input, 6);
     assert_eq!(u.read_cache, 4);
     assert_eq!(u.write_cache, 0);
@@ -94,8 +94,8 @@ fn common_usage_matches_go_struct_semantics() {
 
 #[test]
 fn anthropic_common_usage_matches_semantics() {
-    let raw = br#"{"input_tokens":8,"output_tokens":6,"cache_read_input_tokens":1}"#;
-    let u = extract_common_usage(raw, true).unwrap();
+    let raw = serde_json::json!({"input_tokens":8,"output_tokens":6,"cache_read_input_tokens":1});
+    let u = extract_common_usage(&raw, true);
     assert_eq!(u.platform_input, 8);
     assert_eq!(u.read_cache, 1);
     assert_eq!(u.completion, 6);
@@ -158,8 +158,8 @@ async fn anthropic_no_stop_reason_matches_go() {
 
 #[test]
 fn anthropic_cache_usage_matches_go_recorded() {
-    let raw = br#"{"input_tokens":12,"cache_creation_input_tokens":3,"cache_read_input_tokens":2}"#;
-    let u = extract_common_usage(raw, true).unwrap();
+    let raw = serde_json::json!({"input_tokens":12,"cache_creation_input_tokens":3,"cache_read_input_tokens":2});
+    let u = extract_common_usage(&raw, true);
     assert_eq!(u.platform_input, 12);
     assert_eq!(u.read_cache, 2);
     assert_eq!(u.write_cache, 3);

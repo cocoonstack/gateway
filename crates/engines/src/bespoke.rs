@@ -124,7 +124,7 @@ impl ModelEngine for ErnieEngine {
             prompt_tokens: crate::engine::tok(&usage["prompt_tokens"]),
             completion_tokens: crate::engine::tok(&usage["completion_tokens"]),
             total_tokens: crate::engine::tok(&usage["total_tokens"]),
-            raw_usage_json: serde_json::to_vec(usage).unwrap_or_default(),
+            raw_usage: (!usage.is_null()).then(|| usage.clone()),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
@@ -181,7 +181,7 @@ impl ModelEngine for MinimaxV1Engine {
             model,
             finish_reason: "stop".into(),
             total_tokens: total,
-            raw_usage_json: serde_json::to_vec(&v["usage"]).unwrap_or_default(),
+            raw_usage: v.get_mut("usage").map(Value::take).filter(|u| !u.is_null()),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
@@ -244,10 +244,7 @@ impl ModelEngine for CohereEngine {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            raw_usage_json: serde_json::to_vec(
-                &json!({"input_tokens": input, "output_tokens": output}),
-            )
-            .unwrap_or_default(),
+            raw_usage: Some(json!({"input_tokens": input, "output_tokens": output})),
             is_messages_protocol: true, // anthropic's usage fields align with cohere's input/output
             ..Default::default()
         };
@@ -301,10 +298,9 @@ impl ModelEngine for LlamaEngine {
             prompt_tokens: pt,
             completion_tokens: ct,
             total_tokens: total,
-            raw_usage_json: serde_json::to_vec(
-                &json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total}),
-            )
-            .unwrap_or_default(),
+            raw_usage: Some(
+                json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total}),
+            ),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))

@@ -1,7 +1,7 @@
 //! OpenAI-protocol engine: builds the vendor chat request (full param
 //! passthrough), sends it via [`Transport`], parses the JSON or SSE reply into
-//! `GatewayResponse` + stream chunks, and slices the raw usage subtree into
-//! `raw_usage_json` for the CommonUsage DAG node.
+//! `GatewayResponse` + stream chunks, and keeps the raw usage subtree on
+//! `raw_usage` for the CommonUsage DAG node.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
 use serde_json::{Map, Value, json};
@@ -282,7 +282,7 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
     resp.prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);
     resp.completion_tokens = crate::engine::tok(&usage["completion_tokens"]);
     resp.total_tokens = crate::engine::tok(&usage["total_tokens"]);
-    resp.raw_usage_json = serde_json::to_vec(usage).unwrap_or_default();
+    resp.raw_usage = Some(usage.clone());
 }
 
 #[cfg(test)]
@@ -311,7 +311,7 @@ mod tests {
         assert!(out.response.message.contains("you said: hello world"));
         assert_eq!(out.response.model, "gpt-4o");
         assert!(out.response.total_tokens > 0);
-        assert!(!out.response.raw_usage_json.is_empty());
+        assert!(out.response.raw_usage.is_some());
         assert!(out.chunks.is_empty());
     }
 

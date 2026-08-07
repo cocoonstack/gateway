@@ -64,7 +64,7 @@ impl VertexEngine {
         ]
     }
 
-    fn build_body(&self) -> GResult<Value> {
+    fn build_body(&self) -> Value {
         // system turns go to systemInstruction, never the contents: Gemini has
         // no system content role, and a `user`-role downgrade both loses the
         // directive's authority and breaks turn alternation
@@ -106,13 +106,13 @@ impl VertexEngine {
                 body["generationConfig"] = gen_cfg;
             }
         }
-        Ok(body)
+        body
     }
 
     /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames decoded
     /// as they arrive and forwarded through `stream_tx` (the live-pump contract).
     async fn run_stream(&self) -> GResult<EngineOutcome> {
-        let body = self.build_body()?;
+        let body = self.build_body();
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base.base_url("mock://vertex.googleapis.com"),
@@ -151,7 +151,7 @@ impl ModelEngine for VertexEngine {
         if self.base.request.stream {
             return self.run_stream().await;
         }
-        let body = self.build_body()?;
+        let body = self.build_body();
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.base.base_url("mock://vertex.googleapis.com"),
@@ -303,7 +303,7 @@ impl ModelEngine for EmbeddingsEngine {
             model: param.model_name.clone(),
             prompt_tokens: pt,
             total_tokens: pt,
-            raw_usage_json: serde_json::to_vec(&v["usage"]).unwrap_or_default(),
+            raw_usage: (!v["usage"].is_null()).then(|| v["usage"].clone()),
             response_v2: Some(v),
             finish_reason: "stop".to_owned(),
             ..Default::default()
@@ -718,11 +718,7 @@ impl ModelEngine for CompletionsEngine {
             .as_i64()
             .unwrap_or(pt.saturating_add(ct))
             .max(0);
-        let raw_usage_json = if usage.is_null() {
-            vec![]
-        } else {
-            serde_json::to_vec(usage).unwrap_or_default()
-        };
+        let raw_usage = (!usage.is_null()).then(|| usage.clone());
         let resp = GatewayResponse {
             message: crate::engine::take_string(&mut v, "/choices/0/text").unwrap_or_default(),
             model: crate::engine::take_string(&mut v, "/model")
@@ -732,7 +728,7 @@ impl ModelEngine for CompletionsEngine {
             prompt_tokens: pt,
             completion_tokens: ct,
             total_tokens: total,
-            raw_usage_json,
+            raw_usage,
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
