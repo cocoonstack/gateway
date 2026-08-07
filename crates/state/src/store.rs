@@ -526,6 +526,15 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         user: &str,
         audit: AdminAudit,
     ) -> GResult<u64>;
+    /// The most recent `limit` retained-content rows for `user`, newest first,
+    /// optionally confined to one tenant (a tenant admin's scope). Metadata
+    /// only: `content` comes back empty.
+    async fn content_list_user(
+        &self,
+        tenant: Option<&str>,
+        user: &str,
+        limit: usize,
+    ) -> GResult<Vec<crate::ContentRecord>>;
     /// The retained content for one request (both prompt and response rows).
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>>;
 
@@ -931,6 +940,32 @@ impl Store for MemoryStore {
         Ok(hit("") || hit(tenant))
     }
 
+    async fn content_list_user(
+        &self,
+        tenant: Option<&str>,
+        user: &str,
+        limit: usize,
+    ) -> GResult<Vec<crate::ContentRecord>> {
+        let content = lock(&self.content);
+        Ok(content
+            .iter()
+            .rev()
+            .filter(|r| r.user_id == user && tenant.is_none_or(|t| t == r.tenant))
+            .take(limit)
+            .map(|r| crate::ContentRecord {
+                created_at_epoch_secs: r.created_at_epoch_secs,
+                request_id: r.request_id.clone(),
+                ak: r.ak.clone(),
+                user_id: r.user_id.clone(),
+                tenant: r.tenant.clone(),
+                kind: r.kind.clone(),
+                content: String::new(),
+                sealed: r.sealed,
+                expires_at_epoch_secs: r.expires_at_epoch_secs,
+            })
+            .collect())
+    }
+
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
         let content = lock(&self.content);
         Ok(content
@@ -1171,6 +1206,7 @@ impl SqliteStore {
                 sealed INTEGER NOT NULL DEFAULT 0, expires_at_epoch_secs INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
             "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
+            "CREATE INDEX IF NOT EXISTS content_user_n_idx ON request_content (user_id, n DESC)",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -1724,6 +1760,27 @@ sql_store_impl!(SqliteStore, sqlite, {
         Ok(erased)
     }
 
+    async fn content_list_user(
+        &self,
+        tenant: Option<&str>,
+        user: &str,
+        limit: usize,
+    ) -> GResult<Vec<crate::ContentRecord>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '',
+             sealed, expires_at_epoch_secs FROM request_content
+             WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
+             ORDER BY n DESC LIMIT ?3",
+        )
+        .bind(user)
+        .bind(tenant)
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("list user content", e))?;
+        Ok(rows.iter().map(content_row).collect())
+    }
+
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
         // ids derive from the AUTOINCREMENT sequence (sqlite_sequence), which a
@@ -1911,6 +1968,7 @@ impl PostgresStore {
                 sealed BOOLEAN NOT NULL DEFAULT FALSE, expires_at_epoch_secs BIGINT NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
             "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
+            "CREATE INDEX IF NOT EXISTS content_user_n_idx ON request_content (user_id, n DESC)",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -2228,6 +2286,27 @@ sql_store_impl!(PostgresStore, postgres, {
             .await
             .map_err(|e| crate::sqlx_err("commit erase", e))?;
         Ok(erased)
+    }
+
+    async fn content_list_user(
+        &self,
+        tenant: Option<&str>,
+        user: &str,
+        limit: usize,
+    ) -> GResult<Vec<crate::ContentRecord>> {
+        let rows = sqlx::query(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, ''::text,
+             sealed, expires_at_epoch_secs FROM request_content
+             WHERE user_id = $1 AND ($2::text IS NULL OR tenant = $2)
+             ORDER BY n DESC LIMIT $3",
+        )
+        .bind(user)
+        .bind(tenant)
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("list user content", e))?;
+        Ok(rows.iter().map(content_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -3054,6 +3133,54 @@ mod tests {
         );
     }
 
+    async fn exercise_content_list(store: &dyn Store, ns: &str) {
+        let (t1, t2) = (format!("lt1{ns}"), format!("lt2{ns}"));
+        let (u1, u2) = (format!("lu1{ns}"), format!("lu2{ns}"));
+        let rec = |req: &str, user: &str, tenant: &str, at: i64| crate::ContentRecord {
+            created_at_epoch_secs: at,
+            request_id: req.into(),
+            ak: "ak".into(),
+            user_id: user.into(),
+            tenant: tenant.into(),
+            kind: "prompt".into(),
+            content: "hello".into(),
+            sealed: false,
+            expires_at_epoch_secs: 0,
+        };
+        let (r1, r2, r3) = (format!("lr1{ns}"), format!("lr2{ns}"), format!("lr3{ns}"));
+        store.content_add(&rec(&r1, &u1, &t1, 100)).await.unwrap();
+        store.content_add(&rec(&r2, &u1, &t1, 200)).await.unwrap();
+        store
+            .content_add(&rec(&format!("lrx{ns}"), &u2, &t1, 250))
+            .await
+            .unwrap();
+        store.content_add(&rec(&r3, &u1, &t2, 300)).await.unwrap();
+
+        let ids = |rows: &[crate::ContentRecord]| -> Vec<String> {
+            rows.iter().map(|r| r.request_id.clone()).collect()
+        };
+        let all = store.content_list_user(None, &u1, 10).await.unwrap();
+        assert_eq!(
+            ids(&all),
+            [r3.as_str(), r2.as_str(), r1.as_str()],
+            "the user's rows only, newest first"
+        );
+        assert!(
+            all.iter().all(|r| r.content.is_empty()),
+            "metadata only: no content bodies"
+        );
+        assert_eq!(
+            ids(&store.content_list_user(Some(&t1), &u1, 10).await.unwrap()),
+            [r2.as_str(), r1.as_str()],
+            "tenant filter confines the listing"
+        );
+        assert_eq!(
+            ids(&store.content_list_user(None, &u1, 2).await.unwrap()),
+            [r3.as_str(), r2.as_str()],
+            "limit keeps the newest rows"
+        );
+    }
+
     async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
         let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
         let now = crate::epoch_millis();
@@ -3079,6 +3206,7 @@ mod tests {
         let store = MemoryStore::default();
         exercise_erase(&store, "").await;
         exercise_erasure_markers(&store, "").await;
+        exercise_content_list(&store, "").await;
     }
 
     #[tokio::test]
@@ -3104,6 +3232,7 @@ mod tests {
         let ns = format!("-{nonce}");
         exercise_rollup(&store, &ns).await;
         exercise_erase(&store, &ns).await;
+        exercise_content_list(&store, &ns).await;
 
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
         let items = vec![
@@ -3162,6 +3291,35 @@ mod tests {
             .unwrap();
         exercise_erase(&store, "").await;
         exercise_erasure_markers(&store, "").await;
+        exercise_content_list(&store, "").await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_content_user_query_uses_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("content-index.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '',
+                    sealed, expires_at_epoch_secs FROM request_content
+             WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
+             ORDER BY n DESC LIMIT ?3",
+        )
+        .bind("u1")
+        .bind(Some("t1"))
+        .bind(200_i64)
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let details: Vec<String> = plan.iter().map(|row| row.get(3)).collect();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("content_user_n_idx")),
+            "query plan must use the user ordering index: {details:?}"
+        );
     }
 
     #[tokio::test]
