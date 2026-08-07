@@ -1041,7 +1041,6 @@ mod tests {
             message: vec![ChatMsg::text("user", "码字abc")],
             ..Default::default()
         };
-        // splits the second CJK char and overlaps a second range — must not panic
         let hits = apply_moderation_mask(&mut req, &[2..4, 4..7]).unwrap();
         assert_eq!(hits, 1, "overlapping ranges merge to one replacement");
         assert!(req.message[0].content.contains("[MASKED]"));

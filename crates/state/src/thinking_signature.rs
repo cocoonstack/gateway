@@ -406,14 +406,6 @@ impl ThinkingSignatureAudit {
                     update_field(&mut mac, b"redacted_thinking");
                     update_field(&mut mac, data.as_bytes());
                 }
-                ProtectedBlock::Fallback {
-                    from_model,
-                    to_model,
-                } => {
-                    update_field(&mut mac, b"fallback");
-                    update_field(&mut mac, from_model.as_bytes());
-                    update_field(&mut mac, to_model.as_bytes());
-                }
             }
         }
         finalize_digest(mac)
@@ -463,17 +455,8 @@ fn finalize_digest(mac: HmacSha256) -> Digest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProtectedBlock {
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
-    RedactedThinking {
-        data: String,
-    },
-    Fallback {
-        from_model: String,
-        to_model: String,
-    },
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Default)]
@@ -510,20 +493,6 @@ impl ProtectedSequence {
                     let data = bounded_string(block.get("data"));
                     self.has_opaque_proof |= !data.is_empty();
                     self.blocks.push(ProtectedBlock::RedactedThinking { data });
-                }
-                Some("fallback") => {
-                    // Anthropic requires clients to drop protected/client-tool
-                    // blocks before the final fallback boundary on the next
-                    // turn. Only that final suffix remains reviewable.
-                    self.blocks.clear();
-                    self.tool_ids.clear();
-                    self.has_opaque_proof = false;
-                    self.invalid = invalid_bounded_string(block.pointer("/from/model"))
-                        || invalid_bounded_string(block.pointer("/to/model"));
-                    self.blocks.push(ProtectedBlock::Fallback {
-                        from_model: bounded_string(block.pointer("/from/model")),
-                        to_model: bounded_string(block.pointer("/to/model")),
-                    });
                 }
                 Some("tool_use") => {
                     self.invalid |= invalid_bounded_string(block.get("id"));
@@ -581,11 +550,6 @@ enum CapturedBlock {
         id: String,
         complete: bool,
     },
-    Fallback {
-        from_model: String,
-        to_model: String,
-        complete: bool,
-    },
     Ignored,
 }
 
@@ -594,8 +558,7 @@ impl CapturedBlock {
         match self {
             Self::Thinking { complete, .. }
             | Self::RedactedThinking { complete, .. }
-            | Self::ToolUse { complete, .. }
-            | Self::Fallback { complete, .. } => *complete = true,
+            | Self::ToolUse { complete, .. } => *complete = true,
             Self::Ignored => {}
         }
     }
@@ -604,8 +567,7 @@ impl CapturedBlock {
         match self {
             Self::Thinking { complete, .. }
             | Self::RedactedThinking { complete, .. }
-            | Self::ToolUse { complete, .. }
-            | Self::Fallback { complete, .. } => *complete,
+            | Self::ToolUse { complete, .. } => *complete,
             Self::Ignored => true,
         }
     }
@@ -619,11 +581,6 @@ impl CapturedBlock {
             } => thinking.len().saturating_add(signature.len()),
             Self::RedactedThinking { data, .. } => data.len(),
             Self::ToolUse { id, .. } => id.len(),
-            Self::Fallback {
-                from_model,
-                to_model,
-                ..
-            } => from_model.len().saturating_add(to_model.len()),
             Self::Ignored => 0,
         }
     }
@@ -684,10 +641,6 @@ impl ThinkingStreamCapture {
             }
             Some("redacted_thinking") => invalid_bounded_string(block.get("data")),
             Some("tool_use") => invalid_bounded_string(block.get("id")),
-            Some("fallback") => {
-                invalid_bounded_string(block.pointer("/from/model"))
-                    || invalid_bounded_string(block.pointer("/to/model"))
-            }
             _ => false,
         };
         if invalid {
@@ -706,11 +659,6 @@ impl ThinkingStreamCapture {
             },
             Some("tool_use") => CapturedBlock::ToolUse {
                 id: bounded_string(block.get("id")),
-                complete: false,
-            },
-            Some("fallback") => CapturedBlock::Fallback {
-                from_model: bounded_string(block.pointer("/from/model")),
-                to_model: bounded_string(block.pointer("/to/model")),
                 complete: false,
             },
             _ => CapturedBlock::Ignored,
@@ -804,19 +752,6 @@ impl ThinkingStreamCapture {
                 }
                 CapturedBlock::ToolUse { id, .. } if !id.is_empty() => {
                     sequence.tool_ids.push(id);
-                }
-                CapturedBlock::Fallback {
-                    from_model,
-                    to_model,
-                    ..
-                } => {
-                    sequence.blocks.clear();
-                    sequence.tool_ids.clear();
-                    sequence.has_opaque_proof = false;
-                    sequence.blocks.push(ProtectedBlock::Fallback {
-                        from_model,
-                        to_model,
-                    });
                 }
                 CapturedBlock::ToolUse { .. } | CapturedBlock::Ignored => {}
             }
@@ -1052,62 +987,6 @@ mod tests {
     }
 
     #[test]
-    fn final_fallback_boundary_discards_the_declining_prefix() {
-        let audit = ThinkingSignatureAudit::new();
-        let context = seed_context(&audit, "key-a", "claude");
-        let fallback = json!({
-            "type":"fallback",
-            "from":{"model":"claude-primary"},
-            "to":{"model":"claude-fallback"}
-        });
-        let response = json!([
-            {"type":"thinking","thinking":"old","signature":"sig-old"},
-            {"type":"tool_use","id":"tool-old","name":"probe","input":{}},
-            fallback.clone(),
-            {"type":"thinking","thinking":"new","signature":"sig-new"},
-            {"type":"tool_use","id":"tool-new","name":"probe","input":{}}
-        ]);
-        audit.remember_content(
-            &context,
-            response.as_array().map(Vec::as_slice).unwrap_or(&[]),
-        );
-
-        let make = |content: Value, result_id: &str| {
-            request_with_messages(
-                "claude",
-                vec![
-                    message("assistant", content),
-                    message(
-                        "user",
-                        json!([{"type":"tool_result","tool_use_id":result_id,"content":"ok"}]),
-                    ),
-                ],
-            )
-        };
-        let suffix = json!([
-            fallback,
-            {"type":"thinking","thinking":"new","signature":"sig-new"},
-            {"type":"tool_use","id":"tool-new","name":"probe","input":{}}
-        ]);
-        let (_, exact) = audit.review_request(&make(suffix.clone(), "tool-new"), "key-a");
-        let (_, missing_boundary) = audit.review_request(
-            &make(
-                json!([
-                    {"type":"thinking","thinking":"new","signature":"sig-new"},
-                    {"type":"tool_use","id":"tool-new","name":"probe","input":{}}
-                ]),
-                "tool-new",
-            ),
-            "key-a",
-        );
-        let (_, old_anchor) = audit.review_request(&make(suffix, "tool-old"), "key-a");
-
-        assert_eq!(exact, ReviewVerdict::Match);
-        assert_eq!(missing_boundary, ReviewVerdict::Mismatch);
-        assert_eq!(old_anchor, ReviewVerdict::Miss);
-    }
-
-    #[test]
     fn known_result_rejects_deleted_or_reidentified_assistant_anchor() {
         let audit = ThinkingSignatureAudit::new();
         remember(&audit, "key-a", "claude", "", "sig-original", "tool-known");
@@ -1281,58 +1160,6 @@ mod tests {
         assert_eq!(after_stop, ReviewVerdict::Match);
         assert_eq!(tampered, ReviewVerdict::Mismatch);
         assert_eq!(concatenated, ReviewVerdict::Mismatch);
-    }
-
-    #[test]
-    fn stream_capture_resets_at_the_final_fallback_boundary() {
-        let audit = ThinkingSignatureAudit::new();
-        let context = seed_context(&audit, "key-a", "claude");
-        let mut capture = audit.stream_capture(Some(context)).unwrap();
-        for event in [
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"old","signature":"sig-old"}}),
-            json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-old","name":"probe","input":{}}}),
-            json!({"type":"content_block_stop","index":1}),
-            json!({"type":"content_block_start","index":2,"content_block":{"type":"fallback","from":{"model":"primary"},"to":{"model":"fallback"}}}),
-            json!({"type":"content_block_stop","index":2}),
-            json!({"type":"content_block_start","index":3,"content_block":{"type":"thinking","thinking":"new","signature":"sig-new"}}),
-            json!({"type":"content_block_stop","index":3}),
-            json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"tool-new","name":"probe","input":{}}}),
-            json!({"type":"content_block_stop","index":4}),
-            json!({"type":"message_stop"}),
-        ] {
-            capture.observe(&event);
-        }
-        let suffix = json!([
-            {"type":"fallback","from":{"model":"primary"},"to":{"model":"fallback"}},
-            {"type":"thinking","thinking":"new","signature":"sig-new"},
-            {"type":"tool_use","id":"tool-new","name":"probe","input":{}}
-        ]);
-        let request = request_with_messages(
-            "claude",
-            vec![
-                message("assistant", suffix.clone()),
-                message(
-                    "user",
-                    json!([{"type":"tool_result","tool_use_id":"tool-new","content":"ok"}]),
-                ),
-            ],
-        );
-        let (_, exact) = audit.review_request(&request, "key-a");
-        let old = request_with_messages(
-            "claude",
-            vec![
-                message("assistant", suffix),
-                message(
-                    "user",
-                    json!([{"type":"tool_result","tool_use_id":"tool-old","content":"ok"}]),
-                ),
-            ],
-        );
-        let (_, old_anchor) = audit.review_request(&old, "key-a");
-
-        assert_eq!(exact, ReviewVerdict::Match);
-        assert_eq!(old_anchor, ReviewVerdict::Miss);
     }
 
     #[test]

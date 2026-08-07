@@ -936,6 +936,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         .unwrap_or_default();
     let latency = started.elapsed();
     let user_id = ctx.effective_user_id();
+    let decisions = ctx.decision_lines().collect::<Vec<_>>().join("; ");
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
@@ -952,6 +953,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         completion_tokens = ct,
         total_tokens = tt,
         latency_ms = latency.as_millis() as u64,
+        decisions = %decisions,
         "request served"
     );
 }
@@ -4274,7 +4276,6 @@ mod tests {
 
     #[tokio::test]
     async fn models_status_classifies_and_scopes() {
-        // high threshold + disjoint providers: cooldown/round-robin must not skew samples
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_AVAIL_ADMIN}\nmodels: [{name: m-ok, protocol: openai-chat, provider: openai}, {name: m-bad, protocol: openai-chat, provider: downp}, {name: rt-m, protocol: realtime}]\naccounts: [{name: a-up, provider: openai, protocols: ['openai-chat']}, {name: a-down, provider: downp, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m-ok], admin_token_env: GW_TEST_AVAIL_T1}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {availability_min_samples: 3, failure_threshold: 100}";
         // SAFETY: unique var names for this test; no concurrent reader of them.
         unsafe {
@@ -4341,7 +4342,6 @@ mod tests {
 
     #[tokio::test]
     async fn sustained_pool_exhaustion_converges_to_unavailable() {
-        // past the 2nd request the pool is cooling: those 503s must sample too
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_OUT_ADMIN}\nmodels: [{name: m-out, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-down, provider: downp, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {failure_threshold: 2, cooldown_seconds: 300, availability_min_samples: 5}";
         // SAFETY: unique var name for this test; no concurrent reader of it.
         unsafe {
@@ -4858,7 +4858,6 @@ mod tests {
             from_config: true,
         };
         assert!(realtime_gate(&s, &ak, &pinned, "").await.is_ok());
-        // canary rollback: the reload drops the variant the session pinned
         let without = "listen: {host: h, port: 1}\nmodels: [{name: rt-pub, protocol: realtime}]\naccounts: [{name: a1, provider: openai, protocols: ['realtime']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
         s.handler
             .reload(GatewayConfig::from_yaml(without).unwrap())

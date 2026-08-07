@@ -776,6 +776,10 @@ impl GatewayState {
                     .await?,
             );
             tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
+        } else if cfg.storage.postgres_url.is_empty() && cfg.storage.ledger_max_rows > 0 {
+            state.store = Arc::new(MemoryStore::with_ledger_cap(
+                cfg.storage.ledger_max_rows as usize,
+            ));
         }
         if !cfg.storage.redis_url.is_empty() {
             if cfg.storage.shared_cache {

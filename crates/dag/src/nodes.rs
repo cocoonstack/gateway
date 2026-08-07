@@ -648,8 +648,12 @@ impl DagNode for CommonUsageNode {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         if let Some(outcome) = ctx.outcome.as_mut() {
             let resp = &mut outcome.response;
-            resp.common_usage =
-                gw_engines::extract_common_usage(&resp.raw_usage_json, resp.is_messages_protocol);
+            if resp.common_usage.is_none() {
+                resp.common_usage = gw_engines::extract_common_usage(
+                    &resp.raw_usage_json,
+                    resp.is_messages_protocol,
+                );
+            }
         }
         Ok(())
     }

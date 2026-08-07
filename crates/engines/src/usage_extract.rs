@@ -43,22 +43,12 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
             reason: 0,
         }
     } else {
-        let prompt = get(&v, &["prompt_tokens"]).max(0);
-        let completion = get(&v, &["completion_tokens"]).max(0);
-        // cached ⊆ prompt and reasoning ⊆ completion by the vendor contract,
-        // but never trust upstream: cap the parts so malformed usage can't go
-        // negative or make the parts sum past the vendor's own totals
-        // (billing recomputes the total from these parts).
-        let read_cache = get(&v, &["prompt_tokens_details", "cached_tokens"]).clamp(0, prompt);
-        let reason =
-            get(&v, &["completion_tokens_details", "reasoning_tokens"]).clamp(0, completion);
-        CommonUsage {
-            platform_input: prompt - read_cache,
-            read_cache,
-            write_cache: 0,
-            completion: completion - reason,
-            reason,
-        }
+        CommonUsage::from_openai_parts(
+            get(&v, &["prompt_tokens"]),
+            get(&v, &["completion_tokens"]),
+            get(&v, &["prompt_tokens_details", "cached_tokens"]),
+            get(&v, &["completion_tokens_details", "reasoning_tokens"]),
+        )
     })
 }
 

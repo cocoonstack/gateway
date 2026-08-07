@@ -644,7 +644,6 @@ mod tests {
         request
     }
 
-    /// MockTransport with the usage rewritten to 100 prompt tokens, 80 cached.
     #[derive(Debug)]
     struct CachedUsageTransport;
 
@@ -712,7 +711,6 @@ mod tests {
 
     #[tokio::test]
     async fn variant_split_bills_requested_serves_target() {
-        // tenant entitled only to the public name: entitlement precedes the swap
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
@@ -994,7 +992,6 @@ mod tests {
 
     #[tokio::test]
     async fn abuse_tiers_suspend_after_repeated_rejections() {
-        // qps 0: every request is a true throttling rejection.
         let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 2, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));

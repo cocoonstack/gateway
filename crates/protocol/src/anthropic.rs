@@ -111,26 +111,6 @@ pub struct MessagesResponse {
     pub usage: AnthUsage,
 }
 
-impl MessagesResponse {
-    pub fn new(
-        id: impl Into<String>,
-        model: impl Into<String>,
-        content: Vec<ContentBlock>,
-        stop_reason: impl Into<String>,
-        usage: AnthUsage,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            kind: "message".to_owned(),
-            role: "assistant".to_owned(),
-            model: model.into(),
-            content,
-            stop_reason: stop_reason.into(),
-            usage,
-        }
-    }
-}
-
 /// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
 /// Anthropic `tool_use` content blocks. `arguments` is a JSON string on the
 /// OpenAI wire; it parses into the block's structured `input` (kept verbatim

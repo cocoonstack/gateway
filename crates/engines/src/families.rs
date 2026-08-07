@@ -138,7 +138,7 @@ impl VertexEngine {
         .await?;
         resp.message = full;
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.raw_usage_json = vertex_raw_usage(&resp);
+        resp.common_usage = vertex_common_usage(&resp);
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
@@ -177,7 +177,7 @@ impl ModelEngine for VertexEngine {
         };
         vertex_apply_usage(&v["usageMetadata"], &mut resp);
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.raw_usage_json = vertex_raw_usage(&resp);
+        resp.common_usage = vertex_common_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }
 }
@@ -249,16 +249,13 @@ fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     }
 }
 
-/// usage dialect normalized to the openai shape at the engine boundary
-/// (CommonUsage extraction follows the openai field table).
-fn vertex_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "prompt_tokens": resp.prompt_tokens,
-        "completion_tokens": resp.completion_tokens,
-        "total_tokens": resp.total_tokens,
-        "completion_tokens_details": {"reasoning_tokens": resp.reasoning_tokens},
-    }))
-    .unwrap_or_default()
+fn vertex_common_usage(resp: &GatewayResponse) -> Option<gw_models::CommonUsage> {
+    Some(gw_models::CommonUsage::from_openai_parts(
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        0,
+        resp.reasoning_tokens,
+    ))
 }
 
 base_engine!(EmbeddingsEngine);
@@ -810,7 +807,7 @@ impl ResponsesEngine {
             return Err(err);
         }
         let (text, tool_calls) = responses_output(&v);
-        let (input, output, raw_usage_json) = responses_usage(&v["usage"]);
+        let (input, output, common_usage) = responses_usage(&v["usage"]);
         let resp = GatewayResponse {
             message: text,
             tool_calls: if tool_calls.is_empty() {
@@ -826,7 +823,7 @@ impl ResponsesEngine {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            raw_usage_json,
+            common_usage,
             response_v2: Some(v),
             ..Default::default()
         };
@@ -914,26 +911,20 @@ fn responses_output(v: &Value) -> (String, Vec<Value>) {
     (text, tool_calls)
 }
 
-/// Normalize a Responses `usage` object to the openai shape so downstream
-/// billing reads it unchanged; returns (input, output, raw_usage_json).
-fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
+/// Normalize a Responses `usage` object; returns (input, output, common usage).
+fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) {
     if usage.is_null() {
-        return (0, 0, vec![]);
+        return (0, 0, None);
     }
-    // floor upstream counts so a negative can't refund quota or bill a negative
     let input = crate::engine::tok(&usage["input_tokens"]);
     let output = crate::engine::tok(&usage["output_tokens"]);
-    let cached = crate::engine::tok(&usage["input_tokens_details"]["cached_tokens"]);
-    let reasoning = crate::engine::tok(&usage["output_tokens_details"]["reasoning_tokens"]);
-    let raw = serde_json::to_vec(&json!({
-        "prompt_tokens": input,
-        "completion_tokens": output,
-        "total_tokens": input.saturating_add(output),
-        "prompt_tokens_details": {"cached_tokens": cached},
-        "completion_tokens_details": {"reasoning_tokens": reasoning},
-    }))
-    .unwrap_or_default();
-    (input, output, raw)
+    let common = gw_models::CommonUsage::from_openai_parts(
+        input,
+        output,
+        crate::engine::tok(&usage["input_tokens_details"]["cached_tokens"]),
+        crate::engine::tok(&usage["output_tokens_details"]["reasoning_tokens"]),
+    );
+    (input, output, Some(common))
 }
 
 /// Apply one Responses SSE frame to the accumulating response; returns the
@@ -967,11 +958,11 @@ fn responses_apply_frame(
             if let Some(st) = r["status"].as_str() {
                 resp.finish_reason = st.to_owned();
             }
-            let (input, output, raw) = responses_usage(&r["usage"]);
+            let (input, output, common) = responses_usage(&r["usage"]);
             resp.prompt_tokens = input;
             resp.completion_tokens = output;
-            resp.total_tokens = input.saturating_add(output);
-            resp.raw_usage_json = raw;
+            crate::engine::fill_total_if_zero(resp);
+            resp.common_usage = common;
             chunks.push(StreamChunk {
                 finish_reason: Some(resp.finish_reason.clone()),
                 ..Default::default()
@@ -1257,8 +1248,8 @@ mod tests {
             out.response.total_tokens,
             out.response.prompt_tokens + out.response.completion_tokens
         );
-        let u = String::from_utf8(out.response.raw_usage_json).unwrap();
-        assert!(u.contains("prompt_tokens") && u.contains("completion_tokens"));
+        let usage = out.response.common_usage.unwrap();
+        assert!(usage.prompt_total() > 0 && usage.completion_total() > 0);
     }
 
     #[tokio::test]

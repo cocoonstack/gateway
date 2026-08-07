@@ -18,6 +18,24 @@ pub struct CommonUsage {
 }
 
 impl CommonUsage {
+    /// Openai-shaped usage parts under the never-trust-upstream clamps:
+    /// cached ⊆ prompt, reasoning ⊆ completion, nothing negative. The ONE
+    /// place those rules live — extraction and the direct-setting engines
+    /// both call it.
+    pub fn from_openai_parts(prompt: i64, completion: i64, cached: i64, reasoning: i64) -> Self {
+        let prompt = prompt.max(0);
+        let completion = completion.max(0);
+        let read_cache = cached.clamp(0, prompt);
+        let reason = reasoning.clamp(0, completion);
+        Self {
+            platform_input: prompt - read_cache,
+            read_cache,
+            write_cache: 0,
+            completion: completion - reason,
+            reason,
+        }
+    }
+
     /// All input-side tokens: fresh input plus cache reads and writes.
     pub fn prompt_total(&self) -> i64 {
         self.platform_input

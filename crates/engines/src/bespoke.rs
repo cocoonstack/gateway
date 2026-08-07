@@ -391,7 +391,7 @@ impl DashScopeEngine {
         .await?;
         resp.message = full;
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.raw_usage_json = dashscope_raw_usage(&resp);
+        resp.common_usage = dashscope_common_usage(&resp);
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
@@ -421,7 +421,7 @@ impl ModelEngine for DashScopeEngine {
         };
         dashscope_apply_usage(&v["usage"], &mut resp);
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.raw_usage_json = dashscope_raw_usage(&resp);
+        resp.common_usage = dashscope_common_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }
 }
@@ -481,15 +481,13 @@ fn dashscope_apply_usage(usage: &Value, resp: &mut GatewayResponse) {
     }
 }
 
-/// usage dialect normalized to the openai shape at the engine boundary.
-fn dashscope_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "prompt_tokens": resp.prompt_tokens,
-        "completion_tokens": resp.completion_tokens,
-        "total_tokens": resp.total_tokens,
-        "prompt_tokens_details": {"cached_tokens": resp.read_cached_prompt_tokens},
-    }))
-    .unwrap_or_default()
+fn dashscope_common_usage(resp: &GatewayResponse) -> Option<gw_models::CommonUsage> {
+    Some(gw_models::CommonUsage::from_openai_parts(
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        resp.read_cached_prompt_tokens,
+        0,
+    ))
 }
 
 #[cfg(test)]

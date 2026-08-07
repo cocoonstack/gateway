@@ -684,7 +684,6 @@ impl Transport for MockTransport {
                           "message": "mock vendor rejected the request"}
             }));
         }
-        // route by the URL path segment the family engine chose
         let u = req.url.as_str();
         if u.contains("dashscope") {
             self.dashscope_reply(&req)

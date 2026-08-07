@@ -12,6 +12,9 @@ const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     buf: Vec<u8>,
+    /// bytes of `buf` already scanned without finding a boundary — the next
+    /// scan resumes here instead of rescanning the tail on every read
+    scanned: usize,
     done: bool,
 }
 
@@ -24,7 +27,7 @@ impl SseDecoder {
         // chunk separately would corrupt it permanently.
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        while let Some(end) = event_boundary(&self.buf) {
+        while let Some(end) = event_boundary(&self.buf, self.scanned) {
             let event = String::from_utf8_lossy(&self.buf[..end]);
             for line in event.lines() {
                 if let Some(data) = line.strip_prefix("data:") {
@@ -37,7 +40,10 @@ impl SseDecoder {
                 }
             }
             self.buf.drain(..end);
+            self.scanned = 0;
         }
+        // back up so a terminator split across the old/new join is still seen
+        self.scanned = self.buf.len().saturating_sub(2);
         if self.buf.len() > MAX_EVENT_BYTES {
             return Err(format!(
                 "sse event exceeds {MAX_EVENT_BYTES} bytes without a terminator"
@@ -61,8 +67,8 @@ impl SseDecoder {
 /// Index just past the first blank-line event separator. Vendors frame with
 /// either LF (`\n\n`, OpenAI) or CRLF (`\r\n\r\n`, Google) — a decoder that
 /// only splits on `\n\n` never completes a CRLF-framed event.
-fn event_boundary(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
+fn event_boundary(buf: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
     while i + 1 < buf.len() {
         if buf[i] == b'\n' {
             if buf[i + 1] == b'\n' {
@@ -87,6 +93,16 @@ mod tests {
         let (events, done) = SseDecoder::decode_all(body).unwrap();
         assert_eq!(events, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
         assert!(done);
+    }
+
+    #[test]
+    fn byte_at_a_time_feeds_decode_both_terminator_styles() {
+        let mut d = SseDecoder::default();
+        let mut all = Vec::new();
+        for b in b"data: {\"a\":1}\n\ndata: {\"b\":2}\r\n\r\n" {
+            all.extend(d.feed(&[*b]).unwrap());
+        }
+        assert_eq!(all, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
     }
 
     #[test]

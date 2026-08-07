@@ -475,10 +475,10 @@ impl SseState {
         let (input, output) = (self.input.max(0), self.output.max(0));
         resp.prompt_tokens = input;
         resp.completion_tokens = output;
-        resp.total_tokens = input.saturating_add(output);
-        resp.raw_usage_json =
-            serde_json::to_vec(&json!({"input_tokens": input, "output_tokens": output}))
-                .unwrap_or_default();
+        crate::engine::fill_total_if_zero(resp);
+        resp.common_usage = Some(gw_models::CommonUsage::from_openai_parts(
+            input, output, 0, 0,
+        ));
     }
 }
 
