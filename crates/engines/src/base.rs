@@ -184,14 +184,15 @@ impl Base {
     /// the body (typed fields stay authoritative) and ensures a JSON
     /// content-type, so every field the caller set reaches the vendor.
     pub async fn post_raw(
-        &self,
+        &mut self,
         url: &str,
         mut headers: Vec<(String, String)>,
         mut body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
         if let Some(obj) = body.as_object_mut() {
-            merge_raw_extras(obj, &self.param()?.raw);
+            let raw = self.take_raw();
+            merge_raw_extras_owned(obj, raw);
         }
         ensure_json_content_type(&mut headers);
         self.send_upstream_raw(url, headers, body, stream).await
@@ -199,7 +200,7 @@ impl Base {
 
     /// [`Self::post_raw`] + buffer + parse, expect JSON back (non-streaming).
     pub async fn post_json(
-        &self,
+        &mut self,
         url: &str,
         headers: Vec<(String, String)>,
         body: Value,
@@ -246,23 +247,12 @@ fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
     }
 }
 
-/// [`merge_raw_extras`] over an owned bag: the extras move in.
+/// Merge the raw passthrough bag into a wire body; typed fields stay
+/// authoritative (`or_insert`), and the extras move in.
 pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, raw: Value) {
     if let Value::Object(extra) = raw {
         for (k, v) in extra {
             body.entry(k).or_insert(v);
-        }
-    }
-}
-
-/// Merge `raw` passthrough fields into a wire body; typed fields stay
-/// authoritative (`or_insert`).
-pub(crate) fn merge_raw_extras(body: &mut serde_json::Map<String, Value>, raw: &Value) {
-    if let Value::Object(extra) = raw {
-        for (k, v) in extra {
-            if !body.contains_key(k.as_str()) {
-                body.insert(k.clone(), v.clone());
-            }
         }
     }
 }

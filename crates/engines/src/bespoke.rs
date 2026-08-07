@@ -48,7 +48,7 @@ fn aws_headers(
 /// (else the mock sentinel); SigV4 signs this same host so URL and signature
 /// agree. Raw extras merge before signing so the signature covers the exact
 /// bytes sent — and the body serializes once, not per layer.
-async fn bedrock_invoke(base: &Base, uri: &str, mut body: Value) -> GResult<(u16, Value)> {
+async fn bedrock_invoke(base: &mut Base, uri: &str, mut body: Value) -> GResult<(u16, Value)> {
     let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
     let host = root
         .split_once("://")
@@ -56,7 +56,8 @@ async fn bedrock_invoke(base: &Base, uri: &str, mut body: Value) -> GResult<(u16
         .unwrap_or(&root)
         .to_owned();
     if let Some(obj) = body.as_object_mut() {
-        crate::base::merge_raw_extras(obj, &base.param()?.raw);
+        let raw = base.take_raw();
+        crate::base::merge_raw_extras_owned(obj, raw);
     }
     let payload = crate::base::body_bytes(&body)?;
     let creds = base.aws_credentials();
@@ -233,7 +234,7 @@ impl ModelEngine for CohereEngine {
             body["max_tokens"] = json!(mt);
         }
         let (status, mut v) =
-            bedrock_invoke(&self.base, "/model/cohere.command-r/invoke", body).await?;
+            bedrock_invoke(&mut self.base, "/model/cohere.command-r/invoke", body).await?;
         let message = crate::engine::take_string(&mut v, "/text").unwrap_or_default();
         let tokens = &v["meta"]["tokens"];
         let (input, output) = (
@@ -283,7 +284,7 @@ impl ModelEngine for LlamaEngine {
             }
         }
         let (status, mut v) = bedrock_invoke(
-            &self.base,
+            &mut self.base,
             "/model/meta.llama3-70b-instruct-v1/invoke",
             body,
         )
@@ -368,7 +369,7 @@ impl DashScopeEngine {
 
     /// Native DashScope streaming: SSE frames decoded as they arrive and
     /// forwarded through `stream_tx` (the live-pump contract).
-    async fn run_stream(&self) -> GResult<EngineOutcome> {
+    async fn run_stream(&mut self) -> GResult<EngineOutcome> {
         let body = self.build_body(true)?;
         let reply = self
             .base
