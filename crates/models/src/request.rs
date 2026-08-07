@@ -54,17 +54,17 @@ impl GatewayRequest {
         })
     }
 
-    /// Whether the request explicitly enables extended thinking. A `thinking`
-    /// key with `{"type":"disabled"}` is a routine SDK serialization and must
-    /// not trigger thinking handling.
+    /// Whether the request explicitly enables thinking. A `thinking` key with
+    /// `{"type":"disabled"}` is a routine SDK serialization and must not
+    /// trigger thinking handling.
     pub fn anthropic_thinking_enabled(&self) -> bool {
-        self.model_param_v2.as_ref().is_some_and(|param| {
-            param
-                .raw
-                .pointer("/thinking/type")
-                .and_then(serde_json::Value::as_str)
-                == Some("enabled")
-        })
+        matches!(
+            self.model_param_v2
+                .as_ref()
+                .and_then(|param| param.raw.pointer("/thinking/type"))
+                .and_then(serde_json::Value::as_str),
+            Some("enabled" | "adaptive")
+        )
     }
 
     /// Whether this native Messages request must stay on its requested model.

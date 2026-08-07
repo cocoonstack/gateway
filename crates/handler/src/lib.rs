@@ -628,12 +628,17 @@ mod tests {
         }
     }
 
-    fn thinking_req(name: &str, content: &str) -> GatewayRequest {
+    fn thinking_req(name: &str, content: &str, thinking_type: &str) -> GatewayRequest {
         let mut request = chat_req(name, content);
         request.preserve_anthropic_wire = true;
         if let Some(param) = request.model_param_v2.as_mut() {
+            let thinking = if thinking_type == "enabled" {
+                serde_json::json!({"type":"enabled","budget_tokens":1024})
+            } else {
+                serde_json::json!({"type":thinking_type})
+            };
             param.raw = serde_json::json!({
-                "thinking":{"type":"enabled","budget_tokens":1024}
+                "thinking":thinking
             });
         }
         request
@@ -919,7 +924,10 @@ mod tests {
         )
         .with_moderator(Arc::new(DegradeModerator));
         let key = h.state().auth.authenticate("k1").await.unwrap();
-        let ctx = h.run(thinking_req("pub-m", "hi"), key).await.unwrap();
+        let ctx = h
+            .run(thinking_req("pub-m", "hi", "enabled"), key)
+            .await
+            .unwrap();
         let out = ctx.outcome.expect("moderation denial outcome");
 
         assert_eq!(out.response.finish_reason, "content_filter");
@@ -1089,8 +1097,7 @@ mod tests {
         assert_eq!(rec.served_model, "fb-m");
     }
 
-    #[tokio::test]
-    async fn thinking_seed_and_continuation_stay_off_variants_and_quota_fallbacks() {
+    async fn assert_thinking_route_pinned(thinking_type: &str) {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
@@ -1101,7 +1108,10 @@ mod tests {
         let key = h.state().auth.authenticate("k1").await.unwrap();
 
         let seed = h
-            .run(thinking_req("pub-m", "start thinking"), key.clone())
+            .run(
+                thinking_req("pub-m", "start thinking", thinking_type),
+                key.clone(),
+            )
             .await
             .unwrap();
         assert!(
@@ -1109,7 +1119,7 @@ mod tests {
                 .decisions
                 .iter()
                 .any(|(node, _)| *node == "variant_select"),
-            "the initial thinking request must stay on the requested model"
+            "{thinking_type} thinking must stay on the requested model"
         );
 
         let mut assistant = ChatMsg::text("assistant", String::new());
@@ -1142,6 +1152,13 @@ mod tests {
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 2);
         assert!(ledger.iter().all(|record| record.served_model == "pub-m"));
+    }
+
+    #[tokio::test]
+    async fn thinking_modes_stay_off_variants_and_quota_fallbacks() {
+        for thinking_type in ["enabled", "adaptive"] {
+            assert_thinking_route_pinned(thinking_type).await;
+        }
     }
 
     #[tokio::test]

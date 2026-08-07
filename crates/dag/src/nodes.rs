@@ -105,6 +105,7 @@ impl DagNode for ResolveModel {
         &["model_quota"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        let thinking_route = ctx.request.pins_anthropic_thinking_route();
         let param = ctx
             .request
             .model_param_v2
@@ -124,6 +125,11 @@ impl DagNode for ResolveModel {
                 format!("unknown model: {name}"),
             ));
         };
+        if thinking_route && mt != Protocol::AnthropicMessages {
+            return Err(GatewayError::bad_request(
+                "native Anthropic thinking requires an anthropic-messages model",
+            ));
+        }
         let decision = format!("{name} -> {mt}");
         param.protocol = mt;
         ctx.decide("resolve_model", decision);

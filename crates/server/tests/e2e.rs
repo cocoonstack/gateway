@@ -389,8 +389,8 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
 listen: {host: 127.0.0.1, port: 0}
 security: {dlp_redact: false, detect_secrets: false}
 access_keys: [{ak: ak-thinking, product: demo, qps: 100, daily_token_quota: 1000000}]
-models: [{name: claude-test, protocol: anthropic-messages}]
-accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+models: [{name: claude-test, protocol: anthropic-messages}, {name: gpt-test, protocol: openai-chat}]
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}, {name: openai, provider: openai, protocols: ["openai-chat"]}]
 "#;
     let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
@@ -400,6 +400,30 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         state,
         Arc::new(ThinkingFixture { hits: hits.clone() }),
     ));
+
+    let wrong_protocol = json!({
+        "model":"gpt-test",
+        "max_tokens":128,
+        "thinking":{"type":"enabled","budget_tokens":1024},
+        "messages":[{"role":"user","content":"use the tool"}]
+    });
+    let wrong_protocol_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &wrong_protocol.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_protocol_response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(wrong_protocol_response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "native Anthropic thinking requires an anthropic-messages model"
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 0, "rejected before dispatch");
 
     let seed = json!({
         "model":"claude-test",
