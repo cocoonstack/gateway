@@ -21,6 +21,10 @@ type Digest = [u8; 32];
 
 pub const THINKING_SIGNATURE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_ENTRIES: usize = 250_000;
+/// Compatible upstreams may reuse tool ids ("call_1") across conversations
+/// under one access key; an anchor keeps the last few fingerprints so a
+/// collision cannot invalidate another live conversation's continuation.
+const MAX_ANCHOR_FINGERPRINTS: usize = 4;
 const MAX_STREAM_BLOCKS: usize = 1024;
 const MAX_STREAM_CAPTURE: usize = 4 * 1024 * 1024;
 const MAX_OPAQUE_FIELD: usize = 1024 * 1024;
@@ -75,14 +79,12 @@ struct AuditCache {
     next_sweep: Instant,
 }
 
-#[derive(Clone, Copy)]
 struct CacheEntry {
-    opaque_sequence: Digest,
-    strict_sequence: Option<Digest>,
+    fingerprints: Vec<SequenceFingerprint>,
     expires_at: Instant,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct SequenceFingerprint {
     opaque: Digest,
     strict: Option<Digest>,
@@ -194,6 +196,14 @@ impl ThinkingSignatureAudit {
             }
         }
 
+        // With thinking disabled the API requires the client to strip the
+        // thinking blocks from the replayed turn; nothing signed remains to
+        // audit, so the upstream arbitrates. With thinking enabled a known
+        // anchor whose protected blocks were removed is still a Mismatch.
+        if sequence.blocks.is_empty() && !request.anthropic_thinking_enabled() {
+            return (Some(context), ReviewVerdict::Miss);
+        }
+
         let fingerprint = self.sequence_fingerprint(&context, &sequence.blocks);
         let mut saw_match = false;
         for tool_id in result_ids {
@@ -242,22 +252,24 @@ impl ThinkingSignatureAudit {
             .increment(1);
             return ReviewVerdict::Miss;
         };
-        let Some(entry) = cache.entries.get(&anchor).copied() else {
+        let Some(entry) = cache.entries.get(&anchor) else {
             return ReviewVerdict::Miss;
         };
         if entry.expires_at <= now {
             cache.entries.remove(&anchor);
             return ReviewVerdict::Miss;
         }
-        if !anchor_present
-            || entry.opaque_sequence != actual.opaque
-            || entry
-                .strict_sequence
-                .is_some_and(|expected| actual.strict != Some(expected))
-        {
-            ReviewVerdict::Mismatch
-        } else {
+        let matched = anchor_present
+            && entry.fingerprints.iter().any(|expected| {
+                expected.opaque == actual.opaque
+                    && expected
+                        .strict
+                        .is_none_or(|strict| actual.strict == Some(strict))
+            });
+        if matched {
             ReviewVerdict::Match
+        } else {
+            ReviewVerdict::Mismatch
         }
     }
 
@@ -312,14 +324,26 @@ impl ThinkingSignatureAudit {
             return;
         }
         for anchor in anchors {
-            cache.entries.insert(
-                anchor,
-                CacheEntry {
-                    opaque_sequence: fingerprint.opaque,
-                    strict_sequence: fingerprint.strict,
-                    expires_at,
-                },
-            );
+            match cache.entries.get_mut(&anchor) {
+                Some(entry) if entry.expires_at > now => {
+                    if !entry.fingerprints.contains(&fingerprint) {
+                        if entry.fingerprints.len() >= MAX_ANCHOR_FINGERPRINTS {
+                            entry.fingerprints.remove(0);
+                        }
+                        entry.fingerprints.push(fingerprint);
+                    }
+                    entry.expires_at = expires_at;
+                }
+                _ => {
+                    cache.entries.insert(
+                        anchor,
+                        CacheEntry {
+                            fingerprints: vec![fingerprint],
+                            expires_at,
+                        },
+                    );
+                }
+            }
         }
         metrics::counter!(
             "gateway_thinking_signature_cache_events_total",
@@ -847,9 +871,11 @@ mod tests {
     }
 
     fn request_with_messages(model: &str, messages: Vec<ChatMsg>) -> GatewayRequest {
+        let mut param = ModelParamV2::with_name(Protocol::AnthropicMessages, model);
+        param.raw = json!({"thinking":{"type":"enabled","budget_tokens":1024}});
         GatewayRequest {
             message: messages,
-            model_param_v2: Some(ModelParamV2::with_name(Protocol::AnthropicMessages, model)),
+            model_param_v2: Some(param),
             ..Default::default()
         }
     }
@@ -1106,6 +1132,56 @@ mod tests {
         assert_eq!(deleted_verdict, ReviewVerdict::Mismatch);
         assert_eq!(reidentified, ReviewVerdict::Mismatch);
         assert_eq!(changed_both, ReviewVerdict::Miss);
+    }
+
+    #[test]
+    fn thinking_disabled_continuation_may_strip_protected_blocks() {
+        let audit = ThinkingSignatureAudit::new();
+        remember(&audit, "key-a", "claude", "", "sig-original", "tool-known");
+
+        let mut stripped = request_with_messages(
+            "claude",
+            vec![
+                message(
+                    "assistant",
+                    json!([{"type":"tool_use","id":"tool-known","name":"probe","input":{}}]),
+                ),
+                message(
+                    "user",
+                    json!([{"type":"tool_result","tool_use_id":"tool-known","content":"ok"}]),
+                ),
+            ],
+        );
+        if let Some(param) = stripped.model_param_v2.as_mut() {
+            param.raw = json!({"thinking":{"type":"disabled"}});
+        }
+
+        let (_, verdict) = audit.review_request(&stripped, "key-a");
+        assert_eq!(verdict, ReviewVerdict::Miss);
+    }
+
+    #[test]
+    fn colliding_tool_ids_keep_both_conversations_reviewable() {
+        let audit = ThinkingSignatureAudit::new();
+        remember(&audit, "key-a", "claude", "", "sig-first", "call_1");
+        remember(&audit, "key-a", "claude", "", "sig-second", "call_1");
+
+        let (_, first) = audit.review_request(
+            &continuation("claude", "", "sig-first", "call_1", "call_1"),
+            "key-a",
+        );
+        let (_, second) = audit.review_request(
+            &continuation("claude", "", "sig-second", "call_1", "call_1"),
+            "key-a",
+        );
+        let (_, tampered) = audit.review_request(
+            &continuation("claude", "", "sig-forged", "call_1", "call_1"),
+            "key-a",
+        );
+
+        assert_eq!(first, ReviewVerdict::Match);
+        assert_eq!(second, ReviewVerdict::Match);
+        assert_eq!(tampered, ReviewVerdict::Mismatch);
     }
 
     #[test]

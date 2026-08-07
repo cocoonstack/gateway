@@ -105,9 +105,6 @@ impl DagNode for ResolveModel {
         &["model_quota"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let has_thinking = ctx.request.has_anthropic_thinking_blocks();
-        let invalid_thinking = ctx.request.has_invalid_anthropic_thinking_placement();
-        let native_surface = ctx.request.preserve_anthropic_wire;
         let param = ctx
             .request
             .model_param_v2
@@ -127,13 +124,6 @@ impl DagNode for ResolveModel {
                 format!("unknown model: {name}"),
             ));
         };
-        if has_thinking
-            && (invalid_thinking || !native_surface || mt != Protocol::AnthropicMessages)
-        {
-            return Err(GatewayError::bad_request(
-                "Anthropic thinking blocks require assistant content on the native `/v1/messages` surface and an anthropic-messages model",
-            ));
-        }
         let decision = format!("{name} -> {mt}");
         param.protocol = mt;
         ctx.decide("resolve_model", decision);

@@ -27,15 +27,16 @@ pub struct ScanOutcome {
     pub hits: Vec<RuleHit>,
 }
 
-/// Scan inbound text against the blocklist and regex recognizers. Native
-/// signed-thinking prose is read-only scanned while its signature and opaque
-/// redacted data are excluded.
-pub fn security_check(sec: &SecurityConf, request: &GatewayRequest) -> ScanOutcome {
+/// Scan inbound text against the blocklist and the regex recognizers. One
+/// traversal of every string leaf, signed-thinking opaque fields included, so
+/// no field choice is a bypass. `&mut` only to share the traversal; nothing
+/// is rewritten here.
+pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanOutcome {
     if sec.blocklist.is_empty() && sec.regexes.is_empty() {
         return ScanOutcome::default();
     }
     let mut counts = ScanCounts::new(sec);
-    scan_request_text(request, &mut |s| counts.visit(s));
+    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| counts.visit(s));
     counts.outcome()
 }
 
@@ -92,24 +93,14 @@ impl<'a> ScanCounts<'a> {
     }
 }
 
-/// All mutable inbound text available to moderation and retention. Native
-/// signed-thinking blocks are excluded because moderator masks cannot rewrite
-/// them without invalidating a continuation.
+/// The one text view moderation reviews and content retention records —
+/// signed-thinking prose included (policy must read what the vendor said),
+/// opaque signatures and redacted-thinking data excluded (unscannable).
+/// `&mut` only to share the traversal; nothing is rewritten.
 pub fn inbound_text(request: &mut GatewayRequest) -> String {
     let mut out = String::new();
-    for_each_request_text(request, &mut |s| {
+    for_each_request_text(request, SignedThinking::Prose, &mut |s, _| {
         push_text(&mut out, s);
-        0
-    });
-    out
-}
-
-/// Read-only moderation view. It includes signed-thinking prose, but excludes
-/// opaque signatures and redacted-thinking data.
-pub fn moderation_text(request: &GatewayRequest) -> String {
-    let mut out = String::new();
-    scan_request_text(request, &mut |text| {
-        push_text(&mut out, text);
         0
     });
     out
@@ -124,49 +115,42 @@ fn push_text(out: &mut String, s: &str) {
     }
 }
 
-/// Apply moderator mask spans (byte ranges into the reviewed text) back onto
-/// the request's text slots. Returns the number of replaced ranges.
-pub fn apply_mask_spans(request: &mut GatewayRequest, spans: &[std::ops::Range<usize>]) -> usize {
-    let mut masker = SpanMasker::new(spans);
-    for_each_request_text(request, &mut |s| masker.apply(s));
-    masker.hits
-}
-
-/// Apply moderator spans against [`moderation_text`]. A candidate copy is
-/// mutated first; if any span touches protected thinking, reject the mutation
-/// so the caller can deny instead of invalidating the signature.
+/// Apply moderator mask spans (byte ranges into [`inbound_text`]) back onto
+/// the request's text slots. Signed thinking cannot be rewritten without
+/// invalidating the continuation, so a probing pass first counts spans landing
+/// in protected prose; on `Err` nothing has been mutated and the caller
+/// denies. Returns the number of replaced ranges.
 pub fn apply_moderation_mask(
     request: &mut GatewayRequest,
     spans: &[std::ops::Range<usize>],
 ) -> Result<usize, usize> {
-    let mut candidate = request.clone();
+    let mut dry = SpanMasker::new(spans);
+    let mut protected = 0;
+    for_each_request_text(request, SignedThinking::Prose, &mut |text, prose| {
+        let overlaps = dry.probe(text);
+        if prose {
+            protected += overlaps;
+        }
+        0
+    });
+    if protected > 0 {
+        return Err(protected);
+    }
     let mut masker = SpanMasker::new(spans);
-    let mut protected_hits = 0;
-    let native = candidate.preserve_anthropic_wire;
-    for message in &mut candidate.message {
-        masker.apply(&mut message.content);
-        if let Some(parts) = message.parts.as_mut() {
-            let protect = native && message.role == gw_consts::role::AI;
-            walk_moderation_parts(parts, protect, &mut masker, &mut protected_hits);
+    for_each_request_text(request, SignedThinking::Prose, &mut |text, prose| {
+        // protected prose still advances the offset cursor; the probing pass
+        // proved no span lands in it
+        if prose {
+            masker.probe(text)
+        } else {
+            masker.apply(text)
         }
-        if let Some(tool_calls) = message.tool_calls.as_mut() {
-            walk_json_strings(tool_calls, &mut |text| masker.apply(text));
-        }
-    }
-    if let Some(param) = candidate.model_param_v2.as_mut() {
-        for_each_param_text(param, &mut |text| masker.apply(text));
-    }
-    if protected_hits > 0 {
-        Err(protected_hits)
-    } else {
-        let hits = masker.hits;
-        *request = candidate;
-        Ok(hits)
-    }
+    });
+    Ok(masker.hits)
 }
 
-/// [`apply_mask_spans`] for one realtime frame (spans address the frame's
-/// collected text).
+/// Moderator mask spans applied to one realtime frame (spans address the
+/// frame's collected text).
 pub fn apply_mask_spans_frame(
     frame: &mut serde_json::Value,
     spans: &[std::ops::Range<usize>],
@@ -205,16 +189,36 @@ impl SpanMasker {
         }
     }
 
-    fn apply(&mut self, s: &mut String) -> usize {
-        if s.is_empty() {
-            return 0;
+    /// Advance the offset cursor over one slot, mirroring the `push_text`
+    /// walk; `None` for the empty slots that walk skips.
+    fn advance(&mut self, len: usize) -> Option<(usize, usize)> {
+        if len == 0 {
+            return None;
         }
         if self.seen_any {
             self.base += 1;
         }
         self.seen_any = true;
-        let (start, end) = (self.base, self.base + s.len());
-        self.base = end;
+        let start = self.base;
+        self.base += len;
+        Some((start, self.base))
+    }
+
+    /// Count spans overlapping this slot without rewriting it.
+    fn probe(&mut self, s: &str) -> usize {
+        let Some((start, end)) = self.advance(s.len()) else {
+            return 0;
+        };
+        self.spans
+            .iter()
+            .filter(|span| span.start < end && span.end > start)
+            .count()
+    }
+
+    fn apply(&mut self, s: &mut String) -> usize {
+        let Some((start, end)) = self.advance(s.len()) else {
+            return 0;
+        };
         let mut replaced = 0;
         for span in self.spans.iter().rev() {
             if span.start >= end || span.end <= start {
@@ -278,45 +282,62 @@ fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) 
     }
 }
 
-fn scan_json_strings(v: &serde_json::Value, f: &mut impl FnMut(&str) -> usize) -> usize {
-    match v {
-        serde_json::Value::String(s) => f(s),
-        serde_json::Value::Array(a) => a.iter().map(|value| scan_json_strings(value, f)).sum(),
-        serde_json::Value::Object(o) => o.values().map(|value| scan_json_strings(value, f)).sum(),
-        _ => 0,
-    }
+/// How a traversal treats the signed thinking blocks of a native assistant
+/// turn. Everywhere else such blocks are ordinary client data and every
+/// policy degrades to `Visit`.
+#[derive(Clone, Copy, PartialEq)]
+enum SignedThinking {
+    /// Every string leaf, opaque proof included — the security scans; a
+    /// field choice must never dodge the scanner.
+    Visit,
+    /// Skip the whole block — a rewrite would invalidate the signature.
+    Skip,
+    /// Prose without the opaque signature/data — the moderation/retention
+    /// view and the mask walk, whose offsets must match that view.
+    Prose,
 }
 
-/// Every mutable text-bearing field of a whole request. A native assistant's
-/// top-level signed-thinking blocks are skipped because changing them breaks
-/// the upstream continuation proof.
+/// Every text-bearing field of a whole request — each message plus the tail
+/// params — the ONE per-request traversal the blocklist scan, inbound-text
+/// view, mask application, and DLP redaction all share, so they can't drift
+/// apart field by field. The visitor's second argument marks signed-thinking
+/// prose (only ever true under [`SignedThinking::Prose`]).
 fn for_each_request_text(
     request: &mut GatewayRequest,
-    f: &mut impl FnMut(&mut String) -> usize,
+    signed: SignedThinking,
+    f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
     let mut n = 0;
     let native = request.preserve_anthropic_wire;
     for msg in &mut request.message {
-        let protect = native && msg.role == gw_consts::role::AI;
-        n += for_each_message_text(msg, protect, f);
+        let policy = if native && msg.role == gw_consts::role::AI {
+            signed
+        } else {
+            SignedThinking::Visit
+        };
+        n += for_each_message_text(msg, policy, f);
     }
     if let Some(param) = request.model_param_v2.as_mut() {
-        n += for_each_param_text(param, f);
+        n += for_each_param_text(param, &mut |s| f(s, false));
     }
     n
 }
 
+/// The text-bearing fields of one chat turn — flat content, multimodal parts,
+/// and assistant tool_calls, all forwarded to the vendor by the engines — the
+/// ONE per-message field list every scan and rewrite traverses, so a
+/// `ChatMsg` field added here is covered by all of them.
 fn for_each_message_text(
     msg: &mut ChatMsg,
-    protect_signed_top_level: bool,
-    f: &mut impl FnMut(&mut String) -> usize,
+    signed: SignedThinking,
+    f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
-    let mut n = f(&mut msg.content);
+    let mut n = f(&mut msg.content, false);
     if let Some(parts) = &mut msg.parts {
-        n += walk_part_text(parts, protect_signed_top_level, f);
+        n += walk_part_text(parts, signed, f);
     }
     if let Some(tc) = &mut msg.tool_calls {
-        n += walk_json_strings(tc, f);
+        n += walk_json_strings(tc, &mut |s| f(s, false));
     }
     n
 }
@@ -332,7 +353,7 @@ fn for_each_param_text(
     f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
     let mut n = if matches!(param.protocol, gw_consts::Protocol::Responses) {
-        walk_part_text(&mut param.raw, false, f)
+        walk_part_text(&mut param.raw, SignedThinking::Visit, &mut |s, _| f(s))
     } else {
         walk_json_strings(&mut param.raw, f)
     };
@@ -340,58 +361,6 @@ fn for_each_param_text(
         n += for_each_typed_text(typed, f);
     }
     n
-}
-
-/// Read-only counterpart used by blocklist/regex scanning. Unlike the mutable
-/// walk, it includes plaintext from protected thinking blocks while excluding
-/// the opaque signature and redacted-thinking data.
-fn scan_request_text(request: &GatewayRequest, f: &mut impl FnMut(&str) -> usize) -> usize {
-    let mut n = 0;
-    for msg in &request.message {
-        n += f(&msg.content);
-        if let Some(parts) = &msg.parts {
-            let protect = request.preserve_anthropic_wire && msg.role == gw_consts::role::AI;
-            n += scan_part_text(parts, protect, f);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            n += scan_json_strings(tool_calls, f);
-        }
-    }
-    if let Some(param) = request.model_param_v2.as_ref() {
-        n += if matches!(param.protocol, gw_consts::Protocol::Responses) {
-            scan_part_text(&param.raw, false, f)
-        } else {
-            scan_json_strings(&param.raw, f)
-        };
-        if let Some(typed) = param.typed.as_ref() {
-            n += scan_typed_text(typed, f);
-        }
-    }
-    n
-}
-
-fn scan_typed_text(typed: &gw_models::TypedParams, f: &mut impl FnMut(&str) -> usize) -> usize {
-    use gw_models::TypedParams as T;
-    match typed {
-        T::Chat(p) => {
-            let mut n = p.system.as_deref().map(&mut *f).unwrap_or(0);
-            if let Some(tools) = p.tools.as_ref() {
-                n += scan_json_strings(tools, f);
-            }
-            if let Some(choice) = p.tool_choice.as_ref() {
-                n += scan_json_strings(choice, f);
-            }
-            n
-        }
-        T::Embeddings(p) => p.input.iter().map(|value| f(value)).sum(),
-        T::AudioTts(p) => f(&p.input),
-        T::Image(p) => f(&p.prompt),
-        T::Video(p) => f(&p.prompt),
-        T::Search(p) => f(&p.query),
-        T::Moderation(p) => p.input.iter().map(|value| f(value)).sum(),
-        T::Rerank(p) => f(&p.query) + p.documents.iter().map(|value| f(value)).sum::<usize>(),
-        T::AudioStt(_) => 0,
-    }
 }
 
 /// The free-text fields of the family typed params — the ONE field list both
@@ -480,28 +449,57 @@ fn is_media_payload_key(k: &str) -> bool {
 }
 
 /// Walk a content array with a visitor that may rewrite prose. Only direct
-/// native assistant blocks can be protected; a lookalike nested in a tool
-/// argument or metadata remains ordinary client data.
+/// blocks of the array honor the signed-thinking policy; a lookalike nested
+/// in a tool argument or metadata remains ordinary client data.
 fn walk_part_text(
     v: &mut serde_json::Value,
-    protect_signed_top_level: bool,
-    f: &mut impl FnMut(&mut String) -> usize,
+    signed: SignedThinking,
+    f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
     if let serde_json::Value::Array(parts) = v {
         return parts
             .iter_mut()
             .map(|part| {
-                if protect_signed_top_level
+                if signed != SignedThinking::Visit
                     && part.as_object().is_some_and(is_signed_thinking_block)
                 {
-                    0
+                    if signed == SignedThinking::Skip {
+                        0
+                    } else {
+                        walk_signed_prose(part, f)
+                    }
                 } else {
-                    walk_part_value(part, f)
+                    walk_part_value(part, &mut |s| f(s, false))
                 }
             })
             .sum();
     }
-    walk_part_value(v, f)
+    walk_part_value(v, &mut |s| f(s, false))
+}
+
+/// A signed block's prose fields — everything but the opaque
+/// signature/redacted data, which no scanner can read and no mask may touch.
+fn walk_signed_prose(
+    v: &mut serde_json::Value,
+    f: &mut impl FnMut(&mut String, bool) -> usize,
+) -> usize {
+    let opaque_key = match v.get("type").and_then(serde_json::Value::as_str) {
+        Some("redacted_thinking") => "data",
+        _ => "signature",
+    };
+    let Some(object) = v.as_object_mut() else {
+        return 0;
+    };
+    object
+        .iter_mut()
+        .map(|(key, value)| {
+            if key == opaque_key {
+                0
+            } else {
+                walk_part_value(value, &mut |s| f(s, true))
+            }
+        })
+        .sum()
 }
 
 fn walk_part_value(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
@@ -525,68 +523,6 @@ fn walk_part_value(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) ->
         }
         _ => 0,
     }
-}
-
-fn walk_moderation_parts(
-    value: &mut serde_json::Value,
-    protect_signed_top_level: bool,
-    masker: &mut SpanMasker,
-    protected_hits: &mut usize,
-) {
-    let serde_json::Value::Array(parts) = value else {
-        walk_part_value(value, &mut |text| masker.apply(text));
-        return;
-    };
-    for part in parts {
-        let protected =
-            protect_signed_top_level && part.as_object().is_some_and(is_signed_thinking_block);
-        if protected {
-            let block_type = part
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            if let Some(object) = part.as_object_mut() {
-                for (key, value) in object {
-                    let opaque = matches!(
-                        (block_type.as_deref(), key.as_str()),
-                        (Some("thinking"), "signature") | (Some("redacted_thinking"), "data")
-                    );
-                    if !opaque {
-                        walk_part_value(value, &mut |text| {
-                            let before = masker.hits;
-                            let hits = masker.apply(text);
-                            *protected_hits += masker.hits.saturating_sub(before);
-                            hits
-                        });
-                    }
-                }
-            }
-        } else {
-            walk_part_value(part, &mut |text| masker.apply(text));
-        }
-    }
-}
-
-fn scan_part_text(
-    v: &serde_json::Value,
-    protect_signed_top_level: bool,
-    f: &mut impl FnMut(&str) -> usize,
-) -> usize {
-    if let serde_json::Value::Array(parts) = v {
-        return parts
-            .iter()
-            .map(|part| {
-                let protected = protect_signed_top_level
-                    && part.as_object().is_some_and(is_signed_thinking_block);
-                if protected {
-                    scan_protected_anthropic_block(part, f)
-                } else {
-                    scan_part_value(part, f)
-                }
-            })
-            .sum();
-    }
-    scan_part_value(v, f)
 }
 
 fn scan_part_value(v: &serde_json::Value, f: &mut impl FnMut(&str) -> usize) -> usize {
@@ -695,31 +631,35 @@ pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Val
     gw_engines::realtime::visit_frame_text(frame, &mut |s| redact_in_place(s, pii, secrets))
 }
 
-/// Sensitive plaintext inside a signed thinking block cannot be rewritten
-/// without invalidating it. Detect those cases so the handler can reject the
-/// request instead of silently bypassing DLP.
-pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &GatewayRequest) -> usize {
+/// Sensitive text inside a signed thinking block cannot be rewritten without
+/// invalidating it. Detect those cases — opaque signature/data included, so a
+/// verbatim secret cannot ride an unscannable field to the vendor — and the
+/// handler rejects the request instead of silently bypassing DLP. `&mut` only
+/// to share the walk; nothing is rewritten.
+pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
     if (!sec.dlp_redact && !sec.detect_secrets) || !request.preserve_anthropic_wire {
         return 0;
     }
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    request
-        .message
-        .iter()
-        .filter(|message| message.role == gw_consts::role::AI)
-        .filter_map(|message| message.parts.as_ref().and_then(serde_json::Value::as_array))
-        .flatten()
-        .filter_map(|block| {
-            let object = block.as_object()?;
-            is_signed_thinking_block(object).then_some(block)
-        })
-        .map(|block| {
-            scan_protected_anthropic_block(block, &mut |text| {
-                let mut probe = text.to_owned();
-                redact_in_place(&mut probe, pii, secrets)
-            })
-        })
-        .sum()
+    let mut hits = 0;
+    for message in &mut request.message {
+        if message.role != gw_consts::role::AI {
+            continue;
+        }
+        let Some(parts) = message
+            .parts
+            .as_mut()
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for block in &mut *parts {
+            if block.as_object().is_some_and(is_signed_thinking_block) {
+                hits += walk_part_value(block, &mut |text| redaction_hits(text, pii, secrets));
+            }
+        }
+    }
+    hits
 }
 
 /// DLP inbound redaction: emails, 11-digit phone numbers, and — when
@@ -729,7 +669,9 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
         return 0;
     }
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    for_each_request_text(request, &mut |s| redact_in_place(s, pii, secrets))
+    for_each_request_text(request, SignedThinking::Skip, &mut |s, _| {
+        redact_in_place(s, pii, secrets)
+    })
 }
 
 /// A privacy-safe copy of `text` for content retention: PII and secrets are
@@ -752,6 +694,19 @@ fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     }
     if secrets && let Some((redacted, n)) = redact_secrets(s) {
         *s = redacted;
+        hits += n;
+    }
+    hits
+}
+
+/// [`redact_in_place`]'s hit count without the rewrite — the probe used where
+/// redaction is impossible (signed thinking) or unwanted (buffered events).
+fn redaction_hits(text: &str, pii: bool, secrets: bool) -> usize {
+    let mut hits = 0;
+    if pii && let Some((_, n)) = redact(text) {
+        hits += n;
+    }
+    if secrets && let Some((_, n)) = redact_secrets(text) {
         hits += n;
     }
     hits
@@ -784,10 +739,7 @@ pub fn anthropic_event_dlp_hits(sec: &SecurityConf, chunks: &[gw_models::StreamC
     }
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
     let mut fragments = EventFragments::default();
-    let mut scan = |text: &str| {
-        let mut probe = text.to_owned();
-        redact_in_place(&mut probe, pii, secrets)
-    };
+    let mut scan = |text: &str| redaction_hits(text, pii, secrets);
     let mut hits: usize = chunks
         .iter()
         .filter_map(|chunk| chunk.anthropic_event.as_ref())
@@ -971,19 +923,7 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     let native_hits = response
         .anthropic_content
         .as_mut()
-        .and_then(serde_json::Value::as_array_mut)
-        .map(|blocks| {
-            blocks
-                .iter_mut()
-                .map(|block| {
-                    if block.as_object().is_some_and(is_signed_thinking_block) {
-                        0
-                    } else {
-                        walk_part_value(block, &mut redact_field)
-                    }
-                })
-                .sum()
-        })
+        .map(|content| walk_part_text(content, SignedThinking::Skip, &mut |s, _| redact_field(s)))
         .unwrap_or(0);
     // Native text normally duplicates normalized fields. Count a native-only
     // hit when normalized output was clean, without double-counting text.
@@ -993,34 +933,52 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     hits
 }
 
-/// Outbound DLP hits inside signed-thinking prose cannot be rewritten without
-/// breaking tool-use continuation. The handler rejects those responses rather
-/// than returning a successful but unusable turn.
-pub fn protected_thinking_response_dlp_hits(
-    sec: &SecurityConf,
-    response: &GatewayResponse,
-) -> usize {
-    if !sec.redacts_output() {
+/// Signed thinking whose prose the tenant's policy cannot serve — blocklist
+/// or DLP hits that a rewrite would invalidate the signature over — is
+/// stripped from the native content instead: the client still gets the
+/// redacted normalized turn (main never surfaced thinking at all), rather
+/// than a hard failure after the upstream tokens are already spent. Returns
+/// the number of hits; the caller drops the buffered raw events.
+pub fn strip_unservable_thinking(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
+    let dlp = sec.redacts_output();
+    if !dlp && sec.blocklist.is_empty() && sec.regexes.is_empty() {
         return 0;
     }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    response
+    let Some(blocks) = response
         .anthropic_content
-        .as_ref()
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|block| {
-            let object = block.as_object()?;
-            is_signed_thinking_block(object).then_some(block)
-        })
-        .map(|block| {
-            scan_protected_anthropic_block(block, &mut |text| {
-                let mut probe = text.to_owned();
-                redact_in_place(&mut probe, pii, secrets)
-            })
-        })
-        .sum()
+        .as_mut()
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut hits = 0;
+    for block in &mut *blocks {
+        if !block.as_object().is_some_and(is_signed_thinking_block) {
+            continue;
+        }
+        hits += walk_signed_prose(block, &mut |text, _| {
+            usize::from(would_block_inbound(sec, text))
+                + if dlp {
+                    redaction_hits(text, pii, secrets)
+                } else {
+                    0
+                }
+        });
+    }
+    if hits > 0 {
+        blocks.retain(|block| !block.as_object().is_some_and(is_signed_thinking_block));
+    }
+    hits
+}
+
+/// Whether the inbound scanners would deny a continuation replaying this text.
+fn would_block_inbound(sec: &SecurityConf, text: &str) -> bool {
+    (sec.blocklist_action == Action::Block && blocklist_hit(sec, text))
+        || sec
+            .regexes
+            .iter()
+            .any(|r| r.action == Action::Block && r.re.is_match(text))
 }
 
 /// Cheap byte scan gating the full scanner: an email needs an '@', a phone
@@ -1131,7 +1089,7 @@ mod tests {
         let joined = inbound_text(&mut req.clone());
         let i = joined.find("secret").unwrap();
         let span = i..i + "secret".len();
-        let hits = apply_mask_spans(&mut req, std::slice::from_ref(&span));
+        let hits = apply_moderation_mask(&mut req, std::slice::from_ref(&span)).unwrap();
         assert_eq!(hits, 1);
         assert_eq!(req.message[0].content, "first part", "untouched slot");
         assert_eq!(req.message[1].content, "the [MASKED] word");
@@ -1144,7 +1102,7 @@ mod tests {
             ..Default::default()
         };
         // splits the second CJK char and overlaps a second range — must not panic
-        let hits = apply_mask_spans(&mut req, &[2..4, 4..7]);
+        let hits = apply_moderation_mask(&mut req, &[2..4, 4..7]).unwrap();
         assert_eq!(hits, 1, "overlapping ranges merge to one replacement");
         assert!(req.message[0].content.contains("[MASKED]"));
     }
@@ -1159,15 +1117,15 @@ mod tests {
 
     #[test]
     fn blocklist_hits() {
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "say ForbiddenWord now")],
             ..Default::default()
         };
-        let block = security_check(&sec(), &req).block.unwrap();
+        let block = security_check(&sec(), &mut req).block.unwrap();
         assert!(block.block);
         assert_eq!(block.err_code, 4003);
         assert!(
-            security_check(&sec(), &GatewayRequest::default())
+            security_check(&sec(), &mut GatewayRequest::default())
                 .block
                 .is_none()
         );
@@ -1180,16 +1138,16 @@ mod tests {
             dlp_redact: false,
             ..Default::default()
         };
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
             ..Default::default()
         };
-        assert!(security_check(&s, &req).block.is_some());
-        let req = GatewayRequest {
+        assert!(security_check(&s, &mut req).block.is_some());
+        let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "包含 禁词 的内容")],
             ..Default::default()
         };
-        assert!(security_check(&s, &req).block.is_some());
+        assert!(security_check(&s, &mut req).block.is_some());
     }
 
     #[test]
@@ -1327,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn response_redaction_detects_secret_inside_protected_thinking() {
+    fn unservable_thinking_is_stripped_and_the_turn_still_serves() {
         let s = SecurityConf {
             detect_secrets: true,
             dlp_redact: false,
@@ -1341,7 +1299,7 @@ mod tests {
             },
             {
                 "type":"redacted_thinking",
-                "data":"sk-opaque-data-must-not-be-scanned",
+                "data":"sk-opaque-data-not-scanned-outbound",
                 "extra":"sk-abcdefghijklmnopqrstuvwxyz012345"
             },
             {"type":"text","text":"clean answer"}
@@ -1352,10 +1310,40 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(protected_thinking_response_dlp_hits(&s, &response), 2);
+        assert_eq!(strip_unservable_thinking(&s, &mut response), 2);
+        assert_eq!(
+            response.anthropic_content,
+            Some(serde_json::json!([{"type":"text","text":"clean answer"}])),
+            "protected blocks are dropped, the visible turn survives"
+        );
         assert_eq!(dlp_redact_response(&s, &mut response), 0);
         assert_eq!(response.message, "clean answer");
-        assert!(response.anthropic_content.is_some());
+    }
+
+    #[test]
+    fn blocklisted_thinking_prose_is_stripped_before_serving() {
+        let mut response = GatewayResponse {
+            message: "clean answer".to_owned(),
+            anthropic_content: Some(serde_json::json!([
+                {"type":"thinking","thinking":"mentions ForbiddenWord","signature":"sig"},
+                {"type":"text","text":"clean answer"}
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(strip_unservable_thinking(&sec(), &mut response), 1);
+        assert_eq!(
+            response.anthropic_content,
+            Some(serde_json::json!([{"type":"text","text":"clean answer"}]))
+        );
+
+        let mut clean = GatewayResponse {
+            anthropic_content: Some(serde_json::json!([
+                {"type":"thinking","thinking":"harmless","signature":"sig"}
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(strip_unservable_thinking(&sec(), &mut clean), 0);
+        assert!(clean.anthropic_content.unwrap().as_array().unwrap().len() == 1);
     }
 
     #[test]
@@ -1422,11 +1410,11 @@ mod tests {
             blocklist_action: Action::Flag,
             ..Default::default()
         };
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "contains watchword here")],
             ..Default::default()
         };
-        let out = security_check(&s, &req);
+        let out = security_check(&s, &mut req);
         assert!(out.block.is_none(), "flag does not deny");
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].action, Action::Flag);
@@ -1435,12 +1423,12 @@ mod tests {
     #[test]
     fn regex_rule_blocks_and_redact_secrets_masks() {
         let s = ssn_block();
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "my ssn is 123-45-6789")],
             ..Default::default()
         };
         assert!(
-            security_check(&s, &req).block.is_some(),
+            security_check(&s, &mut req).block.is_some(),
             "regex Block denies"
         );
 
@@ -1510,10 +1498,12 @@ mod tests {
         };
 
         assert!(
-            security_check(&sec(), &request).block.is_some(),
+            security_check(&sec(), &mut request).block.is_some(),
             "plaintext thinking remains subject to blocklist policy"
         );
-        assert_eq!(protected_thinking_dlp_hits(&sec(), &request), 2);
+        // prose email + `extra` email + email inside the opaque `data` — the
+        // opaque fields are probed too, so they are no smuggling channel
+        assert_eq!(protected_thinking_dlp_hits(&sec(), &mut request), 3);
         let hits = dlp_redact_request(&sec(), &mut request);
         let parts = request.message[0].parts.as_ref().unwrap();
         assert_eq!(&parts[0], &signed[0]);
@@ -1530,13 +1520,52 @@ mod tests {
         unsigned.parts = Some(serde_json::json!([
             {"type":"thinking","thinking":"forbiddenword","signature":""}
         ]));
-        let unsigned_request = GatewayRequest {
+        let mut unsigned_request = GatewayRequest {
             message: vec![unsigned],
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &unsigned_request).block.is_some(),
+            security_check(&sec(), &mut unsigned_request)
+                .block
+                .is_some(),
             "an unsigned lookalike must not become a DLP bypass"
+        );
+    }
+
+    #[test]
+    fn opaque_fields_are_no_smuggling_channel_inbound() {
+        let mut message = ChatMsg::text("assistant", String::new());
+        message.parts = Some(serde_json::json!([
+            {"type":"redacted_thinking","data":"contains forbiddenword"}
+        ]));
+        let mut request = GatewayRequest {
+            message: vec![message],
+            preserve_anthropic_wire: true,
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut request).block.is_some(),
+            "a blocklisted term inside opaque data must still deny"
+        );
+
+        let s = SecurityConf {
+            detect_secrets: true,
+            dlp_redact: false,
+            ..Default::default()
+        };
+        let mut message = ChatMsg::text("assistant", String::new());
+        message.parts = Some(serde_json::json!([
+            {"type":"thinking","thinking":"clean","signature":"AKIAABCDEFGHIJKLMNOP"}
+        ]));
+        let mut request = GatewayRequest {
+            message: vec![message],
+            preserve_anthropic_wire: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            protected_thinking_dlp_hits(&s, &mut request),
+            1,
+            "a verbatim credential in the signature field is caught"
         );
     }
 
@@ -1561,8 +1590,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(security_check(&sec(), &request).block.is_some());
-        assert_eq!(protected_thinking_dlp_hits(&sec(), &request), 0);
+        assert!(security_check(&sec(), &mut request).block.is_some());
+        assert_eq!(protected_thinking_dlp_hits(&sec(), &mut request), 0);
         assert!(dlp_redact_request(&sec(), &mut request) >= 1);
         let parts = request.message[0].parts.as_ref().unwrap();
         assert!(!parts.to_string().contains("jane@corp.com"));
@@ -1581,7 +1610,7 @@ mod tests {
             preserve_anthropic_wire: true,
             ..Default::default()
         };
-        let reviewed = moderation_text(&request);
+        let reviewed = inbound_text(&mut request);
         let start = reviewed.find("sensitive").unwrap();
         let span = start..start + "sensitive".len();
         let original = request.message[0].parts.clone();
@@ -1599,12 +1628,12 @@ mod tests {
         msg.parts = Some(serde_json::json!([
             {"type":"tool_result","tool_use_id":"toolu_1","content":"leak forbiddenword here"},
         ]));
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![msg],
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_some(),
+            security_check(&sec(), &mut req).block.is_some(),
             "a blocklisted term inside a tool_result block must be caught"
         );
 
@@ -1615,12 +1644,12 @@ mod tests {
             {"type":"image","source":{"type":"base64","media_type":"image/png","data": noise}},
             {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{noise}")}},
         ]));
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![clean],
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_none(),
+            security_check(&sec(), &mut req).block.is_none(),
             "base64 image data must not be scanned for blocklist terms"
         );
     }
@@ -1632,24 +1661,24 @@ mod tests {
         param.raw = serde_json::json!({"model":"m","input":[{"role":"user","content":[
             {"type":"input_image","image_url": noise},
             {"type":"input_text","text":"hello"}]}]});
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             model_param_v2: Some(param),
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_none(),
+            security_check(&sec(), &mut req).block.is_none(),
             "base64 image_url in the raw body must not match the blocklist"
         );
 
         let mut param = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
         param.raw = serde_json::json!({"input":[{"role":"user","content":[
             {"type":"input_text","text":"say forbiddenword"}]}]});
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             model_param_v2: Some(param),
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_some(),
+            security_check(&sec(), &mut req).block.is_some(),
             "raw input_text is still scanned"
         );
     }
@@ -1685,12 +1714,12 @@ mod tests {
         file.raw = serde_json::json!({"input":[{"role":"user","content":[
             {"type":"input_file","file_id":"file-forbiddenword"}]}]});
         for param in [img, file] {
-            let req = GatewayRequest {
+            let mut req = GatewayRequest {
                 model_param_v2: Some(param),
                 ..Default::default()
             };
             assert!(
-                security_check(&sec(), &req).block.is_none(),
+                security_check(&sec(), &mut req).block.is_none(),
                 "a file_id handle is a reference, not content"
             );
         }
@@ -1698,24 +1727,24 @@ mod tests {
         let mut msg = ChatMsg::text("user", String::new());
         msg.parts = Some(serde_json::json!([
             {"type":"file","file":{"filename":"a.pdf","file_data":"JVBERforbiddenword"}}]));
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![msg],
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_none(),
+            security_check(&sec(), &mut req).block.is_none(),
             "base64 inside a Chat `file` container must not block"
         );
 
         let mut msg = ChatMsg::text("user", String::new());
         msg.parts = Some(serde_json::json!([
             {"type":"tool_use","id":"t","name":"q","input":{"file_id":"forbiddenword"}}]));
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![msg],
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_some(),
+            security_check(&sec(), &mut req).block.is_some(),
             "file_id in a tool argument is not a media handle"
         );
     }
@@ -1730,12 +1759,12 @@ mod tests {
         ] {
             let mut param = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
             param.raw = raw;
-            let req = GatewayRequest {
+            let mut req = GatewayRequest {
                 model_param_v2: Some(param),
                 ..Default::default()
             };
             assert!(
-                security_check(&sec(), &req).block.is_some(),
+                security_check(&sec(), &mut req).block.is_some(),
                 "prose under a media-like key outside a media block must be scanned"
             );
         }
@@ -1752,12 +1781,12 @@ mod tests {
                 "type":"say forbiddenword",
                 "metadata":{"user_id":"forbiddenword"}
             });
-            let req = GatewayRequest {
+            let mut req = GatewayRequest {
                 model_param_v2: Some(param),
                 ..Default::default()
             };
             assert!(
-                security_check(&sec(), &req).block.is_some(),
+                security_check(&sec(), &mut req).block.is_some(),
                 "flat extra prose under media-like keys must be scanned ({proto:?})"
             );
         }
@@ -1775,7 +1804,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_some(),
+            security_check(&sec(), &mut req).block.is_some(),
             "a blocklisted term inside tool_calls arguments must be caught"
         );
         assert!(
@@ -1807,12 +1836,12 @@ mod tests {
             {"type":"tool_use","id":"toolu_1","name":"fetch",
              "input":{"url":"https://x.test/forbiddenword","data":"reach ops@example.com"}}
         ]));
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![msg.clone()],
             ..Default::default()
         };
         assert!(
-            security_check(&sec(), &req).block.is_some(),
+            security_check(&sec(), &mut req).block.is_some(),
             "blocklist must reach tool_use input values named url/data"
         );
         let mut req = GatewayRequest {
@@ -1837,12 +1866,12 @@ mod tests {
             msg.parts = Some(serde_json::json!([
                 {"type":"tool_use","id":"toolu_2","name":"quote","input":input}
             ]));
-            let req = GatewayRequest {
+            let mut req = GatewayRequest {
                 message: vec![msg],
                 ..Default::default()
             };
             assert!(
-                security_check(&sec(), &req).block.is_some(),
+                security_check(&sec(), &mut req).block.is_some(),
                 "a tool argument named source must be scanned whatever its shape"
             );
         }

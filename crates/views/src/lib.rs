@@ -2778,14 +2778,6 @@ async fn messages(
     if body.messages.is_empty() {
         return anthropic_error(400, "messages must not be empty");
     }
-    if body.messages.iter().any(|message| {
-        !matches!(
-            message.role.as_str(),
-            gw_consts::role::USER | gw_consts::role::AI
-        )
-    }) {
-        return anthropic_error(400, "messages roles must be `user` or `assistant`");
-    }
 
     let system = body.system_text();
     let typed = TypedParams::Chat(ChatParams {
@@ -3050,7 +3042,17 @@ fn messages_stream_response(
                         if let Some(capture) = self.thinking_capture.as_mut() {
                             capture.observe(&event);
                         }
-                        let kind = event["type"].as_str().unwrap_or("message_stop").to_owned();
+                        // The event name is upstream-controlled: a missing or
+                        // CR/LF-bearing type cannot become an SSE event name
+                        // (axum asserts on newlines) — drop the frame, keep
+                        // the stream alive.
+                        let Some(kind) = event["type"]
+                            .as_str()
+                            .filter(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']))
+                            .map(str::to_owned)
+                        else {
+                            return false;
+                        };
                         if kind == "message_start" {
                             self.started_msg = true;
                             if let Some(message) =

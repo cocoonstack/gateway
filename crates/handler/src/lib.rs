@@ -98,7 +98,7 @@ impl OnlineHandler {
             request.stream_tx = None;
         }
         // scan the ORIGINAL content pre-DLP: a blocklisted term inside a redacted span would slip
-        let scan = plugins::security_check(sec, &request);
+        let scan = plugins::security_check(sec, &mut request);
 
         let mut ctx = DagContext::new(
             snap.cfg.clone(),
@@ -120,21 +120,18 @@ impl OnlineHandler {
             return Ok(ctx);
         }
 
-        // Pre-DLP retention excludes opaque/protected blocks. Moderation uses
-        // a separate read-only view that includes plaintext thinking.
+        // pre-DLP text, computed once for moderation and the retained prompt
         let retention = snap
             .cfg
             .retention_for(&ctx.ak.tenant)
             .copied()
             .filter(|r| r.content != gw_config::ContentLevel::None);
-        let retained_inbound = retention
-            .is_some()
-            .then(|| plugins::inbound_text(&mut ctx.request));
-        let moderation_input = sec.moderate.then(|| plugins::moderation_text(&ctx.request));
+        let inbound =
+            (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
 
         if sec.moderate {
             match self
-                .moderation(sec, moderation_input.as_deref().unwrap_or_default())
+                .moderation(sec, inbound.as_deref().unwrap_or_default())
                 .await
             {
                 Moderation::Allow => {}
@@ -219,7 +216,7 @@ impl OnlineHandler {
             }
         }
 
-        let protected_dlp = plugins::protected_thinking_dlp_hits(sec, &ctx.request);
+        let protected_dlp = plugins::protected_thinking_dlp_hits(sec, &mut ctx.request);
         if protected_dlp > 0 {
             ctx.decide(
                 "dlp",
@@ -279,16 +276,24 @@ impl OnlineHandler {
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
 
-        if let Some(outcome) = ctx.outcome.as_ref() {
-            let protected = plugins::protected_thinking_response_dlp_hits(sec, &outcome.response);
-            if protected > 0 {
-                emit_security_event(&ctx, "dlp", "block_protected_out", protected as i64).await;
-                return Err(GatewayError::new(
-                    gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
-                    502,
-                    "upstream response contains signed thinking that cannot be safely redacted",
-                ));
-            }
+        let stripped = ctx
+            .outcome
+            .as_mut()
+            .map(|outcome| {
+                let stripped = plugins::strip_unservable_thinking(sec, &mut outcome.response);
+                if stripped > 0 {
+                    // the buffered raw events still carry the unservable prose
+                    outcome.chunks.clear();
+                }
+                stripped
+            })
+            .unwrap_or(0);
+        if stripped > 0 {
+            ctx.decide(
+                "dlp",
+                format!("stripped signed thinking ({stripped} hit(s))"),
+            );
+            emit_security_event(&ctx, "dlp", "strip_protected_out", stripped as i64).await;
         }
 
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
@@ -309,7 +314,7 @@ impl OnlineHandler {
                 &ctx,
                 r,
                 capture_raw,
-                retained_inbound.unwrap_or_default(),
+                inbound.unwrap_or_default(),
                 raw_response,
             )
             .await;
@@ -1479,6 +1484,54 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct ClaudePiiThinkingStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ClaudePiiThinkingStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            let sse = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"mail jane@corp.com\",\"signature\":\"opaque\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pii_inside_thinking_prose_strips_the_thinking_and_still_serves() {
+        let base = handler();
+        let h = OnlineHandler::new(base.config.clone(), Arc::new(ClaudePiiThinkingStream));
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("a served outcome, not a failure");
+
+        assert!(outcome.chunks.is_empty(), "raw events must be dropped");
+        let content = outcome.response.anthropic_content.unwrap();
+        assert!(
+            content
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "thinking"),
+            "unservable thinking is stripped, not failed: {content}"
+        );
+        assert_eq!(content[0]["text"], "answer");
     }
 
     #[tokio::test]

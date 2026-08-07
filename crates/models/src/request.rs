@@ -61,37 +61,27 @@ impl GatewayRequest {
         })
     }
 
-    /// Whether a protected-thinking block appears outside assistant content.
-    pub fn has_invalid_anthropic_thinking_placement(&self) -> bool {
-        self.message.iter().any(|message| {
-            message.role != gw_consts::role::AI
-                && message
-                    .parts
-                    .as_ref()
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|block| {
-                            matches!(
-                                block.get("type").and_then(serde_json::Value::as_str),
-                                Some("thinking" | "redacted_thinking")
-                            )
-                        })
-                    })
+    /// Whether the request explicitly enables extended thinking. A `thinking`
+    /// key with `{"type":"disabled"}` is a routine SDK serialization and must
+    /// not trigger thinking handling.
+    pub fn anthropic_thinking_enabled(&self) -> bool {
+        self.model_param_v2.as_ref().is_some_and(|param| {
+            param
+                .raw
+                .pointer("/thinking/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("enabled")
         })
     }
 
     /// Whether this native Messages request must stay on its requested model.
-    /// The initial extended-thinking request carries the top-level `thinking`
-    /// option; tool continuations carry protected thinking blocks. Pinning
-    /// both sides prevents variants or fallback policy from moving a signed
-    /// continuation to a different model.
+    /// The initial extended-thinking request enables the `thinking` option;
+    /// tool continuations carry protected thinking blocks. Pinning both sides
+    /// prevents variants or fallback policy from moving a signed continuation
+    /// to a different model.
     pub fn pins_anthropic_thinking_route(&self) -> bool {
         self.preserve_anthropic_wire
-            && (self.has_anthropic_thinking_blocks()
-                || self
-                    .model_param_v2
-                    .as_ref()
-                    .is_some_and(|param| param.raw.get("thinking").is_some()))
+            && (self.has_anthropic_thinking_blocks() || self.anthropic_thinking_enabled())
     }
 }
 

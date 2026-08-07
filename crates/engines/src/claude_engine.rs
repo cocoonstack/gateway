@@ -90,14 +90,18 @@ impl ClaudeEngine {
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
+        let preserve_native = self.base.request.preserve_anthropic_wire;
         let mut text = String::new();
         let mut tool_use: Vec<Value> = Vec::new();
-        let content = v.get_mut("content").map(Value::take);
-        if let Some(Value::Array(blocks)) = &content {
+        let mut content = v.get_mut("content").map(Value::take);
+        if let Some(Value::Array(blocks)) = &mut content {
             for b in blocks {
                 match b["type"].as_str() {
                     Some("text") => text.push_str(b["text"].as_str().unwrap_or_default()),
-                    Some("tool_use") => tool_use.push(b.clone()),
+                    // the block stays in `content` only when the native wire is kept
+                    Some("tool_use") => {
+                        tool_use.push(if preserve_native { b.clone() } else { b.take() })
+                    }
                     _ => {}
                 }
             }
@@ -124,11 +128,7 @@ impl ClaudeEngine {
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
             raw_usage_json,
-            anthropic_content: if self.base.request.preserve_anthropic_wire {
-                content
-            } else {
-                None
-            },
+            anthropic_content: if preserve_native { content } else { None },
             ..Default::default()
         };
         let mut outcome = EngineOutcome::with_status(resp, status);
@@ -189,6 +189,12 @@ pub fn anthropic_native_chunks(
     model_override: Option<&str>,
 ) -> Vec<StreamChunk> {
     let stream_model = model_override.unwrap_or(&response.model);
+    // Replay the upstream's own usage object so cache-token detail survives;
+    // it is not on GatewayResponse yet (common_usage is a later DAG step).
+    let start_usage = serde_json::from_slice::<Value>(&response.raw_usage_json)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"input_tokens":response.prompt_tokens,"output_tokens":0}));
     let mut events = vec![json!({
         "type":"message_start",
         "message":{
@@ -197,7 +203,7 @@ pub fn anthropic_native_chunks(
             "model":stream_model,
             "content":[],
             "stop_reason":null,
-            "usage":{"input_tokens":response.prompt_tokens,"output_tokens":0}
+            "usage":start_usage
         }
     })];
     if let Some(blocks) = response
@@ -263,9 +269,14 @@ pub fn anthropic_native_chunks(
             events.push(json!({"type":"content_block_stop","index":index}));
         }
     }
+    let stop_reason = if response.finish_reason.is_empty() {
+        "end_turn"
+    } else {
+        &response.finish_reason
+    };
     events.push(json!({
         "type":"message_delta",
-        "delta":{"stop_reason":response.finish_reason,"stop_sequence":null},
+        "delta":{"stop_reason":stop_reason,"stop_sequence":null},
         "usage":{"output_tokens":response.completion_tokens}
     }));
     events.push(json!({"type":"message_stop"}));
@@ -380,8 +391,10 @@ impl SseState {
                 Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_start" => {
-                self.open_native = Some(v["content_block"].clone());
-                self.open_native_input.clear();
+                if self.preserve_native {
+                    self.open_native = Some(v["content_block"].clone());
+                    self.open_native_input.clear();
+                }
                 if v["content_block"]["type"] == "tool_use" {
                     self.open_tool = Some((v["content_block"].clone(), String::new()));
                 }
@@ -412,7 +425,9 @@ impl SseState {
                     && let Some((_, buf)) = self.open_tool.as_mut()
                 {
                     buf.push_str(pj);
-                    self.open_native_input.push_str(pj);
+                    if self.preserve_native {
+                        self.open_native_input.push_str(pj);
+                    }
                 }
                 Self::push_visible(&mut chunks, native_chunk);
             }
@@ -685,6 +700,43 @@ mod tests {
                 "native-only events must not commit a non-Anthropic stream"
             );
         }
+        assert!(
+            state.native_blocks.is_empty() && state.open_native.is_none(),
+            "a cross-protocol stream must not buffer a native copy"
+        );
+    }
+
+    #[test]
+    fn native_chunk_rebuild_normalizes_stop_reason_and_keeps_cache_usage() {
+        let response = GatewayResponse {
+            model: "claude-sonnet".to_owned(),
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            raw_usage_json: br#"{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":8}"#
+                .to_vec(),
+            anthropic_content: Some(json!([{"type":"text","text":"answer"}])),
+            ..Default::default()
+        };
+        let chunks = anthropic_native_chunks(&response, None);
+        let events: Vec<_> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.anthropic_event.as_ref())
+            .collect();
+
+        assert_eq!(
+            events[0].pointer("/message/usage/cache_read_input_tokens"),
+            Some(&json!(8)),
+            "the upstream usage object rides the synthetic message_start"
+        );
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(
+            delta.pointer("/delta/stop_reason"),
+            Some(&json!("end_turn")),
+            "an absent stop_reason must not serialize as an empty string"
+        );
     }
 
     #[tokio::test]

@@ -465,7 +465,9 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         "mismatch is rejected locally"
     );
 
-    let invalid_role = json!({
+    // A non-standard role forwards as it always did (the vendor arbitrates);
+    // without a trailing user turn the audit has no evidence and fails open.
+    let nonstandard_role = json!({
         "model":"claude-test",
         "max_tokens":128,
         "messages":[
@@ -478,21 +480,17 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
             ]}
         ]
     });
-    let invalid_role_response = app
+    let nonstandard_role_response = app
         .clone()
         .oneshot(post(
             "/v1/messages",
             Some("ak-thinking"),
-            &invalid_role.to_string(),
+            &nonstandard_role.to_string(),
         ))
         .await
         .unwrap();
-    assert_eq!(invalid_role_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        hits.load(Ordering::Relaxed),
-        2,
-        "invalid roles cannot bypass the audit's logical-turn model"
-    );
+    assert_eq!(nonstandard_role_response.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
 
     let mut unknown = original_content;
     unknown[0]["signature"] = "sig-unknown".into();
@@ -508,7 +506,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         .await
         .unwrap();
     assert_eq!(unknown_response.status(), StatusCode::OK);
-    assert_eq!(hits.load(Ordering::Relaxed), 3, "unknown anchor fails open");
+    assert_eq!(hits.load(Ordering::Relaxed), 4, "unknown anchor fails open");
 
     let stream_seed = json!({
         "model":"claude-test",
@@ -529,7 +527,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     let stream_body = String::from_utf8(body_bytes(stream_response).await).unwrap();
     assert!(stream_body.contains("signature_delta"), "{stream_body}");
     assert!(stream_body.contains("sig-stream"), "{stream_body}");
-    assert_eq!(hits.load(Ordering::Relaxed), 4);
+    assert_eq!(hits.load(Ordering::Relaxed), 5);
 
     let stream_content = json!([
         {"type":"thinking","thinking":"","signature":"sig-stream"},
@@ -546,7 +544,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         .await
         .unwrap();
     assert_eq!(stream_exact_response.status(), StatusCode::OK);
-    assert_eq!(hits.load(Ordering::Relaxed), 5);
+    assert_eq!(hits.load(Ordering::Relaxed), 6);
 
     let mut stream_tampered = stream_content;
     stream_tampered[0]["signature"] = "sig-stream-tampered".into();
@@ -562,7 +560,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     assert_eq!(stream_tampered_response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         hits.load(Ordering::Relaxed),
-        5,
+        6,
         "stream-captured mismatch is rejected locally"
     );
 }
