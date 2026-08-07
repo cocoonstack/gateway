@@ -98,7 +98,7 @@ impl OnlineHandler {
             request.stream_tx = None;
         }
         // scan the ORIGINAL content pre-DLP: a blocklisted term inside a redacted span would slip
-        let scan = plugins::security_check(sec, &mut request);
+        let scan = plugins::security_check(sec, &request);
 
         let mut ctx = DagContext::new(
             snap.cfg.clone(),
@@ -120,23 +120,40 @@ impl OnlineHandler {
             return Ok(ctx);
         }
 
-        // pre-DLP text, computed once for moderation and the retained prompt
+        // Pre-DLP retention excludes opaque/protected blocks. Moderation uses
+        // a separate read-only view that includes plaintext thinking.
         let retention = snap
             .cfg
             .retention_for(&ctx.ak.tenant)
             .copied()
             .filter(|r| r.content != gw_config::ContentLevel::None);
-        let inbound =
-            (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
+        let retained_inbound = retention
+            .is_some()
+            .then(|| plugins::inbound_text(&mut ctx.request));
+        let moderation_input = sec.moderate.then(|| plugins::moderation_text(&ctx.request));
 
         if sec.moderate {
             match self
-                .moderation(sec, inbound.as_deref().unwrap_or_default())
+                .moderation(sec, moderation_input.as_deref().unwrap_or_default())
                 .await
             {
                 Moderation::Allow => {}
                 Moderation::Mask(spans) => {
-                    let masked = plugins::apply_mask_spans(&mut ctx.request, &spans);
+                    let masked = match plugins::apply_moderation_mask(&mut ctx.request, &spans) {
+                        Ok(masked) => masked,
+                        Err(protected) => {
+                            emit_security_event(
+                                &ctx,
+                                "moderation",
+                                "block_protected",
+                                protected as i64,
+                            )
+                            .await;
+                            return Err(GatewayError::bad_request(
+                                "moderation cannot rewrite signed thinking content",
+                            ));
+                        }
+                    };
                     if masked > 0 {
                         ctx.decide("moderation", format!("masked {masked} span(s)"));
                         emit_security_event(&ctx, "moderation", "mask", masked as i64).await;
@@ -192,6 +209,18 @@ impl OnlineHandler {
             }
         }
 
+        let protected_dlp = plugins::protected_thinking_dlp_hits(sec, &ctx.request);
+        if protected_dlp > 0 {
+            ctx.decide(
+                "dlp",
+                format!("rejected {protected_dlp} protected thinking span(s)"),
+            );
+            emit_security_event(&ctx, "dlp", "block_protected", protected_dlp as i64).await;
+            return Err(GatewayError::bad_request(
+                "signed thinking contains sensitive data and cannot be safely redacted",
+            ));
+        }
+
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
@@ -240,14 +269,28 @@ impl OnlineHandler {
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
 
+        if let Some(outcome) = ctx.outcome.as_ref() {
+            let protected = plugins::protected_thinking_response_dlp_hits(sec, &outcome.response);
+            if protected > 0 {
+                emit_security_event(&ctx, "dlp", "block_protected_out", protected as i64).await;
+                return Err(GatewayError::new(
+                    gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+                    502,
+                    "upstream response contains signed thinking that cannot be safely redacted",
+                ));
+            }
+        }
+
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
+            let native_event_hits = plugins::anthropic_event_dlp_hits(sec, &outcome.chunks);
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
-            // raw decoded deltas are pre-redaction; drop them so no downstream
-            // reconstruction can replay unmasked text past the boundary
-            if dlp {
+            // Raw decoded deltas are pre-redaction. Drop them when either the
+            // normalized response was rewritten or a native-only payload
+            // (for example a citation) hit DLP. Clean native events survive.
+            if dlp && (n > 0 || native_event_hits > 0) {
                 outcome.chunks.clear();
             }
-            n
+            n.max(native_event_hits)
         } else {
             0
         };
@@ -256,7 +299,7 @@ impl OnlineHandler {
                 &ctx,
                 r,
                 capture_raw,
-                inbound.unwrap_or_default(),
+                retained_inbound.unwrap_or_default(),
                 raw_response,
             )
             .await;
@@ -1282,6 +1325,76 @@ mod tests {
             !out.response.message.contains("jane@corp.com"),
             "email must be redacted: {}",
             out.response.message
+        );
+    }
+
+    #[tokio::test]
+    async fn dlp_buffer_keeps_clean_native_chunks_for_lossless_replay() {
+        let h = handler();
+        assert!(h.cfg().security.dlp_redact, "default config has DLP on");
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("outcome");
+
+        assert!(
+            !outcome.chunks.is_empty(),
+            "clean buffered events must survive outbound DLP"
+        );
+        assert!(
+            outcome
+                .chunks
+                .iter()
+                .any(|chunk| chunk.anthropic_event.is_some()),
+            "native Anthropic events must remain available to the view"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ClaudePiiStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ClaudePiiStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            let sse = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"clean\",\"signature\":\"opaque\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail jane@corp.com\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlp_redacts_native_text_without_dropping_thinking_proof() {
+        let base = handler();
+        let h = OnlineHandler::new(base.config.clone(), Arc::new(ClaudePiiStream));
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("outcome");
+
+        assert!(outcome.chunks.is_empty(), "raw events must be dropped");
+        let content = outcome.response.anthropic_content.unwrap();
+        assert_eq!(content[0]["signature"], "opaque");
+        assert!(
+            content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_EMAIL]")
         );
     }
 

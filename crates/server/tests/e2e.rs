@@ -313,6 +313,260 @@ async fn body_json(resp: Response) -> Value {
     serde_json::from_slice(&body_bytes(resp).await).expect("json body")
 }
 
+#[tokio::test]
+async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_passes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct ThinkingFixture {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ThinkingFixture {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            let request: Value = serde_json::from_slice(&request.body).unwrap();
+            let is_seed = request["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.len() == 1);
+            if request["stream"] == true {
+                let sse = concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-stream-seed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-stream\"}}\n\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-stream\",\"name\":\"probe\",\"input\":{}}}\n\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                );
+                return Ok(gw_engines::transport::UpstreamResponse {
+                    status: 200,
+                    body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                });
+            }
+            let response = if is_seed {
+                json!({
+                    "id":"msg-thinking-seed",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"claude-test",
+                    "content":[
+                        {"type":"thinking","thinking":"","signature":"sig-original"},
+                        {"type":"redacted_thinking","data":"opaque-redacted"},
+                        {"type":"tool_use","id":"tool-known","name":"probe","input":{}}
+                    ],
+                    "stop_reason":"tool_use",
+                    "stop_sequence":null,
+                    "usage":{"input_tokens":10,"output_tokens":8}
+                })
+            } else {
+                json!({
+                    "id":"msg-thinking-followup",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"claude-test",
+                    "content":[{"type":"text","text":"ok"}],
+                    "stop_reason":"end_turn",
+                    "stop_sequence":null,
+                    "usage":{"input_tokens":12,"output_tokens":1}
+                })
+            };
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&response).unwrap().into(),
+                ),
+            })
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {dlp_redact: false, detect_secrets: false}
+access_keys: [{ak: ak-thinking, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: claude-test, protocol: anthropic-messages}]
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(ThinkingFixture { hits: hits.clone() }),
+    ));
+
+    let seed = json!({
+        "model":"claude-test",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"use the tool"}]
+    });
+    let seed_response = app
+        .clone()
+        .oneshot(post("/v1/messages", Some("ak-thinking"), &seed.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(seed_response.status(), StatusCode::OK);
+    let seed_response = body_json(seed_response).await;
+    let original_content = seed_response["content"].clone();
+    assert_eq!(original_content[0]["signature"], "sig-original");
+    assert_eq!(original_content[1]["data"], "opaque-redacted");
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+
+    let followup = |content: Value, result_id: &str| {
+        json!({
+            "model":"claude-test",
+            "max_tokens":128,
+            "messages":[
+                {"role":"user","content":"use the tool"},
+                {"role":"assistant","content":content},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":result_id,"content":"ready"}
+                ]}
+            ]
+        })
+    };
+    let exact = followup(original_content.clone(), "tool-known");
+    let exact_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &exact.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exact_response.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+
+    let mut tampered = original_content.clone();
+    tampered[0]["signature"] = "sig-tampered".into();
+    let tampered = followup(tampered, "tool-known");
+    let tampered_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &tampered.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tampered_response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(tampered_response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        2,
+        "mismatch is rejected locally"
+    );
+
+    let invalid_role = json!({
+        "model":"claude-test",
+        "max_tokens":128,
+        "messages":[
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"","signature":"sig-tampered"},
+                {"type":"tool_use","id":"tool-known","name":"probe","input":{}}
+            ]},
+            {"role":"tool","content":[
+                {"type":"tool_result","tool_use_id":"tool-known","content":"ready"}
+            ]}
+        ]
+    });
+    let invalid_role_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &invalid_role.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_role_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        2,
+        "invalid roles cannot bypass the audit's logical-turn model"
+    );
+
+    let mut unknown = original_content;
+    unknown[0]["signature"] = "sig-unknown".into();
+    unknown[2]["id"] = "tool-unknown".into();
+    let unknown = followup(unknown, "tool-unknown");
+    let unknown_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &unknown.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_response.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::Relaxed), 3, "unknown anchor fails open");
+
+    let stream_seed = json!({
+        "model":"claude-test",
+        "max_tokens":128,
+        "stream":true,
+        "messages":[{"role":"user","content":"stream a tool call"}]
+    });
+    let stream_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &stream_seed.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    let stream_body = String::from_utf8(body_bytes(stream_response).await).unwrap();
+    assert!(stream_body.contains("signature_delta"), "{stream_body}");
+    assert!(stream_body.contains("sig-stream"), "{stream_body}");
+    assert_eq!(hits.load(Ordering::Relaxed), 4);
+
+    let stream_content = json!([
+        {"type":"thinking","thinking":"","signature":"sig-stream"},
+        {"type":"tool_use","id":"tool-stream","name":"probe","input":{}}
+    ]);
+    let stream_exact = followup(stream_content.clone(), "tool-stream");
+    let stream_exact_response = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &stream_exact.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stream_exact_response.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::Relaxed), 5);
+
+    let mut stream_tampered = stream_content;
+    stream_tampered[0]["signature"] = "sig-stream-tampered".into();
+    let stream_tampered = followup(stream_tampered, "tool-stream");
+    let stream_tampered_response = app
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-thinking"),
+            &stream_tampered.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stream_tampered_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        5,
+        "stream-captured mismatch is rejected locally"
+    );
+}
+
 fn post(uri: &str, ak: Option<&str>, body: &str) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")

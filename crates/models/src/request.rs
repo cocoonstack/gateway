@@ -11,6 +11,10 @@ pub struct GatewayRequest {
     pub account: Option<std::sync::Arc<Account>>,
     pub message: Vec<ChatMsg>,
     pub stream: bool,
+    /// The request originated on `/v1/messages`; Anthropic engines may forward
+    /// native SSE events only on that same-protocol surface. This survives
+    /// model resolution, unlike `model_param_v2.protocol`.
+    pub preserve_anthropic_wire: bool,
     pub model_param_v2: Option<ModelParamV2>,
     pub ak: String,
     pub is_online: bool,
@@ -35,6 +39,45 @@ impl GatewayRequest {
     /// The serving account's name; empty when none is selected.
     pub fn account_name(&self) -> &str {
         self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")
+    }
+
+    /// Whether any message carries a top-level Anthropic protected-thinking
+    /// block. These blocks are valid only on the native `/v1/messages`
+    /// surface routed to an Anthropic-messages engine.
+    pub fn has_anthropic_thinking_blocks(&self) -> bool {
+        self.message.iter().any(|message| {
+            message
+                .parts
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        matches!(
+                            block.get("type").and_then(serde_json::Value::as_str),
+                            Some("thinking" | "redacted_thinking")
+                        )
+                    })
+                })
+        })
+    }
+
+    /// Whether a protected-thinking block appears outside assistant content.
+    pub fn has_invalid_anthropic_thinking_placement(&self) -> bool {
+        self.message.iter().any(|message| {
+            message.role != gw_consts::role::AI
+                && message
+                    .parts
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            matches!(
+                                block.get("type").and_then(serde_json::Value::as_str),
+                                Some("thinking" | "redacted_thinking")
+                            )
+                        })
+                    })
+        })
     }
 }
 

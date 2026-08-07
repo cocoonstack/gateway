@@ -181,6 +181,53 @@ async fn anthropic_multimodal_content_preserved() {
 }
 
 #[tokio::test]
+async fn anthropic_signed_thinking_continuation_is_preserved() {
+    let transport = RecordingTransport::new(
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut assistant = ChatMsg::text("assistant", String::new());
+    assistant.parts = Some(serde_json::json!([
+        {"type":"thinking","thinking":"summary","signature":"opaque-signature"},
+        {"type":"redacted_thinking","data":"opaque-redacted-data"},
+        {"type":"tool_use","id":"toolu_1","name":"probe","input":{}}
+    ]));
+    let mut result = ChatMsg::text("user", String::new());
+    result.parts = Some(serde_json::json!([
+        {"type":"tool_result","tool_use_id":"toolu_1","content":"ready"}
+    ]));
+    let mut param = ModelParamV2::with_name(Protocol::AnthropicMessages, "claude-sonnet");
+    param.typed = Some(TypedParams::Chat(ChatParams {
+        max_tokens: Some(2048),
+        ..Default::default()
+    }));
+    param.raw = serde_json::json!({
+        "thinking":{"type":"enabled","budget_tokens":1024}
+    });
+    let request = GatewayRequest {
+        message: vec![assistant, result],
+        model_param_v2: Some(param),
+        ..Default::default()
+    };
+
+    let _ = ClaudeEngine::new(request, transport.clone())
+        .run()
+        .await
+        .unwrap();
+    let body = transport.body_json();
+
+    assert_eq!(
+        body["messages"][0]["content"][0]["signature"],
+        "opaque-signature"
+    );
+    assert_eq!(
+        body["messages"][0]["content"][1]["data"],
+        "opaque-redacted-data"
+    );
+    assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], "toolu_1");
+    assert_eq!(body["thinking"]["budget_tokens"], 1024);
+}
+
+#[tokio::test]
 async fn vertex_request_shape() {
     let t = RecordingTransport::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,

@@ -26,12 +26,14 @@ use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
     ModelParamV2, SttParams, TtsParams, TypedParams,
 };
-use gw_protocol::anthropic::{AnthUsage, MessagesRequest, MessagesResponse};
+use gw_protocol::anthropic::{AnthUsage, MessagesRequest};
 use gw_protocol::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
 };
 use gw_state::admission;
-use gw_state::{AkInfo, GatewayState};
+use gw_state::{
+    AkInfo, GatewayState, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture,
+};
 use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
@@ -2530,7 +2532,7 @@ fn spawn_stream_pipeline(
                         outcome.response.total_tokens,
                     );
                     let common_usage = outcome.response.common_usage;
-                    let mut tail = if dlp {
+                    let mut tail = if dlp && outcome.chunks.is_empty() {
                         redacted_stream_tail(outcome)
                     } else if outcome.streamed_live {
                         Vec::new()
@@ -2739,6 +2741,9 @@ fn synth_chunks(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChu
 /// the raw pre-redaction deltas, so no unmasked text ever leaves.
 fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let mut resp = outcome.response;
+    if resp.anthropic_content.is_some() {
+        return gw_engines::anthropic_native_chunks(&resp, None);
+    }
     let mut chunks = Vec::new();
     if !resp.message.is_empty() {
         chunks.push(gw_engines::StreamChunk {
@@ -2773,6 +2778,14 @@ async fn messages(
     if body.messages.is_empty() {
         return anthropic_error(400, "messages must not be empty");
     }
+    if body.messages.iter().any(|message| {
+        !matches!(
+            message.role.as_str(),
+            gw_consts::role::USER | gw_consts::role::AI
+        )
+    }) {
+        return anthropic_error(400, "messages roles must be `user` or `assistant`");
+    }
 
     let system = body.system_text();
     let typed = TypedParams::Chat(ChatParams {
@@ -2796,6 +2809,7 @@ async fn messages(
     let request = GatewayRequest {
         is_online: true,
         stream: body.stream,
+        preserve_anthropic_wire: true,
         ak: ak.ak.clone(),
         message: body
             .messages
@@ -2816,8 +2830,26 @@ async fn messages(
         ..Default::default()
     };
 
+    let thinking_audit = s.handler.state().thinking_signatures.clone();
+    let (thinking_context, thinking_verdict) = thinking_audit.review_request(&request, &ak.ak);
+    if thinking_verdict == ReviewVerdict::Mismatch {
+        return anthropic_error(
+            400,
+            "protected thinking proof does not match the response previously served for this tool call",
+        );
+    }
+
     if let Some(model) = stream_model {
-        return messages_stream_response(s, request, ak, model, started).into_response();
+        return messages_stream_response(
+            s,
+            request,
+            ak,
+            model,
+            started,
+            thinking_audit,
+            thinking_context,
+        )
+        .into_response();
     }
 
     let ctx = match run_pipeline(&s, request, ak).await {
@@ -2828,34 +2860,38 @@ async fn messages(
     let Some(mut outcome) = ctx.outcome else {
         return anthropic_error(500, "pipeline produced no outcome");
     };
-
     let usage = anthropic_usage(
         outcome.response.prompt_tokens,
         outcome.response.completion_tokens,
         outcome.response.common_usage,
     );
-    let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.take());
-    let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
-    if !outcome.response.message.is_empty() {
-        content.push(gw_protocol::anthropic::ContentBlock::Text {
-            text: outcome.response.message,
-        });
+    let content = match outcome.response.anthropic_content.take() {
+        Some(Value::Array(blocks)) => blocks,
+        _ => {
+            let mut blocks = Vec::new();
+            if !outcome.response.message.is_empty() {
+                blocks.push(json!({"type":"text","text":outcome.response.message}));
+            }
+            blocks.extend(anthropic_tool_blocks(outcome.response.tool_calls.take()));
+            blocks
+        }
+    };
+    if let Some(context) = thinking_context.as_ref() {
+        thinking_audit.remember_content(context, &content);
     }
-    for mut b in tool_use {
-        content.push(gw_protocol::anthropic::ContentBlock::ToolUse {
-            id: b["id"].as_str().unwrap_or_default().to_owned(),
-            name: b["name"].as_str().unwrap_or_default().to_owned(),
-            input: b["input"].take(),
-        });
-    }
-    let resp = MessagesResponse::new(
-        next_id("msg"),
-        outcome.response.model,
-        content,
-        finish_anthropic(&outcome.response.finish_reason),
-        usage,
-    );
-    (StatusCode::OK, Json(resp)).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": next_id("msg"),
+            "type": "message",
+            "role": "assistant",
+            "model": outcome.response.model,
+            "content": content,
+            "stop_reason": finish_anthropic(&outcome.response.finish_reason),
+            "usage": usage,
+        })),
+    )
+        .into_response()
 }
 
 /// tool_use blocks for an engine's tool_calls: native blocks pass through;
@@ -2883,6 +2919,8 @@ fn messages_stream_response(
     ak: AkInfo,
     model: String,
     started: Instant,
+    thinking_audit: ThinkingSignatureAudit,
+    thinking_context: Option<gw_state::AuditContext>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
     let rx = spawn_stream_pipeline(&s, request, ak, "messages", started);
 
@@ -2896,6 +2934,7 @@ fn messages_stream_response(
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
         pending_finish: Option<String>,
+        thinking_capture: Option<ThinkingStreamCapture>,
     }
 
     impl St {
@@ -3007,6 +3046,23 @@ fn messages_stream_response(
                     true
                 }
                 Some(mut c) => {
+                    if let Some(mut event) = c.anthropic_event.take() {
+                        if let Some(capture) = self.thinking_capture.as_mut() {
+                            capture.observe(&event);
+                        }
+                        let kind = event["type"].as_str().unwrap_or("message_stop").to_owned();
+                        if kind == "message_start" {
+                            self.started_msg = true;
+                            if let Some(message) =
+                                event.get_mut("message").and_then(Value::as_object_mut)
+                            {
+                                message.insert("id".to_owned(), self.id.clone().into());
+                            }
+                        }
+                        let done = kind == "message_stop";
+                        self.queue.push_back(St::ev(&kind, event));
+                        return done;
+                    }
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
                         let idx = self.open_text();
@@ -3058,6 +3114,7 @@ fn messages_stream_response(
             next_idx: 0,
             tool_frags: None,
             pending_finish: None,
+            thinking_capture: thinking_audit.stream_capture(thinking_context),
         },
     )
 }

@@ -95,6 +95,9 @@ impl DagNode for ResolveModel {
         &["model_quota"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        let has_thinking = ctx.request.has_anthropic_thinking_blocks();
+        let invalid_thinking = ctx.request.has_invalid_anthropic_thinking_placement();
+        let native_surface = ctx.request.preserve_anthropic_wire;
         let param = ctx
             .request
             .model_param_v2
@@ -114,6 +117,13 @@ impl DagNode for ResolveModel {
                 format!("unknown model: {name}"),
             ));
         };
+        if has_thinking
+            && (invalid_thinking || !native_surface || mt != Protocol::AnthropicMessages)
+        {
+            return Err(GatewayError::bad_request(
+                "Anthropic thinking blocks require assistant content on the native `/v1/messages` surface and an anthropic-messages model",
+            ));
+        }
         let decision = format!("{name} -> {mt}");
         param.protocol = mt;
         ctx.decide("resolve_model", decision);
@@ -244,15 +254,17 @@ impl DagNode for CacheLookup {
     }
 }
 
-/// Cache key: sha256 of model name + messages + typed params + passthrough
-/// params. Not keyed by tenant: entitlement gates before the cache, and a
-/// per-tenant split would only shrink the hit rate.
+/// Cache key: sha256 of surface + model name + messages + typed params +
+/// passthrough params. Not keyed by tenant: entitlement gates before the
+/// cache, and a per-tenant split would only shrink the hit rate.
 fn cache_key_of(ctx: &DagContext) -> Option<String> {
     use sha2::{Digest, Sha256};
     let param = ctx.request.model_param_v2.as_ref()?;
     let mut h = Sha256::new();
     // generation: a reload may have remapped the model — a pre-reload entry must not match
     h.update(ctx.cfg.generation().to_le_bytes());
+    h.update(b"native-anthropic-wire-v1");
+    h.update([u8::from(ctx.request.preserve_anthropic_wire)]);
     h.update(param.model_name.as_bytes());
     // serialize straight into the hasher — no throwaway buffers for a multi-KB history
     serde_json::to_writer(&mut h, &ctx.request.message).ok()?;
@@ -829,6 +841,16 @@ impl DagNode for CacheStore {
         else {
             return Ok(());
         };
+        // The general response cache can outlive the ten-minute thinking
+        // consistency window and may be Redis-backed. Never persist raw
+        // thinking signatures or redacted-thinking data through that cache.
+        if outcome.response.has_protected_anthropic_content() {
+            ctx.decide(
+                "cache_store",
+                "skipped protected anthropic thinking".to_owned(),
+            );
+            return Ok(());
+        }
         if outcome.http_code == 200
             && !outcome.block.block
             && !outcome.response.aborted

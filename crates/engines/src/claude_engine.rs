@@ -92,11 +92,12 @@ impl ClaudeEngine {
         }
         let mut text = String::new();
         let mut tool_use: Vec<Value> = Vec::new();
-        if let Some(Value::Array(blocks)) = v.get_mut("content").map(Value::take) {
+        let content = v.get_mut("content").map(Value::take);
+        if let Some(Value::Array(blocks)) = &content {
             for b in blocks {
                 match b["type"].as_str() {
                     Some("text") => text.push_str(b["text"].as_str().unwrap_or_default()),
-                    Some("tool_use") => tool_use.push(b),
+                    Some("tool_use") => tool_use.push(b.clone()),
                     _ => {}
                 }
             }
@@ -123,9 +124,24 @@ impl ClaudeEngine {
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
             raw_usage_json,
+            anthropic_content: if self.base.request.preserve_anthropic_wire {
+                content
+            } else {
+                None
+            },
             ..Default::default()
         };
-        Ok(EngineOutcome::with_status(resp, status))
+        let mut outcome = EngineOutcome::with_status(resp, status);
+        if self.base.request.stream && self.base.request.preserve_anthropic_wire {
+            let model_override = self
+                .base
+                .request
+                .model_param_v2
+                .as_ref()
+                .and_then(|param| param.fallback_from.as_deref());
+            outcome.chunks = anthropic_native_chunks(&outcome.response, model_override);
+        }
+        Ok(outcome)
     }
 
     /// Buffered or live anthropic event sequence through the shared pump.
@@ -134,7 +150,13 @@ impl ClaudeEngine {
             is_messages_protocol: true,
             ..Default::default()
         };
-        let mut st = SseState::default();
+        let model_override = self
+            .base
+            .request
+            .model_param_v2
+            .as_ref()
+            .and_then(|param| param.fallback_from.clone());
+        let mut st = SseState::new(self.base.request.preserve_anthropic_wire, model_override);
         let r = crate::pump::pump_sse(
             "anthropic",
             body,
@@ -157,6 +179,103 @@ impl ModelEngine for ClaudeEngine {
             body => self.run_sse(reply.status, body).await,
         }
     }
+}
+
+/// Some compatible upstreams ignore `stream:true` and return a complete JSON
+/// message. Re-emit standard native events so thinking proof is not lost at
+/// the streaming surface.
+pub fn anthropic_native_chunks(
+    response: &GatewayResponse,
+    model_override: Option<&str>,
+) -> Vec<StreamChunk> {
+    let stream_model = model_override.unwrap_or(&response.model);
+    let mut events = vec![json!({
+        "type":"message_start",
+        "message":{
+            "type":"message",
+            "role":"assistant",
+            "model":stream_model,
+            "content":[],
+            "stop_reason":null,
+            "usage":{"input_tokens":response.prompt_tokens,"output_tokens":0}
+        }
+    })];
+    if let Some(blocks) = response
+        .anthropic_content
+        .as_ref()
+        .and_then(Value::as_array)
+    {
+        for (index, block) in blocks.iter().enumerate() {
+            let mut start = block.clone();
+            let mut deltas = Vec::new();
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    if let Some(object) = start.as_object_mut() {
+                        object.insert("thinking".to_owned(), "".into());
+                        object.insert("signature".to_owned(), "".into());
+                    }
+                    if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
+                        && !thinking.is_empty()
+                    {
+                        deltas.push(json!({"type":"thinking_delta","thinking":thinking}));
+                    }
+                    if let Some(signature) = block.get("signature").and_then(Value::as_str)
+                        && !signature.is_empty()
+                    {
+                        deltas.push(json!({"type":"signature_delta","signature":signature}));
+                    }
+                }
+                Some("text") => {
+                    if let Some(object) = start.as_object_mut() {
+                        object.insert("text".to_owned(), "".into());
+                    }
+                    if let Some(text) = block.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        deltas.push(json!({"type":"text_delta","text":text}));
+                    }
+                }
+                Some("tool_use") => {
+                    if let Some(object) = start.as_object_mut() {
+                        object.insert("input".to_owned(), json!({}));
+                    }
+                    if let Some(input) = block.get("input") {
+                        deltas.push(json!({
+                            "type":"input_json_delta",
+                            "partial_json":input.to_string()
+                        }));
+                    }
+                }
+                _ => {}
+            }
+            events.push(json!({
+                "type":"content_block_start",
+                "index":index,
+                "content_block":start
+            }));
+            for delta in deltas {
+                events.push(json!({
+                    "type":"content_block_delta",
+                    "index":index,
+                    "delta":delta
+                }));
+            }
+            events.push(json!({"type":"content_block_stop","index":index}));
+        }
+    }
+    events.push(json!({
+        "type":"message_delta",
+        "delta":{"stop_reason":response.finish_reason,"stop_sequence":null},
+        "usage":{"output_tokens":response.completion_tokens}
+    }));
+    events.push(json!({"type":"message_stop"}));
+    events
+        .into_iter()
+        .map(|event| StreamChunk {
+            anthropic_event: Some(event),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Tool definitions in the anthropic wire shape. Cross-protocol requests carry
@@ -185,18 +304,47 @@ fn normalize_tools_anthropic(tools: &Value) -> Value {
 
 /// Accumulating state for the anthropic streaming event sequence, shared by
 /// the buffered and live decode paths.
-#[derive(Default)]
 struct SseState {
+    preserve_native: bool,
+    model_override: Option<String>,
     full: String,
     input: i64,
     output: i64,
     tool_blocks: Vec<Value>,
+    native_blocks: Vec<Value>,
+    open_native: Option<Value>,
+    open_native_input: String,
     /// in-flight tool_use block: (skeleton from content_block_start,
     /// accumulated input_json_delta fragments)
     open_tool: Option<(Value, String)>,
 }
 
 impl SseState {
+    fn new(preserve_native: bool, model_override: Option<String>) -> Self {
+        Self {
+            preserve_native,
+            model_override,
+            full: String::new(),
+            input: 0,
+            output: 0,
+            tool_blocks: Vec::new(),
+            native_blocks: Vec::new(),
+            open_native: None,
+            open_native_input: String::new(),
+            open_tool: None,
+        }
+    }
+
+    fn push_visible(chunks: &mut Vec<StreamChunk>, chunk: StreamChunk) {
+        if chunk.anthropic_event.is_some()
+            || !chunk.delta.is_empty()
+            || chunk.tool_calls.is_some()
+            || chunk.finish_reason.is_some()
+        {
+            chunks.push(chunk);
+        }
+    }
+
     /// Apply one decoded event; returns the chunks it yields.
     fn apply(
         &mut self,
@@ -208,6 +356,20 @@ impl SseState {
             return Err(err);
         }
         let mut chunks = Vec::new();
+        let mut native_event = self.preserve_native.then(|| v.clone());
+        if v.get("type").and_then(Value::as_str) == Some("message_start")
+            && let Some(model) = self.model_override.as_ref()
+            && let Some(message) = native_event
+                .as_mut()
+                .and_then(|event| event.get_mut("message"))
+                .and_then(Value::as_object_mut)
+        {
+            message.insert("model".to_owned(), model.clone().into());
+        }
+        let mut native_chunk = StreamChunk {
+            anthropic_event: native_event,
+            ..Default::default()
+        };
         match v["type"].as_str().unwrap_or_default() {
             "message_start" => {
                 resp.model = v["message"]["model"]
@@ -215,47 +377,68 @@ impl SseState {
                     .unwrap_or_default()
                     .to_owned();
                 self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
+                Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_start" => {
+                self.open_native = Some(v["content_block"].clone());
+                self.open_native_input.clear();
                 if v["content_block"]["type"] == "tool_use" {
                     self.open_tool = Some((v["content_block"].clone(), String::new()));
                 }
+                Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_delta" => {
                 if let Some(t) = v["delta"]["text"].as_str() {
                     self.full.push_str(t);
-                    chunks.push(StreamChunk {
-                        delta: t.to_owned(),
-                        finish_reason: None,
-                        ..Default::default()
-                    });
+                    native_chunk.delta = t.to_owned();
+                    if let Some(block) = self.open_native.as_mut()
+                        && let Some(Value::String(text)) = block.get_mut("text")
+                    {
+                        text.push_str(t);
+                    }
+                }
+                if let Some(t) = v["delta"]["thinking"].as_str()
+                    && let Some(block) = self.open_native.as_mut()
+                    && let Some(Value::String(thinking)) = block.get_mut("thinking")
+                {
+                    thinking.push_str(t);
+                }
+                if let Some(signature) = v["delta"]["signature"].as_str()
+                    && let Some(block) = self.open_native.as_mut()
+                {
+                    block["signature"] = signature.into();
                 }
                 if let Some(pj) = v["delta"]["partial_json"].as_str()
                     && let Some((_, buf)) = self.open_tool.as_mut()
                 {
                     buf.push_str(pj);
+                    self.open_native_input.push_str(pj);
                 }
+                Self::push_visible(&mut chunks, native_chunk);
             }
             "content_block_stop" => {
+                if let Some(mut block) = self.open_native.take() {
+                    if block["type"] == "tool_use"
+                        && let Ok(parsed) = serde_json::from_str::<Value>(&self.open_native_input)
+                    {
+                        block["input"] = parsed;
+                    }
+                    self.native_blocks.push(block);
+                }
+                self.open_native_input.clear();
                 if let Some((mut block, buf)) = self.open_tool.take() {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
                         block["input"] = parsed;
                     }
-                    chunks.push(StreamChunk {
-                        tool_calls: Some(Value::Array(vec![block.clone()])),
-                        ..Default::default()
-                    });
+                    native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
                     self.tool_blocks.push(block);
                 }
+                Self::push_visible(&mut chunks, native_chunk);
             }
             "message_delta" => {
                 if let Some(sr) = v["delta"]["stop_reason"].as_str() {
                     resp.finish_reason = sr.to_owned();
-                    chunks.push(StreamChunk {
-                        delta: String::new(),
-                        finish_reason: Some(sr.to_owned()),
-                        ..Default::default()
-                    });
+                    native_chunk.finish_reason = Some(sr.to_owned());
                 }
                 self.output = v["usage"]["output_tokens"].as_i64().unwrap_or(self.output);
                 // Anthropic reports input_tokens in message_start; some
@@ -263,8 +446,11 @@ impl SseState {
                 if let Some(it) = v["usage"]["input_tokens"].as_i64() {
                     self.input = it;
                 }
+                Self::push_visible(&mut chunks, native_chunk);
             }
-            _ => {} // message_stop
+            // message_stop and forward-compatible events are visible only on
+            // the native Anthropic surface.
+            _ => Self::push_visible(&mut chunks, native_chunk),
         }
         Ok(chunks)
     }
@@ -272,6 +458,9 @@ impl SseState {
     fn finish(self, resp: &mut GatewayResponse) {
         if !self.tool_blocks.is_empty() {
             resp.tool_calls = Some(Value::Array(self.tool_blocks));
+        }
+        if self.preserve_native && !self.native_blocks.is_empty() {
+            resp.anthropic_content = Some(Value::Array(self.native_blocks));
         }
         resp.message = self.full;
         let (input, output) = (self.input.max(0), self.output.max(0));
@@ -340,6 +529,161 @@ mod tests {
                 status: 200,
                 body: crate::transport::UpstreamBody::Sse(self.0.as_bytes().to_vec()),
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct JsonReply(&'static [u8]);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for JsonReply {
+        async fn send(
+            &self,
+            _req: crate::transport::UpstreamRequest,
+        ) -> gw_models::GResult<crate::transport::UpstreamResponse> {
+            Ok(crate::transport::UpstreamResponse {
+                status: 200,
+                body: crate::transport::UpstreamBody::Json(self.0.to_vec().into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_blocks_survive_non_stream() {
+        let body = br#"{
+            "id":"msg_1",
+            "type":"message",
+            "role":"assistant",
+            "model":"claude-sonnet",
+            "content":[
+                {"type":"thinking","thinking":"private reasoning","signature":"opaque-signature"},
+                {"type":"redacted_thinking","data":"opaque-redacted-data"},
+                {"type":"text","text":"answer"}
+            ],
+            "stop_reason":"end_turn",
+            "stop_sequence":"STOP",
+            "usage":{"input_tokens":11,"output_tokens":7}
+        }"#;
+        let mut request = base_req();
+        request.preserve_anthropic_wire = true;
+        let engine = ClaudeEngine::new(request, Arc::new(JsonReply(body)));
+        let outcome = engine.run().await.unwrap();
+
+        assert_eq!(outcome.response.message, "answer");
+        assert_eq!(
+            outcome.response.anthropic_content,
+            Some(json!([
+                {"type":"thinking","thinking":"private reasoning","signature":"opaque-signature"},
+                {"type":"redacted_thinking","data":"opaque-redacted-data"},
+                {"type":"text","text":"answer"}
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_request_preserves_thinking_when_upstream_returns_json() {
+        let body = br#"{
+            "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet",
+            "content":[
+                {"type":"thinking","thinking":"private reasoning","signature":"opaque-signature"},
+                {"type":"tool_use","id":"tool-1","name":"probe","input":{"ok":true}}
+            ],
+            "stop_reason":"tool_use","usage":{"input_tokens":11,"output_tokens":7}
+        }"#;
+        let mut request = base_req();
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let outcome = ClaudeEngine::new(request, Arc::new(JsonReply(body)))
+            .run()
+            .await
+            .unwrap();
+
+        assert!(outcome.chunks.iter().any(|chunk| {
+            chunk.anthropic_event.as_ref().is_some_and(|event| {
+                event.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
+                    && event.pointer("/delta/signature").and_then(Value::as_str)
+                        == Some("opaque-signature")
+            })
+        }));
+        assert!(outcome.chunks.iter().any(|chunk| {
+            chunk.anthropic_event.as_ref().is_some_and(|event| {
+                event.get("type").and_then(Value::as_str) == Some("message_stop")
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn native_thinking_stream_preserves_signature_delta_and_order() {
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":11}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"stale-start\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private reasoning\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"intermediate-signature\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque-signature\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut request = base_req();
+        request.stream = true;
+        request.preserve_anthropic_wire = true;
+        let engine = ClaudeEngine::new(request, Arc::new(SseReply(sse)));
+        let outcome = engine.run().await.unwrap();
+
+        assert_eq!(
+            outcome.response.anthropic_content,
+            Some(json!([
+                {"type":"thinking","thinking":"private reasoning","signature":"opaque-signature"},
+                {"type":"text","text":"answer"}
+            ]))
+        );
+        let event_types = outcome
+            .chunks
+            .iter()
+            .filter_map(|chunk| {
+                chunk
+                    .anthropic_event
+                    .as_ref()
+                    .and_then(|event| event["type"].as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_protocol_stream_drops_native_only_chunks() {
+        let mut state = SseState::new(false, None);
+        let mut response = GatewayResponse::default();
+        for event in [
+            json!({"type":"message_start","message":{"model":"claude-sonnet","usage":{"input_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_stop"}),
+        ] {
+            assert!(
+                state.apply(&event, 200, &mut response).unwrap().is_empty(),
+                "native-only events must not commit a non-Anthropic stream"
+            );
         }
     }
 
