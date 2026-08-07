@@ -189,6 +189,7 @@ regardless.
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
 | GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |
+| GET | `/admin/audit/content?user=` | retained-content row metadata for one end user (`request_id`, `user_id`, `kind`, `created_at_epoch_secs` — no content bodies), newest first; `?limit=` (default 200, max 1000); tenant-scoped |
 | DELETE | `/admin/audit/content?user=` | erase all retained content for one end user — retained rows, batch result messages, leftover batch inputs (GDPR/PIPL); tenant-scoped, audited atomically as `content_erase` |
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a

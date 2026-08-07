@@ -39,6 +39,8 @@ use serde_json::{Value, json};
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
 const CONFIG_VERSION_PAGE_DEFAULT: usize = 20;
+const CONTENT_PAGE_DEFAULT: usize = 200;
+const CONTENT_PAGE_MAX: usize = 1_000;
 const USAGE_SERIES_MAX_POINTS: i64 = 400;
 const STREAM_CHANNEL_CAP: usize = 64;
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
@@ -145,7 +147,7 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/audit/content/{request_id}", get(admin_content_get))
         .route(
             "/admin/audit/content",
-            axum::routing::delete(admin_content_erase),
+            get(admin_content_list).delete(admin_content_erase),
         )
         .route(
             "/admin/keys/{ak}",
@@ -2202,6 +2204,44 @@ async fn admin_content_get(
         })
         .collect();
     Json(json!({ "request_id": request_id, "entries": entries })).into_response()
+}
+
+/// GET /admin/audit/content?user=&limit= — retained-content row metadata for
+/// one end user, newest first; no content bodies (those stay on the
+/// per-request read). Tenant-scoped exactly like the erase below.
+async fn admin_content_list(
+    State(s): State<AppState>,
+    scope: AdminScope,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(user) = q.get("user").filter(|u| !u.is_empty()) else {
+        return error_response(400, "user is required");
+    };
+    let tenant = scope.tenant_filter(&q);
+    let limit = q_num(&q, "limit", CONTENT_PAGE_DEFAULT).min(CONTENT_PAGE_MAX);
+    match s
+        .handler
+        .state()
+        .store
+        .content_list_user(tenant, user, limit)
+        .await
+    {
+        Ok(rows) => {
+            let rows: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "request_id": r.request_id,
+                        "user_id": r.user_id,
+                        "kind": r.kind,
+                        "created_at_epoch_secs": r.created_at_epoch_secs,
+                    })
+                })
+                .collect();
+            Json(json!({ "rows": rows })).into_response()
+        }
+        Err(e) => gateway_error(e),
+    }
 }
 
 /// DELETE /admin/audit/content?user= — erase every retained trace of one end
@@ -4467,6 +4507,120 @@ mod tests {
             .filter(|e| e["action"] == "content_erase" && e["target"] == "u1")
             .collect();
         assert_eq!(erases.len(), 2, "both erasures audited");
+    }
+
+    #[tokio::test]
+    async fn content_list_is_tenant_scoped_metadata_newest_first() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_CLIST_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\ntenants: [{name: t1, admin_token_env: GW_TEST_CLIST_T1}, {name: t2, admin_token_env: GW_TEST_CLIST_T2}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 10, daily_token_quota: 1000}]";
+        // SAFETY: unique var names for this test; no concurrent reader of them.
+        unsafe {
+            std::env::set_var("GW_TEST_CLIST_ADMIN", "root-tok");
+            std::env::set_var("GW_TEST_CLIST_T1", "t1-tok");
+            std::env::set_var("GW_TEST_CLIST_T2", "t2-tok");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        let rec = |req: &str, user: &str, tenant: &str, at: i64| gw_state::ContentRecord {
+            created_at_epoch_secs: at,
+            request_id: req.into(),
+            ak: "k1".into(),
+            user_id: user.into(),
+            tenant: tenant.into(),
+            kind: "prompt".into(),
+            content: "hello".into(),
+            sealed: false,
+            expires_at_epoch_secs: 0,
+        };
+        store
+            .content_add(&rec("r1", "u1", "t1", 100))
+            .await
+            .unwrap();
+        store
+            .content_add(&rec("r2", "u1", "t1", 200))
+            .await
+            .unwrap();
+        store
+            .content_add(&rec("rx", "u2", "t1", 250))
+            .await
+            .unwrap();
+        store
+            .content_add(&rec("r3", "u1", "t2", 300))
+            .await
+            .unwrap();
+        let router = app(app_state);
+
+        let list = |uri: &str, token: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ids = |j: &Value| -> Vec<String> {
+            j["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["request_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let resp = router
+            .clone()
+            .oneshot(list("/admin/audit/content?user=u1", "root-tok"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(
+            ids(&j),
+            ["r3", "r2", "r1"],
+            "global scope: the user's rows across tenants, newest first"
+        );
+        assert!(
+            j["rows"][0].get("content").is_none(),
+            "metadata only: no content bodies"
+        );
+        assert_eq!(j["rows"][0]["user_id"], "u1");
+        assert_eq!(j["rows"][0]["kind"], "prompt");
+        assert_eq!(j["rows"][0]["created_at_epoch_secs"], 300);
+
+        let resp = router
+            .clone()
+            .oneshot(list("/admin/audit/content?user=u1", "t1-tok"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&body_json(resp).await),
+            ["r2", "r1"],
+            "tenant admin sees only its own tenant's rows"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(list("/admin/audit/content?user=u2", "t2-tok"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ids(&body_json(resp).await).is_empty(),
+            "foreign tenant token sees nothing"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(list("/admin/audit/content?user=u1&limit=1", "root-tok"))
+            .await
+            .unwrap();
+        assert_eq!(ids(&body_json(resp).await), ["r3"], "limit respected");
+
+        let resp = router
+            .oneshot(list("/admin/audit/content", "root-tok"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "user is required");
     }
 
     #[tokio::test]
