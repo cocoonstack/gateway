@@ -718,7 +718,7 @@ impl ModelEngine for CompletionsEngine {
             .as_i64()
             .unwrap_or(pt.saturating_add(ct))
             .max(0);
-        let raw_usage = (!usage.is_null()).then(|| usage.clone());
+        let raw_usage = v.get_mut("usage").map(Value::take).filter(|u| !u.is_null());
         let resp = GatewayResponse {
             message: crate::engine::take_string(&mut v, "/choices/0/text").unwrap_or_default(),
             model: crate::engine::take_string(&mut v, "/model")

@@ -59,7 +59,7 @@ async fn openai_chat_matches_go_recorded_response() {
     assert_eq!(out.response.prompt_tokens, 5);
     assert_eq!(out.response.completion_tokens, 3);
     assert_eq!(out.response.total_tokens, 8);
-    let usage: serde_json::Value = out.response.raw_usage.clone().unwrap();
+    let usage = out.response.raw_usage.unwrap();
     assert_eq!(
         usage,
         serde_json::json!({"completion_tokens": 3, "prompt_tokens": 5, "total_tokens": 8})

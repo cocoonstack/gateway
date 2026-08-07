@@ -113,6 +113,9 @@ impl ModelEngine for ErnieEngine {
         let (status, mut v) = self.base.post_json(&url, vec![], body).await?;
         let message = crate::engine::take_string(&mut v, "/result").unwrap_or_default();
         let usage = &v["usage"];
+        let prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);
+        let completion_tokens = crate::engine::tok(&usage["completion_tokens"]);
+        let total_tokens = crate::engine::tok(&usage["total_tokens"]);
         let resp = GatewayResponse {
             message,
             model,
@@ -121,10 +124,10 @@ impl ModelEngine for ErnieEngine {
             } else {
                 "stop".into()
             },
-            prompt_tokens: crate::engine::tok(&usage["prompt_tokens"]),
-            completion_tokens: crate::engine::tok(&usage["completion_tokens"]),
-            total_tokens: crate::engine::tok(&usage["total_tokens"]),
-            raw_usage: (!usage.is_null()).then(|| usage.clone()),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            raw_usage: v.get_mut("usage").map(Value::take).filter(|u| !u.is_null()),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))

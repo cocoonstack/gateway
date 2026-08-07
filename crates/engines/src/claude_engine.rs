@@ -189,8 +189,9 @@ pub fn anthropic_native_chunks(
     // it is not on GatewayResponse yet (common_usage is a later DAG step).
     let start_usage = response
         .raw_usage
-        .clone()
-        .filter(Value::is_object)
+        .as_ref()
+        .filter(|usage| usage.is_object())
+        .cloned()
         .unwrap_or_else(|| json!({"input_tokens":response.prompt_tokens,"output_tokens":0}));
     let mut events = vec![json!({
         "type":"message_start",

@@ -3534,7 +3534,6 @@ async fn images_edits(
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    // move the blobs out — cloning a multi-MB base64 image doubles peak memory
     let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
     let image = gw_engines::engine::take_string(&mut body, "/image").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() || image.is_empty() {
@@ -3651,7 +3650,6 @@ async fn audio_transcribe(
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    // move the blob out — cloning multi-MB base64 audio doubles peak memory
     let audio = gw_engines::engine::take_string(&mut body, "/audio_b64").unwrap_or_default();
     if model.is_empty() || audio.is_empty() {
         return error_response(400, "model and audio_b64 are required");
@@ -3856,7 +3854,6 @@ async fn files_upload(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
-    // move the content out — cloning a large upload doubles peak memory
     let Some(content) = gw_engines::engine::take_string(&mut body, "/file") else {
         return error_response(400, "file content (string) is required");
     };

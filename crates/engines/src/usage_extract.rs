@@ -9,9 +9,8 @@ use serde_json::Value;
 
 /// Extract a normalized usage view from the vendor's usage subtree.
 /// `messages_protocol` selects the Anthropic field map; otherwise OpenAI's.
-/// `None` when the subtree carries none of the mapped part fields (a
-/// total-only vendor) — callers fall back to the top-level token counts,
-/// which a fabricated all-zero view would otherwise override into billing 0.
+/// `None` when none of the mapped part fields are present (a total-only
+/// vendor) — callers fall back to the top-level counts.
 pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<CommonUsage> {
     fn get(v: &Value, path: &[&str]) -> i64 {
         let mut cur = v;
