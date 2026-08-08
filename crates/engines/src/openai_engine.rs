@@ -127,6 +127,9 @@ impl OpenAiEngine {
                 .unwrap_or_default(),
             ..Default::default()
         };
+        if let Some(calls) = &mut resp.tool_calls {
+            crate::engine::normalize_tool_arguments(calls);
+        }
         apply_openai_usage(&mut resp, &v["usage"]);
         Ok(EngineOutcome::with_status(resp, status))
     }
@@ -140,6 +143,9 @@ impl OpenAiEngine {
         })
         .await?;
         resp.message = full;
+        if let Some(calls) = &mut resp.tool_calls {
+            crate::engine::normalize_tool_arguments(calls);
+        }
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }

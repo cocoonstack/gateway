@@ -126,6 +126,33 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     })
 }
 
+/// Drop the empty object some OpenAI-compatible vendors emit ahead of a tool
+/// call's accumulated arguments (`{}{"command":"…"}`) — the block-open payload
+/// concatenated with the deltas, which no JSON parser accepts. Only a prefix
+/// that leaves valid JSON behind is removed, so a merely unparseable arguments
+/// string is passed through untouched rather than guessed at.
+pub fn normalize_tool_arguments(calls: &mut Value) {
+    let Some(calls) = calls.as_array_mut() else {
+        return;
+    };
+    for call in calls {
+        let Some(Value::String(args)) = call.pointer_mut("/function/arguments") else {
+            continue;
+        };
+        if serde_json::from_str::<Value>(args).is_ok() {
+            continue;
+        }
+        let mut rest = args.trim_start();
+        while let Some(stripped) = rest.strip_prefix("{}") {
+            rest = stripped.trim_start();
+            if serde_json::from_str::<Value>(rest).is_ok() {
+                *args = rest.to_owned();
+                break;
+            }
+        }
+    }
+}
+
 /// Fill `total_tokens` from prompt + completion when the vendor omitted it.
 pub fn fill_total_if_zero(resp: &mut GatewayResponse) {
     if resp.total_tokens == 0 {
@@ -176,5 +203,41 @@ mod tests {
     fn success_shapes_are_not_errors() {
         assert!(vendor_error(200, &json!({"choices": []})).is_none());
         assert!(vendor_error(200, &json!({"error": "string not object"})).is_none());
+    }
+
+    #[test]
+    fn tool_arguments_drop_a_leading_empty_object() {
+        let mut calls = json!([{
+            "id": "tooluse_1", "type": "function",
+            "function": {"name": "shell", "arguments": "{}{\"command\": \"ls\"}"}
+        }]);
+        normalize_tool_arguments(&mut calls);
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            json!("{\"command\": \"ls\"}")
+        );
+    }
+
+    #[test]
+    fn well_formed_and_unrecoverable_tool_arguments_are_untouched() {
+        for original in ["{\"command\":\"ls\"}", "{}", "not json at all", "{\"a\":"] {
+            let mut calls = json!([{"function": {"name": "shell", "arguments": original}}]);
+            normalize_tool_arguments(&mut calls);
+            assert_eq!(
+                calls[0]["function"]["arguments"],
+                json!(original),
+                "arguments {original:?} must be passed through"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_arguments_survive_shapes_without_a_string_payload() {
+        let mut calls = json!([{"function": {"name": "shell"}}, {"no_function": true}]);
+        normalize_tool_arguments(&mut calls);
+        assert_eq!(calls[0]["function"]["name"], json!("shell"));
+        let mut not_an_array = json!({"function": {"arguments": "{}{}"}});
+        normalize_tool_arguments(&mut not_an_array);
+        assert_eq!(not_an_array["function"]["arguments"], json!("{}{}"));
     }
 }
