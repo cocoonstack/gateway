@@ -1295,7 +1295,8 @@ async fn rt_inbound_policy(
 ) -> Result<usize, String> {
     let cfg = s.handler.cfg();
     let sec = cfg.security_for(&ak.tenant);
-    let (scan, text) = gw_handler::plugins::realtime_frame_scan(sec, frame, sec.moderate);
+    let (scan, text, walk_redacted) =
+        gw_handler::plugins::realtime_frame_scan(sec, frame, sec.moderate);
     emit_rt_hits(s, ak, &scan.hits, hint).await;
     if let Some(block) = scan.block {
         return Err(block.message);
@@ -1323,7 +1324,11 @@ async fn rt_inbound_policy(
             }
         }
     }
-    let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, frame);
+    let redacted = if sec.moderate {
+        gw_handler::plugins::dlp_redact_realtime_frame(sec, frame)
+    } else {
+        walk_redacted
+    };
     if redacted > 0 {
         write_rt_event(
             s,

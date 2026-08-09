@@ -535,22 +535,30 @@ pub fn realtime_frame_scan(
     sec: &SecurityConf,
     frame: &mut serde_json::Value,
     collect_text: bool,
-) -> (ScanOutcome, String) {
+) -> (ScanOutcome, String, usize) {
     let scan_rules = !sec.blocklist.is_empty() || !sec.regexes.is_empty();
+    // redaction joins the walk only when no moderation text is collected:
+    // mask spans address pre-redaction offsets
+    let redact = (sec.dlp_redact || sec.detect_secrets) && !collect_text;
     let mut counts = ScanCounts::new(sec);
     let mut text = String::new();
-    if scan_rules || collect_text {
-        gw_engines::realtime::visit_frame_text(frame, &mut |s| {
+    let mut redacted = 0;
+    if scan_rules || collect_text || redact {
+        redacted = gw_engines::realtime::visit_frame_text(frame, &mut |s| {
             if scan_rules {
                 counts.visit(s);
             }
             if collect_text {
                 push_text(&mut text, s);
             }
-            0
+            if redact {
+                redact_in_place(s, sec.dlp_redact, sec.detect_secrets)
+            } else {
+                0
+            }
         });
     }
-    (counts.outcome(), text)
+    (counts.outcome(), text, redacted)
 }
 
 /// DLP-redact a realtime frame's text-bearing fields in place; the hit count.
@@ -1133,7 +1141,7 @@ mod tests {
     fn realtime_frame_scan_honors_regex_and_actions() {
         let s = ssn_block();
         let mut frame = serde_json::json!({"type":"input_text","text":"my ssn is 123-45-6789"});
-        let (out, text) = realtime_frame_scan(&s, &mut frame, true);
+        let (out, text, _) = realtime_frame_scan(&s, &mut frame, true);
         assert!(out.block.is_some(), "regex Block denies on realtime too");
         assert!(
             text.contains("123-45-6789"),
@@ -1146,10 +1154,53 @@ mod tests {
             ..Default::default()
         };
         let mut frame = serde_json::json!({"type":"input_text","text":"please watch this"});
-        let (out, text) = realtime_frame_scan(&s2, &mut frame, false);
+        let (out, text, _) = realtime_frame_scan(&s2, &mut frame, false);
         assert!(out.block.is_none(), "flag does not block realtime");
         assert_eq!(out.hits.len(), 1);
         assert!(text.is_empty(), "no text collected unless asked");
+    }
+
+    #[test]
+    fn scan_walk_redacts_but_scans_the_original_text() {
+        let s = SecurityConf {
+            blocklist: vec!["sk-abcdefghijklmnopqrstuvwxyz012345".into()],
+            blocklist_action: Action::Flag,
+            detect_secrets: true,
+            ..Default::default()
+        };
+        let mut frame = serde_json::json!({
+            "type":"input_text","text":"key sk-abcdefghijklmnopqrstuvwxyz012345"
+        });
+        let (out, _, redacted) = realtime_frame_scan(&s, &mut frame, false);
+        assert_eq!(
+            out.hits.len(),
+            1,
+            "the scan must see the pre-redaction text"
+        );
+        assert_eq!(redacted, 1);
+        assert!(
+            frame["text"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_SECRET]")
+        );
+    }
+
+    #[test]
+    fn moderation_collection_defers_redaction_to_the_second_pass() {
+        let s = SecurityConf {
+            detect_secrets: true,
+            moderate: true,
+            ..Default::default()
+        };
+        let mut frame = serde_json::json!({
+            "type":"input_text","text":"key sk-abcdefghijklmnopqrstuvwxyz012345"
+        });
+        let (_, text, redacted) = realtime_frame_scan(&s, &mut frame, true);
+        assert_eq!(redacted, 0, "mask spans address pre-redaction offsets");
+        assert!(text.contains("sk-abc"), "moderation sees the original text");
+        assert!(frame["text"].as_str().unwrap().contains("sk-abc"));
+        assert_eq!(dlp_redact_realtime_frame(&s, &mut frame), 1);
     }
 
     #[test]
