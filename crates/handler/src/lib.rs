@@ -70,9 +70,8 @@ impl OnlineHandler {
         self.config.load().state.clone()
     }
 
-    /// Swap in a new config and push the transport policies derived from it as
-    /// one step, so config and upstream policy can never desync. On error the
-    /// old snapshot (and its policies) stay live.
+    /// Swap in a new config, then refresh its timeout/connect policies. Status
+    /// replay permission stays on each request's selected account snapshot.
     pub async fn reload(&self, cfg: GatewayConfig) -> GResult<()> {
         let handoff = self.config.reload(cfg).await;
         if handoff.is_ok() {
@@ -368,11 +367,7 @@ impl OnlineHandler {
         let per_account: HashMap<String, UpstreamPolicy> = cfg
             .accounts
             .iter()
-            .filter(|a| {
-                a.timeout_seconds.is_some()
-                    || a.connect_retries.is_some()
-                    || a.retry_status.as_ref().is_some_and(|s| !s.is_empty())
-            })
+            .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
             .map(|a| {
                 (
                     a.name.clone(),
@@ -382,7 +377,6 @@ impl OnlineHandler {
                             .map(std::time::Duration::from_secs)
                             .unwrap_or(default.timeout),
                         connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
-                        retry_status: Arc::from(a.retry_status.as_deref().unwrap_or_default()),
                     },
                 )
             })
@@ -607,36 +601,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retry_status_only_account_reaches_the_transport_policy() {
+    async fn a_retry_status_only_account_reaches_the_upstream_request() {
         #[derive(Debug, Default)]
-        struct Recording(std::sync::Mutex<HashMap<String, UpstreamPolicy>>);
+        struct Recording(std::sync::Mutex<Option<Arc<gw_models::Account>>>);
         #[async_trait::async_trait]
         impl gw_engines::transport::Transport for Recording {
-            fn reload_policies(
-                &self,
-                _default: UpstreamPolicy,
-                per_account: HashMap<String, UpstreamPolicy>,
-            ) {
-                *self.0.lock().unwrap() = per_account;
-            }
             async fn send(
                 &self,
                 req: gw_engines::transport::UpstreamRequest,
             ) -> GResult<gw_engines::transport::UpstreamResponse> {
+                *self.0.lock().unwrap() = req.replay_account.as_ref().map(Arc::clone);
                 gw_engines::MockTransport.send(req).await
             }
         }
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a1, provider: p, protocols: [openai-chat], retry_status: [429, 502]}]";
+        let yaml = "listen: {host: h, port: 1}\naccess_keys: [{ak: test, product: p, qps: 10, daily_token_quota: 1000}]\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a1, provider: p, protocols: [openai-chat], retry_status: [429, 502]}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let recording = Arc::new(Recording::default());
-        OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), recording.clone());
-        let policies = recording.0.lock().unwrap();
-        let p = policies
-            .get("a1")
-            .expect("retry_status alone must produce a per-account policy");
-        assert_eq!(p.retry_status.as_ref(), [429, 502]);
-        assert_eq!(p.connect_retries, UpstreamPolicy::default().connect_retries);
+        let transport = Arc::clone(&recording);
+        let h = OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport);
+        let ak = h.state().auth.authenticate("test").await.unwrap();
+        h.run(chat_req("m", "hi"), ak).await.unwrap();
+        let recorded = recording.0.lock().unwrap();
+        let replay = recorded
+            .as_ref()
+            .expect("selected account must carry its replay policy");
+        assert_eq!(replay.retry_status, [429, 502]);
+        assert_eq!(
+            replay
+                .connect_retries
+                .unwrap_or(UpstreamPolicy::default().connect_retries),
+            UpstreamPolicy::default().connect_retries
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inflight_request_keeps_its_vendors_replay_permission_across_reload() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Debug)]
+        struct GateModerator {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl moderation::Moderator for GateModerator {
+            async fn review(&self, _text: &str) -> Result<moderation::Verdict, String> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(moderation::Verdict::Allow)
+            }
+        }
+
+        async fn flaky_vendor() -> (String, Arc<AtomicU32>) {
+            let hits = Arc::new(AtomicU32::new(0));
+            let seen = Arc::clone(&hits);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0u8; 1024];
+                    let _ = socket.read(&mut request).await;
+                    let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                    let (status, body) = if first {
+                        (502, r#"{"error":{"message":"old vendor failed"}}"#)
+                    } else {
+                        (
+                            200,
+                            r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            (format!("http://{addr}"), hits)
+        }
+
+        let (old_endpoint, hits) = flaky_vendor().await;
+        let config = |endpoint: &str, retry_status: &str| {
+            GatewayConfig::from_yaml(&format!(
+                "listen: {{host: h, port: 1}}\nsecurity: {{moderate: true}}\naccess_keys: [{{ak: test, product: p, qps: 100, daily_token_quota: 100000}}]\nmodels: [{{name: m, protocol: openai-chat}}]\naccounts: [{{name: a1, provider: p, endpoint: '{endpoint}', protocols: [openai-chat], connect_retries: 1, retry_status: {retry_status}}}]"
+            ))
+            .unwrap()
+        };
+        let old_cfg = Arc::new(config(&old_endpoint, "[]"));
+        let state = Arc::new(GatewayState::from_config(&old_cfg));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(old_cfg, state),
+            Arc::new(
+                gw_engines::http_transport::HttpTransport::new(std::time::Duration::from_secs(5))
+                    .unwrap(),
+            ),
+        )
+        .with_moderator(Arc::new(GateModerator {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        let ak = h.state().auth.authenticate("test").await.unwrap();
+        let running = tokio::spawn({
+            let h = h.clone();
+            async move { h.run(chat_req("m", "hi"), ak).await }
+        });
+        entered.notified().await;
+        h.reload(config("http://127.0.0.1:9", "[502]"))
+            .await
+            .unwrap();
+        release.notify_one();
+        assert!(
+            running.await.unwrap().is_err(),
+            "old 502 must not be replayed"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "new vendor policy must not replay an old vendor request"
+        );
     }
 
     async fn ak(h: &OnlineHandler) -> AkInfo {

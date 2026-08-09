@@ -2,6 +2,8 @@
 //! (endpoint/key resolution), and the JSON round-trip helpers the family and
 //! bespoke engines build on.
 
+use std::sync::Arc;
+
 use gw_models::{GResult, GatewayError};
 use serde_json::Value;
 
@@ -19,6 +21,14 @@ impl Base {
 
     pub fn account(&self) -> String {
         self.request.account_name().to_owned()
+    }
+
+    pub fn replay_account(&self) -> Option<Arc<gw_models::Account>> {
+        self.request
+            .account
+            .as_ref()
+            .filter(|account| !account.retry_status.is_empty())
+            .map(Arc::clone)
     }
 
     /// The go-live seam: the account's configured endpoint when set, else the
@@ -160,6 +170,7 @@ impl Base {
             body,
             stream,
             account: self.account(),
+            replay_account: self.replay_account(),
         };
         self.transport.send(up).await
     }

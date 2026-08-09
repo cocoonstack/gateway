@@ -87,6 +87,7 @@ impl ClaudeEngine {
             body: crate::base::body_bytes(&Value::Object(body))?,
             stream: self.base.request.stream,
             account: self.base.account(),
+            replay_account: self.base.replay_account(),
         })
     }
 

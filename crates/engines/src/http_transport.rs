@@ -7,14 +7,13 @@
 //! engines decode incrementally or drain via `UpstreamResponse::buffered`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use gw_models::{GResult, GatewayError};
 
 use crate::transport::{
-    MockTransport, StreamFault, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
-    upstream_fault_code,
+    DEFAULT_CONNECT_RETRIES, MockTransport, StreamFault, Transport, UpstreamBody, UpstreamRequest,
+    UpstreamResponse, upstream_fault_code,
 };
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
@@ -22,26 +21,18 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // retry predicate covers — instead of burning the whole request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-account upstream policy: request timeout, connect-phase retry budget,
-/// and which upstream statuses may be replayed from that same budget.
-///
-/// LLM calls are not idempotent — a replayed generation double-bills — so a
-/// request that reached the vendor is never replayed unless the operator
-/// declares, via `retry_status`, that this vendor issues those statuses
-/// before the model runs. Empty means never; the gateway does not guess.
-#[derive(Debug, Clone)]
+/// Live per-account request timeout and connect-phase retry budget.
+#[derive(Debug, Clone, Copy)]
 pub struct UpstreamPolicy {
     pub timeout: Duration,
     pub connect_retries: u32,
-    pub retry_status: Arc<[u16]>,
 }
 
 impl Default for UpstreamPolicy {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(60),
-            connect_retries: 1,
-            retry_status: Arc::default(),
+            connect_retries: DEFAULT_CONNECT_RETRIES,
         }
     }
 }
@@ -110,10 +101,7 @@ impl HttpTransport {
 
     pub fn policy_for(&self, account: &str) -> UpstreamPolicy {
         let p = self.policies.load();
-        p.per_account
-            .get(account)
-            .cloned()
-            .unwrap_or_else(|| p.default.clone())
+        p.per_account.get(account).copied().unwrap_or(p.default)
     }
 }
 
@@ -133,15 +121,17 @@ impl Transport for HttpTransport {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| GatewayError::bad_request(format!("bad method: {e}")))?;
-        let (timeout, connect_retries, retry_status) = {
+        let (timeout, connect_retries) = {
             let p = self.policies.load();
             let policy = p.per_account.get(&req.account).unwrap_or(&p.default);
-            (
-                policy.timeout,
-                policy.connect_retries,
-                (!policy.retry_status.is_empty()).then(|| Arc::clone(&policy.retry_status)),
-            )
+            (policy.timeout, policy.connect_retries)
         };
+        let retry_budget = req
+            .replay_account
+            .as_ref()
+            .map_or(connect_retries, |account| {
+                account.connect_retries.unwrap_or(DEFAULT_CONNECT_RETRIES)
+            });
         let body = bytes::Bytes::from(req.body);
         let mut attempt = 0u32;
         let resp = loop {
@@ -175,10 +165,9 @@ impl Transport for HttpTransport {
             };
             match result {
                 Ok(resp)
-                    if retry_status
-                        .as_deref()
-                        .is_some_and(|s| s.contains(&resp.status().as_u16()))
-                        && attempt < connect_retries =>
+                    if req.replay_account.as_ref().is_some_and(|account| {
+                        account.retry_status.contains(&resp.status().as_u16())
+                    }) && attempt < retry_budget =>
                 {
                     attempt += 1;
                     metrics::counter!(
@@ -192,7 +181,7 @@ impl Transport for HttpTransport {
                     tokio::time::sleep(wait).await;
                 }
                 Ok(resp) => break resp,
-                Err(e) if e.is_connect() && attempt < connect_retries => {
+                Err(e) if e.is_connect() && attempt < retry_budget => {
                     attempt += 1;
                     metrics::counter!(
                         "gateway_upstream_connect_retries_total",
@@ -332,6 +321,7 @@ impl Transport for DispatchTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -387,6 +377,7 @@ mod tests {
             body: b"{}".to_vec(),
             stream: false,
             account: "acct".into(),
+            replay_account: None,
         }
     }
 
@@ -394,10 +385,17 @@ mod tests {
         let policy = UpstreamPolicy {
             timeout: Duration::from_secs(5),
             connect_retries: 2,
-            retry_status: Arc::from(retry_status),
         };
         let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
-        t.send(request(url)).await.unwrap().status
+        let mut req = request(url);
+        if !retry_status.is_empty() {
+            req.replay_account = Some(Arc::new(gw_models::Account {
+                connect_retries: Some(2),
+                retry_status,
+                ..Default::default()
+            }));
+        }
+        t.send(req).await.unwrap().status
     }
 
     #[tokio::test]
@@ -438,11 +436,15 @@ mod tests {
         let policy = UpstreamPolicy {
             timeout: Duration::from_secs(5),
             connect_retries: 2,
-            retry_status: Arc::from(vec![502u16]),
         };
         let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
         let mut req = request(url);
         req.stream = true;
+        req.replay_account = Some(Arc::new(gw_models::Account {
+            connect_retries: Some(2),
+            retry_status: vec![502],
+            ..Default::default()
+        }));
         let resp = t.send(req).await.unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2);

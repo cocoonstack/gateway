@@ -79,6 +79,7 @@ async fn http_transport_json_over_real_socket() {
             .into_bytes(),
         stream: false,
         account: "real-local".into(),
+        replay_account: None,
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
@@ -128,6 +129,7 @@ async fn non_stream_body_timeout_classifies_as_model_timeout() {
             body: b"{}".to_vec(),
             stream: false,
             account: "slow-body".into(),
+            replay_account: None,
         })
         .await
         .expect_err("the non-stream body must share the request deadline");
@@ -170,6 +172,7 @@ async fn non_stream_body_break_classifies_as_model_error() {
             body: b"{}".to_vec(),
             stream: false,
             account: "broken-body".into(),
+            replay_account: None,
         })
         .await
         .expect_err("a mid-body break must surface as an error");
@@ -195,6 +198,7 @@ async fn http_transport_sse_over_real_socket() {
             .into_bytes(),
         stream: true,
         account: "real-local".into(),
+        replay_account: None,
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
@@ -223,6 +227,7 @@ async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
             .into_bytes(),
         stream: false,
         account: "dispatch-test".into(),
+        replay_account: None,
     };
 
     let resp = transport
@@ -290,7 +295,6 @@ async fn per_account_policy_and_connect_retry() {
         UpstreamPolicy {
             timeout: Duration::from_secs(5),
             connect_retries: 2,
-            ..UpstreamPolicy::default()
         },
     );
     let transport = HttpTransport::with_policies(UpstreamPolicy::default(), per_account).unwrap();
@@ -303,7 +307,6 @@ async fn per_account_policy_and_connect_retry() {
         UpstreamPolicy {
             timeout: Duration::from_secs(9),
             connect_retries: 5,
-            ..UpstreamPolicy::default()
         },
     );
     Transport::reload_policies(&transport, UpstreamPolicy::default(), reloaded);
@@ -332,6 +335,7 @@ async fn per_account_policy_and_connect_retry() {
             body: b"{}".to_vec(),
             stream: false,
             account: "tight".into(),
+            replay_account: None,
         })
         .await
         .unwrap_err();
@@ -378,6 +382,7 @@ fn paced_req(url: String) -> UpstreamRequest {
         body: b"{}".to_vec(),
         stream: true,
         account: "paced".into(),
+        replay_account: None,
     }
 }
 
