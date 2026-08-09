@@ -158,8 +158,12 @@ accounts:
     connect_retries: 1         # connect-phase retries; also bounds retry_status replays
     retry_status: [429, 502]   # statuses this vendor issues BEFORE the model runs, so a
                                # replay cannot double-bill. Empty (the default) means a
-                               # request that reached the vendor is never replayed —
-                               # honours Retry-After, capped at 30s
+                               # request that reached the vendor is never replayed.
+                               # Replays honour Retry-After capped at 30s per attempt;
+                               # that wait is on top of timeout_seconds, so worst case
+                               # a request occupies (retries+1)×timeout + retries×30s.
+                               # Only 4xx/5xx are accepted here — anything else is
+                               # rejected at load
                                # timeout_seconds bounds a non-streaming request whole; a streaming
                                # one gets it on the headers and then per gap between chunks
     api_key_env: ""            # env var name holding the API key (never the key itself)

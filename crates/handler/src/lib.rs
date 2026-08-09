@@ -368,7 +368,11 @@ impl OnlineHandler {
         let per_account: HashMap<String, UpstreamPolicy> = cfg
             .accounts
             .iter()
-            .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
+            .filter(|a| {
+                a.timeout_seconds.is_some()
+                    || a.connect_retries.is_some()
+                    || !a.retry_status.is_empty()
+            })
             .map(|a| {
                 (
                     a.name.clone(),
@@ -378,7 +382,7 @@ impl OnlineHandler {
                             .map(std::time::Duration::from_secs)
                             .unwrap_or(default.timeout),
                         connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
-                        retry_status: a.retry_status.clone().into(),
+                        retry_status: Arc::from(a.retry_status.as_slice()),
                     },
                 )
             })
@@ -600,6 +604,39 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         )
+    }
+
+    #[tokio::test]
+    async fn a_retry_status_only_account_reaches_the_transport_policy() {
+        #[derive(Debug, Default)]
+        struct Recording(std::sync::Mutex<HashMap<String, UpstreamPolicy>>);
+        #[async_trait::async_trait]
+        impl gw_engines::transport::Transport for Recording {
+            fn reload_policies(
+                &self,
+                _default: UpstreamPolicy,
+                per_account: HashMap<String, UpstreamPolicy>,
+            ) {
+                *self.0.lock().unwrap() = per_account;
+            }
+            async fn send(
+                &self,
+                req: gw_engines::transport::UpstreamRequest,
+            ) -> GResult<gw_engines::transport::UpstreamResponse> {
+                gw_engines::MockTransport.send(req).await
+            }
+        }
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a1, provider: p, protocols: [openai-chat], retry_status: [429, 502]}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let recording = Arc::new(Recording::default());
+        OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), recording.clone());
+        let policies = recording.0.lock().unwrap();
+        let p = policies
+            .get("a1")
+            .expect("retry_status alone must produce a per-account policy");
+        assert_eq!(p.retry_status.as_ref(), [429, 502]);
+        assert_eq!(p.connect_retries, UpstreamPolicy::default().connect_retries);
     }
 
     async fn ak(h: &OnlineHandler) -> AkInfo {

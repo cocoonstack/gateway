@@ -22,16 +22,13 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // retry predicate covers — instead of burning the whole request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-account upstream policy: request timeout, how many times a
-/// connect-phase failure is retried, and which upstream statuses may be
-/// retried on top of that.
+/// Per-account upstream policy: request timeout, connect-phase retry budget,
+/// and which upstream statuses may be replayed from that same budget.
 ///
-/// A request that reached the vendor is never replayed on its own — LLM calls
-/// are not idempotent, and a replayed generation double-bills. `retry_status`
-/// is the operator's declaration that, for *this* vendor, those statuses are
-/// refusals issued before the model ran (a 429 throttle, or an edge 502 whose
-/// body says its own upstream call failed), so replaying them is safe. Empty
-/// by default: the gateway never decides this for the operator.
+/// LLM calls are not idempotent — a replayed generation double-bills — so a
+/// request that reached the vendor is never replayed unless the operator
+/// declares, via `retry_status`, that this vendor issues those statuses
+/// before the model runs. Empty means never; the gateway does not guess.
 #[derive(Debug, Clone)]
 pub struct UpstreamPolicy {
     pub timeout: Duration,
@@ -44,15 +41,15 @@ impl Default for UpstreamPolicy {
         Self {
             timeout: Duration::from_secs(60),
             connect_retries: 1,
-            retry_status: Arc::from([] as [u16; 0]),
+            retry_status: Arc::default(),
         }
     }
 }
 
 /// How long to wait before replaying a retryable status: the vendor's
-/// `Retry-After` (seconds, or an HTTP date we only read as "at least a
-/// second") when it sends one, else the same linear backoff the connect path
-/// uses. Capped so one hostile header cannot pin a worker for minutes.
+/// `Retry-After` seconds when it sends them (the HTTP-date form falls back to
+/// the connect path's linear backoff, like no header at all), capped so one
+/// hostile header cannot pin a worker for minutes.
 fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
     const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
     headers
@@ -131,7 +128,15 @@ impl Transport for HttpTransport {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| GatewayError::bad_request(format!("bad method: {e}")))?;
-        let policy = self.policy_for(&req.account);
+        let (timeout, connect_retries, retry_status) = {
+            let p = self.policies.load();
+            let policy = p.per_account.get(&req.account).unwrap_or(&p.default);
+            (
+                policy.timeout,
+                policy.connect_retries,
+                (!policy.retry_status.is_empty()).then(|| Arc::clone(&policy.retry_status)),
+            )
+        };
         let body = bytes::Bytes::from(req.body);
         let mut attempt = 0u32;
         let resp = loop {
@@ -140,14 +145,14 @@ impl Transport for HttpTransport {
             // which would kill a streaming generation longer than the policy —
             // streams get a header-phase deadline here and an idle gap cap below
             if !req.stream {
-                builder = builder.timeout(policy.timeout);
+                builder = builder.timeout(timeout);
             }
             for (k, v) in &req.headers {
                 builder = builder.header(k, v);
             }
             let sent = builder.body(body.clone()).send();
             let result = if req.stream {
-                match tokio::time::timeout(policy.timeout, sent).await {
+                match tokio::time::timeout(timeout, sent).await {
                     Ok(r) => r,
                     Err(_) => {
                         return Err(GatewayError::new(
@@ -155,7 +160,7 @@ impl Transport for HttpTransport {
                             502,
                             format!(
                                 "upstream request failed: no response headers within {:?}",
-                                policy.timeout
+                                timeout
                             ),
                         ));
                     }
@@ -165,8 +170,10 @@ impl Transport for HttpTransport {
             };
             match result {
                 Ok(resp)
-                    if policy.retry_status.contains(&resp.status().as_u16())
-                        && attempt < policy.connect_retries =>
+                    if retry_status
+                        .as_deref()
+                        .is_some_and(|s| s.contains(&resp.status().as_u16()))
+                        && attempt < connect_retries =>
                 {
                     attempt += 1;
                     metrics::counter!(
@@ -178,7 +185,7 @@ impl Transport for HttpTransport {
                     tokio::time::sleep(status_backoff(resp.headers(), attempt)).await;
                 }
                 Ok(resp) => break resp,
-                Err(e) if e.is_connect() && attempt < policy.connect_retries => {
+                Err(e) if e.is_connect() && attempt < connect_retries => {
                     attempt += 1;
                     metrics::counter!(
                         "gateway_upstream_connect_retries_total",
@@ -211,20 +218,18 @@ impl Transport for HttpTransport {
             }));
             return Ok(UpstreamResponse {
                 status,
-                body: idle_capped(stream, policy.timeout),
+                body: idle_capped(stream, timeout),
             });
         }
         let read = resp.bytes();
         let bytes = if req.stream {
-            tokio::time::timeout(policy.timeout, read)
-                .await
-                .map_err(|_| {
-                    GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_TIMEOUT,
-                        502,
-                        format!("upstream body not read within {:?}", policy.timeout),
-                    )
-                })?
+            tokio::time::timeout(timeout, read).await.map_err(|_| {
+                GatewayError::new(
+                    gw_consts::ErrCode::FED_RESP_TIMEOUT,
+                    502,
+                    format!("upstream body not read within {:?}", timeout),
+                )
+            })?
         } else {
             read.await
         };
@@ -324,8 +329,6 @@ mod tests {
 
     use super::*;
 
-    /// A one-shot server that answers `fail_times` requests with `status`, then
-    /// 200, counting what it saw.
     async fn flaky(
         status: u16,
         fail_times: u32,
@@ -381,7 +384,7 @@ mod tests {
         let policy = UpstreamPolicy {
             timeout: Duration::from_secs(5),
             connect_retries: 2,
-            retry_status: Arc::from(retry_status.into_boxed_slice()),
+            retry_status: Arc::from(retry_status),
         };
         let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
         t.send(request(url)).await.unwrap().status
@@ -390,17 +393,8 @@ mod tests {
     #[tokio::test]
     async fn a_status_not_declared_retryable_is_returned_as_is() {
         let (url, hits) = flaky(502, 1, None).await;
-        let policy = UpstreamPolicy {
-            timeout: Duration::from_secs(5),
-            connect_retries: 2,
-            ..UpstreamPolicy::default()
-        };
-        let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
-        let resp = t.send(request(url)).await.unwrap();
-        assert_eq!(
-            resp.status, 502,
-            "default must never replay a reached vendor"
-        );
+        let status = send_with(Vec::new(), url).await;
+        assert_eq!(status, 502, "default must never replay a reached vendor");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "exactly one upstream call");
     }
 

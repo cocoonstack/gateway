@@ -46,6 +46,8 @@ pub enum ConfigError {
     NegativePrice { owner: String },
     #[error("model `{model}` token_rate `{field}` must be finite and >= 0")]
     BadTokenRate { model: String, field: &'static str },
+    #[error("`{owner}` marks non-error status {status} as retryable")]
+    BadRetryStatus { owner: String, status: u16 },
     #[error("stability: bad {field}")]
     BadStability { field: &'static str },
     #[error("model `{model}` variant `{variant}`: {reason}")]
@@ -849,6 +851,14 @@ impl GatewayConfig {
                     owner: format!("account {}", a.name),
                 });
             }
+            // a success status here would replay every response to budget
+            // exhaustion — multiplying vendor calls and billing on all traffic
+            if let Some(&status) = a.retry_status.iter().find(|s| !(400..=599).contains(*s)) {
+                return Err(ConfigError::BadRetryStatus {
+                    owner: format!("account {}", a.name),
+                    status,
+                });
+            }
         }
         for t in &self.tenants {
             for (model, p) in &t.model_prices {
@@ -1472,6 +1482,24 @@ tenants: [{name: t1}, {name: t1}]
                 Err(ConfigError::NegativePrice { .. })
             ),
             "negative prices are rejected at load"
+        );
+
+        for bad in [200, 302, 99, 600] {
+            let replay_ok = format!(
+                "listen: {{host: h, port: 1}}\naccounts: [{{name: a1, provider: p, protocols: [openai-chat], retry_status: [429, {bad}]}}]"
+            );
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&replay_ok),
+                    Err(ConfigError::BadRetryStatus { status, .. }) if status == bad
+                ),
+                "retry_status {bad} is rejected at load"
+            );
+        }
+        let replay_edge = "listen: {host: h, port: 1}\naccounts: [{name: a1, provider: p, protocols: [openai-chat], retry_status: [400, 599]}]";
+        assert!(
+            GatewayConfig::from_yaml(replay_edge).is_ok(),
+            "the 4xx/5xx boundary statuses are accepted"
         );
 
         for bad in [".nan", "-0.5"] {
