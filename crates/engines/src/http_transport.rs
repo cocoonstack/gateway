@@ -37,9 +37,8 @@ impl Default for UpstreamPolicy {
     }
 }
 
-/// The vendor's `Retry-After` seconds, capped against hostile values; an
-/// unparsed header (the HTTP-date form) still waits at least a second; no
-/// header falls back to the connect path's linear backoff.
+/// The vendor's `Retry-After` seconds, capped; unparseable waits at least a
+/// second, absent falls back to the connect path's linear backoff.
 fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
     const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
     const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
@@ -121,15 +120,12 @@ impl Transport for HttpTransport {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| GatewayError::bad_request(format!("bad method: {e}")))?;
-        let (timeout, connect_retries) = {
-            let p = self.policies.load();
-            let policy = p.per_account.get(&req.account).unwrap_or(&p.default);
-            (policy.timeout, policy.connect_retries)
-        };
+        let policy = self.policy_for(&req.account);
+        let timeout = policy.timeout;
         let retry_budget = req
             .replay_account
             .as_ref()
-            .map_or(connect_retries, |account| {
+            .map_or(policy.connect_retries, |account| {
                 account.connect_retries.unwrap_or(DEFAULT_CONNECT_RETRIES)
             });
         let body = bytes::Bytes::from(req.body);

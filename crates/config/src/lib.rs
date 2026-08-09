@@ -850,8 +850,7 @@ impl GatewayConfig {
                     owner: format!("account {}", a.name),
                 });
             }
-            // a success status here would replay every response to budget
-            // exhaustion — multiplying vendor calls and billing on all traffic
+            // a success status here would replay all traffic to budget exhaustion
             if let Some(&status) = a
                 .retry_status
                 .iter()
