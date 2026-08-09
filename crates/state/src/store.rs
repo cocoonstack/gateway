@@ -3300,6 +3300,20 @@ mod tests {
         let store = SqliteStore::open(dir.path().join("content-index.db").to_str().unwrap())
             .await
             .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 512)
+             INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id, tenant,
+                                          kind, content, sealed, expires_at_epoch_secs)
+             SELECT n, 'r' || n, 'ak', CASE WHEN n % 8 = 0 THEN 'u1' ELSE 'other-' || n END,
+                    't1', '', '', 0, 0 FROM seq",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE request_content")
+            .execute(&store.pool)
+            .await
+            .unwrap();
         let plan = sqlx::query(
             "EXPLAIN QUERY PLAN
              SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '',

@@ -139,9 +139,6 @@ pub fn normalize_tool_arguments(calls: &mut Value) {
         let Some(Value::String(args)) = call.pointer_mut("/function/arguments") else {
             continue;
         };
-        if serde_json::from_str::<Value>(args).is_ok() {
-            continue;
-        }
         let mut rest = args.trim_start();
         while let Some(stripped) = rest.strip_prefix("{}") {
             rest = stripped.trim_start();

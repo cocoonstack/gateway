@@ -139,7 +139,7 @@ impl OpenAiEngine {
         let mut resp = GatewayResponse::default();
         let mut full = String::new();
         let r = crate::pump::pump_sse("openai", body, self.base.request.stream_tx.clone(), |v| {
-            apply_sse_event(&v, status, &mut resp, &mut full)
+            apply_sse_event(v, status, &mut resp, &mut full)
         })
         .await?;
         resp.message = full;
@@ -165,12 +165,12 @@ impl ModelEngine for OpenAiEngine {
 /// Apply one decoded SSE event to the accumulating response; returns the
 /// chunks the event yields.
 fn apply_sse_event(
-    v: &Value,
+    mut v: Value,
     status: u16,
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
-    if let Some(err) = crate::engine::vendor_error(status, v) {
+    if let Some(err) = crate::engine::vendor_error(status, &v) {
         return Err(err);
     }
     let mut chunks = Vec::new();
@@ -188,14 +188,61 @@ fn apply_sse_event(
             ..Default::default()
         });
     }
-    if let Some(tc) = delta.get("tool_calls").filter(|t| !t.is_null()) {
-        merge_tool_call_fragments(&mut resp.tool_calls, tc);
-        chunks.push(StreamChunk {
-            tool_calls: Some(tc.clone()),
-            ..Default::default()
-        });
+    let tool_calls = v
+        .pointer_mut("/choices/0/delta/tool_calls")
+        .map(Value::take)
+        .filter(|t| !t.is_null());
+    if let Some(mut tool_calls) = tool_calls {
+        merge_tool_call_fragments(&mut resp.tool_calls, &tool_calls);
+        if let Some(calls) = tool_calls.as_array_mut() {
+            calls.retain_mut(|call| {
+                let Some(fields) = call.as_object_mut() else {
+                    return true;
+                };
+                if let Some(function) = fields.get_mut("function").and_then(Value::as_object_mut) {
+                    function.remove("arguments");
+                }
+                fields.iter().any(|(name, value)| match name.as_str() {
+                    "index" => false,
+                    "function" => value
+                        .as_object()
+                        .is_none_or(|function| !function.is_empty()),
+                    _ => true,
+                })
+            });
+        }
+        if tool_calls.as_array().is_none_or(|calls| !calls.is_empty()) {
+            chunks.push(StreamChunk {
+                tool_calls: Some(tool_calls),
+                ..Default::default()
+            });
+        }
     }
     if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+        if let Some(calls) = resp.tool_calls.as_mut() {
+            crate::engine::normalize_tool_arguments(calls);
+            let arguments: Vec<Value> = calls
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(index, call)| {
+                    call.pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .map(|arguments| {
+                            json!({"index": index, "function": {"arguments": arguments}})
+                        })
+                })
+                .collect();
+            if !arguments.is_empty() {
+                // Arguments are actionable only at finish; emitting them once lets
+                // split vendor fragments be normalized without rebuilding per delta.
+                chunks.push(StreamChunk {
+                    tool_calls: Some(Value::Array(arguments)),
+                    ..Default::default()
+                });
+            }
+        }
         resp.finish_reason = fr.to_owned();
         chunks.push(StreamChunk {
             delta: String::new(),
@@ -394,6 +441,43 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[0]["function"]["name"], "get_weather");
         assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"sf\"}");
+    }
+
+    #[test]
+    fn split_tool_argument_repair_reaches_stream_chunks() {
+        let mut resp = GatewayResponse::default();
+        let mut full = String::new();
+        let events = [
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ls\"}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        let mut chunks = Vec::new();
+        for event in events {
+            chunks.extend(apply_sse_event(event, 200, &mut resp, &mut full).unwrap());
+        }
+        assert_eq!(
+            resp.tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{\"command\":\"ls\"}"
+        );
+        let tool_chunks: Vec<&Value> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.tool_calls.as_ref())
+            .collect();
+        assert_eq!(tool_chunks.len(), 2);
+        assert_eq!(tool_chunks[0][0]["id"], "call_1");
+        assert_eq!(tool_chunks[0][0]["function"]["name"], "shell");
+        let emitted: String = chunks
+            .iter()
+            .filter_map(|chunk| {
+                chunk
+                    .tool_calls
+                    .as_ref()?
+                    .pointer("/0/function/arguments")?
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(emitted, "{\"command\":\"ls\"}");
     }
 
     #[tokio::test]
