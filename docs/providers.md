@@ -72,8 +72,10 @@ models:
 ```
 
 A preset also accepts `endpoint`, `timeout_seconds`, `connect_retries`, and
-`secret_key_env`, inherited by the synthesized account. An explicit `accounts:`
-entry with the same name wins over the preset.
+`secret_key_env`, inherited by every account naming the provider for whatever
+the account leaves unset (an explicit `endpoint: "mock://…"` keeps an account
+on the mock transport). An explicit `accounts:` entry with the same name wins
+over the preset.
 
 ## Going live
 

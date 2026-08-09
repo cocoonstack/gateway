@@ -204,8 +204,9 @@ pub struct AccountConf {
     /// "ptu" (provisioned throughput, preferred) or "paygo" (default).
     #[serde(default)]
     pub tier: String,
-    /// Upstream base URL; empty = mock:// (MockTransport). A real URL routes to
-    /// the real endpoint — going live is a pure config change.
+    /// Upstream base URL; empty = mock:// (MockTransport) unless `provider` names
+    /// a declared provider, whose endpoint is inherited instead. An explicit
+    /// `mock://…` URL opts out of inheritance and stays on the mock transport.
     #[serde(default)]
     pub endpoint: String,
     /// Env var name holding this account's API key (empty = mock credentials);
@@ -726,27 +727,41 @@ impl GatewayConfig {
                     provider: p.name.clone(),
                     kind: p.kind.clone(),
                 })?;
-            if self.accounts.iter().any(|a| a.name == p.name) {
-                continue;
+            if !self.accounts.iter().any(|a| a.name == p.name) {
+                self.accounts.push(AccountConf {
+                    name: p.name.clone(),
+                    provider: p.name.clone(),
+                    priority: 1,
+                    tier: String::new(),
+                    cost_input_price_per_1k_micros: 0,
+                    cost_output_price_per_1k_micros: 0,
+                    timeout_seconds: None,
+                    connect_retries: None,
+                    endpoint: String::new(),
+                    api_key_env: String::new(),
+                    secret_key_env: String::new(),
+                    protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
+                });
             }
-            self.accounts.push(AccountConf {
-                name: p.name.clone(),
-                provider: p.name.clone(),
-                priority: 1,
-                tier: String::new(),
-                cost_input_price_per_1k_micros: 0,
-                cost_output_price_per_1k_micros: 0,
-                timeout_seconds: p.timeout_seconds,
-                connect_retries: p.connect_retries,
-                endpoint: if p.endpoint.is_empty() {
-                    preset.endpoint.to_owned()
-                } else {
-                    p.endpoint.clone()
-                },
-                api_key_env: p.api_key_env.clone(),
-                secret_key_env: p.secret_key_env.clone(),
-                protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
-            });
+            // an empty endpoint here would answer from the mock transport beside
+            // the provider's real one — fabricated replies that read as successes
+            for a in self.accounts.iter_mut().filter(|a| a.provider == p.name) {
+                if a.endpoint.is_empty() {
+                    a.endpoint = if p.endpoint.is_empty() {
+                        preset.endpoint.to_owned()
+                    } else {
+                        p.endpoint.clone()
+                    };
+                }
+                if a.api_key_env.is_empty() {
+                    a.api_key_env = p.api_key_env.clone();
+                }
+                if a.secret_key_env.is_empty() {
+                    a.secret_key_env = p.secret_key_env.clone();
+                }
+                a.timeout_seconds = a.timeout_seconds.or(p.timeout_seconds);
+                a.connect_retries = a.connect_retries.or(p.connect_retries);
+            }
         }
         compile_security(&mut self.security);
         for t in &mut self.tenants {
@@ -1306,6 +1321,47 @@ accounts:
         let preset = cfg.accounts.iter().find(|a| a.name == "openai").unwrap();
         assert_eq!(preset.timeout_seconds, Some(30));
         assert_eq!(preset.connect_retries, Some(3));
+    }
+
+    #[test]
+    fn an_account_naming_a_live_provider_never_keeps_a_mock_endpoint() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+providers:
+  - {name: relay, kind: openai, api_key_env: RELAY_KEY, endpoint: "https://relay.example.com", timeout_seconds: 90}
+  - {name: hosted, kind: anthropic, api_key_env: HOSTED_KEY}
+accounts:
+  - {name: relay-1, provider: relay, priority: 1, protocols: ["openai-chat"]}
+  - {name: relay-2, provider: relay, priority: 2, protocols: ["openai-chat"], endpoint: "https://own.example.com"}
+  - {name: hosted-1, provider: hosted, priority: 1, protocols: ["anthropic-messages"]}
+  - {name: mock-1, provider: undeclared, priority: 1, protocols: ["openai-chat"]}
+  - {name: relay-mock, provider: relay, priority: 3, protocols: ["openai-chat"], endpoint: "mock://api.openai.com"}
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        let by = |n: &str| cfg.accounts.iter().find(|a| a.name == n).unwrap();
+        assert_eq!(by("relay-1").endpoint, "https://relay.example.com");
+        assert_eq!(by("relay-1").api_key_env, "RELAY_KEY");
+        assert_eq!(by("relay-1").timeout_seconds, Some(90));
+        assert_eq!(
+            by("relay-2").endpoint,
+            "https://own.example.com",
+            "an account's own endpoint wins over the provider's"
+        );
+        assert_eq!(
+            by("hosted-1").endpoint,
+            "https://api.anthropic.com",
+            "a provider without an explicit endpoint hands down its preset"
+        );
+        assert_eq!(
+            by("mock-1").endpoint,
+            "",
+            "an account naming no declared provider stays on the mock transport"
+        );
+        assert_eq!(
+            by("relay-mock").endpoint,
+            "mock://api.openai.com",
+            "an explicit mock:// endpoint opts a provider-bound account out of inheritance"
+        );
     }
 
     #[test]
