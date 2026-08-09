@@ -52,7 +52,7 @@ the whole pipeline runs offline in tests:
 | Trait | Default | Alternative |
 |-------|---------|-------------|
 | `Transport` | dispatch (mock in-process, HTTP for real URLs) | force mock / force HTTP |
-| `Store` | in-memory | SQLite (`sqlx`) |
+| `Store` | in-memory | SQLite / Postgres (fleet) |
 | `Governance` | in-memory counters | Redis |
 | `TokenEncoder` | tiktoken cl100k BPE | heuristic fallback |
 

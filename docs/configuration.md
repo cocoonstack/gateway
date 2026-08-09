@@ -140,7 +140,7 @@ models:
 A provider entry expands into an upstream account with the kind's preset
 base URL (overridable via `endpoint:`, e.g. for OpenAI-compatible
 vendors) and served wire types; an explicit account with the same name
-wins. Gemini auth alignment is pending live verification.
+wins.
 
 ### `accounts` — upstream credential slots
 
@@ -248,8 +248,10 @@ trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unf
 (route/status), `gateway_request_duration_seconds`,
 `gateway_node_duration_seconds` (pipeline stage), `gateway_tokens_total`,
 `gateway_cache_hits_total`, `gateway_ledger_write_failures_total`, and
-`gateway_upstream_connect_retries_total` (account) and
-`gateway_upstream_status_retries_total` (account, status). One structured access
+`gateway_upstream_connect_retries_total` (account),
+`gateway_upstream_status_retries_total` (account, status),
+`gateway_thinking_signature_review_total` (result) and
+`gateway_thinking_signature_cache_events_total` (event). One structured access
 log line per successfully served request goes to stdout.
 
 ## Going live against real upstreams

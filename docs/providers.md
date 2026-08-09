@@ -27,6 +27,8 @@ models:
 | `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
 | `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` |
+| `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` |
+| `siliconflow` | `https://api.siliconflow.cn` | openai-chat, embeddings, rerank | `Bearer` |
 
 Any other OpenAI-compatible vendor (Qwen, Ollama, vLLM, a relay) uses
 `kind: openai` with an `endpoint:` override:

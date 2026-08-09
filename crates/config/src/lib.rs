@@ -553,7 +553,7 @@ pub struct RetentionConf {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConf {
     pub name: String,
-    /// openai | anthropic | gemini | deepseek | openrouter
+    /// openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
     pub kind: String,
     #[serde(default)]
     pub api_key_env: String,
@@ -790,7 +790,8 @@ impl GatewayConfig {
         Self::from_yaml(DEFAULT_YAML)
     }
 
-    /// Every wire string must resolve to a known Protocol up front.
+    /// Structural and value invariants checked before use: wire types, prices,
+    /// token-rate weights, retry_status range, quota/variant shape.
     fn validate(&self) -> Result<(), ConfigError> {
         if self.storage.shared_cache && self.storage.redis_url.is_empty() {
             return Err(ConfigError::SharedCacheNeedsRedis);
