@@ -129,7 +129,8 @@ providers:
     kind: openai              # openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
     api_key_env: OPENAI_API_KEY
     # endpoint / timeout_seconds / connect_retries / secret_key_env may be
-    # set here too and are inherited by the synthesized account
+    # set here too and are inherited by every account naming this provider
+    # for whatever the account leaves unset
 models:
   - name: gpt-4o
     provider: openai          # fills the protocol with the kind's default
@@ -150,7 +151,9 @@ accounts:
     priority: 1                # lower = preferred
     tier: ptu                  # ptu (provisioned, preferred) | paygo (default)
     protocols: ["openai-chat", "embeddings"]
-    endpoint: ""               # empty → mock transport; real base URL → real upstream
+    endpoint: ""               # empty → mock transport, or the provider's endpoint when
+                               # `provider` names a declared one; real base URL → real
+                               # upstream; explicit "mock://…" → stays on the mock
     timeout_seconds: 60        # upstream request timeout (default 60)
     connect_retries: 1         # connect-phase retries; an in-flight request is never replayed
                                # timeout_seconds bounds a non-streaming request whole; a streaming
@@ -248,6 +251,9 @@ cargo run -p gw-server
 ```
 
 Accounts with an `endpoint` egress to it; accounts without one are served
-by the in-process mock. `GW_TRANSPORT` overrides the routing: `mock`
-forces zero egress (nothing leaves the process), `http` disables the mock
-so misconfigured accounts fail loudly instead of returning fake data.
+by the in-process mock — unless the account names a declared provider,
+whose endpoint and credentials it then inherits. An explicit
+`endpoint: "mock://…"` opts a provider-bound account back onto the mock.
+`GW_TRANSPORT` overrides the routing: `mock` forces zero egress (nothing
+leaves the process), `http` disables the mock so misconfigured accounts
+fail loudly instead of returning fake data.

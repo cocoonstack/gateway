@@ -205,7 +205,8 @@ pub struct AccountConf {
     #[serde(default)]
     pub tier: String,
     /// Upstream base URL; empty = mock:// (MockTransport) unless `provider` names
-    /// a declared provider, whose endpoint is inherited instead.
+    /// a declared provider, whose endpoint is inherited instead. An explicit
+    /// `mock://…` URL opts out of inheritance and stays on the mock transport.
     #[serde(default)]
     pub endpoint: String,
     /// Env var name holding this account's API key (empty = mock credentials);
@@ -1334,6 +1335,7 @@ accounts:
   - {name: relay-2, provider: relay, priority: 2, protocols: ["openai-chat"], endpoint: "https://own.example.com"}
   - {name: hosted-1, provider: hosted, priority: 1, protocols: ["anthropic-messages"]}
   - {name: mock-1, provider: undeclared, priority: 1, protocols: ["openai-chat"]}
+  - {name: relay-mock, provider: relay, priority: 3, protocols: ["openai-chat"], endpoint: "mock://api.openai.com"}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
         let by = |n: &str| cfg.accounts.iter().find(|a| a.name == n).unwrap();
@@ -1354,6 +1356,11 @@ accounts:
             by("mock-1").endpoint,
             "",
             "an account naming no declared provider stays on the mock transport"
+        );
+        assert_eq!(
+            by("relay-mock").endpoint,
+            "mock://api.openai.com",
+            "an explicit mock:// endpoint opts a provider-bound account out of inheritance"
         );
     }
 
