@@ -46,18 +46,23 @@ impl Default for UpstreamPolicy {
     }
 }
 
-/// How long to wait before replaying a retryable status: the vendor's
-/// `Retry-After` seconds when it sends them (the HTTP-date form falls back to
-/// the connect path's linear backoff, like no header at all), capped so one
-/// hostile header cannot pin a worker for minutes.
+/// The vendor's `Retry-After` seconds, capped against hostile values; an
+/// unparsed header (the HTTP-date form) still waits at least a second; no
+/// header falls back to the connect path's linear backoff.
 fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
     const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
-    headers
+    const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
+    match headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
-        .unwrap_or(RETRY_BACKOFF * attempt)
+    {
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT)),
+        None => RETRY_BACKOFF * attempt,
+    }
 }
 
 /// The default plus per-account upstream policies, swapped as one unit on reload.
@@ -182,7 +187,9 @@ impl Transport for HttpTransport {
                         "status" => resp.status().as_u16().to_string(),
                     )
                     .increment(1);
-                    tokio::time::sleep(status_backoff(resp.headers(), attempt)).await;
+                    let wait = status_backoff(resp.headers(), attempt);
+                    drop(resp);
+                    tokio::time::sleep(wait).await;
                 }
                 Ok(resp) => break resp,
                 Err(e) if e.is_connect() && attempt < connect_retries => {
@@ -343,6 +350,9 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
                 let n = seen.fetch_add(1, Ordering::SeqCst);
                 let (code, extra) = if n < fail_times {
                     (
@@ -422,6 +432,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_streaming_request_replays_declared_statuses_too() {
+        let (url, hits) = flaky(502, 1, None).await;
+        let policy = UpstreamPolicy {
+            timeout: Duration::from_secs(5),
+            connect_retries: 2,
+            retry_status: Arc::from(vec![502u16]),
+        };
+        let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
+        let mut req = request(url);
+        req.stream = true;
+        let resp = t.send(req).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn retry_after_is_honoured_and_capped() {
         let mut h = reqwest::header::HeaderMap::new();
@@ -444,8 +470,8 @@ mod tests {
         );
         assert_eq!(
             status_backoff(&h, 3),
-            RETRY_BACKOFF * 3,
-            "an http-date falls back to backoff"
+            Duration::from_secs(1),
+            "an unparsed header still waits at least a second"
         );
     }
 }

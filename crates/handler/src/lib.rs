@@ -361,8 +361,8 @@ impl OnlineHandler {
         }
     }
 
-    /// Derive the upstream policies (timeouts/connect-retries) from `cfg` and
-    /// apply them to the transport live.
+    /// Derive the per-account upstream policies from `cfg` and apply them to
+    /// the transport live.
     fn push_policies(&self, cfg: &GatewayConfig) {
         let default = UpstreamPolicy::default();
         let per_account: HashMap<String, UpstreamPolicy> = cfg
@@ -371,7 +371,7 @@ impl OnlineHandler {
             .filter(|a| {
                 a.timeout_seconds.is_some()
                     || a.connect_retries.is_some()
-                    || !a.retry_status.is_empty()
+                    || a.retry_status.as_ref().is_some_and(|s| !s.is_empty())
             })
             .map(|a| {
                 (
@@ -382,7 +382,7 @@ impl OnlineHandler {
                             .map(std::time::Duration::from_secs)
                             .unwrap_or(default.timeout),
                         connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
-                        retry_status: Arc::from(a.retry_status.as_slice()),
+                        retry_status: Arc::from(a.retry_status.as_deref().unwrap_or_default()),
                     },
                 )
             })

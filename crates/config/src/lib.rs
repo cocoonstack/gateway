@@ -222,11 +222,10 @@ pub struct AccountConf {
     /// reached the vendor is never replayed unless `retry_status` says so.
     #[serde(default)]
     pub connect_retries: Option<u32>,
-    /// Upstream statuses this vendor issues *before* the model runs, so
-    /// replaying them cannot double-bill (e.g. `[429, 502]` for a relay whose
-    /// 502 means its own upstream call failed). Empty = never replay.
+    /// Statuses this vendor issues before the model runs, so a replay cannot
+    /// double-bill. Unset = inherit the provider's; `[]` = never replay.
     #[serde(default)]
-    pub retry_status: Vec<u16>,
+    pub retry_status: Option<Vec<u16>>,
     /// AWS SigV4 accounts: env var name holding the secret access key (paired with
     /// api_key_env = access key). Leave empty for non-AWS providers.
     #[serde(default)]
@@ -747,7 +746,7 @@ impl GatewayConfig {
                     cost_output_price_per_1k_micros: 0,
                     timeout_seconds: None,
                     connect_retries: None,
-                    retry_status: Vec::new(),
+                    retry_status: None,
                     endpoint: String::new(),
                     api_key_env: String::new(),
                     secret_key_env: String::new(),
@@ -772,8 +771,8 @@ impl GatewayConfig {
                 }
                 a.timeout_seconds = a.timeout_seconds.or(p.timeout_seconds);
                 a.connect_retries = a.connect_retries.or(p.connect_retries);
-                if a.retry_status.is_empty() {
-                    a.retry_status.clone_from(&p.retry_status);
+                if a.retry_status.is_none() {
+                    a.retry_status = Some(p.retry_status.clone());
                 }
             }
         }
@@ -853,7 +852,12 @@ impl GatewayConfig {
             }
             // a success status here would replay every response to budget
             // exhaustion — multiplying vendor calls and billing on all traffic
-            if let Some(&status) = a.retry_status.iter().find(|s| !(400..=599).contains(*s)) {
+            if let Some(&status) = a
+                .retry_status
+                .iter()
+                .flatten()
+                .find(|s| !(400..=599).contains(*s))
+            {
                 return Err(ConfigError::BadRetryStatus {
                     owner: format!("account {}", a.name),
                     status,
@@ -1501,6 +1505,16 @@ tenants: [{name: t1}, {name: t1}]
             GatewayConfig::from_yaml(replay_edge).is_ok(),
             "the 4xx/5xx boundary statuses are accepted"
         );
+
+        let opt_out = "listen: {host: h, port: 1}\nproviders: [{name: relay, kind: openai, retry_status: [502]}]\naccounts: [{name: a1, provider: relay, protocols: [openai-chat], retry_status: []}, {name: a2, provider: relay, protocols: [openai-chat]}]";
+        let cfg = GatewayConfig::from_yaml(opt_out).unwrap();
+        let by = |n: &str| cfg.accounts.iter().find(|a| a.name == n).unwrap();
+        assert_eq!(
+            by("a1").retry_status,
+            Some(Vec::new()),
+            "an explicit [] opts out of the provider's replay list"
+        );
+        assert_eq!(by("a2").retry_status, Some(vec![502]), "unset inherits");
 
         for bad in [".nan", "-0.5"] {
             let bad_rate = format!(

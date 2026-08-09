@@ -154,18 +154,19 @@ accounts:
     endpoint: ""               # empty → mock transport, or the provider's endpoint when
                                # `provider` names a declared one; real base URL → real
                                # upstream; explicit "mock://…" → stays on the mock
-    timeout_seconds: 60        # upstream request timeout (default 60)
+    timeout_seconds: 60        # per-attempt timeout (default 60): bounds a non-streaming
+                               # attempt whole; a streaming one gets it on the headers and
+                               # then per gap between chunks
     connect_retries: 1         # connect-phase retries; also bounds retry_status replays
-    retry_status: [429, 502]   # statuses this vendor issues BEFORE the model runs, so a
-                               # replay cannot double-bill. Empty (the default) means a
-                               # request that reached the vendor is never replayed.
-                               # Replays honour Retry-After capped at 30s per attempt;
-                               # that wait is on top of timeout_seconds, so worst case
-                               # a request occupies (retries+1)×timeout + retries×30s.
-                               # Only 4xx/5xx are accepted here — anything else is
-                               # rejected at load
-                               # timeout_seconds bounds a non-streaming request whole; a streaming
-                               # one gets it on the headers and then per gap between chunks
+    retry_status: []           # statuses this vendor issues BEFORE the model runs, so a
+                               # replay cannot double-bill — e.g. [429, 502] for a relay
+                               # whose 502 means its own upstream call failed. 4xx/5xx
+                               # only; unset inherits the provider's list, [] never
+                               # replays (the default). Replays honour Retry-After capped
+                               # at 30s per attempt on top of each attempt's timeout, so
+                               # worst case ≈ (retries+1)×timeout + retries×30s; statuses
+                               # that outlive the budget still count against account
+                               # health and can fail over to another account
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
     cost_input_price_per_1k_micros: 100   # optional: what this vendor charges us (margin accounting)
