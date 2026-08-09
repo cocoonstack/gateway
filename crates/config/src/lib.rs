@@ -204,8 +204,8 @@ pub struct AccountConf {
     /// "ptu" (provisioned throughput, preferred) or "paygo" (default).
     #[serde(default)]
     pub tier: String,
-    /// Upstream base URL; empty = mock:// (MockTransport). A real URL routes to
-    /// the real endpoint — going live is a pure config change.
+    /// Upstream base URL; empty = mock:// (MockTransport) unless `provider` names
+    /// a declared provider, whose endpoint is inherited instead.
     #[serde(default)]
     pub endpoint: String,
     /// Env var name holding this account's API key (empty = mock credentials);
@@ -720,63 +720,47 @@ impl GatewayConfig {
             })?;
             m.protocol = preset.default_model_wire.to_owned();
         }
-        // An account naming a live provider inherits its endpoint and credentials
-        // for whatever it leaves unset. Without this, an account declared under a
-        // name of its own keeps an empty endpoint and answers from the mock
-        // transport beside the provider's real one — fabricated replies that read
-        // as successes.
-        for a in &mut self.accounts {
-            let Some(p) = self.providers.iter().find(|p| p.name == a.provider) else {
-                continue;
-            };
-            let preset =
-                provider_preset(&p.kind).ok_or_else(|| ConfigError::UnknownProviderKind {
-                    provider: p.name.clone(),
-                    kind: p.kind.clone(),
-                })?;
-            if a.endpoint.is_empty() {
-                a.endpoint = if p.endpoint.is_empty() {
-                    preset.endpoint.to_owned()
-                } else {
-                    p.endpoint.clone()
-                };
-            }
-            if a.api_key_env.is_empty() {
-                a.api_key_env = p.api_key_env.clone();
-            }
-            if a.secret_key_env.is_empty() {
-                a.secret_key_env = p.secret_key_env.clone();
-            }
-            a.timeout_seconds = a.timeout_seconds.or(p.timeout_seconds);
-            a.connect_retries = a.connect_retries.or(p.connect_retries);
-        }
         for p in &self.providers {
             let preset =
                 provider_preset(&p.kind).ok_or_else(|| ConfigError::UnknownProviderKind {
                     provider: p.name.clone(),
                     kind: p.kind.clone(),
                 })?;
-            if self.accounts.iter().any(|a| a.name == p.name) {
-                continue;
+            if !self.accounts.iter().any(|a| a.name == p.name) {
+                self.accounts.push(AccountConf {
+                    name: p.name.clone(),
+                    provider: p.name.clone(),
+                    priority: 1,
+                    tier: String::new(),
+                    cost_input_price_per_1k_micros: 0,
+                    cost_output_price_per_1k_micros: 0,
+                    timeout_seconds: None,
+                    connect_retries: None,
+                    endpoint: String::new(),
+                    api_key_env: String::new(),
+                    secret_key_env: String::new(),
+                    protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
+                });
             }
-            self.accounts.push(AccountConf {
-                name: p.name.clone(),
-                provider: p.name.clone(),
-                priority: 1,
-                tier: String::new(),
-                cost_input_price_per_1k_micros: 0,
-                cost_output_price_per_1k_micros: 0,
-                timeout_seconds: p.timeout_seconds,
-                connect_retries: p.connect_retries,
-                endpoint: if p.endpoint.is_empty() {
-                    preset.endpoint.to_owned()
-                } else {
-                    p.endpoint.clone()
-                },
-                api_key_env: p.api_key_env.clone(),
-                secret_key_env: p.secret_key_env.clone(),
-                protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
-            });
+            // an empty endpoint here would answer from the mock transport beside
+            // the provider's real one — fabricated replies that read as successes
+            for a in self.accounts.iter_mut().filter(|a| a.provider == p.name) {
+                if a.endpoint.is_empty() {
+                    a.endpoint = if p.endpoint.is_empty() {
+                        preset.endpoint.to_owned()
+                    } else {
+                        p.endpoint.clone()
+                    };
+                }
+                if a.api_key_env.is_empty() {
+                    a.api_key_env = p.api_key_env.clone();
+                }
+                if a.secret_key_env.is_empty() {
+                    a.secret_key_env = p.secret_key_env.clone();
+                }
+                a.timeout_seconds = a.timeout_seconds.or(p.timeout_seconds);
+                a.connect_retries = a.connect_retries.or(p.connect_retries);
+            }
         }
         compile_security(&mut self.security);
         for t in &mut self.tenants {
@@ -1349,6 +1333,7 @@ accounts:
   - {name: relay-1, provider: relay, priority: 1, protocols: ["openai-chat"]}
   - {name: relay-2, provider: relay, priority: 2, protocols: ["openai-chat"], endpoint: "https://own.example.com"}
   - {name: hosted-1, provider: hosted, priority: 1, protocols: ["anthropic-messages"]}
+  - {name: mock-1, provider: undeclared, priority: 1, protocols: ["openai-chat"]}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
         let by = |n: &str| cfg.accounts.iter().find(|a| a.name == n).unwrap();
@@ -1365,9 +1350,10 @@ accounts:
             "https://api.anthropic.com",
             "a provider without an explicit endpoint hands down its preset"
         );
-        assert!(
-            !cfg.accounts.iter().any(|a| a.endpoint.is_empty()),
-            "no account that names a live provider may be left on the mock transport"
+        assert_eq!(
+            by("mock-1").endpoint,
+            "",
+            "an account naming no declared provider stays on the mock transport"
         );
     }
 
