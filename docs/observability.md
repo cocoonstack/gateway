@@ -13,6 +13,7 @@
 | `gateway_cache_hits_total` | counter | — |
 | `gateway_ledger_write_failures_total` | counter | — |
 | `gateway_upstream_connect_retries_total` | counter | `account` |
+| `gateway_upstream_status_retries_total` | counter | `account`, `status` |
 | `gateway_thinking_signature_review_total` | counter | `result` (match/mismatch/miss/no_evidence) |
 | `gateway_thinking_signature_cache_events_total` | counter | `event` |
 
