@@ -177,71 +177,38 @@ fn apply_sse_event(
     if resp.model.is_empty() {
         resp.model = v["model"].as_str().unwrap_or_default().to_owned();
     }
-    let delta = &v["choices"][0]["delta"];
-    if let Some(text) = delta["content"].as_str()
-        && !text.is_empty()
+    let mut tool_calls = None;
+    if let Some(delta) = v
+        .get_mut("choices")
+        .and_then(|choices| choices.get_mut(0))
+        .and_then(|choice| choice.get_mut("delta"))
     {
-        full.push_str(text);
-        chunks.push(StreamChunk {
-            delta: text.to_owned(),
-            finish_reason: None,
-            ..Default::default()
-        });
-    }
-    let tool_calls = v
-        .pointer_mut("/choices/0/delta/tool_calls")
-        .map(Value::take)
-        .filter(|t| !t.is_null());
-    if let Some(mut tool_calls) = tool_calls {
-        merge_tool_call_fragments(&mut resp.tool_calls, &tool_calls);
-        if let Some(calls) = tool_calls.as_array_mut() {
-            calls.retain_mut(|call| {
-                let Some(fields) = call.as_object_mut() else {
-                    return true;
-                };
-                if let Some(function) = fields.get_mut("function").and_then(Value::as_object_mut) {
-                    function.remove("arguments");
-                }
-                fields.iter().any(|(name, value)| match name.as_str() {
-                    "index" => false,
-                    "function" => value
-                        .as_object()
-                        .is_none_or(|function| !function.is_empty()),
-                    _ => true,
-                })
-            });
-        }
-        if tool_calls.as_array().is_none_or(|calls| !calls.is_empty()) {
+        if let Some(Value::String(text)) = delta.get_mut("content").map(Value::take)
+            && !text.is_empty()
+        {
+            full.push_str(&text);
             chunks.push(StreamChunk {
-                tool_calls: Some(tool_calls),
+                delta: text,
+                finish_reason: None,
                 ..Default::default()
             });
         }
+        tool_calls = delta
+            .get_mut("tool_calls")
+            .map(Value::take)
+            .filter(|t| !t.is_null());
+    }
+    if let Some(mut tool_calls) = tool_calls {
+        withhold_block_open_arguments(&mut tool_calls);
+        merge_tool_call_fragments(&mut resp.tool_calls, &tool_calls);
+        chunks.push(StreamChunk {
+            tool_calls: Some(tool_calls),
+            ..Default::default()
+        });
     }
     if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
-        if let Some(calls) = resp.tool_calls.as_mut() {
-            crate::engine::normalize_tool_arguments(calls);
-            let arguments: Vec<Value> = calls
-                .as_array()
-                .into_iter()
-                .flatten()
-                .enumerate()
-                .filter_map(|(index, call)| {
-                    call.pointer("/function/arguments")
-                        .and_then(Value::as_str)
-                        .map(|arguments| {
-                            json!({"index": index, "function": {"arguments": arguments}})
-                        })
-                })
-                .collect();
-            if !arguments.is_empty() {
-                // Arguments are actionable only at finish; emitting them once lets
-                // split vendor fragments be normalized without rebuilding per delta.
-                chunks.push(StreamChunk {
-                    tool_calls: Some(Value::Array(arguments)),
-                    ..Default::default()
-                });
-            }
+        if let Some(chunk) = reemit_withheld_arguments(resp.tool_calls.as_mut()) {
+            chunks.push(chunk);
         }
         resp.finish_reason = fr.to_owned();
         chunks.push(StreamChunk {
@@ -256,6 +223,48 @@ fn apply_sse_event(
     Ok(chunks)
 }
 
+/// Hold back the `arguments: "{}"` some vendors open a tool call with — the
+/// client would otherwise concatenate it onto the real object that follows.
+fn withhold_block_open_arguments(fragment: &mut Value) {
+    let Some(frags) = fragment.as_array_mut() else {
+        return;
+    };
+    for f in frags {
+        if f.get("id").is_none()
+            && f.get("function")
+                .and_then(|func| func.get("name"))
+                .is_none()
+        {
+            continue;
+        }
+        if let Some(function) = f.get_mut("function").and_then(Value::as_object_mut)
+            && function.get("arguments").and_then(Value::as_str) == Some("{}")
+        {
+            function.remove("arguments");
+        }
+    }
+}
+
+/// Close out [`withhold_block_open_arguments`]: an opened call still missing
+/// its arguments at finish really took none — deliver its `{}`.
+fn reemit_withheld_arguments(acc: Option<&mut Value>) -> Option<StreamChunk> {
+    let calls = acc?.as_array_mut()?;
+    let mut withheld = Vec::new();
+    for (index, call) in calls.iter_mut().enumerate() {
+        let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if !function.contains_key("arguments") {
+            function.insert("arguments".to_owned(), json!("{}"));
+            withheld.push(json!({"index": index, "function": {"arguments": "{}"}}));
+        }
+    }
+    (!withheld.is_empty()).then(|| StreamChunk {
+        tool_calls: Some(Value::Array(withheld)),
+        ..Default::default()
+    })
+}
+
 /// OpenAI streams tool calls as fragments keyed by `index`: the first fragment
 /// of a call carries id/type/function.name, later ones append to
 /// function.arguments. Overwriting would keep only the last fragment.
@@ -268,11 +277,12 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
         return;
     };
     for f in frags {
+        // an index-less fragment continues the open call; indices stay contiguous
         let idx = f["index"]
             .as_u64()
-            .map(|i| i as usize)
-            .unwrap_or(calls.len());
-        while calls.len() <= idx {
+            .map_or(calls.len().saturating_sub(1), |i| i as usize)
+            .min(calls.len());
+        if idx == calls.len() {
             calls.push(json!({"function": {}}));
         }
         let call = &mut calls[idx];
@@ -444,40 +454,96 @@ mod tests {
     }
 
     #[test]
-    fn split_tool_argument_repair_reaches_stream_chunks() {
-        let mut resp = GatewayResponse::default();
-        let mut full = String::new();
-        let events = [
+    fn an_index_less_fragment_continues_the_open_call() {
+        let mut acc = None;
+        merge_tool_call_fragments(
+            &mut acc,
+            &json!([{"id":"call_1","function":{"name":"shell","arguments":"{\"a"}}]),
+        );
+        merge_tool_call_fragments(&mut acc, &json!([{"function":{"arguments":"\":1}"}}]));
+        let calls = acc.unwrap();
+        assert_eq!(calls.as_array().unwrap().len(), 1);
+        assert_eq!(calls[0]["function"]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_far_index_extends_the_accumulator_by_one_slot() {
+        let mut acc = None;
+        merge_tool_call_fragments(
+            &mut acc,
+            &json!([{"index":900_000_000,"function":{"arguments":"{}"}}]),
+        );
+        assert_eq!(acc.unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_split_block_open_never_reaches_the_wire() {
+        let (chunks, resp) = stream_events([
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}),
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ls\"}"}}]}}]}),
             json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
-        ];
+        ]);
+        assert_eq!(emitted_arguments(&chunks), "{\"command\":\"ls\"}");
+        let opener = chunks[0].tool_calls.as_ref().unwrap();
+        assert_eq!(opener[0]["id"], "call_1");
+        assert_eq!(opener[0]["function"]["name"], "shell");
+        assert_eq!(
+            resp.tool_calls.unwrap()[0]["function"]["arguments"],
+            "{\"command\":\"ls\"}"
+        );
+    }
+
+    #[test]
+    fn a_conforming_no_arg_call_is_not_doubled() {
+        let (chunks, resp) = stream_events([
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"now","arguments":""}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        assert_eq!(emitted_arguments(&chunks), "{}");
+        assert_eq!(resp.tool_calls.unwrap()[0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn conforming_argument_fragments_still_stream_one_by_one() {
+        let (chunks, _) = stream_events([
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"comm"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ls\"}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        assert_eq!(chunks.iter().filter(|c| c.tool_calls.is_some()).count(), 3);
+        assert_eq!(emitted_arguments(&chunks), "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn a_no_argument_call_delivers_its_empty_object_once() {
+        let (chunks, resp) = stream_events([
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"now","arguments":"{}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"total_tokens":3}}),
+        ]);
+        assert_eq!(emitted_arguments(&chunks), "{}");
+        assert_eq!(resp.tool_calls.unwrap()[0]["function"]["arguments"], "{}");
+    }
+
+    fn stream_events<const N: usize>(events: [Value; N]) -> (Vec<StreamChunk>, GatewayResponse) {
+        let mut resp = GatewayResponse::default();
+        let mut full = String::new();
         let mut chunks = Vec::new();
         for event in events {
             chunks.extend(apply_sse_event(event, 200, &mut resp, &mut full).unwrap());
         }
-        assert_eq!(
-            resp.tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
-            "{\"command\":\"ls\"}"
-        );
-        let tool_chunks: Vec<&Value> = chunks
+        (chunks, resp)
+    }
+
+    fn emitted_arguments(chunks: &[StreamChunk]) -> String {
+        chunks
             .iter()
-            .filter_map(|chunk| chunk.tool_calls.as_ref())
-            .collect();
-        assert_eq!(tool_chunks.len(), 2);
-        assert_eq!(tool_chunks[0][0]["id"], "call_1");
-        assert_eq!(tool_chunks[0][0]["function"]["name"], "shell");
-        let emitted: String = chunks
-            .iter()
-            .filter_map(|chunk| {
-                chunk
-                    .tool_calls
-                    .as_ref()?
-                    .pointer("/0/function/arguments")?
-                    .as_str()
-            })
-            .collect();
-        assert_eq!(emitted, "{\"command\":\"ls\"}");
+            .filter_map(|chunk| chunk.tool_calls.as_ref()?.as_array())
+            .flatten()
+            .filter_map(|call| call.pointer("/function/arguments")?.as_str())
+            .collect()
     }
 
     #[tokio::test]
