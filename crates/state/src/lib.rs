@@ -383,6 +383,8 @@ impl AccountPool {
                     priority: a.priority,
                     tier: a.tier.clone(),
                     endpoint: a.endpoint.clone(),
+                    connect_retries: a.connect_retries,
+                    retry_status: a.retry_status.clone().unwrap_or_default(),
                     api_key_env: a.api_key_env.clone(),
                     secret_key_env: a.secret_key_env.clone(),
                     cost_input_price_per_1k_micros: a.cost_input_price_per_1k_micros,

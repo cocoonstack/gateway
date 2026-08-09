@@ -200,10 +200,11 @@ reload, config-publish, and the cross-tenant `/admin/audit/ops` trail answer
 
 A reload rebuilds the AK table (config keys), models, providers, tenants, and
 accounts while preserving the runtime seams — governance counters, the durable
-store, account health, and the response cache. Per-account upstream policy
-(`timeout_seconds` / `connect_retries`) is pushed into the live transport, and
-the response cache is invalidated (a reload may remap a model), so a published
-change takes effect without a restart. Storage-backend URL changes
+store, account health, and the response cache. Per-account timeout/connect
+policy is refreshed in the live transport; `retry_status` stays on the selected
+account snapshot so an in-flight request cannot borrow another vendor's replay
+permission. The response cache is invalidated (a reload may remap a model), so
+a published change takes effect without a restart. Storage-backend URL changes
 (`storage.postgres_url` / `redis_url` / `sqlite_path`) still need a restart.
 Reload is also triggered by `SIGHUP` and, with the Postgres config store, by
 any instance publishing via `PUT /admin/config`.

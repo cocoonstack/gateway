@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 pub const MOCK_CREATED: i64 = 1_720_000_000;
 /// 1x1 PNG-ish placeholder bytes, base64. Deterministic image/audio payload.
 pub const MOCK_B64: &str = "TU9DS0JZVEVT"; // "MOCKBYTES"
+pub(crate) const DEFAULT_CONNECT_RETRIES: u32 = 1;
 
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct UpstreamRequest {
     pub stream: bool,
     /// upstream account slot handling this call (used by failover/downtime simulation).
     pub account: String,
+    /// Selected account snapshot when it permits status replay.
+    pub replay_account: Option<Arc<gw_models::Account>>,
 }
 
 /// A live-stream item failure: a transport fault or one of our deadlines.

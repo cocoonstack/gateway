@@ -71,10 +71,11 @@ models:
     protocol: dashscope
 ```
 
-A preset also accepts `endpoint`, `timeout_seconds`, `connect_retries`, and
+A preset also accepts `endpoint`, `timeout_seconds`, `connect_retries`, `retry_status`, and
 `secret_key_env`, inherited by every account naming the provider for whatever
 the account leaves unset (an explicit `endpoint: "mock://…"` keeps an account
-on the mock transport). An explicit `accounts:` entry with the same name wins
+on the mock transport; an explicit `retry_status: []` disables replays the
+provider declared). An explicit `accounts:` entry with the same name wins
 over the preset.
 
 ## Going live

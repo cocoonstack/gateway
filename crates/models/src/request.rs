@@ -187,6 +187,10 @@ pub mod domain {
         /// upstream base URL; empty = the engine's `mock://…` sentinel. A real
         /// URL routes over HttpTransport — going live is a pure config change.
         pub endpoint: String,
+        /// Connect/status retry budget; unset uses the transport default.
+        pub connect_retries: Option<u32>,
+        /// Statuses this account's vendor declares safe to replay.
+        pub retry_status: Vec<u16>,
         /// env var holding this account's API key (empty = mock creds), read at
         /// request time; for AWS it holds the access key id (see `secret_key_env`).
         pub api_key_env: String,
