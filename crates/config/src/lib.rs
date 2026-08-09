@@ -720,6 +720,36 @@ impl GatewayConfig {
             })?;
             m.protocol = preset.default_model_wire.to_owned();
         }
+        // An account naming a live provider inherits its endpoint and credentials
+        // for whatever it leaves unset. Without this, an account declared under a
+        // name of its own keeps an empty endpoint and answers from the mock
+        // transport beside the provider's real one — fabricated replies that read
+        // as successes.
+        for a in &mut self.accounts {
+            let Some(p) = self.providers.iter().find(|p| p.name == a.provider) else {
+                continue;
+            };
+            let preset =
+                provider_preset(&p.kind).ok_or_else(|| ConfigError::UnknownProviderKind {
+                    provider: p.name.clone(),
+                    kind: p.kind.clone(),
+                })?;
+            if a.endpoint.is_empty() {
+                a.endpoint = if p.endpoint.is_empty() {
+                    preset.endpoint.to_owned()
+                } else {
+                    p.endpoint.clone()
+                };
+            }
+            if a.api_key_env.is_empty() {
+                a.api_key_env = p.api_key_env.clone();
+            }
+            if a.secret_key_env.is_empty() {
+                a.secret_key_env = p.secret_key_env.clone();
+            }
+            a.timeout_seconds = a.timeout_seconds.or(p.timeout_seconds);
+            a.connect_retries = a.connect_retries.or(p.connect_retries);
+        }
         for p in &self.providers {
             let preset =
                 provider_preset(&p.kind).ok_or_else(|| ConfigError::UnknownProviderKind {
@@ -1306,6 +1336,39 @@ accounts:
         let preset = cfg.accounts.iter().find(|a| a.name == "openai").unwrap();
         assert_eq!(preset.timeout_seconds, Some(30));
         assert_eq!(preset.connect_retries, Some(3));
+    }
+
+    #[test]
+    fn an_account_naming_a_live_provider_never_keeps_a_mock_endpoint() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+providers:
+  - {name: relay, kind: openai, api_key_env: RELAY_KEY, endpoint: "https://relay.example.com", timeout_seconds: 90}
+  - {name: hosted, kind: anthropic, api_key_env: HOSTED_KEY}
+accounts:
+  - {name: relay-1, provider: relay, priority: 1, protocols: ["openai-chat"]}
+  - {name: relay-2, provider: relay, priority: 2, protocols: ["openai-chat"], endpoint: "https://own.example.com"}
+  - {name: hosted-1, provider: hosted, priority: 1, protocols: ["anthropic-messages"]}
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        let by = |n: &str| cfg.accounts.iter().find(|a| a.name == n).unwrap();
+        assert_eq!(by("relay-1").endpoint, "https://relay.example.com");
+        assert_eq!(by("relay-1").api_key_env, "RELAY_KEY");
+        assert_eq!(by("relay-1").timeout_seconds, Some(90));
+        assert_eq!(
+            by("relay-2").endpoint,
+            "https://own.example.com",
+            "an account's own endpoint wins over the provider's"
+        );
+        assert_eq!(
+            by("hosted-1").endpoint,
+            "https://api.anthropic.com",
+            "a provider without an explicit endpoint hands down its preset"
+        );
+        assert!(
+            !cfg.accounts.iter().any(|a| a.endpoint.is_empty()),
+            "no account that names a live provider may be left on the mock transport"
+        );
     }
 
     #[test]
