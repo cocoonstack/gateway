@@ -542,9 +542,8 @@ pub fn realtime_frame_scan(
     let redact = (sec.dlp_redact || sec.detect_secrets) && !collect_text;
     let mut counts = ScanCounts::new(sec);
     let mut text = String::new();
-    let mut redacted = 0;
-    if scan_rules || collect_text || redact {
-        redacted = gw_engines::realtime::visit_frame_text(frame, &mut |s| {
+    let redacted = if scan_rules || collect_text {
+        gw_engines::realtime::visit_frame_text(frame, &mut |s| {
             if scan_rules {
                 counts.visit(s);
             }
@@ -556,8 +555,10 @@ pub fn realtime_frame_scan(
             } else {
                 0
             }
-        });
-    }
+        })
+    } else {
+        dlp_redact_realtime_frame(sec, frame)
+    };
     (counts.outcome(), text, redacted)
 }
 
@@ -1177,6 +1178,25 @@ mod tests {
             1,
             "the scan must see the pre-redaction text"
         );
+        assert_eq!(redacted, 1);
+        assert!(
+            frame["text"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_SECRET]")
+        );
+    }
+
+    #[test]
+    fn a_dlp_only_tenant_still_redacts_through_the_scan_seam() {
+        let s = SecurityConf {
+            detect_secrets: true,
+            ..Default::default()
+        };
+        let mut frame = serde_json::json!({
+            "type":"input_text","text":"key sk-abcdefghijklmnopqrstuvwxyz012345"
+        });
+        let (_, _, redacted) = realtime_frame_scan(&s, &mut frame, false);
         assert_eq!(redacted, 1);
         assert!(
             frame["text"]
