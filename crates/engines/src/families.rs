@@ -385,7 +385,6 @@ impl ModelEngine for ImageEngine {
     }
 }
 
-/// Which audio surface this engine serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioKind {
     Tts,

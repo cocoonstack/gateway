@@ -355,7 +355,6 @@ impl QuotaStore {
         settle_on(&mut slot_mut(&self.used, key, || 0), delta);
     }
 
-    /// Daily reset.
     pub fn reset_all(&self) {
         self.used.clear();
     }

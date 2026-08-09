@@ -48,7 +48,6 @@ const REALTIME_TURN_RESERVE: i64 = 1_000;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// A boxed future resolving to a freshly loaded config.
 pub type ConfigFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<GatewayConfig, String>> + Send>>;
 /// Reloads config from its source (file or the Postgres config store).
@@ -574,7 +573,7 @@ async fn realtime_session(
                         continue;
                     }
                 };
-                let input = ev["text"].as_str().unwrap_or_default().to_owned();
+                let input = ev["text"].as_str().unwrap_or_default();
                 let reply = format!("[mock-realtime:{}] you said: {input}", rtm.served);
                 let (it, ot) = (
                     (input.len() as i64 / 4).max(1) + 3,

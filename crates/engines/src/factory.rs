@@ -16,7 +16,6 @@ use crate::families::{
 use crate::openai_engine::OpenAiEngine;
 use crate::transport::SharedTransport;
 
-/// Build the engine for a request.
 pub fn get_engine(
     request: GatewayRequest,
     transport: SharedTransport,

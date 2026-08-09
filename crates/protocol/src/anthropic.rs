@@ -74,7 +74,6 @@ pub fn blocks_text(blocks: &[Value]) -> String {
         .collect()
 }
 
-/// Output content block: text or tool_use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {

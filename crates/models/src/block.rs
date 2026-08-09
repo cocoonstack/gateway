@@ -1,6 +1,5 @@
 //! The content-safety verdict (`Block`).
 
-/// Content-safety verdict.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub block: bool,

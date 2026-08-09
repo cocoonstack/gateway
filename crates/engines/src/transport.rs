@@ -196,7 +196,7 @@ impl MockTransport {
 
     fn openai_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "openai")?;
-        let model = body["model"].as_str().unwrap_or("mock-model").to_owned();
+        let model = body["model"].as_str().unwrap_or("mock-model");
         let empty = Vec::new();
         let msgs = body["messages"].as_array().unwrap_or(&empty);
         let user = Self::last_user_text(msgs);
@@ -212,7 +212,7 @@ impl MockTransport {
         if let Some(first_tool) = body["tools"].as_array().and_then(|t| t.first()) {
             let name = first_tool["function"]["name"].as_str().unwrap_or("tool");
             let call = json!({"id":"call-mock-1","type":"function",
-                "function":{"name":name,"arguments":format!("{{\"echo\":{}}}", Value::String(user.clone()))}});
+                "function":{"name":name,"arguments":format!("{{\"echo\":{}}}", Value::String(user))}});
             if req.stream {
                 let frames = [
                     json!({"id":"chatcmpl-mock","object":"chat.completion.chunk","created":MOCK_CREATED,"model":model,
@@ -287,7 +287,7 @@ impl MockTransport {
 
     fn anthropic_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "anthropic")?;
-        let model = body["model"].as_str().unwrap_or("mock-claude").to_owned();
+        let model = body["model"].as_str().unwrap_or("mock-claude");
         let user = Self::last_user_text(body["messages"].as_array().unwrap_or(&vec![]));
         let sys = body["system"].as_str().unwrap_or_default();
         let sys_note = if sys.is_empty() {
@@ -395,26 +395,25 @@ impl MockTransport {
             .as_array()
             .and_then(|ms| ms.iter().rev().find(|m| m["sender_type"] == "USER"))
             .and_then(|m| m["text"].as_str())
-            .unwrap_or_default()
-            .to_owned();
+            .unwrap_or_default();
         let reply = format!("[mock-minimax] you said: {user}");
         Self::ok_json(json!({
             "created": MOCK_CREATED, "model": body["model"],
             "reply": reply,
             "choices": [{"text": reply}],
-            "usage": {"total_tokens": Self::tokens(&user) + Self::tokens(&reply) + 3},
+            "usage": {"total_tokens": Self::tokens(user) + Self::tokens(&reply) + 3},
             "base_resp": {"status_code": 0, "status_msg": ""}
         }))
     }
 
     fn cohere_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "cohere")?;
-        let user = body["message"].as_str().unwrap_or_default().to_owned();
+        let user = body["message"].as_str().unwrap_or_default();
         let reply = format!("[mock-cohere] you said: {user}");
         Self::ok_json(json!({
             "response_id": "cohere-mock", "generation_id": "gen-mock",
             "text": reply, "finish_reason": "COMPLETE",
-            "meta": {"tokens": {"input_tokens": Self::tokens(&user) + 3,
+            "meta": {"tokens": {"input_tokens": Self::tokens(user) + 3,
                                   "output_tokens": Self::tokens(&reply)}}
         }))
     }
@@ -469,12 +468,9 @@ impl MockTransport {
 
     fn embeddings_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "embeddings")?;
-        let inputs: Vec<String> = match &body["input"] {
-            Value::String(s) => vec![s.clone()],
-            Value::Array(a) => a
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect(),
+        let inputs: Vec<&str> = match &body["input"] {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
             _ => vec![],
         };
         // deterministic 8-dim vector from byte sums
@@ -576,7 +572,7 @@ impl MockTransport {
 
     fn search_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "search")?;
-        let q = body["query"].as_str().unwrap_or("").to_owned();
+        let q = body["query"].as_str().unwrap_or("");
         let n = body["count"].as_i64().unwrap_or(3).clamp(1, 10);
         let results: Vec<Value> = (0..n)
             .map(|i| {
@@ -597,7 +593,7 @@ impl MockTransport {
     /// `choices[].text` (not chat's message.content), usage same as openai.
     fn completions_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "completions")?;
-        let model = body["model"].as_str().unwrap_or("mock-model").to_owned();
+        let model = body["model"].as_str().unwrap_or("mock-model");
         let prompt = body["prompt"].as_str().unwrap_or_default();
         let reply = format!("[mock-completions:{model}] you said: {prompt}");
         let (pt, ct) = (Self::tokens(prompt) + 3, Self::tokens(&reply));
@@ -616,8 +612,8 @@ impl MockTransport {
     fn responses_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "responses")?;
         // `input` may be a plain string or an array of input items.
-        let input: String = match &body["input"] {
-            Value::String(s) => s.clone(),
+        let input: std::borrow::Cow<str> = match &body["input"] {
+            Value::String(s) => s.as_str().into(),
             Value::Array(items) => items
                 .iter()
                 .filter_map(|it| {
@@ -628,8 +624,9 @@ impl MockTransport {
                     })
                 })
                 .collect::<Vec<_>>()
-                .join(""),
-            _ => String::new(),
+                .join("")
+                .into(),
+            _ => "".into(),
         };
         let model = body["model"].as_str().unwrap_or("responses");
         let reply = format!("[mock-responses:{model}] you said: {input}");

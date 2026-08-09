@@ -7,7 +7,6 @@ use std::fmt;
 
 use gw_consts::ErrCode;
 
-/// Result alias used across the gateway.
 pub type GResult<T> = Result<T, GatewayError>;
 
 /// A gateway error: a stable numeric code, an HTTP status to surface, a
@@ -54,7 +53,6 @@ impl GatewayError {
         Self::new(ErrCode::SYSTEM_ERROR, 499, message)
     }
 
-    /// Attach an underlying cause.
     pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.source = Some(Box::new(source));
         self

@@ -27,7 +27,6 @@ const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Runs one request through the plugin pre-stage, the DAG, and the plugin post-stage.
 #[derive(Clone)]
 pub struct OnlineHandler {
     pub config: SharedConfig,

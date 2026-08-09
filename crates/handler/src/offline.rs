@@ -205,7 +205,7 @@ impl OfflineHandler {
                 ok: false,
                 message,
                 total_tokens: 0,
-                user: user.clone(),
+                user: String::new(),
             };
             let result = match ran {
                 Ok(Ok(ctx)) => match ctx.outcome {
@@ -214,13 +214,14 @@ impl OfflineHandler {
                         ok: true,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
-                        user: user.clone(),
+                        user: String::new(),
                     },
                     None => fail("pipeline produced no outcome".into()),
                 },
                 Ok(Err(e)) => fail(e.to_string()),
                 Err(join_err) => fail(format!("item task failed: {join_err}")),
             };
+            let result = BatchItemResult { user, ..result };
             // if we lost the claim mid-run, don't persist — the new owner is authoritative
             if lost.load(Relaxed) {
                 break;

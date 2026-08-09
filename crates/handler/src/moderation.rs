@@ -42,7 +42,6 @@ impl Moderator for AllowModerator {
     }
 }
 
-/// The default moderator handle.
 pub fn default_moderator() -> Arc<dyn Moderator> {
     Arc::new(AllowModerator)
 }

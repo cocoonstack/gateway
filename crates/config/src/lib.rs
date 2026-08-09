@@ -298,7 +298,6 @@ pub struct SecurityConf {
     /// On a moderator error, admit the request (`true`) or deny it (`false`).
     #[serde(default)]
     pub moderation_fail_open: bool,
-    /// Named regex recognizers.
     #[serde(default)]
     pub regex_rules: Vec<RegexRule>,
     /// Compiled `regex_rules`, built at config load (rules that fail to compile
@@ -785,7 +784,6 @@ impl GatewayConfig {
         Ok(())
     }
 
-    /// The embedded conf/gateway.yaml.
     pub fn embedded_default() -> Result<Self, ConfigError> {
         Self::from_yaml(DEFAULT_YAML)
     }
