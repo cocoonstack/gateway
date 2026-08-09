@@ -290,6 +290,7 @@ async fn per_account_policy_and_connect_retry() {
         UpstreamPolicy {
             timeout: Duration::from_secs(5),
             connect_retries: 2,
+            ..UpstreamPolicy::default()
         },
     );
     let transport = HttpTransport::with_policies(UpstreamPolicy::default(), per_account).unwrap();
@@ -302,6 +303,7 @@ async fn per_account_policy_and_connect_retry() {
         UpstreamPolicy {
             timeout: Duration::from_secs(9),
             connect_retries: 5,
+            ..UpstreamPolicy::default()
         },
     );
     Transport::reload_policies(&transport, UpstreamPolicy::default(), reloaded);

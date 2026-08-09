@@ -7,6 +7,7 @@
 //! engines decode incrementally or drain via `UpstreamResponse::buffered`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gw_models::{GResult, GatewayError};
@@ -21,13 +22,21 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // retry predicate covers — instead of burning the whole request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-account upstream policy: request timeout and how many times a
-/// connect-phase failure is retried (a request that reached the vendor is
-/// never replayed — LLM calls are not idempotent).
-#[derive(Debug, Clone, Copy)]
+/// Per-account upstream policy: request timeout, how many times a
+/// connect-phase failure is retried, and which upstream statuses may be
+/// retried on top of that.
+///
+/// A request that reached the vendor is never replayed on its own — LLM calls
+/// are not idempotent, and a replayed generation double-bills. `retry_status`
+/// is the operator's declaration that, for *this* vendor, those statuses are
+/// refusals issued before the model ran (a 429 throttle, or an edge 502 whose
+/// body says its own upstream call failed), so replaying them is safe. Empty
+/// by default: the gateway never decides this for the operator.
+#[derive(Debug, Clone)]
 pub struct UpstreamPolicy {
     pub timeout: Duration,
     pub connect_retries: u32,
+    pub retry_status: Arc<[u16]>,
 }
 
 impl Default for UpstreamPolicy {
@@ -35,8 +44,23 @@ impl Default for UpstreamPolicy {
         Self {
             timeout: Duration::from_secs(60),
             connect_retries: 1,
+            retry_status: Arc::from([] as [u16; 0]),
         }
     }
+}
+
+/// How long to wait before replaying a retryable status: the vendor's
+/// `Retry-After` (seconds, or an HTTP date we only read as "at least a
+/// second") when it sends one, else the same linear backoff the connect path
+/// uses. Capped so one hostile header cannot pin a worker for minutes.
+fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+        .unwrap_or(RETRY_BACKOFF * attempt)
 }
 
 /// The default plus per-account upstream policies, swapped as one unit on reload.
@@ -84,7 +108,10 @@ impl HttpTransport {
 
     pub fn policy_for(&self, account: &str) -> UpstreamPolicy {
         let p = self.policies.load();
-        p.per_account.get(account).copied().unwrap_or(p.default)
+        p.per_account
+            .get(account)
+            .cloned()
+            .unwrap_or_else(|| p.default.clone())
     }
 }
 
@@ -137,6 +164,19 @@ impl Transport for HttpTransport {
                 sent.await
             };
             match result {
+                Ok(resp)
+                    if policy.retry_status.contains(&resp.status().as_u16())
+                        && attempt < policy.connect_retries =>
+                {
+                    attempt += 1;
+                    metrics::counter!(
+                        "gateway_upstream_status_retries_total",
+                        "account" => req.account.clone(),
+                        "status" => resp.status().as_u16().to_string(),
+                    )
+                    .increment(1);
+                    tokio::time::sleep(status_backoff(resp.headers(), attempt)).await;
+                }
                 Ok(resp) => break resp,
                 Err(e) if e.is_connect() && attempt < policy.connect_retries => {
                     attempt += 1;
@@ -275,5 +315,143 @@ impl Transport for DispatchTransport {
         } else {
             self.http.send(req).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// A one-shot server that answers `fail_times` requests with `status`, then
+    /// 200, counting what it saw.
+    async fn flaky(
+        status: u16,
+        fail_times: u32,
+        retry_after: Option<&'static str>,
+    ) -> (String, Arc<AtomicU32>) {
+        let hits = Arc::new(AtomicU32::new(0));
+        let seen = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let (code, extra) = if n < fail_times {
+                    (
+                        status,
+                        retry_after
+                            .map(|v| format!("Retry-After: {v}\r\n"))
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    (200, String::new())
+                };
+                let body = "{\"ok\":true}";
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n{extra}\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                use tokio::io::AsyncWriteExt;
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1/chat/completions"), hits)
+    }
+
+    fn request(url: String) -> UpstreamRequest {
+        UpstreamRequest {
+            protocol: gw_consts::Protocol::OpenaiChat,
+            method: "POST".into(),
+            url,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+            stream: false,
+            account: "acct".into(),
+        }
+    }
+
+    async fn send_with(retry_status: Vec<u16>, url: String) -> u16 {
+        let policy = UpstreamPolicy {
+            timeout: Duration::from_secs(5),
+            connect_retries: 2,
+            retry_status: Arc::from(retry_status.into_boxed_slice()),
+        };
+        let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
+        t.send(request(url)).await.unwrap().status
+    }
+
+    #[tokio::test]
+    async fn a_status_not_declared_retryable_is_returned_as_is() {
+        let (url, hits) = flaky(502, 1, None).await;
+        let policy = UpstreamPolicy {
+            timeout: Duration::from_secs(5),
+            connect_retries: 2,
+            ..UpstreamPolicy::default()
+        };
+        let t = HttpTransport::with_policies(policy, HashMap::new()).unwrap();
+        let resp = t.send(request(url)).await.unwrap();
+        assert_eq!(
+            resp.status, 502,
+            "default must never replay a reached vendor"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "exactly one upstream call");
+    }
+
+    #[tokio::test]
+    async fn a_declared_status_is_replayed_until_it_succeeds() {
+        let (url, hits) = flaky(502, 1, None).await;
+        let status = send_with(vec![502], url).await;
+        assert_eq!(status, 200, "the retry must surface the successful attempt");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "one failure plus one replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn replays_are_bounded_by_the_retry_budget() {
+        let (url, hits) = flaky(429, 99, None).await;
+        let status = send_with(vec![429], url).await;
+        assert_eq!(status, 429, "a vendor that never recovers still answers");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "initial call plus connect_retries replays"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_honoured_and_capped() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            status_backoff(&h, 2),
+            RETRY_BACKOFF * 2,
+            "no header falls back to backoff"
+        );
+        h.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(status_backoff(&h, 1), Duration::from_secs(3));
+        h.insert(reqwest::header::RETRY_AFTER, "9000".parse().unwrap());
+        assert_eq!(
+            status_backoff(&h, 1),
+            Duration::from_secs(30),
+            "a hostile header is capped"
+        );
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            status_backoff(&h, 3),
+            RETRY_BACKOFF * 3,
+            "an http-date falls back to backoff"
+        );
     }
 }

@@ -128,7 +128,7 @@ providers:
   - name: openai
     kind: openai              # openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
     api_key_env: OPENAI_API_KEY
-    # endpoint / timeout_seconds / connect_retries / secret_key_env may be
+    # endpoint / timeout_seconds / connect_retries / retry_status / secret_key_env may be
     # set here too and are inherited by every account naming this provider
     # for whatever the account leaves unset
 models:
@@ -155,7 +155,11 @@ accounts:
                                # `provider` names a declared one; real base URL → real
                                # upstream; explicit "mock://…" → stays on the mock
     timeout_seconds: 60        # upstream request timeout (default 60)
-    connect_retries: 1         # connect-phase retries; an in-flight request is never replayed
+    connect_retries: 1         # connect-phase retries; also bounds retry_status replays
+    retry_status: [429, 502]   # statuses this vendor issues BEFORE the model runs, so a
+                               # replay cannot double-bill. Empty (the default) means a
+                               # request that reached the vendor is never replayed —
+                               # honours Retry-After, capped at 30s
                                # timeout_seconds bounds a non-streaming request whole; a streaming
                                # one gets it on the headers and then per gap between chunks
     api_key_env: ""            # env var name holding the API key (never the key itself)
@@ -239,7 +243,8 @@ trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unf
 (route/status), `gateway_request_duration_seconds`,
 `gateway_node_duration_seconds` (pipeline stage), `gateway_tokens_total`,
 `gateway_cache_hits_total`, `gateway_ledger_write_failures_total`, and
-`gateway_upstream_connect_retries_total` (account). One structured access
+`gateway_upstream_connect_retries_total` (account) and
+`gateway_upstream_status_retries_total` (account, status). One structured access
 log line per successfully served request goes to stdout.
 
 ## Going live against real upstreams

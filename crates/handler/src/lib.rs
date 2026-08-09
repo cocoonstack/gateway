@@ -378,6 +378,7 @@ impl OnlineHandler {
                             .map(std::time::Duration::from_secs)
                             .unwrap_or(default.timeout),
                         connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
+                        retry_status: a.retry_status.clone().into(),
                     },
                 )
             })

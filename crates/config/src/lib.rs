@@ -217,9 +217,14 @@ pub struct AccountConf {
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// Connect-phase retries before giving up; unset = 1. A request that
-    /// reached the vendor is never replayed.
+    /// reached the vendor is never replayed unless `retry_status` says so.
     #[serde(default)]
     pub connect_retries: Option<u32>,
+    /// Upstream statuses this vendor issues *before* the model runs, so
+    /// replaying them cannot double-bill (e.g. `[429, 502]` for a relay whose
+    /// 502 means its own upstream call failed). Empty = never replay.
+    #[serde(default)]
+    pub retry_status: Vec<u16>,
     /// AWS SigV4 accounts: env var name holding the secret access key (paired with
     /// api_key_env = access key). Leave empty for non-AWS providers.
     #[serde(default)]
@@ -562,6 +567,9 @@ pub struct ProviderConf {
     /// Connect-phase retries; unset = 1.
     #[serde(default)]
     pub connect_retries: Option<u32>,
+    /// Statuses safe to replay for this vendor; handed down to its accounts.
+    #[serde(default)]
+    pub retry_status: Vec<u16>,
 }
 
 struct ProviderPreset {
@@ -737,6 +745,7 @@ impl GatewayConfig {
                     cost_output_price_per_1k_micros: 0,
                     timeout_seconds: None,
                     connect_retries: None,
+                    retry_status: Vec::new(),
                     endpoint: String::new(),
                     api_key_env: String::new(),
                     secret_key_env: String::new(),
@@ -761,6 +770,9 @@ impl GatewayConfig {
                 }
                 a.timeout_seconds = a.timeout_seconds.or(p.timeout_seconds);
                 a.connect_retries = a.connect_retries.or(p.connect_retries);
+                if a.retry_status.is_empty() {
+                    a.retry_status.clone_from(&p.retry_status);
+                }
             }
         }
         compile_security(&mut self.security);
