@@ -115,6 +115,7 @@ models:
     protocol: anthropic-messages
     input_price_per_1k_micros: 3000
     output_price_per_1k_micros: 15000
+    token_rate: {read_cache: 0.1, write_cache: 1.25} # Anthropic cache pricing
   - name: gemini-pro
     protocol: gemini
     input_price_per_1k_micros: 1250
