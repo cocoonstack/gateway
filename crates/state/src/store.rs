@@ -3300,6 +3300,7 @@ mod tests {
         let store = SqliteStore::open(dir.path().join("content-index.db").to_str().unwrap())
             .await
             .unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
         sqlx::query(
             "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 512)
              INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id, tenant,
@@ -3307,11 +3308,11 @@ mod tests {
              SELECT n, 'r' || n, 'ak', CASE WHEN n % 8 = 0 THEN 'u1' ELSE 'other-' || n END,
                     't1', '', '', 0, 0 FROM seq",
         )
-        .execute(&store.pool)
+        .execute(&mut *conn)
         .await
         .unwrap();
         sqlx::query("ANALYZE request_content")
-            .execute(&store.pool)
+            .execute(&mut *conn)
             .await
             .unwrap();
         let plan = sqlx::query(
@@ -3324,7 +3325,7 @@ mod tests {
         .bind("u1")
         .bind(Some("t1"))
         .bind(200_i64)
-        .fetch_all(&store.pool)
+        .fetch_all(&mut *conn)
         .await
         .unwrap();
         let details: Vec<String> = plan.iter().map(|row| row.get(3)).collect();
