@@ -127,8 +127,10 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
 }
 
 /// Drop the empty object some OpenAI-compatible vendors emit ahead of a tool
-/// call's accumulated arguments (`{}{"command":"…"}`). Committed only when an
-/// object remains, so an unparseable string is passed through, not guessed at.
+/// call's accumulated arguments (`{}{"command":"…"}`), and complete the empty
+/// string others leave on a no-argument call to `{}`. A strip is committed only
+/// when an object remains, so an unparseable string is passed through, not
+/// guessed at.
 pub fn normalize_tool_arguments(calls: &mut Value) {
     let Some(calls) = calls.as_array_mut() else {
         return;
@@ -137,7 +139,13 @@ pub fn normalize_tool_arguments(calls: &mut Value) {
         let Some(Value::String(args)) = call.pointer_mut("/function/arguments") else {
             continue;
         };
-        let Some(rest) = args.trim_start().strip_prefix("{}") else {
+        let trimmed = args.trim_start();
+        if trimmed.is_empty() {
+            args.clear();
+            args.push_str("{}");
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("{}") else {
             continue;
         };
         let rest = rest.trim_start();
@@ -211,6 +219,15 @@ mod tests {
             calls[0]["function"]["arguments"],
             json!("{\"command\": \"ls\"}")
         );
+    }
+
+    #[test]
+    fn empty_tool_arguments_complete_to_an_object() {
+        for original in ["", "  "] {
+            let mut calls = json!([{"function": {"name": "now", "arguments": original}}]);
+            normalize_tool_arguments(&mut calls);
+            assert_eq!(calls[0]["function"]["arguments"], json!("{}"));
+        }
     }
 
     #[test]

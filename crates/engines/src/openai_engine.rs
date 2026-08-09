@@ -229,11 +229,13 @@ fn withhold_block_open_arguments(fragment: &mut Value) {
     let Some(frags) = fragment.as_array_mut() else {
         return;
     };
+    let opened = |field: &Value| field.as_str().is_some_and(|s| !s.is_empty());
     for f in frags {
-        if f.get("id").is_none()
-            && f.get("function")
+        if !f.get("id").is_some_and(opened)
+            && !f
+                .get("function")
                 .and_then(|func| func.get("name"))
-                .is_none()
+                .is_some_and(opened)
         {
             continue;
         }
@@ -245,8 +247,8 @@ fn withhold_block_open_arguments(fragment: &mut Value) {
     }
 }
 
-/// Close out [`withhold_block_open_arguments`]: an opened call still missing
-/// its arguments at finish really took none — deliver its `{}`.
+/// Close out [`withhold_block_open_arguments`]: a call whose arguments are
+/// still missing or empty at finish really took none — deliver its `{}`.
 fn reemit_withheld_arguments(acc: Option<&mut Value>) -> Option<StreamChunk> {
     let calls = acc?.as_array_mut()?;
     let mut withheld = Vec::new();
@@ -254,7 +256,12 @@ fn reemit_withheld_arguments(acc: Option<&mut Value>) -> Option<StreamChunk> {
         let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
             continue;
         };
-        if !function.contains_key("arguments") {
+        let absent = match function.get("arguments") {
+            None => true,
+            Some(Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        };
+        if absent {
             function.insert("arguments".to_owned(), json!("{}"));
             withheld.push(json!({"index": index, "function": {"arguments": "{}"}}));
         }
@@ -514,6 +521,16 @@ mod tests {
         ]);
         assert_eq!(chunks.iter().filter(|c| c.tool_calls.is_some()).count(), 3);
         assert_eq!(emitted_arguments(&chunks), "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn a_vendor_that_never_sends_arguments_gets_them_at_finish() {
+        let (chunks, resp) = stream_events([
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"now","arguments":""}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        assert_eq!(emitted_arguments(&chunks), "{}");
+        assert_eq!(resp.tool_calls.unwrap()[0]["function"]["arguments"], "{}");
     }
 
     #[test]

@@ -410,3 +410,87 @@ async fn gemini_usage_metadata_matches_go_recorded() {
     assert_eq!(out.response.completion_tokens, 10);
     assert_eq!(out.response.total_tokens, 25);
 }
+
+fn emitted_arguments(out: &gw_engines::EngineOutcome) -> String {
+    out.chunks
+        .iter()
+        .filter_map(|c| c.tool_calls.as_ref()?.as_array())
+        .flatten()
+        .filter_map(|call| call.pointer("/function/arguments")?.as_str())
+        .collect()
+}
+
+const YYLX_TOOL_ARGS_SSE: &str = "data: {\"id\":\"msg_011Cdrd2XtxmXszwJB3DqaUj\",\"object\":\"chat.completion.chunk\",\"created\":1786253284,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"msg_011Cdrd2XtxmXszwJB3DqaUj\",\"object\":\"chat.completion.chunk\",\"created\":1786253284,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"toolu_016Z8ASP2TT9fMRNTiu6dL3S\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"msg_011Cdrd2XtxmXszwJB3DqaUj\",\"object\":\"chat.completion.chunk\",\"created\":1786253284,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"command\\\": \\\"ls -la /tmp\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"msg_011Cdrd2XtxmXszwJB3DqaUj\",\"object\":\"chat.completion.chunk\",\"created\":1786253284,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+#[tokio::test]
+async fn yylx_recorded_empty_name_continuation_assembles_one_call() {
+    let transport = Arc::new(FixtureTransport {
+        status: 200,
+        sse: true,
+        bytes: YYLX_TOOL_ARGS_SSE.as_bytes().to_vec(),
+    });
+    let out = OpenAiEngine::new(openai_req(), transport)
+        .run()
+        .await
+        .unwrap();
+    let calls = out.response.tool_calls.as_ref().expect("tool calls");
+    let calls = calls.as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "shell");
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        "{\"command\": \"ls -la /tmp\"}"
+    );
+    let emitted = emitted_arguments(&out);
+    assert_eq!(emitted, "{\"command\": \"ls -la /tmp\"}");
+}
+
+const YYLX_NO_ARG_SSE: &str = "data: {\"id\":\"msg_9afb323acd5c466d833909124cb45916\",\"object\":\"chat.completion.chunk\",\"created\":1786253287,\"model\":\"claude-haiku-4-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"msg_9afb323acd5c466d833909124cb45916\",\"object\":\"chat.completion.chunk\",\"created\":1786253287,\"model\":\"claude-haiku-4-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tooluse_37bmNjkbDnFcluXowfrJQG\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"msg_9afb323acd5c466d833909124cb45916\",\"object\":\"chat.completion.chunk\",\"created\":1786253287,\"model\":\"claude-haiku-4-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+#[tokio::test]
+async fn yylx_recorded_no_arg_call_completes_to_an_object() {
+    let transport = Arc::new(FixtureTransport {
+        status: 200,
+        sse: true,
+        bytes: YYLX_NO_ARG_SSE.as_bytes().to_vec(),
+    });
+    let out = OpenAiEngine::new(openai_req(), transport)
+        .run()
+        .await
+        .unwrap();
+    let calls = out.response.tool_calls.as_ref().expect("tool calls");
+    assert_eq!(calls[0]["function"]["arguments"], "{}");
+    let emitted = emitted_arguments(&out);
+    assert_eq!(emitted, "{}");
+}
+
+const YYLX_GPT_NO_ARG_SSE: &str = "data: {\"id\":\"resp_09ab326ce09ca4b3016a7811233af8819a8bba052986e818e1\",\"object\":\"chat.completion.chunk\",\"created\":1786253603,\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resp_09ab326ce09ca4b3016a7811233af8819a8bba052986e818e1\",\"object\":\"chat.completion.chunk\",\"created\":1786253603,\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_FzvrVLrIodcfubgWJS0LzLCo\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resp_09ab326ce09ca4b3016a7811233af8819a8bba052986e818e1\",\"object\":\"chat.completion.chunk\",\"created\":1786253603,\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resp_09ab326ce09ca4b3016a7811233af8819a8bba052986e818e1\",\"object\":\"chat.completion.chunk\",\"created\":1786253603,\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"resp_09ab326ce09ca4b3016a7811233af8819a8bba052986e818e1\",\"object\":\"chat.completion.chunk\",\"created\":1786253603,\"model\":\"gpt-5.4-mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":41,\"completion_tokens\":33,\"total_tokens\":74,\"completion_tokens_details\":{\"reasoning_tokens\":18}}}\n\ndata: [DONE]\n\n";
+
+#[tokio::test]
+async fn yylx_recorded_empty_name_object_continuation_streams_through() {
+    let transport = Arc::new(FixtureTransport {
+        status: 200,
+        sse: true,
+        bytes: YYLX_GPT_NO_ARG_SSE.as_bytes().to_vec(),
+    });
+    let out = OpenAiEngine::new(openai_req(), transport)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(
+        out.response.tool_calls.expect("tool calls")[0]["function"]["arguments"],
+        "{}"
+    );
+    assert!(
+        out.chunks.iter().any(|c| {
+            c.tool_calls
+                .as_ref()
+                .and_then(|t| t.pointer("/0/function"))
+                .is_some_and(|f| f["name"] == "" && f["arguments"] == "{}")
+        }),
+        "the {{}} continuation must reach the wire as-is, not be withheld"
+    );
+    assert_eq!(out.response.completion_tokens, 33);
+    let usage = extract_common_usage(out.response.raw_usage.as_ref().unwrap(), false).unwrap();
+    assert_eq!(usage.reason, 18);
+}
