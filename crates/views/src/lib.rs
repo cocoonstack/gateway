@@ -2172,6 +2172,18 @@ async fn admin_audit_ops(
     }
 }
 
+/// A retained row's body for an admin read: unsealed when possible, `null`
+/// when the seal key cannot open it — never the raw ciphertext.
+fn unsealed_content(sealed: bool, content: String) -> Value {
+    if sealed {
+        gw_state::content::open(&content)
+            .map(Value::String)
+            .unwrap_or(Value::Null)
+    } else {
+        Value::String(content)
+    }
+}
+
 /// GET /admin/audit/content/{request_id} — the retained prompt/response rows
 /// for one request, unsealed when the content key is present (a sealed row
 /// without it returns `content: null`). Tenant-scoped like the other reads.
@@ -2188,13 +2200,7 @@ async fn admin_content_get(
         .into_iter()
         .filter(|r| scope.covers(&r.tenant))
         .map(|r| {
-            let content = if r.sealed {
-                gw_state::content::open(&r.content)
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::String(r.content)
-            };
+            let content = unsealed_content(r.sealed, r.content);
             json!({
                 "created_at_epoch_secs": r.created_at_epoch_secs,
                 "kind": r.kind,
@@ -2210,9 +2216,10 @@ async fn admin_content_get(
     Json(json!({ "request_id": request_id, "entries": entries })).into_response()
 }
 
-/// GET /admin/audit/content?user=&limit= — retained-content row metadata for
-/// one end user, newest first; no content bodies (those stay on the
-/// per-request read). Tenant-scoped exactly like the erase below.
+/// GET /admin/audit/content?user=&limit=&include= — retained-content rows for
+/// one end user, newest first; metadata only unless `include=bodies`, which
+/// inlines each row's unsealed content (`null` when the seal key is absent,
+/// as on the per-request read). Tenant-scoped exactly like the erase below.
 async fn admin_content_list(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -2223,23 +2230,28 @@ async fn admin_content_list(
     };
     let tenant = scope.tenant_filter(&q);
     let limit = q_num(&q, "limit", CONTENT_PAGE_DEFAULT).min(CONTENT_PAGE_MAX);
+    let with_bodies = q.get("include").is_some_and(|v| v == "bodies");
     match s
         .handler
         .state()
         .store
-        .content_list_user(tenant, user, limit)
+        .content_list_user(tenant, user, limit, with_bodies)
         .await
     {
         Ok(rows) => {
             let rows: Vec<Value> = rows
                 .into_iter()
                 .map(|r| {
-                    json!({
+                    let mut row = json!({
                         "request_id": r.request_id,
                         "user_id": r.user_id,
                         "kind": r.kind,
                         "created_at_epoch_secs": r.created_at_epoch_secs,
-                    })
+                    });
+                    if with_bodies {
+                        row["content"] = unsealed_content(r.sealed, r.content);
+                    }
+                    row
                 })
                 .collect();
             Json(json!({ "rows": rows })).into_response()
@@ -3950,6 +3962,19 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn unsealed_content_passes_plaintext_and_nulls_unopenable() {
+        assert_eq!(
+            unsealed_content(false, "hello".into()),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            unsealed_content(true, "not-real-ciphertext".into()),
+            Value::Null,
+            "an unopenable sealed row must never leak ciphertext"
+        );
+    }
 
     fn test_app() -> Router {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());

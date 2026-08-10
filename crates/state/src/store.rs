@@ -528,12 +528,14 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<u64>;
     /// The most recent `limit` retained-content rows for `user`, newest first,
     /// optionally confined to one tenant (a tenant admin's scope). Metadata
-    /// only: `content` comes back empty.
+    /// only unless `with_bodies`, which carries each row's stored (possibly
+    /// sealed) content for whole-user archiving.
     async fn content_list_user(
         &self,
         tenant: Option<&str>,
         user: &str,
         limit: usize,
+        with_bodies: bool,
     ) -> GResult<Vec<crate::ContentRecord>>;
     /// The retained content for one request (both prompt and response rows).
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>>;
@@ -945,6 +947,7 @@ impl Store for MemoryStore {
         tenant: Option<&str>,
         user: &str,
         limit: usize,
+        with_bodies: bool,
     ) -> GResult<Vec<crate::ContentRecord>> {
         let content = lock(&self.content);
         Ok(content
@@ -959,7 +962,11 @@ impl Store for MemoryStore {
                 user_id: r.user_id.clone(),
                 tenant: r.tenant.clone(),
                 kind: r.kind.clone(),
-                content: String::new(),
+                content: if with_bodies {
+                    r.content.clone()
+                } else {
+                    String::new()
+                },
                 sealed: r.sealed,
                 expires_at_epoch_secs: r.expires_at_epoch_secs,
             })
@@ -1765,19 +1772,26 @@ sql_store_impl!(SqliteStore, sqlite, {
         tenant: Option<&str>,
         user: &str,
         limit: usize,
+        with_bodies: bool,
     ) -> GResult<Vec<crate::ContentRecord>> {
-        let rows = sqlx::query(
+        let sql = if with_bodies {
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
+             sealed, expires_at_epoch_secs FROM request_content
+             WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
+             ORDER BY n DESC LIMIT ?3"
+        } else {
             "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '',
              sealed, expires_at_epoch_secs FROM request_content
              WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
-             ORDER BY n DESC LIMIT ?3",
-        )
-        .bind(user)
-        .bind(tenant)
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("list user content", e))?;
+             ORDER BY n DESC LIMIT ?3"
+        };
+        let rows = sqlx::query(sql)
+            .bind(user)
+            .bind(tenant)
+            .bind(limit.min(i64::MAX as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("list user content", e))?;
         Ok(rows.iter().map(content_row).collect())
     }
 
@@ -2293,19 +2307,26 @@ sql_store_impl!(PostgresStore, postgres, {
         tenant: Option<&str>,
         user: &str,
         limit: usize,
+        with_bodies: bool,
     ) -> GResult<Vec<crate::ContentRecord>> {
-        let rows = sqlx::query(
+        let sql = if with_bodies {
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
+             sealed, expires_at_epoch_secs FROM request_content
+             WHERE user_id = $1 AND ($2::text IS NULL OR tenant = $2)
+             ORDER BY n DESC LIMIT $3"
+        } else {
             "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, ''::text,
              sealed, expires_at_epoch_secs FROM request_content
              WHERE user_id = $1 AND ($2::text IS NULL OR tenant = $2)
-             ORDER BY n DESC LIMIT $3",
-        )
-        .bind(user)
-        .bind(tenant)
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("list user content", e))?;
+             ORDER BY n DESC LIMIT $3"
+        };
+        let rows = sqlx::query(sql)
+            .bind(user)
+            .bind(tenant)
+            .bind(limit.min(i64::MAX as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("list user content", e))?;
         Ok(rows.iter().map(content_row).collect())
     }
 
@@ -3159,7 +3180,7 @@ mod tests {
         let ids = |rows: &[crate::ContentRecord]| -> Vec<String> {
             rows.iter().map(|r| r.request_id.clone()).collect()
         };
-        let all = store.content_list_user(None, &u1, 10).await.unwrap();
+        let all = store.content_list_user(None, &u1, 10, false).await.unwrap();
         assert_eq!(
             ids(&all),
             [r3.as_str(), r2.as_str(), r1.as_str()],
@@ -3169,13 +3190,21 @@ mod tests {
             all.iter().all(|r| r.content.is_empty()),
             "metadata only: no content bodies"
         );
+        let with = store.content_list_user(None, &u1, 10, true).await.unwrap();
+        assert!(
+            with.iter().all(|r| r.content == "hello"),
+            "with_bodies carries the stored content"
+        );
         assert_eq!(
-            ids(&store.content_list_user(Some(&t1), &u1, 10).await.unwrap()),
+            ids(&store
+                .content_list_user(Some(&t1), &u1, 10, false)
+                .await
+                .unwrap()),
             [r2.as_str(), r1.as_str()],
             "tenant filter confines the listing"
         );
         assert_eq!(
-            ids(&store.content_list_user(None, &u1, 2).await.unwrap()),
+            ids(&store.content_list_user(None, &u1, 2, false).await.unwrap()),
             [r3.as_str(), r2.as_str()],
             "limit keeps the newest rows"
         );
