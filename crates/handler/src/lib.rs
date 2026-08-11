@@ -576,8 +576,7 @@ struct TerminalSubject {
     tenant: String,
 }
 
-/// Persist one lifecycle result row (no provider message or user content);
-/// a store failure is logged, never surfaced into the request result.
+/// Persist one lifecycle result row (no provider message or user content).
 async fn persist_terminal(
     store: &dyn gw_state::Store,
     subject: &TerminalSubject,
