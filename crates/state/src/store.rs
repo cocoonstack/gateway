@@ -688,18 +688,16 @@ impl MemoryContent {
         }
     }
 
-    fn retain(&mut self, keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
-        let (rows, terminal_keys) = (&mut self.rows, &mut self.terminal_keys);
-        let before = rows.len();
-        let mut keep = keep;
-        rows.retain(|record| {
+    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
+        let before = self.rows.len();
+        self.rows.retain(|record| {
             let retained = keep(record);
             if !retained && record.kind == "terminal" {
-                terminal_keys.remove(&Self::terminal_key(record));
+                self.terminal_keys.remove(&Self::terminal_key(record));
             }
             retained
         });
-        (before - rows.len()) as u64
+        (before - self.rows.len()) as u64
     }
 
     fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {

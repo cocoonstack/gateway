@@ -509,12 +509,10 @@ impl DagNode for CallEngine {
         &["user_budget"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let threshold = ctx.cfg.stability.failure_threshold;
-        let cooldown = std::time::Duration::from_secs(ctx.cfg.stability.cooldown_seconds);
         let mut engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
         match engine.run().await {
             Ok(outcome) => {
-                note_engine_outcome(ctx, &outcome, threshold, cooldown).await;
+                note_engine_outcome(ctx, &outcome).await;
                 ctx.decide(
                     "call_engine",
                     format!(
@@ -536,7 +534,7 @@ impl DagNode for CallEngine {
                     .account
                     .clone()
                     .ok_or_else(|| GatewayError::internal("call_engine without an account"))?;
-                note_failure(ctx, &failed.name, threshold, cooldown).await;
+                note_failure(ctx, &failed.name).await;
                 let provider = model_provider(ctx);
                 let next = ctx
                     .state
@@ -566,7 +564,7 @@ impl DagNode for CallEngine {
                 let mut retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        note_engine_outcome(ctx, &outcome, threshold, cooldown).await;
+                        note_engine_outcome(ctx, &outcome).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
@@ -575,7 +573,7 @@ impl DagNode for CallEngine {
                         ctx.state
                             .avail
                             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-                        note_failure(ctx, &next.name, threshold, cooldown).await;
+                        note_failure(ctx, &next.name).await;
                         Err(named(e, ctx))
                     }
                 }
@@ -585,21 +583,17 @@ impl DagNode for CallEngine {
     }
 }
 
-async fn note_engine_outcome(
-    ctx: &mut DagContext,
-    outcome: &gw_engines::EngineOutcome,
-    threshold: usize,
-    cooldown: std::time::Duration,
-) {
+async fn note_engine_outcome(ctx: &mut DagContext, outcome: &gw_engines::EngineOutcome) {
     if outcome.terminal_error.is_some() {
         ctx.state
             .avail
             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
         if let Some(account) = ctx.request.account.clone() {
-            note_failure(ctx, &account.name, threshold, cooldown).await;
+            note_failure(ctx, &account.name).await;
         }
         return;
     }
+    // a client disconnect is neither a success nor an account fault
     if outcome.response.aborted {
         return;
     }
@@ -623,21 +617,17 @@ fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
 /// Record an account failure; on the cooldown transition, alert and note the
 /// decision — one implementation for both engine attempts, so the fleet-backed
 /// `record_failure` call and its alerting can't drift apart.
-async fn note_failure(
-    ctx: &mut DagContext,
-    account: &str,
-    threshold: usize,
-    cooldown: std::time::Duration,
-) {
+async fn note_failure(ctx: &mut DagContext, account: &str) {
+    let threshold = ctx.cfg.stability.failure_threshold;
+    let secs = ctx.cfg.stability.cooldown_seconds;
     if !ctx
         .state
         .health
-        .record_failure(account, threshold, cooldown)
+        .record_failure(account, threshold, std::time::Duration::from_secs(secs))
         .await
     {
         return;
     }
-    let secs = ctx.cfg.stability.cooldown_seconds;
     ctx.state.alerts.emit(
         "account_cooldown",
         account.to_owned(),
