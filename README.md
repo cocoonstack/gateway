@@ -8,7 +8,7 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 
 ## Highlights
 
-- **OpenAI + Anthropic compatible surface** — `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/embeddings`, `/v1/images/{generations,edits}`, `/v1/audio/{speech,transcriptions}`, `/v1/batches` + `/v1/files`, `/v1/models`, `/v1/realtime` (WebSocket) — streaming and non-streaming
+- **OpenAI + Anthropic compatible surface** — `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/embeddings`, `/v1/images/{generations,edits}`, `/v1/audio/{speech,transcriptions,translations}`, `/v1/moderations`, `/v1/rerank`, `/v1/batches` + `/v1/files`, `/v1/models`, `/v1/realtime` (WebSocket) — streaming and non-streaming
 - **Cross-protocol conversion** — serve Anthropic-style `/v1/messages` on OpenAI-protocol models and vice versa, including streaming event mapping
 - **Anthropic extended thinking, natively** — `/v1/messages` preserves signed `thinking`/`redacted_thinking` blocks end-to-end, pins thinking traffic to its requested model, and audits tool-loop continuations against what was actually served (fail-open; tampering is a local 400)
 - **Staged request pipeline** — a 4-layer DAG per request: model resolve / quota / cache lookup → account selection (priority, PTU-first, failover) → rate limits + engine call (retry on upstream 5xx) → usage extraction, billing, cache store

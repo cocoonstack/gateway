@@ -17,7 +17,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 | `engines`   | L3    | engine implementations behind the `Transport` seam, SSE decoding, usage extraction, SigV4 |
 | `dag`       | L3    | 4-layer pipeline executor + nodes |
 | `handler`   | L4    | online/offline orchestration, DLP/blocklist plugins |
-| `task`      | L5    | background tasks (daily quota reset) |
+| `task`      | L5    | background tasks (quota reset, content purge, usage rollup, availability flush/alerts, webhook dispatch) |
 | `views`     | L5    | axum HTTP/WebSocket handlers, protocol conversion |
 | `server`    | L6    | binary entrypoint: config + state + transport wiring |
 
@@ -57,9 +57,9 @@ default, so the whole pipeline is testable offline:
   rustls). `GW_TRANSPORT=mock` forces zero egress, `GW_TRANSPORT=http`
   disables the mock. Tests inject `MockTransport` directly.
 - **`TokenEncoder`** — prompt token estimation capability (tiktoken
-  cl100k_base BPE default, zero-dependency heuristic fallback). Not yet on
-  a request path: its consumer is token-aware PTU sizing, which is not
-  ported yet.
+  cl100k_base BPE default, zero-dependency heuristic fallback). `cost_calc`
+  uses it to bill an aborted stream from the delivered text when the vendor's
+  usage frame never arrives; token-aware PTU sizing is not ported yet.
 - **`Store`** — durable records (billing ledger, uploaded files, batch
   jobs). `MemoryStore` by default; `SqliteStore` when `storage.sqlite_path`
   is configured; `PostgresStore` when `storage.postgres_url` is — shared

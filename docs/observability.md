@@ -38,8 +38,9 @@ request.
 
 `GET /internal/ledger?limit=N` returns the most recent `N` billing records,
 oldest-first within the page; `count` is always the true total, independent of
-the page size. Records persist when a SQLite store is configured and can be
-capped with `storage.ledger_max_rows`. Each record carries `request_id`, the
+the page size. Records persist when a SQLite or Postgres store is configured
+and can be capped with `storage.ledger_max_rows`. Each record carries
+`request_id`, the
 access key, product, `tenant`, `user_id` (effective end user), the requested
 `model` and the `served_model` (differs after a quota fallback), protocol,
 account, token counts, charged `cost_micros` and `vendor_cost_micros`,

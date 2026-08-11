@@ -13,7 +13,7 @@ client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
 
 ## Guides
 
-- [Examples](examples.md) — copy-paste curl for every surface, going live
+- [Examples](examples.md) — copy-paste curl for the main surfaces, going live
 - [API reference](api.md) — every endpoint, auth, streaming, batch/files
 - [Providers](providers.md) — presets, going live, failover, SigV4
 - [Governance](governance.md) — access keys, rate limits, quotas, cache, safety

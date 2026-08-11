@@ -22,7 +22,7 @@ models:
 
 | kind | base URL | protocols | auth |
 |------|----------|-----------|------|
-| `openai` | `https://api.openai.com` | openai-chat, embeddings, image, tts, stt, responses, completions, realtime | `Bearer` |
+| `openai` | `https://api.openai.com` | openai-chat, embeddings, image, tts, stt, responses, completions, realtime, moderations | `Bearer` |
 | `anthropic` | `https://api.anthropic.com` | anthropic-messages | `x-api-key` + `anthropic-version` |
 | `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
@@ -45,7 +45,8 @@ providers:
 
 Some vendors are addressed in their own wire dialect rather than an
 OpenAI-compatible shape, via a raw `accounts:` entry pinned to the vendor's
-`protocol`. All of these stream natively (incremental deltas + billed usage):
+`protocol`. Those that stream do so natively (incremental deltas + billed
+usage); the rest are marked non-streaming below and always answer buffered:
 
 | protocol | vendor | endpoint | notes |
 |----------|--------|----------|-------|
@@ -55,7 +56,7 @@ OpenAI-compatible shape, via a raw `accounts:` entry pinned to the vendor's
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | `access_token` query param (non-streaming) |
 | `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming) |
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming) |
-| `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer`; kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
+| `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
 The factory also dispatches `video`, `search`, generic `audio`, and
 `passthrough` protocols (kling-video and brave-search ship example accounts in
@@ -106,7 +107,9 @@ paygo. On an upstream 5xx the failed account is excluded and another is tried
 once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
 an account into cooldown (`stability.failure_threshold` / `cooldown_seconds`),
 and it auto-recovers on expiry. A streaming response that already sent bytes to
-the client is never failed over.
+the client is never failed over, but a provider error that breaks such a stream
+still counts against the account's health and the model's availability; a plain
+client disconnect counts as neither.
 
 ## AWS SigV4
 
