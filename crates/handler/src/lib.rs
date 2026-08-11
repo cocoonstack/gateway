@@ -8,7 +8,8 @@ pub mod offline;
 pub mod plugins;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use futures::FutureExt;
 use gw_config::GatewayConfig;
@@ -24,6 +25,9 @@ pub use gw_models::BatchItem;
 pub use offline::OfflineHandler;
 
 const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
+
+static REQ_INSTANCE: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
+static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct OnlineHandler {
@@ -427,9 +431,15 @@ pub enum RtModeration {
     Deny(String),
 }
 
-/// A fleet-unique request correlation id.
+/// A fleet-unique request correlation id: `req-<process instance>-<seq>`.
+/// The 128-bit random instance tag is drawn once per process, keeping per-id
+/// cost at one relaxed atomic add instead of an OS RNG draw.
 pub fn new_request_id() -> String {
-    format!("req-{}", Uuid::new_v4())
+    format!(
+        "req-{}-{}",
+        REQ_INSTANCE.as_str(),
+        REQ_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Persist the final HTTP result for an online non-streaming request after its
@@ -894,15 +904,19 @@ mod tests {
     }
 
     #[test]
-    fn generated_request_ids_are_uuid_v4() {
-        let id = new_request_id();
-        let parsed = Uuid::parse_str(id.strip_prefix("req-").expect("request id prefix"))
-            .expect("request id uuid");
-        assert_eq!(parsed.get_version_num(), 4);
-        assert_ne!(
-            new_request_id(),
-            id,
-            "generated request ids must not repeat"
+    fn generated_request_ids_are_fleet_unique() {
+        let (a, b) = (new_request_id(), new_request_id());
+        let (instance, seq) = a
+            .strip_prefix("req-")
+            .expect("request id prefix")
+            .rsplit_once('-')
+            .expect("instance-seq shape");
+        Uuid::parse_str(instance).expect("random instance tag");
+        seq.parse::<u64>().expect("sequence tail");
+        assert_ne!(a, b, "generated request ids must not repeat");
+        assert!(
+            b.starts_with(&format!("req-{instance}-")),
+            "one instance tag per process"
         );
     }
 
