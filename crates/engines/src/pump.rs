@@ -19,6 +19,10 @@ pub struct PumpResult {
     /// delivered so billing can account for it; failover must not run — a
     /// retry would splice a second generation into the same stream.
     pub aborted: bool,
+    /// The external terminal error already sent after a committed stream.
+    /// Kept separately from `aborted`: a client disconnect has no provider
+    /// error to report.
+    pub terminal_error: Option<StreamError>,
 }
 
 /// Drive a vendor SSE reply through `apply` (which owns the engine's
@@ -50,6 +54,7 @@ async fn abort_frame(
     error: StreamError,
 ) {
     debug_assert!(tx.is_some(), "committed abort implies a live channel");
+    out.terminal_error = Some(error.clone());
     if let Some(sender) = tx {
         let _ = sender
             .send(StreamChunk {
@@ -121,17 +126,20 @@ where
                     }
                 };
                 for data in events {
-                    let v: Value = serde_json::from_str(&data).map_err(|e| {
-                        GatewayError::internal(format!("parse {vendor} sse frame")).with_source(e)
-                    })?;
-                    // A vendor error frame (or any apply failure) after bytes
-                    // reached the client is a committed abort, NOT a failover
-                    // signal — replaying would splice a second generation onto
-                    // the same stream.
-                    let chunks = match apply(v) {
+                    // A malformed frame, vendor error frame, or apply failure
+                    // after bytes reached the client is a committed abort, NOT
+                    // a failover signal — replaying would splice a second
+                    // generation onto the same stream.
+                    let applied = serde_json::from_str(&data)
+                        .map_err(|e| {
+                            GatewayError::internal(format!("parse {vendor} sse frame"))
+                                .with_source(e)
+                        })
+                        .and_then(&mut apply);
+                    let chunks = match applied {
                         Ok(c) => c,
                         Err(e) if sent_any => {
-                            tracing::warn!(vendor, error = %e, "vendor error frame after commit");
+                            tracing::warn!(vendor, error = %e, "vendor frame error after commit");
                             if let Some(error) = StreamError::from_committed_error(e) {
                                 abort_frame(&tx, &mut out, error).await;
                             } else {
@@ -172,4 +180,62 @@ where
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_frame_is_error_before_commit_and_abort_after_commit() {
+        let malformed = || {
+            UpstreamBody::SseStream(
+                futures::stream::iter([Ok(bytes::Bytes::from_static(b"data: not-json\n\n"))])
+                    .boxed(),
+            )
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            pump_sse("test", malformed(), Some(tx), |_| Ok(Vec::new()))
+                .await
+                .is_err(),
+            "a pre-commit parse error remains eligible for failover"
+        );
+
+        let frames = [
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"delta\":\"first\"}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(b"data: not-json\n\n")),
+        ];
+        let body = UpstreamBody::SseStream(futures::stream::iter(frames).boxed());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let result = pump_sse("test", body, Some(tx), |v| {
+            Ok(vec![StreamChunk {
+                delta: v["delta"].as_str().unwrap_or_default().to_owned(),
+                ..Default::default()
+            }])
+        })
+        .await
+        .unwrap();
+
+        assert!(result.aborted);
+        assert!(result.streamed_live);
+        assert_eq!(
+            result.terminal_error.as_ref().map(|error| error.class),
+            Some(gw_consts::ErrClass::InternalServer)
+        );
+        assert_eq!(rx.recv().await.unwrap().delta, "first");
+        assert_eq!(
+            rx.recv()
+                .await
+                .unwrap()
+                .error
+                .as_ref()
+                .map(|error| error.class),
+            Some(gw_consts::ErrClass::InternalServer)
+        );
+    }
 }

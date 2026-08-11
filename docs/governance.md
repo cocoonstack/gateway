@@ -166,14 +166,24 @@ is served with the protected blocks stripped rather than failed.
   `x-forwarded-for` — do that ONLY behind a proxy that sets them, or a direct
   client could forge the recorded IP.
 - **Content retention** (`tenants[].retention`): `none` (default), `redacted`
-  (PII/secrets stripped), or `full` (raw). Stored in `request_content`, sealed
-  at rest with XChaCha20-Poly1305 under `GW_CONTENT_KEY` (64 hex chars).
+  (PII/secrets stripped), or `full` (raw). Stored in `request_content`; retained
+  prompt/response text is sealed at rest with XChaCha20-Poly1305 under
+  `GW_CONTENT_KEY` (64 hex chars).
   Retention owns its redaction, so `redacted` — and a keyless `full` that falls
   back to it — never persists raw secrets/PII even if the tenant forwards
   traffic with DLP off. `full` refuses to store raw without a key. `days` sets
-  expiry; an hourly purge deletes elapsed content. Read back with
+  expiry. Each completed request also attempts one unsealed `terminal` row with no
+  provider message or user content: success/error/client-closed state, external
+  error code/status, optional original upstream status, and whether the stream
+  had committed. Non-streaming rows use the final HTTP view status; streaming
+  rows land after their detached pipeline settles. The row is owner-scoped,
+  first-writer-wins by request identity, and follows the same `days` expiry. An
+  hourly purge deletes elapsed content. Read back with
   `GET /admin/audit/content/{request_id}` (tenant-scoped; sealed rows are
   unsealed when the key is present, else returned as `content: null`).
+  The write is best-effort: a missing terminal row after bounded polling is
+  unknown, not proof of success. A terminal row reports the request outcome;
+  it does not guarantee that optional prompt/response rows were retained.
   `DELETE /admin/audit/content?user=` erases every retained trace of one end
   user's content (the GDPR/PIPL right-to-erasure hook): retained rows, batch
   result messages, and queued batch inputs — a pending/running item belonging

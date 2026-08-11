@@ -4,7 +4,7 @@
 //! [`SqliteStore`] (`storage.sqlite_path`, one durable node), and
 //! [`PostgresStore`] (`storage.postgres_url`, shared across a fleet).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -509,6 +509,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 
     /// Store one retained prompt/response record (per-tenant retention policy).
     async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()>;
+    /// Store one terminal request marker. First writer wins for the same
+    /// tenant, attributed user, and request id.
+    async fn content_terminal_put(&self, r: &crate::ContentRecord) -> GResult<()>;
     /// Delete content whose `expires_at_epoch_secs` is in `(0, now]`; returns the
     /// number deleted. Rows with `expires_at = 0` are kept until manual purge.
     async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
@@ -537,7 +540,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         limit: usize,
         with_bodies: bool,
     ) -> GResult<Vec<crate::ContentRecord>>;
-    /// The retained content for one request (both prompt and response rows).
+    /// The retained content for one request (prompt, response, and terminal rows).
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>>;
 
     /// Store `content` under a fresh id owned by `tenant`; returns the metadata.
@@ -652,7 +655,7 @@ pub struct MemoryStore {
     rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
-    content: Mutex<Vec<crate::ContentRecord>>,
+    content: Mutex<MemoryContent>,
     /// Latest erasure instant per (tenant, user), backing
     /// [`Store::user_erased_since`] — one entry per pair, not a log.
     erasures: Mutex<std::collections::HashMap<(String, String), i64>>,
@@ -669,6 +672,40 @@ impl MemoryStore {
             ledger_max_rows: max_rows,
             ..Self::default()
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryContent {
+    rows: Vec<crate::ContentRecord>,
+    terminal_keys: HashSet<(String, String, String)>,
+}
+
+impl MemoryContent {
+    fn push_terminal(&mut self, record: &crate::ContentRecord) {
+        if self.terminal_keys.insert(Self::terminal_key(record)) {
+            self.rows.push(record.clone());
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
+        let before = self.rows.len();
+        self.rows.retain(|record| {
+            let retained = keep(record);
+            if !retained && record.kind == "terminal" {
+                self.terminal_keys.remove(&Self::terminal_key(record));
+            }
+            retained
+        });
+        (before - self.rows.len()) as u64
+    }
+
+    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
+        (
+            record.tenant.clone(),
+            record.user_id.clone(),
+            record.request_id.clone(),
+        )
     }
 }
 
@@ -889,15 +926,19 @@ impl Store for MemoryStore {
     }
 
     async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
-        lock(&self.content).push(r.clone());
+        lock(&self.content).rows.push(r.clone());
+        Ok(())
+    }
+
+    async fn content_terminal_put(&self, r: &crate::ContentRecord) -> GResult<()> {
+        debug_assert_eq!(r.kind, "terminal");
+        lock(&self.content).push_terminal(r);
         Ok(())
     }
 
     async fn content_purge(&self, now: i64) -> GResult<u64> {
         let mut content = lock(&self.content);
-        let before = content.len();
-        content.retain(|r| r.expires_at_epoch_secs == 0 || r.expires_at_epoch_secs > now);
-        Ok((before - content.len()) as u64)
+        Ok(content.retain(|r| r.expires_at_epoch_secs == 0 || r.expires_at_epoch_secs > now))
     }
 
     async fn content_erase_user(
@@ -908,9 +949,7 @@ impl Store for MemoryStore {
     ) -> GResult<u64> {
         let mut erased = {
             let mut content = lock(&self.content);
-            let before = content.len();
-            content.retain(|r| r.user_id != user || tenant.is_some_and(|t| t != r.tenant));
-            (before - content.len()) as u64
+            content.retain(|r| r.user_id != user || tenant.is_some_and(|t| t != r.tenant))
         };
         for mut job in self.jobs.iter_mut() {
             if tenant.is_some_and(|t| t != job.tenant) {
@@ -951,6 +990,7 @@ impl Store for MemoryStore {
     ) -> GResult<Vec<crate::ContentRecord>> {
         let content = lock(&self.content);
         Ok(content
+            .rows
             .iter()
             .rev()
             .filter(|r| r.user_id == user && tenant.is_none_or(|t| t == r.tenant))
@@ -976,6 +1016,7 @@ impl Store for MemoryStore {
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
         let content = lock(&self.content);
         Ok(content
+            .rows
             .iter()
             .filter(|r| r.request_id == request_id)
             .cloned()
@@ -1214,6 +1255,8 @@ impl SqliteStore {
             "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
             "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
             "CREATE INDEX IF NOT EXISTS content_user_n_idx ON request_content (user_id, n DESC)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS content_terminal_uidx
+             ON request_content (tenant, user_id, request_id) WHERE kind = 'terminal'",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -1435,6 +1478,29 @@ macro_rules! sql_store_impl {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::sqlx_err("insert content", e))?;
+                Ok(())
+            }
+
+            async fn content_terminal_put(&self, r: &crate::ContentRecord) -> GResult<()> {
+                debug_assert_eq!(r.kind, "terminal");
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
+                     tenant, kind, content, sealed, expires_at_epoch_secs)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
+                ))
+                .bind(r.created_at_epoch_secs)
+                .bind(&r.request_id)
+                .bind(&r.ak)
+                .bind(&r.user_id)
+                .bind(&r.tenant)
+                .bind(&r.kind)
+                .bind(&r.content)
+                .bind(r.sealed)
+                .bind(r.expires_at_epoch_secs)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("insert terminal content", e))?;
                 Ok(())
             }
 
@@ -1983,6 +2049,8 @@ impl PostgresStore {
             "CREATE INDEX IF NOT EXISTS content_expiry_idx ON request_content (expires_at_epoch_secs)",
             "CREATE INDEX IF NOT EXISTS content_request_idx ON request_content (request_id)",
             "CREATE INDEX IF NOT EXISTS content_user_n_idx ON request_content (user_id, n DESC)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS content_terminal_uidx
+             ON request_content (tenant, user_id, request_id) WHERE kind = 'terminal'",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
@@ -3210,6 +3278,117 @@ mod tests {
         );
     }
 
+    async fn exercise_terminal_idempotence(store: &dyn Store, ns: &str) {
+        let tenant = format!("terminal-tenant{ns}");
+        let user = format!("terminal-user{ns}");
+        let request = format!("terminal-request{ns}");
+        let rec = |user: &str, content: &str, expires: i64| crate::ContentRecord {
+            created_at_epoch_secs: 100,
+            request_id: request.clone(),
+            ak: "ak".into(),
+            user_id: user.into(),
+            tenant: tenant.clone(),
+            kind: "terminal".into(),
+            content: content.into(),
+            sealed: false,
+            expires_at_epoch_secs: expires,
+        };
+        store
+            .content_terminal_put(&rec(&user, r#"{"state":"success"}"#, 200))
+            .await
+            .unwrap();
+        store
+            .content_terminal_put(&rec(&user, r#"{"state":"error"}"#, 200))
+            .await
+            .unwrap();
+        let rows = store
+            .content_list_user(Some(&tenant), &user, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one owner/request has one terminal row");
+        assert_eq!(
+            rows[0].content, r#"{"state":"success"}"#,
+            "the first terminal result wins"
+        );
+
+        let other = format!("terminal-other{ns}");
+        store
+            .content_terminal_put(&rec(&other, r#"{"state":"error"}"#, 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .content_list_user(Some(&tenant), &other, 10, true)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the same process-local request id under another owner is independent"
+        );
+
+        assert_eq!(store.content_purge(200).await.unwrap(), 1);
+        store
+            .content_terminal_put(&rec(&other, r#"{"state":"success"}"#, 0))
+            .await
+            .unwrap();
+        let other_rows = store
+            .content_list_user(Some(&tenant), &other, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(other_rows.len(), 1, "purge keeps surviving keys indexed");
+        assert_eq!(other_rows[0].content, r#"{"state":"error"}"#);
+        store
+            .content_terminal_put(&rec(&user, r#"{"state":"error"}"#, 0))
+            .await
+            .unwrap();
+        let rows = store
+            .content_list_user(Some(&tenant), &user, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "a purged terminal key can be reused");
+        assert_eq!(rows[0].content, r#"{"state":"error"}"#);
+
+        let audit = AdminAudit {
+            created_at_epoch_secs: 201,
+            actor: "global".into(),
+            scope: "global".into(),
+            action: "content_erase".into(),
+            target: user.clone(),
+            summary: String::new(),
+            source_ip: "10.0.0.1".into(),
+        };
+        assert_eq!(
+            store
+                .content_erase_user(Some(&tenant), &user, audit)
+                .await
+                .unwrap(),
+            1
+        );
+        store
+            .content_terminal_put(&rec(&other, r#"{"state":"success"}"#, 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .content_list_user(Some(&tenant), &other, 10, true)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "erasing one owner keeps another owner's terminal"
+        );
+        store
+            .content_terminal_put(&rec(&user, r#"{"state":"success"}"#, 0))
+            .await
+            .unwrap();
+        let rows = store
+            .content_list_user(Some(&tenant), &user, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "an erased terminal key can be reused");
+        assert_eq!(rows[0].content, r#"{"state":"success"}"#);
+    }
+
     async fn exercise_erasure_markers(store: &dyn Store, ns: &str) {
         let (t1, u1, u2) = (format!("t1{ns}"), format!("u1{ns}"), format!("u2{ns}"));
         let now = crate::epoch_millis();
@@ -3236,6 +3415,7 @@ mod tests {
         exercise_erase(&store, "").await;
         exercise_erasure_markers(&store, "").await;
         exercise_content_list(&store, "").await;
+        exercise_terminal_idempotence(&store, "").await;
     }
 
     #[tokio::test]
@@ -3262,6 +3442,7 @@ mod tests {
         exercise_rollup(&store, &ns).await;
         exercise_erase(&store, &ns).await;
         exercise_content_list(&store, &ns).await;
+        exercise_terminal_idempotence(&store, &ns).await;
 
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
         let items = vec![
@@ -3321,6 +3502,7 @@ mod tests {
         exercise_erase(&store, "").await;
         exercise_erasure_markers(&store, "").await;
         exercise_content_list(&store, "").await;
+        exercise_terminal_idempotence(&store, "").await;
     }
 
     #[tokio::test]

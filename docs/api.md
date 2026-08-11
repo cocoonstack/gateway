@@ -188,9 +188,24 @@ regardless.
 | GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per billed turn and on session-fatal upstream errors; tenant-scoped |
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
-| GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |
-| GET | `/admin/audit/content?user=` | retained-content row metadata for one end user (`request_id`, `user_id`, `kind`, `created_at_epoch_secs` — no content bodies), newest first; `?limit=` (default 200, max 1000); tenant-scoped |
+| GET | `/admin/audit/content/{request_id}` | retained prompt/response and terminal result for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |
+| GET | `/admin/audit/content?user=` | retained rows for one attributed end user, newest first; metadata only by default, `?include=bodies` inlines content; `?limit=` (default 200, max 1000); tenant-scoped |
 | DELETE | `/admin/audit/content?user=` | erase all retained content for one end user — retained rows, batch result messages, leftover batch inputs (GDPR/PIPL); tenant-scoped, audited atomically as `content_erase` |
+
+For a tenant with prompt/response retention enabled, each completed request
+attempts to add one `kind: "terminal"` row. A non-streaming row is written after
+the HTTP view has rendered its final status; a streaming row is written after
+the detached pipeline settles. Its content is a small JSON object:
+`state` (`success`, `error`, or `client_closed`), `http_status`, and
+`stream_committed`; an error also carries the external `code` and, when an
+upstream HTTP reply supplied one, `original_status_code`. The row is written
+after request accounting settles, contains no provider message or user content,
+and is first-writer-wins for `(tenant, user_id, request_id)`. A committed stream
+can deliver its error frame just before this row becomes visible. Retention is
+best-effort: absence after bounded polling remains unknown (for example, a
+store or process failure) and must not be interpreted as success.
+A terminal row reports the request outcome only; optional prompt/response rows
+remain best-effort and may be absent.
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a
 tenant's `admin_token_env` token manages only that tenant's keys, usage, and

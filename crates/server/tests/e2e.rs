@@ -1443,8 +1443,7 @@ async fn chat_non_stream_full_pipeline_bills_the_ledger() {
     assert_eq!(rec["ak"], "ak-demo-123");
     assert_eq!(rec["model"], "gpt-4o");
     assert_eq!(rec["account"], "mock-openai-1");
-    // equal only while gpt-4o sets no token_rate: ledger total is weighted,
-    // wire usage stays vendor-raw — they diverge by design under weights
+    // equal only while gpt-4o sets no token_rate: a weighted ledger total diverges from raw wire usage
     assert_eq!(rec["total_tokens"].as_i64().unwrap(), total);
     assert!(rec["cost_micros"].as_i64().unwrap() > 0);
 }
@@ -3701,8 +3700,8 @@ access_keys: [{ak: k-erase, tenant: t1, product: p, qps: 100, daily_token_quota:
     let j = body_json(resp).await;
     assert_eq!(
         j["entries"].as_array().unwrap().len(),
-        2,
-        "prompt and response retained: {j}"
+        3,
+        "prompt, response, and terminal retained: {j}"
     );
 
     let resp = app
@@ -3726,7 +3725,7 @@ access_keys: [{ak: k-erase, tenant: t1, product: p, qps: 100, daily_token_quota:
         )
         .await
         .unwrap();
-    assert_eq!(body_json(resp).await["deleted"], 2);
+    assert_eq!(body_json(resp).await["deleted"], 3);
 
     let resp = app
         .clone()

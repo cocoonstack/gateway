@@ -8,8 +8,8 @@ pub mod offline;
 pub mod plugins;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use futures::FutureExt;
 use gw_config::GatewayConfig;
@@ -19,12 +19,14 @@ use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{Block, GResult, GatewayError, GatewayRequest, GatewayResponse};
 use gw_state::admission;
 use gw_state::{AkInfo, GatewayState, SharedConfig};
+use uuid::Uuid;
 
 pub use gw_models::BatchItem;
 pub use offline::OfflineHandler;
 
 const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
 
+static REQ_INSTANCE: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -87,6 +89,39 @@ impl OnlineHandler {
         }
         // one consistent snapshot for the whole request
         let snap = self.config.load();
+        let retention = active_retention(&snap.cfg, &ak.tenant);
+        let terminal = retention.map(|retention| {
+            (
+                retention,
+                TerminalSubject {
+                    request_id: request.request_id.clone(),
+                    ak: ak.ak.clone(),
+                    user_id: ak
+                        .attributed_user(request.user_id.as_deref().unwrap_or_default())
+                        .to_owned(),
+                    tenant: ak.tenant.clone(),
+                },
+            )
+        });
+        let result = self.run_inner(request, ak, &snap, retention).await;
+        let settled_here = match result.as_ref() {
+            Err(_) => true,
+            Ok(ctx) => !ctx.request.buffered_online(),
+        };
+        if settled_here && let Some((retention, subject)) = terminal {
+            let body = terminal_result_body(result.as_ref());
+            persist_terminal(snap.state.store.as_ref(), &subject, retention, body).await;
+        }
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        mut request: GatewayRequest,
+        ak: AkInfo,
+        snap: &gw_state::Snapshot,
+        retention: Option<gw_config::RetentionConf>,
+    ) -> GResult<DagContext> {
         let sec = snap.cfg.security_for(&ak.tenant);
         // outbound redaction (PII or secrets) is a response-buffering boundary:
         // a masked span can straddle deltas, so no engine may stream raw ones —
@@ -119,11 +154,6 @@ impl OnlineHandler {
         }
 
         // pre-DLP text, computed once for moderation and the retained prompt
-        let retention = snap
-            .cfg
-            .retention_for(&ctx.ak.tenant)
-            .copied()
-            .filter(|r| r.content != gw_config::ContentLevel::None);
         let inbound =
             (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
 
@@ -401,11 +431,36 @@ pub enum RtModeration {
     Deny(String),
 }
 
-/// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
-/// unique within the process (the seq disambiguates same-millisecond requests).
+/// A fleet-unique request correlation id: `req-<process instance>-<seq>`.
+/// The 128-bit random instance tag is drawn once per process, keeping per-id
+/// cost at one relaxed atomic add instead of an OS RNG draw.
 pub fn new_request_id() -> String {
-    let ms = gw_state::epoch_millis();
-    format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "req-{}-{}",
+        REQ_INSTANCE.as_str(),
+        REQ_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Persist the final HTTP result for an online non-streaming request after its
+/// view has finished rendering the response.
+pub async fn persist_terminal_response(ctx: &DagContext, http_status: u16) {
+    let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
+        return;
+    };
+    let subject = TerminalSubject {
+        request_id: ctx.request.request_id.clone(),
+        ak: ctx.ak.ak.clone(),
+        user_id: ctx.effective_user_id().to_owned(),
+        tenant: ctx.ak.tenant.clone(),
+    };
+    persist_terminal(
+        ctx.state.store.as_ref(),
+        &subject,
+        retention,
+        terminal_status_body(http_status),
+    )
+    .await;
 }
 
 /// Count one admission rejection against the key's daily abuse counter and
@@ -514,6 +569,104 @@ async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i
     .await;
 }
 
+struct TerminalSubject {
+    request_id: String,
+    ak: String,
+    user_id: String,
+    tenant: String,
+}
+
+/// Persist one lifecycle result row (no provider message or user content).
+async fn persist_terminal(
+    store: &dyn gw_state::Store,
+    subject: &TerminalSubject,
+    retention: gw_config::RetentionConf,
+    body: serde_json::Value,
+) {
+    let now = gw_state::epoch_secs();
+    let record = gw_state::ContentRecord {
+        created_at_epoch_secs: now,
+        request_id: subject.request_id.clone(),
+        ak: subject.ak.clone(),
+        user_id: subject.user_id.clone(),
+        tenant: subject.tenant.clone(),
+        kind: "terminal".to_owned(),
+        content: body.to_string(),
+        sealed: false,
+        expires_at_epoch_secs: retention_expiry(retention, now),
+    };
+    if let Err(error) = store.content_terminal_put(&record).await {
+        tracing::warn!(error = %error, request_id = %subject.request_id, "terminal retention write failed");
+    }
+}
+
+fn terminal_result_body(result: Result<&DagContext, &GatewayError>) -> serde_json::Value {
+    match result {
+        Err(error) => match gw_consts::ErrClass::classify(error.code, error.http_status) {
+            Some(class) => terminal_error_body(class, error.original_status(), false),
+            None => terminal_plain_body("client_closed", error.http_status, false),
+        },
+        Ok(ctx) => match ctx.outcome.as_ref() {
+            Some(outcome) => match outcome.terminal_error.as_ref() {
+                Some(error) => terminal_error_body(error.class, error.original_status, true),
+                None if outcome.response.aborted => terminal_plain_body("client_closed", 499, true),
+                None => terminal_plain_body("success", outcome.http_code, false),
+            },
+            None => terminal_error_body(gw_consts::ErrClass::InternalServer, None, false),
+        },
+    }
+}
+
+fn terminal_status_body(http_status: u16) -> serde_json::Value {
+    if (200..300).contains(&http_status) {
+        return terminal_plain_body("success", http_status, false);
+    }
+    match gw_consts::ErrClass::from_status(http_status) {
+        Some(class) => terminal_error_body(class, None, false),
+        None => terminal_plain_body("client_closed", http_status, false),
+    }
+}
+
+fn terminal_plain_body(state: &str, http_status: u16, stream_committed: bool) -> serde_json::Value {
+    serde_json::json!({
+        "state": state,
+        "http_status": http_status,
+        "stream_committed": stream_committed,
+    })
+}
+
+fn terminal_error_body(
+    class: gw_consts::ErrClass,
+    original_status: Option<u16>,
+    stream_committed: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "state": "error",
+        "code": class.code(),
+        "http_status": class.status(),
+        "stream_committed": stream_committed,
+    });
+    if let Some(status) = original_status {
+        body["original_status_code"] = status.into();
+    }
+    body
+}
+
+/// The tenant's retention policy when it actually retains content.
+fn active_retention(cfg: &GatewayConfig, tenant: &str) -> Option<gw_config::RetentionConf> {
+    cfg.retention_for(tenant)
+        .copied()
+        .filter(|r| r.content != gw_config::ContentLevel::None)
+}
+
+fn retention_expiry(retention: gw_config::RetentionConf, now: i64) -> i64 {
+    if retention.days > 0 {
+        now + retention.days as i64 * 86_400
+    } else {
+        0
+    }
+}
+
 /// Persist this request's prompt and response per the tenant's retention policy.
 /// `inbound` is the pre-DLP prompt text; `store_full` (resolved once by the
 /// caller: full level AND a content key) stores it sealed, else it is stored
@@ -531,11 +684,7 @@ async fn persist_content(
     }
 
     let now = gw_state::epoch_secs();
-    let expires = if retention.days > 0 {
-        now + retention.days as i64 * 86_400
-    } else {
-        0
-    };
+    let expires = retention_expiry(retention, now);
     let redacted_response = || {
         plugins::redact_retained(
             ctx.outcome
@@ -733,6 +882,43 @@ mod tests {
         h.state().auth.authenticate("ak-demo-123").await.unwrap()
     }
 
+    fn retained_handler(transport: SharedTransport) -> OnlineHandler {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: [openai-chat]}]\ntenants: [{name: t1, retention: {content: redacted, days: 1}}]\naccess_keys: [{ak: retained-ak, tenant: t1, owner: attempt-1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport)
+    }
+
+    async fn retained_ak(h: &OnlineHandler) -> AkInfo {
+        h.state().auth.authenticate("retained-ak").await.unwrap()
+    }
+
+    async fn terminal_body(h: &OnlineHandler, request_id: &str) -> serde_json::Value {
+        let rows = h.state().store.content_for(request_id).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.kind == "terminal")
+            .expect("terminal row");
+        serde_json::from_str(&row.content).unwrap()
+    }
+
+    #[test]
+    fn generated_request_ids_are_fleet_unique() {
+        let (a, b) = (new_request_id(), new_request_id());
+        let (instance, seq) = a
+            .strip_prefix("req-")
+            .expect("request id prefix")
+            .rsplit_once('-')
+            .expect("instance-seq shape");
+        Uuid::parse_str(instance).expect("random instance tag");
+        seq.parse::<u64>().expect("sequence tail");
+        assert_ne!(a, b, "generated request ids must not repeat");
+        assert!(
+            b.starts_with(&format!("req-{instance}-")),
+            "one instance tag per process"
+        );
+    }
+
     async fn wait_terminal(h: &OnlineHandler, id: &str) {
         for _ in 0..100 {
             if let Some(j) = h.state().store.batch_get(id).await.unwrap()
@@ -754,6 +940,15 @@ mod tests {
             model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, name)),
             ..Default::default()
         }
+    }
+
+    fn drained_stream_req(name: &str, content: &str) -> GatewayRequest {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut request = chat_req(name, content);
+        request.stream = true;
+        request.stream_tx = Some(tx);
+        request
     }
 
     fn thinking_req(name: &str, content: &str, thinking_type: &str) -> GatewayRequest {
@@ -1425,6 +1620,86 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ProviderFailure;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ProviderFailure {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 502,
+                body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
+                    br#"{"error":{"message":"provider failed"}}"#,
+                )),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_provider_error_has_external_terminal_result() {
+        let h = retained_handler(Arc::new(ProviderFailure));
+        let mut request = chat_req("gpt-4o", "hello");
+        request.request_id = "req-provider-error".into();
+        let error = h
+            .run(request, retained_ak(&h).await)
+            .await
+            .err()
+            .expect("provider error");
+        assert_eq!(error.http_status, 502);
+
+        let terminal = terminal_body(&h, "req-provider-error").await;
+        assert_eq!(terminal["state"], "error");
+        assert_eq!(terminal["code"], "model_error_exception");
+        assert_eq!(terminal["http_status"], 424);
+        assert_eq!(terminal["original_status_code"], 502);
+        assert_eq!(terminal["stream_committed"], false);
+    }
+
+    #[derive(Debug)]
+    struct ToolOnlyReply;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ToolOnlyReply {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
+                    br#"{"model":"gpt-4o","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"probe","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
+                )),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_online_success_waits_for_view_result() {
+        let h = retained_handler(Arc::new(ToolOnlyReply));
+        let mut request = chat_req("gpt-4o", "use a tool");
+        request.request_id = "req-tool-only".into();
+        let ctx = h.run(request, retained_ak(&h).await).await.unwrap();
+        let outcome = ctx.outcome.as_ref().expect("outcome");
+        assert!(outcome.response.message.is_empty());
+        assert!(outcome.response.tool_calls.is_some());
+        let before = h.state().store.content_for("req-tool-only").await.unwrap();
+        assert!(
+            before.iter().all(|row| row.kind != "terminal"),
+            "the handler cannot know the final non-streaming view status"
+        );
+
+        persist_terminal_response(&ctx, 200).await;
+
+        let terminal = terminal_body(&h, "req-tool-only").await;
+        assert_eq!(terminal["state"], "success");
+        assert_eq!(terminal["http_status"], 200);
+        assert_eq!(terminal["stream_committed"], false);
+        assert!(terminal.get("code").is_none());
+    }
+
+    #[derive(Debug)]
     struct BreakingStream;
 
     #[async_trait::async_trait]
@@ -1452,25 +1727,71 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailoverBreakingStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for FailoverBreakingStream {
+        async fn send(
+            &self,
+            req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            if req.account == "a-down" {
+                return gw_engines::MockTransport.send(req).await;
+            }
+            BreakingStream.send(req).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct PausedStream {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PausedStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let first = futures::stream::once(async {
+                Ok::<_, gw_engines::transport::StreamFault>(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                ))
+            });
+            let release = Arc::clone(&self.release);
+            let second = futures::stream::once(async move {
+                release.notified().await;
+                Ok::<_, gw_engines::transport::StreamFault>(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n",
+                ))
+            });
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(first.chain(second).boxed()),
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn aborted_stream_bills_estimated_delivered_tokens() {
-        let mut cfg = GatewayConfig::embedded_default().unwrap();
-        cfg.security.dlp_redact = false;
-        let cfg = Arc::new(cfg);
-        let state = Arc::new(GatewayState::from_config(&cfg));
-        let h = OnlineHandler::new(
-            gw_state::SharedConfig::new(cfg, state),
-            Arc::new(BreakingStream),
-        );
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut req = chat_req("gpt-4o", "please stream something long");
-        req.stream = true;
-        req.stream_tx = Some(tx);
-        let ctx = h.run(req, ak(&h).await).await.unwrap();
+    async fn committed_stream_error_bills_and_records_failure() {
+        let h = retained_handler(Arc::new(BreakingStream));
+        let mut req = drained_stream_req("gpt-4o", "please stream something long");
+        req.request_id = "req-committed-error".into();
+        let ctx = h.run(req, retained_ak(&h).await).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted, "mid-stream break must mark aborted");
+        assert_eq!(
+            out.terminal_error.as_ref().map(|error| error.class),
+            Some(gw_consts::ErrClass::ModelStreamError)
+        );
         assert_eq!(out.response.message, "partial answer");
+        let terminal = terminal_body(&h, "req-committed-error").await;
+        assert_eq!(terminal["state"], "error");
+        assert_eq!(terminal["code"], "model_stream_error_exception");
+        assert_eq!(terminal["http_status"], 424);
+        assert_eq!(terminal["stream_committed"], true);
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 1, "aborted stream must still bill");
         assert!(
@@ -1483,9 +1804,129 @@ mod tests {
         let minute = gw_state::epoch_secs() / 60;
         assert_eq!(
             avail.window("gpt-4o", minute - 5, minute).await,
-            (0, 0),
-            "an aborted stream is neither an availability success nor an error"
+            (0, 1),
+            "a committed provider error is an availability failure"
         );
+    }
+
+    #[tokio::test]
+    async fn committed_retry_error_records_both_account_failures() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: [openai-chat]}, {name: a-up, provider: p, priority: 2, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(FailoverBreakingStream),
+        );
+        let mut alerts = h.state().alerts.take_receiver().expect("receiver");
+        let request = drained_stream_req("m", "please stream something long");
+
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(request, key).await.unwrap();
+        assert_eq!(
+            ctx.outcome
+                .as_ref()
+                .and_then(|outcome| outcome.terminal_error.as_ref())
+                .map(|error| error.class),
+            Some(gw_consts::ErrClass::ModelStreamError)
+        );
+        assert!(!h.state().health.available("a-down").await);
+        assert!(!h.state().health.available("a-up").await);
+        let first = alerts.try_recv().expect("first account cooldown alert");
+        let second = alerts.try_recv().expect("retry account cooldown alert");
+        assert_eq!(
+            (first.kind, first.subject.as_str()),
+            ("account_cooldown", "a-down")
+        );
+        assert_eq!(
+            (second.kind, second.subject.as_str()),
+            ("account_cooldown", "a-up")
+        );
+        assert!(alerts.try_recv().is_err(), "one alert per failed account");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_after_commit_stays_health_neutral() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: false}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a1, provider: p, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(PausedStream {
+                release: Arc::clone(&release),
+            }),
+        );
+        let mut alerts = h.state().alerts.take_receiver().expect("receiver");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut request = chat_req("m", "please stream something long");
+        request.stream = true;
+        request.stream_tx = Some(tx);
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let running = tokio::spawn({
+            let h = h.clone();
+            async move { h.run(request, key).await }
+        });
+
+        assert_eq!(rx.recv().await.expect("first chunk").delta, "first");
+        drop(rx);
+        release.notify_one();
+        let ctx = running.await.unwrap().unwrap();
+        let outcome = ctx.outcome.expect("outcome");
+        assert!(outcome.response.aborted);
+        assert!(outcome.terminal_error.is_none());
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(avail.window("m", minute - 5, minute).await, (0, 0));
+        assert!(h.state().health.available("a1").await);
+        assert!(alerts.try_recv().is_err());
+    }
+
+    #[derive(Debug)]
+    struct MalformedCommittedStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for MalformedCommittedStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from("data: not-json\n\n")),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_committed_stream_persists_terminal_error() {
+        let h = retained_handler(Arc::new(MalformedCommittedStream));
+        let mut request = drained_stream_req("gpt-4o", "please stream something long");
+        request.request_id = "req-committed-parse-error".into();
+
+        let ctx = h.run(request, retained_ak(&h).await).await.unwrap();
+        let outcome = ctx.outcome.expect("outcome");
+        assert!(outcome.response.aborted);
+        assert_eq!(outcome.response.message, "partial answer");
+        assert_eq!(
+            outcome.terminal_error.as_ref().map(|error| error.class),
+            Some(gw_consts::ErrClass::InternalServer)
+        );
+        let terminal = terminal_body(&h, "req-committed-parse-error").await;
+        assert_eq!(terminal["state"], "error");
+        assert_eq!(terminal["code"], "internal_server_exception");
+        assert_eq!(terminal["http_status"], 500);
+        assert_eq!(terminal["stream_committed"], true);
     }
 
     #[derive(Debug)]
@@ -1529,11 +1970,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(BreakingAnthropicStream),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut req = chat_req("claude-sonnet", "please stream something");
-        req.stream = true;
-        req.stream_tx = Some(tx);
+        let req = drained_stream_req("claude-sonnet", "please stream something");
         let ctx = h.run(req, ak(&h).await).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted);

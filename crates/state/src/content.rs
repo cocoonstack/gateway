@@ -21,7 +21,7 @@ static CIPHER: LazyLock<Option<XChaCha20Poly1305>> = LazyLock::new(|| {
     }
 });
 
-/// One stored prompt or response.
+/// One stored prompt, response, or terminal request result.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ContentRecord {
     pub created_at_epoch_secs: i64,
@@ -29,7 +29,7 @@ pub struct ContentRecord {
     pub ak: String,
     pub user_id: String,
     pub tenant: String,
-    /// "prompt" | "response".
+    /// "prompt" | "response" | "terminal".
     pub kind: String,
     /// Sealed (base64 nonce||ciphertext) or plaintext, per [`ContentRecord::sealed`].
     pub content: String,
