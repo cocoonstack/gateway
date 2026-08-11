@@ -2,7 +2,7 @@
 //! (response, http_code, block) with the error folded into the `Result`.
 
 use gw_consts::ErrCode;
-use gw_models::{Block, GResult, GatewayError, GatewayResponse};
+use gw_models::{Block, GResult, GatewayError, GatewayResponse, StreamError};
 use serde_json::{Map, Value};
 
 pub use gw_models::StreamChunk;
@@ -18,6 +18,8 @@ pub struct EngineOutcome {
     pub chunks: Vec<StreamChunk>,
     /// chunks were forwarded through the request's `stream_tx` as they arrived.
     pub streamed_live: bool,
+    /// The external error sent after a live stream had already committed.
+    pub terminal_error: Option<StreamError>,
 }
 
 impl EngineOutcome {
@@ -34,6 +36,7 @@ impl EngineOutcome {
             block: Block::allow(),
             chunks: Vec::new(),
             streamed_live: false,
+            terminal_error: None,
         }
     }
 
@@ -50,6 +53,7 @@ impl EngineOutcome {
             block: Block::allow(),
             chunks: pump.chunks,
             streamed_live: pump.streamed_live,
+            terminal_error: pump.terminal_error,
         }
     }
 }

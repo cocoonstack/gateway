@@ -62,6 +62,7 @@ tempfile = "3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
 
 # --- internal crates (path deps) ---
 gw-consts = { path = "crates/consts" }

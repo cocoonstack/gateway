@@ -2184,7 +2184,7 @@ fn unsealed_content(sealed: bool, content: String) -> Value {
     }
 }
 
-/// GET /admin/audit/content/{request_id} — the retained prompt/response rows
+/// GET /admin/audit/content/{request_id} — the retained prompt/response/terminal rows
 /// for one request, unsealed when the content key is present (a sealed row
 /// without it returns `content: null`). Tenant-scoped like the other reads.
 async fn admin_content_get(
@@ -2362,6 +2362,11 @@ async fn run_pipeline(s: &AppState, request: GatewayRequest, ak: AkInfo) -> GRes
     }
 }
 
+async fn terminal_response(ctx: &DagContext, response: Response) -> Response {
+    gw_handler::persist_terminal_response(ctx, response.status().as_u16()).await;
+    response
+}
+
 fn next_id(prefix: &str) -> String {
     format!("{prefix}-local-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
@@ -2524,13 +2529,14 @@ async fn chat_completions(
         return chat_stream_response(s, request, ak, model, started).into_response();
     }
 
-    let ctx = match run_pipeline(&s, request, ak).await {
+    let mut ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
     log_access("chat_completions", &ctx, started);
-    let Some(mut outcome) = ctx.outcome else {
-        return error_response(500, "pipeline produced no outcome");
+    let Some(mut outcome) = ctx.outcome.take() else {
+        let response = error_response(500, "pipeline produced no outcome");
+        return terminal_response(&ctx, response).await;
     };
 
     let id = next_id("chatcmpl");
@@ -2547,7 +2553,8 @@ async fn chat_completions(
         let calls: Vec<gw_protocol::openai::ToolCall> =
             serde_json::from_value(tc).unwrap_or_default();
         let resp = ChatCompletionResponse::tool_calls(id, created, model_out, calls, usage);
-        return (StatusCode::OK, Json(resp)).into_response();
+        let response = (StatusCode::OK, Json(resp)).into_response();
+        return terminal_response(&ctx, response).await;
     }
 
     let resp = ChatCompletionResponse::text(
@@ -2558,7 +2565,8 @@ async fn chat_completions(
         finish_openai(&outcome.response.finish_reason),
         usage,
     );
-    (StatusCode::OK, Json(resp)).into_response()
+    let response = (StatusCode::OK, Json(resp)).into_response();
+    terminal_response(&ctx, response).await
 }
 
 /// Run the pipeline on its own task, forwarding stream chunks through a bounded
@@ -2902,13 +2910,14 @@ async fn messages(
         .into_response();
     }
 
-    let ctx = match run_pipeline(&s, request, ak).await {
+    let mut ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
-    let Some(mut outcome) = ctx.outcome else {
-        return anthropic_error(500, "pipeline produced no outcome");
+    let Some(mut outcome) = ctx.outcome.take() else {
+        let response = anthropic_error(500, "pipeline produced no outcome");
+        return terminal_response(&ctx, response).await;
     };
     let usage = anthropic_usage(
         outcome.response.prompt_tokens,
@@ -2929,7 +2938,7 @@ async fn messages(
     if let Some(context) = thinking_context.as_ref() {
         thinking_audit.remember_content(context, &content);
     }
-    (
+    let response = (
         StatusCode::OK,
         Json(json!({
             "id": next_id("msg"),
@@ -2941,7 +2950,8 @@ async fn messages(
             "usage": usage,
         })),
     )
-        .into_response()
+        .into_response();
+    terminal_response(&ctx, response).await
 }
 
 /// tool_use blocks for an engine's tool_calls: native blocks pass through;
@@ -3222,9 +3232,10 @@ async fn family_response(
     started: Instant,
 ) -> Response {
     match run_family(s, ak, model, mt, typed, vec![], user_id).await {
-        Ok(ctx) => {
+        Ok(mut ctx) => {
             log_access(surface, &ctx, started);
-            response_v2_or_500(ctx.outcome, engine)
+            let response = response_v2_or_500(ctx.outcome.take(), engine);
+            terminal_response(&ctx, response).await
         }
         Err(resp) => resp,
     }
@@ -3289,7 +3300,7 @@ async fn completions(
         temperature: body["temperature"].as_f64(),
         ..Default::default()
     });
-    let ctx = match run_family(
+    let mut ctx = match run_family(
         &s,
         ak,
         model,
@@ -3304,8 +3315,9 @@ async fn completions(
         Err(resp) => return resp,
     };
     log_access("completions", &ctx, started);
-    let Some(outcome) = ctx.outcome else {
-        return error_response(500, "pipeline produced no outcome");
+    let Some(outcome) = ctx.outcome.take() else {
+        let response = error_response(500, "pipeline produced no outcome");
+        return terminal_response(&ctx, response).await;
     };
     let r = &outcome.response;
     let finish = finish_or_stop(&r.finish_reason);
@@ -3322,7 +3334,8 @@ async fn completions(
             r.common_usage
         ),
     });
-    (StatusCode::OK, Json(resp)).into_response()
+    let response = (StatusCode::OK, Json(resp)).into_response();
+    terminal_response(&ctx, response).await
 }
 
 /// POST /v1/responses — native passthrough: the whole body rides as `raw`
@@ -3359,12 +3372,13 @@ async fn responses(
         return responses_stream_response(s, request, ak, model, started).into_response();
     }
 
-    let ctx = match run_pipeline(&s, request, ak).await {
+    let mut ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
     log_access("responses", &ctx, started);
-    response_v2_or_500(ctx.outcome, "responses")
+    let response = response_v2_or_500(ctx.outcome.take(), "responses");
+    terminal_response(&ctx, response).await
 }
 
 /// Streaming /v1/responses as the Responses SSE dialect; live for real vendors,
@@ -3610,28 +3624,35 @@ async fn audio_speech(
         Err(resp) => return resp,
     };
     log_access("audio_speech", &ctx, started);
-    if let Some(o) = ctx.outcome.take_if(|o| o.block.block) {
-        return error_response(400, o.response.message);
-    }
-    let Some(b64) = ctx
-        .outcome
-        .and_then(|o| o.response.response_v2)
-        .and_then(|v| v["audio_b64"].as_str().map(str::to_owned))
-    else {
-        return error_response(500, "tts engine returned no audio");
+    let response = if let Some(o) = ctx.outcome.take_if(|o| o.block.block) {
+        error_response(400, o.response.message)
+    } else {
+        match ctx
+            .outcome
+            .take()
+            .and_then(|o| o.response.response_v2)
+            .and_then(|v| v["audio_b64"].as_str().map(str::to_owned))
+        {
+            Some(b64) => {
+                let content_type = match format.as_str() {
+                    "wav" => "audio/wav",
+                    "pcm" => "audio/pcm",
+                    "opus" => "audio/opus",
+                    "aac" => "audio/aac",
+                    "flac" => "audio/flac",
+                    _ => "audio/mpeg",
+                };
+                match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                    Ok(bytes) => {
+                        (StatusCode::OK, [("content-type", content_type)], bytes).into_response()
+                    }
+                    Err(e) => error_response(500, format!("bad audio payload: {e}")),
+                }
+            }
+            None => error_response(500, "tts engine returned no audio"),
+        }
     };
-    let content_type = match format.as_str() {
-        "wav" => "audio/wav",
-        "pcm" => "audio/pcm",
-        "opus" => "audio/opus",
-        "aac" => "audio/aac",
-        "flac" => "audio/flac",
-        _ => "audio/mpeg",
-    };
-    match base64::engine::general_purpose::STANDARD.decode(&b64) {
-        Ok(bytes) => (StatusCode::OK, [("content-type", content_type)], bytes).into_response(),
-        Err(e) => error_response(500, format!("bad audio payload: {e}")),
-    }
+    terminal_response(&ctx, response).await
 }
 
 /// POST /v1/audio/transcriptions (STT; JSON carries b64 audio, not multipart).
@@ -3675,7 +3696,7 @@ async fn audio_transcribe(
         language: body["language"].as_str().map(str::to_owned),
         translate,
     });
-    let ctx = match run_family(
+    let mut ctx = match run_family(
         &s,
         ak,
         model,
@@ -3695,11 +3716,12 @@ async fn audio_transcribe(
         "audio_transcriptions"
     };
     log_access(surface, &ctx, started);
-    match ctx.outcome {
+    let response = match ctx.outcome.take() {
         Some(o) if o.block.block => error_response(400, o.response.message),
         Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
         None => error_response(500, "stt engine returned no outcome"),
-    }
+    };
+    terminal_response(&ctx, response).await
 }
 
 /// POST /v1/moderations — OpenAI moderations shape; input may be a string or
@@ -3963,6 +3985,24 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    #[derive(Debug)]
+    struct InvalidTtsPayload;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for InvalidTtsPayload {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
+                    br#"{"audio_b64":"%%%"}"#,
+                )),
+            })
+        }
+    }
+
     #[test]
     fn unsealed_content_passes_plaintext_and_nulls_unopenable() {
         assert_eq!(
@@ -3984,6 +4024,26 @@ mod tests {
             state,
             Arc::new(gw_engines::MockTransport),
         ))
+    }
+
+    fn retained_view_app(transport: SharedTransport) -> (Router, Arc<dyn gw_state::Store>) {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {blocklist: [forbiddenword]}\nmodels: [{name: gpt-5-responses, protocol: responses}, {name: tts-1, protocol: tts}]\naccounts: [{name: a1, provider: openai, protocols: [responses, tts]}]\ntenants: [{name: t1, retention: {content: redacted, days: 1}}]\naccess_keys: [{ak: retained-ak, tenant: t1, owner: user-1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let store = state.store.clone();
+        (app(AppState::new(cfg, state, transport)), store)
+    }
+
+    async fn retained_terminal(store: &dyn gw_state::Store) -> Value {
+        let rows = store
+            .content_list_user(Some("t1"), "user-1", 10, true)
+            .await
+            .unwrap();
+        let terminal = rows
+            .iter()
+            .find(|row| row.kind == "terminal")
+            .expect("terminal row");
+        serde_json::from_str(&terminal.content).unwrap()
     }
 
     fn rt(name: &str) -> RtModel {
@@ -4022,6 +4082,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn retained_non_chat_block_uses_view_status() {
+        let (router, store) = retained_view_app(Arc::new(gw_engines::MockTransport));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer retained-ak")
+            .body(Body::from(
+                r#"{"model":"gpt-5-responses","input":"forbiddenword"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let terminal = retained_terminal(store.as_ref()).await;
+        assert_eq!(terminal["state"], "error");
+        assert_eq!(terminal["code"], "validation_exception");
+        assert_eq!(terminal["http_status"], 400);
+        assert_eq!(terminal["stream_committed"], false);
+    }
+
+    #[tokio::test]
+    async fn retained_tts_decode_failure_uses_view_status() {
+        let (router, store) = retained_view_app(Arc::new(InvalidTtsPayload));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer retained-ak")
+            .body(Body::from(
+                r#"{"model":"tts-1","input":"read this","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let terminal = retained_terminal(store.as_ref()).await;
+        assert_eq!(terminal["state"], "error");
+        assert_eq!(terminal["code"], "internal_server_exception");
+        assert_eq!(terminal["http_status"], 500);
+        assert_eq!(terminal["stream_committed"], false);
     }
 
     #[tokio::test]
@@ -4581,6 +4685,11 @@ mod tests {
             .content_add(&rec("r3", "u1", "t2", 300))
             .await
             .unwrap();
+        let mut terminal = rec("rt", "u1", "t1", 400);
+        terminal.kind = "terminal".into();
+        terminal.content =
+            r#"{"state":"success","http_status":200,"stream_committed":false}"#.into();
+        store.content_terminal_put(&terminal).await.unwrap();
         let router = app(app_state);
 
         let list = |uri: &str, token: &str| {
@@ -4608,7 +4717,7 @@ mod tests {
         let j = body_json(resp).await;
         assert_eq!(
             ids(&j),
-            ["r3", "r2", "r1"],
+            ["rt", "r3", "r2", "r1"],
             "global scope: the user's rows across tenants, newest first"
         );
         assert!(
@@ -4616,8 +4725,8 @@ mod tests {
             "metadata only: no content bodies"
         );
         assert_eq!(j["rows"][0]["user_id"], "u1");
-        assert_eq!(j["rows"][0]["kind"], "prompt");
-        assert_eq!(j["rows"][0]["created_at_epoch_secs"], 300);
+        assert_eq!(j["rows"][0]["kind"], "terminal");
+        assert_eq!(j["rows"][0]["created_at_epoch_secs"], 400);
 
         let resp = router
             .clone()
@@ -4626,8 +4735,25 @@ mod tests {
             .unwrap();
         assert_eq!(
             ids(&body_json(resp).await),
-            ["r2", "r1"],
+            ["rt", "r2", "r1"],
             "tenant admin sees only its own tenant's rows"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(list(
+                "/admin/audit/content?user=u1&limit=1&include=bodies",
+                "t1-tok",
+            ))
+            .await
+            .unwrap();
+        let j = body_json(resp).await;
+        assert_eq!(j["rows"][0]["kind"], "terminal");
+        let terminal: Value =
+            serde_json::from_str(j["rows"][0]["content"].as_str().unwrap()).expect("terminal json");
+        assert_eq!(
+            terminal["state"], "success",
+            "the owner-scoped archive exposes the terminal body"
         );
 
         let resp = router
@@ -4646,7 +4772,7 @@ mod tests {
             .oneshot(list("/admin/audit/content?user=u1&limit=1", "root-tok"))
             .await
             .unwrap();
-        assert_eq!(ids(&body_json(resp).await), ["r3"], "limit respected");
+        assert_eq!(ids(&body_json(resp).await), ["rt"], "limit respected");
 
         let resp = router
             .oneshot(list("/admin/audit/content", "root-tok"))
@@ -4715,7 +4841,11 @@ mod tests {
         assert_eq!(read.status(), StatusCode::OK);
         let j = body_json(read).await;
         let entries = j["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2, "prompt and response rows read back");
+        assert_eq!(
+            entries.len(),
+            3,
+            "prompt, response, and terminal rows read back"
+        );
         let prompt_entry = entries
             .iter()
             .find(|e| e["kind"] == "prompt")
@@ -4727,6 +4857,12 @@ mod tests {
                 .contains("[REDACTED_SECRET]"),
             "read-back returns the redacted text"
         );
+        let terminal = entries
+            .iter()
+            .find(|entry| entry["kind"] == "terminal")
+            .expect("terminal entry");
+        let terminal: Value = serde_json::from_str(terminal["content"].as_str().unwrap()).unwrap();
+        assert_eq!(terminal["state"], "success");
     }
 
     #[derive(Debug)]

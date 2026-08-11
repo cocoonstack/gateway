@@ -3701,8 +3701,8 @@ access_keys: [{ak: k-erase, tenant: t1, product: p, qps: 100, daily_token_quota:
     let j = body_json(resp).await;
     assert_eq!(
         j["entries"].as_array().unwrap().len(),
-        2,
-        "prompt and response retained: {j}"
+        3,
+        "prompt, response, and terminal retained: {j}"
     );
 
     let resp = app
@@ -3726,7 +3726,7 @@ access_keys: [{ak: k-erase, tenant: t1, product: p, qps: 100, daily_token_quota:
         )
         .await
         .unwrap();
-    assert_eq!(body_json(resp).await["deleted"], 2);
+    assert_eq!(body_json(resp).await["deleted"], 3);
 
     let resp = app
         .clone()
