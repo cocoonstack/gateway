@@ -244,7 +244,7 @@ impl DagNode for CacheLookup {
         else {
             return Ok(());
         };
-        if ctx.request.stream || !ctx.request.is_online {
+        if !ctx.request.buffered_online() {
             return Ok(());
         }
         let Some(key) = cache_key_of(ctx) else {
@@ -842,7 +842,7 @@ impl DagNode for CacheStore {
         &["cost_calc"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.request.stream || !ctx.request.is_online {
+        if !ctx.request.buffered_online() {
             return Ok(());
         }
         let Some(outcome) = ctx.outcome.as_ref() else {

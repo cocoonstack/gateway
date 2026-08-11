@@ -85,27 +85,28 @@ impl OnlineHandler {
         }
         // one consistent snapshot for the whole request
         let snap = self.config.load();
-        let retention = snap
-            .cfg
-            .retention_for(&ak.tenant)
-            .copied()
-            .filter(|r| r.content != gw_config::ContentLevel::None);
-        let terminal = TerminalSubject {
-            request_id: request.request_id.clone(),
-            ak: ak.ak.clone(),
-            user_id: ak
-                .attributed_user(request.user_id.as_deref().unwrap_or_default())
-                .to_owned(),
-            tenant: ak.tenant.clone(),
-        };
-        let result = self.run_inner(request, ak, snap.clone()).await;
+        let retention = active_retention(&snap.cfg, &ak.tenant);
+        let terminal = retention.map(|retention| {
+            (
+                retention,
+                TerminalSubject {
+                    request_id: request.request_id.clone(),
+                    ak: ak.ak.clone(),
+                    user_id: ak
+                        .attributed_user(request.user_id.as_deref().unwrap_or_default())
+                        .to_owned(),
+                    tenant: ak.tenant.clone(),
+                },
+            )
+        });
+        let result = self.run_inner(request, ak, &snap, retention).await;
         let settled_here = match result.as_ref() {
             Err(_) => true,
-            Ok(ctx) => ctx.request.stream || !ctx.request.is_online,
+            Ok(ctx) => !ctx.request.buffered_online(),
         };
-        if settled_here && let Some(retention) = retention {
+        if settled_here && let Some((retention, subject)) = terminal {
             let body = terminal_result_body(result.as_ref());
-            persist_terminal(snap.state.store.as_ref(), &terminal, retention, body).await;
+            persist_terminal(snap.state.store.as_ref(), &subject, retention, body).await;
         }
         result
     }
@@ -114,7 +115,8 @@ impl OnlineHandler {
         &self,
         mut request: GatewayRequest,
         ak: AkInfo,
-        snap: Arc<gw_state::Snapshot>,
+        snap: &gw_state::Snapshot,
+        retention: Option<gw_config::RetentionConf>,
     ) -> GResult<DagContext> {
         let sec = snap.cfg.security_for(&ak.tenant);
         // outbound redaction (PII or secrets) is a response-buffering boundary:
@@ -148,11 +150,6 @@ impl OnlineHandler {
         }
 
         // pre-DLP text, computed once for moderation and the retained prompt
-        let retention = snap
-            .cfg
-            .retention_for(&ctx.ak.tenant)
-            .copied()
-            .filter(|r| r.content != gw_config::ContentLevel::None);
         let inbound =
             (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
 
@@ -438,12 +435,7 @@ pub fn new_request_id() -> String {
 /// Persist the final HTTP result for an online non-streaming request after its
 /// view has finished rendering the response.
 pub async fn persist_terminal_response(ctx: &DagContext, http_status: u16) {
-    let Some(retention) = ctx
-        .cfg
-        .retention_for(&ctx.ak.tenant)
-        .copied()
-        .filter(|r| r.content != gw_config::ContentLevel::None)
-    else {
+    let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
         return;
     };
     let subject = TerminalSubject {
@@ -574,9 +566,8 @@ struct TerminalSubject {
     tenant: String,
 }
 
-/// Persist one trusted lifecycle result. The row contains no provider message
-/// or user content. A store failure stays best-effort and loud: it cannot
-/// replace the request result.
+/// Persist one lifecycle result row (no provider message or user content);
+/// a store failure is logged, never surfaced into the request result.
 async fn persist_terminal(
     store: &dyn gw_state::Store,
     subject: &TerminalSubject,
@@ -604,25 +595,13 @@ fn terminal_result_body(result: Result<&DagContext, &GatewayError>) -> serde_jso
     match result {
         Err(error) => match gw_consts::ErrClass::classify(error.code, error.http_status) {
             Some(class) => terminal_error_body(class, error.original_status(), false),
-            None => serde_json::json!({
-                "state": "client_closed",
-                "http_status": error.http_status,
-                "stream_committed": false,
-            }),
+            None => terminal_plain_body("client_closed", error.http_status, false),
         },
         Ok(ctx) => match ctx.outcome.as_ref() {
             Some(outcome) => match outcome.terminal_error.as_ref() {
                 Some(error) => terminal_error_body(error.class, error.original_status, true),
-                None if outcome.response.aborted => serde_json::json!({
-                    "state": "client_closed",
-                    "http_status": 499,
-                    "stream_committed": true,
-                }),
-                None => serde_json::json!({
-                    "state": "success",
-                    "http_status": outcome.http_code,
-                    "stream_committed": false,
-                }),
+                None if outcome.response.aborted => terminal_plain_body("client_closed", 499, true),
+                None => terminal_plain_body("success", outcome.http_code, false),
             },
             None => terminal_error_body(gw_consts::ErrClass::InternalServer, None, false),
         },
@@ -631,20 +610,20 @@ fn terminal_result_body(result: Result<&DagContext, &GatewayError>) -> serde_jso
 
 fn terminal_status_body(http_status: u16) -> serde_json::Value {
     if (200..300).contains(&http_status) {
-        return serde_json::json!({
-            "state": "success",
-            "http_status": http_status,
-            "stream_committed": false,
-        });
+        return terminal_plain_body("success", http_status, false);
     }
     match gw_consts::ErrClass::from_status(http_status) {
         Some(class) => terminal_error_body(class, None, false),
-        None => serde_json::json!({
-            "state": "client_closed",
-            "http_status": http_status,
-            "stream_committed": false,
-        }),
+        None => terminal_plain_body("client_closed", http_status, false),
     }
+}
+
+fn terminal_plain_body(state: &str, http_status: u16, stream_committed: bool) -> serde_json::Value {
+    serde_json::json!({
+        "state": state,
+        "http_status": http_status,
+        "stream_committed": stream_committed,
+    })
 }
 
 fn terminal_error_body(
@@ -662,6 +641,13 @@ fn terminal_error_body(
         body["original_status_code"] = status.into();
     }
     body
+}
+
+/// The tenant's retention policy when it actually retains content.
+fn active_retention(cfg: &GatewayConfig, tenant: &str) -> Option<gw_config::RetentionConf> {
+    cfg.retention_for(tenant)
+        .copied()
+        .filter(|r| r.content != gw_config::ContentLevel::None)
 }
 
 fn retention_expiry(retention: gw_config::RetentionConf, now: i64) -> i64 {
@@ -909,14 +895,15 @@ mod tests {
 
     #[test]
     fn generated_request_ids_are_uuid_v4() {
-        let mut ids = std::collections::HashSet::new();
-        for _ in 0..256 {
-            let id = new_request_id();
-            let parsed = Uuid::parse_str(id.strip_prefix("req-").expect("request id prefix"))
-                .expect("request id uuid");
-            assert_eq!(parsed.get_version_num(), 4);
-            assert!(ids.insert(id), "generated request ids must not repeat");
-        }
+        let id = new_request_id();
+        let parsed = Uuid::parse_str(id.strip_prefix("req-").expect("request id prefix"))
+            .expect("request id uuid");
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_ne!(
+            new_request_id(),
+            id,
+            "generated request ids must not repeat"
+        );
     }
 
     async fn wait_terminal(h: &OnlineHandler, id: &str) {

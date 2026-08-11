@@ -36,6 +36,12 @@ impl GatewayRequest {
         self.model_param_v2.as_ref().map(|p| p.protocol)
     }
 
+    /// Whether the result is one buffered HTTP render (online, non-streaming) —
+    /// the mode response caching and the view-side terminal write apply to.
+    pub fn buffered_online(&self) -> bool {
+        self.is_online && !self.stream
+    }
+
     /// The serving account's name; empty when none is selected.
     pub fn account_name(&self) -> &str {
         self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")

@@ -126,32 +126,20 @@ where
                     }
                 };
                 for data in events {
-                    let v: Value = match serde_json::from_str(&data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let error = GatewayError::internal(format!("parse {vendor} sse frame"))
-                                .with_source(e);
-                            if sent_any {
-                                tracing::warn!(vendor, error = %error, "vendor frame parse failed after commit");
-                                if let Some(error) = StreamError::from_committed_error(error) {
-                                    abort_frame(&tx, &mut out, error).await;
-                                } else {
-                                    out.aborted = true;
-                                }
-                                out.streamed_live = tx.is_some();
-                                return Ok(out);
-                            }
-                            return Err(error);
-                        }
-                    };
-                    // A vendor error frame (or any apply failure) after bytes
-                    // reached the client is a committed abort, NOT a failover
-                    // signal — replaying would splice a second generation onto
-                    // the same stream.
-                    let chunks = match apply(v) {
+                    // A malformed frame, vendor error frame, or apply failure
+                    // after bytes reached the client is a committed abort, NOT
+                    // a failover signal — replaying would splice a second
+                    // generation onto the same stream.
+                    let applied = serde_json::from_str(&data)
+                        .map_err(|e| {
+                            GatewayError::internal(format!("parse {vendor} sse frame"))
+                                .with_source(e)
+                        })
+                        .and_then(&mut apply);
+                    let chunks = match applied {
                         Ok(c) => c,
                         Err(e) if sent_any => {
-                            tracing::warn!(vendor, error = %e, "vendor error frame after commit");
+                            tracing::warn!(vendor, error = %e, "vendor frame error after commit");
                             if let Some(error) = StreamError::from_committed_error(e) {
                                 abort_frame(&tx, &mut out, error).await;
                             } else {

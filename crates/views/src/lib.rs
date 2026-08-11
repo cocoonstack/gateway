@@ -3624,33 +3624,26 @@ async fn audio_speech(
         Err(resp) => return resp,
     };
     log_access("audio_speech", &ctx, started);
-    let response = if let Some(o) = ctx.outcome.take_if(|o| o.block.block) {
-        error_response(400, o.response.message)
-    } else {
-        match ctx
-            .outcome
-            .take()
-            .and_then(|o| o.response.response_v2)
-            .and_then(|v| v["audio_b64"].as_str().map(str::to_owned))
-        {
-            Some(b64) => {
-                let content_type = match format.as_str() {
-                    "wav" => "audio/wav",
-                    "pcm" => "audio/pcm",
-                    "opus" => "audio/opus",
-                    "aac" => "audio/aac",
-                    "flac" => "audio/flac",
-                    _ => "audio/mpeg",
-                };
-                match base64::engine::general_purpose::STANDARD.decode(&b64) {
-                    Ok(bytes) => {
-                        (StatusCode::OK, [("content-type", content_type)], bytes).into_response()
-                    }
-                    Err(e) => error_response(500, format!("bad audio payload: {e}")),
-                }
-            }
-            None => error_response(500, "tts engine returned no audio"),
-        }
+    if let Some(o) = ctx.outcome.take_if(|o| o.block.block) {
+        let response = error_response(400, o.response.message);
+        return terminal_response(&ctx, response).await;
+    }
+    let payload = ctx.outcome.take().and_then(|o| o.response.response_v2);
+    let Some(b64) = payload.as_ref().and_then(|v| v["audio_b64"].as_str()) else {
+        let response = error_response(500, "tts engine returned no audio");
+        return terminal_response(&ctx, response).await;
+    };
+    let content_type = match format.as_str() {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        _ => "audio/mpeg",
+    };
+    let response = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => (StatusCode::OK, [("content-type", content_type)], bytes).into_response(),
+        Err(e) => error_response(500, format!("bad audio payload: {e}")),
     };
     terminal_response(&ctx, response).await
 }
