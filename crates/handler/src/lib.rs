@@ -942,6 +942,15 @@ mod tests {
         }
     }
 
+    fn drained_stream_req(name: &str, content: &str) -> GatewayRequest {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut request = chat_req(name, content);
+        request.stream = true;
+        request.stream_tx = Some(tx);
+        request
+    }
+
     fn thinking_req(name: &str, content: &str, thinking_type: &str) -> GatewayRequest {
         let mut request = chat_req(name, content);
         request.preserve_anthropic_wire = true;
@@ -1718,15 +1727,58 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailoverBreakingStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for FailoverBreakingStream {
+        async fn send(
+            &self,
+            req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            if req.account == "a-down" {
+                return gw_engines::MockTransport.send(req).await;
+            }
+            BreakingStream.send(req).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct PausedStream {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PausedStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let first = futures::stream::once(async {
+                Ok::<_, gw_engines::transport::StreamFault>(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                ))
+            });
+            let release = Arc::clone(&self.release);
+            let second = futures::stream::once(async move {
+                release.notified().await;
+                Ok::<_, gw_engines::transport::StreamFault>(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n",
+                ))
+            });
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(first.chain(second).boxed()),
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn aborted_stream_bills_estimated_delivered_tokens() {
+    async fn committed_stream_error_bills_and_records_failure() {
         let h = retained_handler(Arc::new(BreakingStream));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut req = chat_req("gpt-4o", "please stream something long");
+        let mut req = drained_stream_req("gpt-4o", "please stream something long");
         req.request_id = "req-committed-error".into();
-        req.stream = true;
-        req.stream_tx = Some(tx);
         let ctx = h.run(req, retained_ak(&h).await).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted, "mid-stream break must mark aborted");
@@ -1752,9 +1804,83 @@ mod tests {
         let minute = gw_state::epoch_secs() / 60;
         assert_eq!(
             avail.window("gpt-4o", minute - 5, minute).await,
-            (0, 0),
-            "an aborted stream is neither an availability success nor an error"
+            (0, 1),
+            "a committed provider error is an availability failure"
         );
+    }
+
+    #[tokio::test]
+    async fn committed_retry_error_records_both_account_failures() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: [openai-chat]}, {name: a-up, provider: p, priority: 2, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(FailoverBreakingStream),
+        );
+        let mut alerts = h.state().alerts.take_receiver().expect("receiver");
+        let request = drained_stream_req("m", "please stream something long");
+
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(request, key).await.unwrap();
+        assert_eq!(
+            ctx.outcome
+                .as_ref()
+                .and_then(|outcome| outcome.terminal_error.as_ref())
+                .map(|error| error.class),
+            Some(gw_consts::ErrClass::ModelStreamError)
+        );
+        assert!(!h.state().health.available("a-down").await);
+        assert!(!h.state().health.available("a-up").await);
+        let first = alerts.try_recv().expect("first account cooldown alert");
+        let second = alerts.try_recv().expect("retry account cooldown alert");
+        assert_eq!(
+            (first.kind, first.subject.as_str()),
+            ("account_cooldown", "a-down")
+        );
+        assert_eq!(
+            (second.kind, second.subject.as_str()),
+            ("account_cooldown", "a-up")
+        );
+        assert!(alerts.try_recv().is_err(), "one alert per failed account");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_after_commit_stays_health_neutral() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: false}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a1, provider: p, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(PausedStream {
+                release: Arc::clone(&release),
+            }),
+        );
+        let mut alerts = h.state().alerts.take_receiver().expect("receiver");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut request = chat_req("m", "please stream something long");
+        request.stream = true;
+        request.stream_tx = Some(tx);
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let running = tokio::spawn({
+            let h = h.clone();
+            async move { h.run(request, key).await }
+        });
+
+        assert_eq!(rx.recv().await.expect("first chunk").delta, "first");
+        drop(rx);
+        release.notify_one();
+        let ctx = running.await.unwrap().unwrap();
+        let outcome = ctx.outcome.expect("outcome");
+        assert!(outcome.response.aborted);
+        assert!(outcome.terminal_error.is_none());
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(avail.window("m", minute - 5, minute).await, (0, 0));
+        assert!(h.state().health.available("a1").await);
+        assert!(alerts.try_recv().is_err());
     }
 
     #[derive(Debug)]
@@ -1785,12 +1911,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_committed_stream_persists_terminal_error() {
         let h = retained_handler(Arc::new(MalformedCommittedStream));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut request = chat_req("gpt-4o", "please stream something long");
+        let mut request = drained_stream_req("gpt-4o", "please stream something long");
         request.request_id = "req-committed-parse-error".into();
-        request.stream = true;
-        request.stream_tx = Some(tx);
 
         let ctx = h.run(request, retained_ak(&h).await).await.unwrap();
         let outcome = ctx.outcome.expect("outcome");
@@ -1848,11 +1970,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(BreakingAnthropicStream),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut req = chat_req("claude-sonnet", "please stream something");
-        req.stream = true;
-        req.stream_tx = Some(tx);
+        let req = drained_stream_req("claude-sonnet", "please stream something");
         let ctx = h.run(req, ak(&h).await).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted);

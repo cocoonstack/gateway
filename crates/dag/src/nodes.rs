@@ -514,15 +514,7 @@ impl DagNode for CallEngine {
         let mut engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
         match engine.run().await {
             Ok(outcome) => {
-                // an aborted stream is neither a success nor an account fault
-                if !outcome.response.aborted {
-                    ctx.state
-                        .avail
-                        .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
-                    if let Some(a) = ctx.request.account.as_ref() {
-                        ctx.state.health.record_success(&a.name).await;
-                    }
-                }
+                note_engine_outcome(ctx, &outcome, threshold, cooldown).await;
                 ctx.decide(
                     "call_engine",
                     format!(
@@ -574,13 +566,7 @@ impl DagNode for CallEngine {
                 let mut retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        // same aborted-stream exclusion as the first attempt
-                        if !outcome.response.aborted {
-                            ctx.state
-                                .avail
-                                .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
-                            ctx.state.health.record_success(&next.name).await;
-                        }
+                        note_engine_outcome(ctx, &outcome, threshold, cooldown).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
@@ -596,6 +582,32 @@ impl DagNode for CallEngine {
             }
             Err(e) => Err(named(e, ctx)),
         }
+    }
+}
+
+async fn note_engine_outcome(
+    ctx: &mut DagContext,
+    outcome: &gw_engines::EngineOutcome,
+    threshold: usize,
+    cooldown: std::time::Duration,
+) {
+    if outcome.terminal_error.is_some() {
+        ctx.state
+            .avail
+            .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
+        if let Some(account) = ctx.request.account.clone() {
+            note_failure(ctx, &account.name, threshold, cooldown).await;
+        }
+        return;
+    }
+    if outcome.response.aborted {
+        return;
+    }
+    ctx.state
+        .avail
+        .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
+    if let Some(account) = ctx.request.account.as_ref() {
+        ctx.state.health.record_success(&account.name).await;
     }
 }
 
