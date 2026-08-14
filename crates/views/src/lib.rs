@@ -938,13 +938,14 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
     let latency = started.elapsed();
     let user_id = ctx.effective_user_id();
     let decisions = ctx.decision_lines().collect::<Vec<_>>().join("; ");
+    let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
         target: "access",
         surface,
         request_id = %ctx.request.request_id,
-        ak = %ctx.ak.ak,
+        ak_id,
         product = %ctx.ak.product,
         user_id,
         model = %model,

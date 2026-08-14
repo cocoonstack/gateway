@@ -494,7 +494,8 @@ async fn note_abuse(ctx: &DagContext) {
         ..Default::default()
     };
     if let Err(e) = ctx.state.auth.patch(&ctx.ak.ak, &patch).await {
-        tracing::warn!(error = %e, ak = %ctx.ak.ak, "abuse suspension patch failed");
+        let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
+        tracing::warn!(error = %e, ak_id, "abuse suspension patch failed");
         return;
     }
     let summary = format!(

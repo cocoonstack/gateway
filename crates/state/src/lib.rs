@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use gw_config::GatewayConfig;
 use gw_consts::Protocol;
 use gw_models::Account;
+use sha2::{Digest, Sha256};
 
 pub mod admission;
 pub mod alerts;
@@ -797,7 +798,7 @@ impl GatewayState {
             match RedisGovernance::connect(&cfg.storage.redis_url).await {
                 Ok(g) => {
                     state.governance = Arc::new(g);
-                    tracing::info!(url = %cfg.storage.redis_url, "governance = redis");
+                    tracing::info!("governance = redis");
                 }
                 Err(e) => tracing::error!(error = %e, "redis connect failed; staying in-process"),
             }
@@ -979,6 +980,12 @@ pub fn epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Stable SHA-256 identifier for correlating an access key in logs.
+pub fn access_key_fingerprint(ak: &str) -> String {
+    let digest = Sha256::digest(ak.as_bytes());
+    format!("sha256:{}", hex::encode(&digest[..16]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1008,14 @@ mod tests {
             suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
         }
+    }
+
+    #[test]
+    fn access_key_fingerprint_is_stable_without_exposing_the_key() {
+        let fingerprint = access_key_fingerprint("ak-secret");
+        assert_eq!(fingerprint, "sha256:41d7cef0ff97ad3b306ff0a0fff45d54");
+        assert!(!fingerprint.contains("ak-secret"));
+        assert_ne!(fingerprint, access_key_fingerprint("ak-other"));
     }
 
     #[test]

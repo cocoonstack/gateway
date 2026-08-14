@@ -26,7 +26,8 @@ status codes, protocol/stage names) — no per-key or per-model cardinality.
 
 One structured line per successfully served request goes to stdout (via
 `tracing`; control level with `RUST_LOG`), carrying `surface`, `request_id`,
-`ak`, `product`, `user_id`, `model`, `protocol`, `account`, `prompt_tokens`,
+`ak_id` (a stable SHA-256 fingerprint, never the bearer credential), `product`,
+`user_id`, `model`, `protocol`, `account`, `prompt_tokens`,
 `completion_tokens`, `total_tokens`, `latency_ms`, and `decisions` — the
 pipeline's routing trail for that request (quota fallback, variant pick,
 degrade, DLP/moderation outcomes). Errored requests are

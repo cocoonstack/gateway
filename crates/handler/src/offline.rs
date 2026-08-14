@@ -257,7 +257,8 @@ impl OfflineHandler {
                             ak
                         }
                         _ => {
-                            tracing::warn!(batch = %job.id, ak = %job.ak, "claimed batch's key is gone or inactive; failing it");
+                            let ak_id = gw_state::access_key_fingerprint(&job.ak);
+                            tracing::warn!(batch = %job.id, ak_id, "claimed batch's key is gone or inactive; failing it");
                             let _ = store
                                 .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
                                 .await;
