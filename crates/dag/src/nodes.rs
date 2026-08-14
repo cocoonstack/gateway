@@ -672,36 +672,19 @@ impl DagNode for CostCalc {
         &["common_usage"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        // fail loud: silently skipping here would serve a response unbilled
         let outcome = ctx
             .outcome
             .as_ref()
             .ok_or_else(|| GatewayError::internal("cost_calc without an engine outcome"))?;
+        if ctx.billing_deferred {
+            return Ok(());
+        }
         let resp = &outcome.response;
         // An aborted stream delivered text but never the final usage frame — bill it.
         // Gate on completion_tokens==0, not total: Anthropic reports input up front,
         // output only in the final message_delta the break skipped.
         if resp.aborted && resp.completion_tokens == 0 {
-            let enc = gw_models::token_estimate::default_encoder();
-            let param = ctx.request.model_param_v2.as_ref();
-            let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
-                gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
-                _ => None,
-            });
-            let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-            let pt = if resp.prompt_tokens > 0 {
-                resp.prompt_tokens
-            } else {
-                gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
-            };
-            let ct = enc.encode_len(&resp.message) as i64;
-            let rate = gw_state::model_token_rate(
-                &ctx.cfg,
-                served_model(ctx.request.model_param_v2.as_ref()),
-            );
-            let tokens = BillTokens::weighted(pt, ct, &rate);
-            ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, tokens, true).await;
+            return bill_aborted_stream(ctx, None).await;
         }
         let rate =
             gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
@@ -733,6 +716,13 @@ impl DagNode for CostCalc {
     }
 }
 
+/// What the HTTP view delivered from an outbound-DLP buffered stream.
+pub enum StreamDelivery {
+    Complete(i64),
+    Partial(i64),
+    None,
+}
+
 /// Token counts for one bill: vendor-reported sides plus the weighted billable
 /// sides; the platform total is always the billable sum, so quota consumption
 /// and cost cannot drift.
@@ -761,6 +751,103 @@ impl BillTokens {
     fn total(&self) -> i64 {
         self.billable_prompt
             .saturating_add(self.billable_completion)
+    }
+}
+
+async fn bill_aborted_stream(
+    ctx: &mut DagContext,
+    delivered_completion: Option<i64>,
+) -> GResult<()> {
+    let response = &ctx
+        .outcome
+        .as_ref()
+        .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
+        .response;
+    let enc = gw_models::token_estimate::default_encoder();
+    let param = ctx.request.model_param_v2.as_ref();
+    let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
+        gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
+        _ => None,
+    });
+    let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+    let prompt = if response.prompt_tokens > 0 {
+        response.prompt_tokens
+    } else {
+        gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
+    };
+    let completion = delivered_completion
+        .unwrap_or_else(|| enc.encode_len(&response.message) as i64)
+        .max(0);
+    let rate =
+        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
+    ctx.decide(
+        "cost_calc",
+        format!("aborted stream, billed {prompt}+{completion}"),
+    );
+    bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
+}
+
+/// Close the deferred reserve/billing lifecycle after the view replays a
+/// buffered stream. A pre-delivery disconnect refunds; a partial delivery uses
+/// the same estimated-token path as an interrupted live stream.
+pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
+    if !ctx.billing_deferred {
+        return Ok(());
+    }
+    ctx.billing_deferred = false;
+    if ctx.quota_reserved.is_none() && ctx.tpm_reserved.is_none() {
+        return Ok(());
+    }
+    match delivery {
+        StreamDelivery::Complete(completion)
+            if ctx.outcome.as_ref().is_some_and(|outcome| {
+                outcome.response.aborted && outcome.response.completion_tokens == 0
+            }) =>
+        {
+            bill_aborted_stream(ctx, Some(completion)).await
+        }
+        StreamDelivery::Complete(_) => CostCalc.execute(ctx).await,
+        StreamDelivery::Partial(completion) => {
+            {
+                let outcome = ctx
+                    .outcome
+                    .as_mut()
+                    .ok_or_else(|| GatewayError::internal("stream delivery without an outcome"))?;
+                let response = &mut outcome.response;
+                response.message.clear();
+                response.completion_tokens = 0;
+                response.total_tokens = response.prompt_tokens;
+                response.common_usage = None;
+                response.raw_usage = None;
+                response.aborted = true;
+            }
+            bill_aborted_stream(ctx, Some(completion)).await
+        }
+        StreamDelivery::None => {
+            ctx.state
+                .governance
+                .refund_reserves(
+                    &ctx.ak.ak,
+                    ctx.quota_reserved.take().unwrap_or(0),
+                    ctx.tpm_reserved.take(),
+                    ctx.quota_at,
+                )
+                .await;
+            if let Some(outcome) = ctx.outcome.as_mut() {
+                outcome.response.message.clear();
+                outcome.response.prompt_tokens = 0;
+                outcome.response.completion_tokens = 0;
+                outcome.response.total_tokens = 0;
+                outcome.response.common_usage = None;
+                outcome.response.raw_usage = None;
+                outcome.response.aborted = true;
+            }
+            ctx.decide(
+                "delivery",
+                "client closed before buffered stream".to_owned(),
+            );
+            Ok(())
+        }
     }
 }
 

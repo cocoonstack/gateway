@@ -2582,16 +2582,19 @@ fn spawn_stream_pipeline(
     started: Instant,
 ) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
-    let dlp = s.handler.cfg().security_for(&ak.tenant).redacts_output();
-    if !dlp {
+    let buffer_output = s.handler.cfg().security_for(&ak.tenant).redacts_output();
+    if !buffer_output {
         request.stream_tx = Some(tx.clone());
     }
     let handler = s.handler.clone();
     tokio::spawn(async move {
         match handler.run(request, ak).await {
-            Ok(ctx) => {
-                log_access(surface, &ctx, started);
-                if let Some(outcome) = ctx.outcome {
+            Ok(mut ctx) => {
+                let dlp = ctx.billing_deferred;
+                if !dlp {
+                    log_access(surface, &ctx, started);
+                }
+                if let Some(outcome) = ctx.outcome.as_mut() {
                     let usage_totals = (
                         outcome.response.prompt_tokens,
                         outcome.response.completion_tokens,
@@ -2610,9 +2613,35 @@ fn spawn_stream_pipeline(
                         common_usage,
                         ..Default::default()
                     });
-                    for c in tail {
-                        if tx.send(c).await.is_err() {
-                            break; // client went away; billing already happened
+                    if dlp {
+                        let mut delivered = 0i64;
+                        let mut complete = true;
+                        for chunk in tail {
+                            let tokens = stream_chunk_output_tokens(&chunk);
+                            if tx.send(chunk).await.is_err() {
+                                complete = false;
+                                break;
+                            }
+                            delivered = delivered.saturating_add(tokens);
+                        }
+                        let delivery = if complete {
+                            gw_dag::StreamDelivery::Complete(delivered)
+                        } else if delivered > 0 {
+                            gw_dag::StreamDelivery::Partial(delivered)
+                        } else {
+                            gw_dag::StreamDelivery::None
+                        };
+                        if let Err(e) =
+                            gw_handler::complete_buffered_stream(&mut ctx, delivery).await
+                        {
+                            tracing::error!(error = %e, "buffered stream settlement failed");
+                        }
+                        log_access(surface, &ctx, started);
+                    } else {
+                        for chunk in tail {
+                            if tx.send(chunk).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2776,15 +2805,15 @@ fn chat_stream_response(
 }
 
 /// Chunks for an engine that returned a buffered response.
-fn synth_chunks(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
-    let mut resp = outcome.response;
+fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let resp = &mut outcome.response;
     let mut chunks = if outcome.chunks.is_empty() && !resp.message.is_empty() {
         vec![gw_engines::StreamChunk {
-            delta: resp.message,
+            delta: std::mem::take(&mut resp.message),
             ..Default::default()
         }]
     } else {
-        outcome.chunks
+        std::mem::take(&mut outcome.chunks)
     };
     if let Some(tc) = resp.tool_calls.take()
         && !chunks.iter().any(|c| c.tool_calls.is_some())
@@ -2805,15 +2834,17 @@ fn synth_chunks(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChu
 
 /// The stream tail under outbound DLP: unlike [`synth_chunks`] it never replays
 /// the raw pre-redaction deltas, so no unmasked text ever leaves.
-fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
-    let mut resp = outcome.response;
+fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let resp = &mut outcome.response;
     if resp.anthropic_content.is_some() {
-        return gw_engines::anthropic_native_chunks(&resp, None);
+        let chunks = gw_engines::anthropic_native_chunks(resp, None);
+        resp.anthropic_content = None;
+        return chunks;
     }
     let mut chunks = Vec::new();
     if !resp.message.is_empty() {
         chunks.push(gw_engines::StreamChunk {
-            delta: resp.message,
+            delta: std::mem::take(&mut resp.message),
             ..Default::default()
         });
     }
@@ -2828,6 +2859,25 @@ fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::S
         ..Default::default()
     });
     chunks
+}
+
+fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
+    let encoder = gw_models::token_estimate::default_encoder();
+    let mut tokens = encoder.encode_len(&chunk.delta) as i64;
+    if let Some(tool_calls) = &chunk.tool_calls {
+        tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
+    }
+    if let Some(event) = &chunk.anthropic_event {
+        for field in ["text", "thinking", "partial_json"] {
+            if let Some(value) = event["delta"][field].as_str() {
+                tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
+            }
+        }
+        if let Some(name) = event["content_block"]["name"].as_str() {
+            tokens = tokens.saturating_add(encoder.encode_len(name) as i64);
+        }
+    }
+    gw_state::clamp_tokens(tokens)
 }
 
 /// POST /v1/messages (Anthropic-compatible surface, stream + non-stream)
@@ -3996,6 +4046,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DelayedDlpStream {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for DelayedDlpStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            self.release.notified().await;
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n"
+                        .to_vec(),
+                ),
+            })
+        }
+    }
+
     #[test]
     fn unsealed_content_passes_plaintext_and_nulls_unopenable() {
         assert_eq!(
@@ -4151,6 +4223,58 @@ mod tests {
             .unwrap();
         assert_eq!(by_user.len(), 1);
         assert!(by_user[0].total_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn dlp_disconnect_before_replay_refunds_and_marks_terminal() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: true}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a, provider: openai, protocols: [openai-chat]}]\ntenants: [{name: t, retention: {content: redacted, days: 1}}]\naccess_keys: [{ak: k, tenant: t, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app_state = AppState::new(
+            cfg,
+            state.clone(),
+            Arc::new(DelayedDlpStream {
+                release: release.clone(),
+            }),
+        );
+        let ak = state.auth.authenticate("k").await.unwrap();
+        let request = GatewayRequest {
+            is_online: true,
+            stream: true,
+            request_id: "req-dlp-disconnect".into(),
+            ak: "k".into(),
+            message: vec![ChatMsg::text("user", "hi")],
+            model_param_v2: Some(ModelParamV2::with_name(
+                gw_consts::Protocol::OpenaiChat,
+                "m",
+            )),
+            ..Default::default()
+        };
+        drop(spawn_stream_pipeline(
+            &app_state,
+            request,
+            ak,
+            "test",
+            Instant::now(),
+        ));
+        release.notify_one();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let rows = state.store.content_for("req-dlp-disconnect").await.unwrap();
+                if let Some(row) = rows.into_iter().find(|row| row.kind == "terminal") {
+                    break serde_json::from_str::<Value>(&row.content).unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal result");
+        assert_eq!(terminal["state"], "client_closed");
+        assert_eq!(terminal["stream_committed"], false);
+        assert_eq!(state.store.ledger_snapshot(10).await.unwrap().0, 0);
+        assert_eq!(state.governance.quota_used("k").await, 0);
     }
 
     #[tokio::test]
@@ -5317,6 +5441,29 @@ mod tests {
             !users.contains("mallory"),
             "spoofed hint never overrides owner"
         );
+    }
+
+    #[test]
+    fn partial_stream_estimate_covers_visible_output_only() {
+        let text = gw_engines::StreamChunk {
+            delta: "hello".into(),
+            ..Default::default()
+        };
+        let tool = gw_engines::StreamChunk {
+            tool_calls: Some(json!([{"function":{"name":"lookup","arguments":"{}"}}])),
+            ..Default::default()
+        };
+        let native = gw_engines::StreamChunk {
+            anthropic_event: Some(json!({
+                "type":"content_block_delta",
+                "delta":{"type":"text_delta","text":"answer"}
+            })),
+            ..Default::default()
+        };
+        assert!(stream_chunk_output_tokens(&text) > 0);
+        assert!(stream_chunk_output_tokens(&tool) > 0);
+        assert!(stream_chunk_output_tokens(&native) > 0);
+        assert_eq!(stream_chunk_output_tokens(&Default::default()), 0);
     }
 
     #[test]

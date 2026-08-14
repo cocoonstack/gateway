@@ -95,6 +95,9 @@ Outbound redaction needs the whole message (a masked span may straddle two SSE
 deltas), so **with `dlp_redact` enabled a streaming response is buffered and the
 redacted text replayed** rather than forwarded token-by-token — DLP trades
 incremental delivery for a guarantee that no unmasked text reaches the client.
+Billing is settled after that replay: a disconnect before the first redacted
+chunk refunds the reservation, while a partial replay bills only an estimate of
+the delivered text.
 Turn `dlp_redact` off to keep incremental delivery; note the embedded demo
 config ships with it on.
 

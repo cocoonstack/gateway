@@ -2285,7 +2285,7 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
 "#;
     let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
-    let app = gw_views::app(AppState::new(cfg, state, Arc::new(PiiStream)));
+    let app = gw_views::app(AppState::new(cfg, state.clone(), Arc::new(PiiStream)));
 
     let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let resp = app
@@ -2301,6 +2301,12 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
     assert!(
         !text.contains("leak@evil.com"),
         "raw PII must never reach the client over the stream: {text}"
+    );
+    let (_, ledger) = state.store.ledger_snapshot(10).await.unwrap();
+    assert_eq!(
+        ledger.len(),
+        1,
+        "a fully replayed DLP stream is billed once"
     );
 }
 

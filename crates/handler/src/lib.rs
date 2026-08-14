@@ -106,7 +106,7 @@ impl OnlineHandler {
         let result = self.run_inner(request, ak, &snap, retention).await;
         let settled_here = match result.as_ref() {
             Err(_) => true,
-            Ok(ctx) => !ctx.request.buffered_online(),
+            Ok(ctx) => !ctx.request.buffered_online() && !ctx.billing_deferred,
         };
         if settled_here && let Some((retention, subject)) = terminal {
             let body = terminal_result_body(result.as_ref());
@@ -140,6 +140,7 @@ impl OnlineHandler {
             request,
             ak,
         );
+        ctx.billing_deferred = dlp && ctx.request.is_online && ctx.request.stream;
         // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
         for hit in &scan.hits {
             emit_security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count).await;
@@ -461,6 +462,31 @@ pub async fn persist_terminal_response(ctx: &DagContext, http_status: u16) {
         terminal_status_body(http_status),
     )
     .await;
+}
+
+/// Settle billing and terminal retention after an outbound-DLP buffered stream
+/// has been replayed by the HTTP view.
+pub async fn complete_buffered_stream(
+    ctx: &mut DagContext,
+    delivery: gw_dag::StreamDelivery,
+) -> GResult<()> {
+    let terminal = match &delivery {
+        gw_dag::StreamDelivery::Complete(_) => terminal_plain_body("success", 200, false),
+        gw_dag::StreamDelivery::Partial(_) => terminal_plain_body("client_closed", 499, true),
+        gw_dag::StreamDelivery::None => terminal_plain_body("client_closed", 499, false),
+    };
+    gw_dag::settle_deferred_stream(ctx, delivery).await?;
+    let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
+        return Ok(());
+    };
+    let subject = TerminalSubject {
+        request_id: ctx.request.request_id.clone(),
+        ak: ctx.ak.ak.clone(),
+        user_id: ctx.effective_user_id().to_owned(),
+        tenant: ctx.ak.tenant.clone(),
+    };
+    persist_terminal(ctx.state.store.as_ref(), &subject, retention, terminal).await;
+    Ok(())
 }
 
 /// Count one admission rejection against the key's daily abuse counter and
@@ -2042,6 +2068,28 @@ mod tests {
             "email must be redacted: {}",
             out.response.message
         );
+    }
+
+    #[tokio::test]
+    async fn dlp_partial_replay_bills_only_delivered_text() {
+        let h = OnlineHandler::new(handler().config.clone(), Arc::new(PiiStream));
+        let mut request = chat_req("gpt-4o", "hello");
+        request.stream = true;
+        let mut ctx = h.run(request, ak(&h).await).await.unwrap();
+        assert_eq!(
+            h.state().store.ledger_snapshot(10).await.unwrap().0,
+            0,
+            "billing waits for the buffered replay"
+        );
+
+        complete_buffered_stream(&mut ctx, gw_dag::StreamDelivery::Partial(2))
+            .await
+            .unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(10).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger[0].estimated);
+        assert!(ledger[0].completion_tokens > 0);
+        assert!(ctx.outcome.as_ref().unwrap().response.aborted);
     }
 
     #[tokio::test]

@@ -40,6 +40,9 @@ pub struct DagContext {
     pub quota_at: i64,
     /// Tokens reserved in the AK TPM window at admission (same lifecycle).
     pub tpm_reserved: Option<i64>,
+    /// Outbound DLP buffered this stream, so billing waits for the view's
+    /// delivery result instead of settling inside the DAG.
+    pub billing_deferred: bool,
 }
 
 impl DagContext {
@@ -64,6 +67,7 @@ impl DagContext {
             quota_reserved: None,
             quota_at: 0,
             tpm_reserved: None,
+            billing_deferred: false,
         }
     }
 
