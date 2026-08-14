@@ -595,8 +595,8 @@ impl ModelEngine for RerankEngine {
     /// Cohere/Jina-compatible rerank: `{model, query, documents, top_n?}` →
     /// `{results: [{index, relevance_score}]}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let Some(TypedParams::Rerank(p)) = &param.typed else {
+        let model = self.base.model_name()?.to_owned();
+        let Some(TypedParams::Rerank(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("rerank params are required"));
         };
         require_non_empty(&p.query, "rerank query")?;
@@ -605,11 +605,10 @@ impl ModelEngine for RerankEngine {
                 "rerank documents must not be empty",
             ));
         }
-        let mut body = json!({
-            "model": param.model_name,
-            "query": p.query,
-            "documents": p.documents,
-        });
+        // the document set moves — json! would re-copy every string
+        let mut body = json!({"model": model});
+        body["query"] = p.query.into();
+        body["documents"] = Value::Array(p.documents.into_iter().map(Value::String).collect());
         if let Some(n) = p.top_n {
             body["top_n"] = json!(n);
         }
@@ -622,7 +621,7 @@ impl ModelEngine for RerankEngine {
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
-        let mut out = family_outcome(format!("{n} results"), &param.model_name, v, status);
+        let mut out = family_outcome(format!("{n} results"), &model, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
         Ok(out)
