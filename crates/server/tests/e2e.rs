@@ -2934,25 +2934,31 @@ async fn realtime_bridges_to_a_real_upstream_websocket() {
             let _ = socket
                 .send(send(serde_json::json!({"type":"session.created","session":{"vendor":"fake"}})))
                 .await;
+            let mut turn = 0;
             while let Some(Ok(M::Text(t))) = socket.recv().await {
                 let Ok(v) = serde_json::from_str::<Value>(&t) else {
                     continue;
                 };
                 if v["type"] == "response.create" {
+                    turn += 1;
                     let _ = socket
-                        .send(send(
-                            serde_json::json!({"type":"response.output_text.delta","delta":"bridge "}),
-                        ))
+                        .send(send(serde_json::json!({
+                            "type":"response.output_text.delta",
+                            "delta": if turn == 1 { "bridge " } else { "partial output" },
+                        })))
                         .await;
-                    let _ = socket
-                        .send(send(
-                            serde_json::json!({"type":"response.output_text.delta","delta":"ok"}),
-                        ))
-                        .await;
-                    let _ = socket
-                        .send(send(serde_json::json!({"type":"response.done",
-                            "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}})))
-                        .await;
+                    if turn == 1 {
+                        let _ = socket
+                            .send(send(serde_json::json!({
+                                "type":"response.output_text.delta",
+                                "delta":"ok",
+                            })))
+                            .await;
+                        let _ = socket
+                            .send(send(serde_json::json!({"type":"response.done",
+                                "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}})))
+                            .await;
+                    }
                 }
             }
         })
@@ -3028,6 +3034,43 @@ models:
     assert_eq!(records[0].model, "rt-model");
     assert_eq!(records[0].account, "rt-vendor");
     assert_eq!(records[0].total_tokens, 13);
+
+    ws.send(Message::text(
+        serde_json::json!({"type":"response.create"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let partial = ws.next().await.unwrap().unwrap();
+    let partial: Value = serde_json::from_str(partial.to_text().unwrap()).unwrap();
+    assert_eq!(partial["type"], "response.output_text.delta");
+    assert_eq!(partial["delta"], "partial output");
+    ws.close(None).await.unwrap();
+
+    let (count, records) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+            if snapshot.0 == 2 {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted turn was never settled");
+    assert_eq!(count, 2);
+    let aborted = &records[1];
+    assert!(aborted.estimated);
+    assert_eq!(aborted.prompt_tokens, 0);
+    assert!(aborted.completion_tokens > 0);
+    assert_ne!(aborted.request_id, records[0].request_id);
+    assert_eq!(
+        state.governance.quota_used("ak-rt").await,
+        records
+            .iter()
+            .map(|record| record.total_tokens)
+            .sum::<i64>(),
+        "the delivered partial output must not be refunded"
+    );
 }
 
 #[tokio::test]

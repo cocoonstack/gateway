@@ -20,7 +20,9 @@ use gw_config::GatewayConfig;
 use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
-use gw_engines::realtime::{is_response_create, realtime_turn_started, realtime_usage};
+use gw_engines::realtime::{
+    is_response_create, realtime_output_delta, realtime_turn_started, realtime_usage,
+};
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
@@ -361,6 +363,33 @@ impl RealtimeAdmit {
     }
 }
 
+struct RealtimeTurn {
+    admit: RealtimeAdmit,
+    delivered_output_tokens: i64,
+}
+
+impl RealtimeTurn {
+    fn new(admit: RealtimeAdmit) -> Self {
+        Self {
+            admit,
+            delivered_output_tokens: 0,
+        }
+    }
+
+    fn record_text(&mut self, text: &str) {
+        let tokens = gw_models::token_estimate::default_encoder().encode_len(text);
+        self.record_units(i64::try_from(tokens).unwrap_or(i64::MAX));
+    }
+
+    fn estimated_output_tokens(&self) -> Option<i64> {
+        (self.delivered_output_tokens > 0).then_some(self.delivered_output_tokens)
+    }
+
+    fn record_units(&mut self, units: i64) {
+        self.delivered_output_tokens = self.delivered_output_tokens.saturating_add(units);
+    }
+}
+
 /// The REST admission chain applied per realtime generation via the shared
 /// [`admission`] checks, with the key re-fetched each turn so mid-session
 /// bans/de-entitlements take effect. Denials carry the rendering class
@@ -470,6 +499,7 @@ async fn bill_realtime_turn(
     account: &str,
     it: i64,
     ot: i64,
+    estimated: bool,
 ) {
     let ak = &admit.ak;
     // clamp parts and total so a hostile count can't overflow shared counters
@@ -505,7 +535,7 @@ async fn bill_realtime_turn(
                 billable_completion: bc,
                 total,
                 ptu_spillover: false,
-                estimated: false,
+                estimated,
             },
             reserved: admit.reserved,
             tpm_reserved: admit.tpm_reserved,
@@ -522,9 +552,23 @@ async fn bill_realtime_turn(
         total,
     )
     .await;
-    state.avail.record(&m.requested, true);
+    if !estimated {
+        state.avail.record(&m.requested, true);
+    }
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot as u64);
+}
+
+async fn settle_realtime_abort(
+    turn: RealtimeTurn,
+    m: &RtModel,
+    mt: gw_consts::Protocol,
+    account: &str,
+) {
+    match turn.estimated_output_tokens() {
+        Some(output) => bill_realtime_turn(&turn.admit, m, mt, account, 0, output, true).await,
+        None => turn.admit.refund().await,
+    }
 }
 
 /// One mock realtime session.
@@ -572,6 +616,7 @@ async fn realtime_session(
                         continue;
                     }
                 };
+                let mut turn = RealtimeTurn::new(admit);
                 let input = ev["text"].as_str().unwrap_or_default();
                 let reply = format!("[mock-realtime:{}] you said: {input}", rtm.served);
                 let (it, ot) = (
@@ -583,17 +628,27 @@ async fn realtime_session(
                     .find(|&i| reply.is_char_boundary(i))
                     .unwrap_or(0);
                 let (a, b) = reply.split_at(mid);
-                let _ = socket
-                    .send(send(json!({"type":"response.delta","delta": a})))
-                    .await;
-                let _ = socket
-                    .send(send(json!({"type":"response.delta","delta": b})))
-                    .await;
-                let _ = socket
+                for delta in [a, b] {
+                    if socket
+                        .send(send(json!({"type":"response.delta","delta": delta})))
+                        .await
+                        .is_err()
+                    {
+                        settle_realtime_abort(turn, &rtm, mt, &account).await;
+                        return;
+                    }
+                    turn.record_text(delta);
+                }
+                if socket
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
-                    .await;
-                bill_realtime_turn(&admit, &rtm, mt, &account, it, ot).await;
+                    .await
+                    .is_err()
+                {
+                    bill_realtime_turn(&turn.admit, &rtm, mt, &account, it, ot, false).await;
+                    return;
+                }
+                bill_realtime_turn(&turn.admit, &rtm, mt, &account, it, ot, false).await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -704,7 +759,7 @@ async fn realtime_bridge(
     let mut recognized = 0u64;
     // the one admitted turn awaiting settle (the OpenAI dialect allows a single
     // active response); refunded on exit so its reserve never leaks
-    let mut pending: Option<RealtimeAdmit> = None;
+    let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
     // outbound DLP redactions summed within a turn, recorded once at its boundary
@@ -746,7 +801,7 @@ async fn realtime_bridge(
                     if is_response_create(&frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
-                                pending = Some(admit);
+                                pending = Some(RealtimeTurn::new(admit));
                                 generations += 1;
                             }
                             Err((class, denied)) => {
@@ -788,6 +843,7 @@ async fn realtime_bridge(
                 let mut relay = true;
                 let mut redacted: Option<String> = None;
                 let mut turn_ended = false;
+                let mut output_units = 0;
                 match frame {
                     Some(mut v) => {
                         if suppress {
@@ -800,7 +856,7 @@ async fn realtime_bridge(
                         // response.create — gate it here like a manual one
                         else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
-                                Ok(admit) => pending = Some(admit),
+                                Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
                                 Err((class, denied)) => {
                                     let _ = up_tx
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
@@ -816,8 +872,20 @@ async fn realtime_bridge(
                             // turn boundary — settle the admitted turn;
                             // a boundary with no gated turn bills unreserved
                             match pending.take() {
-                                Some(a) => {
-                                    bill_realtime_turn(&a, &rtm, mt, &account.name, it, ot).await
+                                Some(turn) if it.saturating_add(ot) > 0 => {
+                                    bill_realtime_turn(
+                                        &turn.admit,
+                                        &rtm,
+                                        mt,
+                                        &account.name,
+                                        it,
+                                        ot,
+                                        false,
+                                    )
+                                    .await
+                                }
+                                Some(turn) => {
+                                    settle_realtime_abort(turn, &rtm, mt, &account.name).await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
                                     // re-authenticate so billing uses the key's current
@@ -846,6 +914,7 @@ async fn realtime_bridge(
                                         &account.name,
                                         it,
                                         ot,
+                                        false,
                                     )
                                     .await
                                 }
@@ -868,6 +937,17 @@ async fn realtime_bridge(
                         if n > 0 {
                             redacted = Some(v.to_string());
                         }
+                        if relay {
+                            let (text, opaque) = realtime_output_delta(&v);
+                            output_units = text.map_or(0, |text| {
+                                let tokens = gw_models::token_estimate::default_encoder()
+                                    .encode_len(text);
+                                i64::try_from(tokens).unwrap_or(i64::MAX)
+                            });
+                            output_units = output_units.saturating_add(
+                                i64::try_from(opaque).unwrap_or(i64::MAX),
+                            );
+                        }
                         // per-token events would be too hot: sum the turn, record once at its boundary
                         out_redacted += n as i64;
                         if turn_ended {
@@ -876,7 +956,15 @@ async fn realtime_bridge(
                         }
                     }
                     // a denied turn's non-JSON output (e.g. audio deltas) is dropped too
-                    None => relay = !suppress,
+                    None => {
+                        relay = !suppress;
+                        if relay {
+                            let opaque = raw_bytes
+                                .as_ref()
+                                .map_or(0, |bytes| bytes.len().div_ceil(4));
+                            output_units = i64::try_from(opaque).unwrap_or(i64::MAX);
+                        }
+                    }
                 }
                 if relay {
                     let out = match (redacted, was_text, raw_text, raw_bytes) {
@@ -889,12 +977,15 @@ async fn realtime_bridge(
                     if cl_tx.send(out).await.is_err() {
                         break;
                     }
+                    if let Some(turn) = pending.as_mut() {
+                        turn.record_units(output_units);
+                    }
                 }
             },
         }
     }
-    if let Some(a) = pending {
-        a.refund().await;
+    if let Some(turn) = pending {
+        settle_realtime_abort(turn, &rtm, mt, &account.name).await;
     }
     // a turn aborted before its boundary (upstream drop) still applied its
     // redactions per frame — flush the pending count so the audit isn't lost
@@ -5206,6 +5297,7 @@ mod tests {
             "acc",
             30,
             70,
+            false,
         )
         .await;
         assert_eq!(used().await, 100, "settled to actual (30 + 70)");
@@ -5229,6 +5321,7 @@ mod tests {
             "acc",
             0,
             0,
+            false,
         )
         .await;
         assert_eq!(used().await, 100, "zero-usage turn refunds its reserve");
@@ -5263,6 +5356,7 @@ mod tests {
             "acc",
             100,
             100,
+            false,
         )
         .await;
         let (_, ledger) = s
@@ -5367,6 +5461,7 @@ mod tests {
             "acc",
             100,
             100,
+            false,
         )
         .await;
 
@@ -5402,6 +5497,7 @@ mod tests {
             "acc",
             40,
             60,
+            false,
         )
         .await;
 
@@ -5426,6 +5522,7 @@ mod tests {
             "acc",
             10,
             20,
+            false,
         )
         .await;
 

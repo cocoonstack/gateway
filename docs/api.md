@@ -146,8 +146,10 @@ phone numbers, and credential masking — redacts text fields in both directions
 buffer). Every hit is audited without prompt text; per-user attribution comes
 from the `x-gw-user` hint captured at connect. Each generation re-checks the
 key, so a key banned, expired, or revoked (or a model de-entitled) mid-session
-stops generating. An endpoint-less account serves a local mock session (OpenAI
-Realtime event shape) for offline development.
+stops generating. If a turn delivers output but disconnects before its usage
+boundary, the delivered text or audio is billed from an estimate; a turn that
+delivered nothing is refunded. An endpoint-less account serves a local mock
+session (OpenAI Realtime event shape) for offline development.
 
 ## Introspection
 
