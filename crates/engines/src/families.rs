@@ -346,26 +346,28 @@ base_engine!(ImageEngine);
 impl ModelEngine for ImageEngine {
     /// Merges the dalle/wanx/flux/stability/... engines to the images/generations shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let (prompt, n, size, image, mask) = match &param.typed {
-            Some(TypedParams::Image(p)) => (
-                p.prompt.as_str(),
-                p.n,
-                p.size.as_deref(),
-                p.image.as_deref(),
-                p.mask.as_deref(),
+        let model = self.base.model_name()?.to_owned();
+        let (prompt, n, size, image, mask) = match self.base.take_typed() {
+            Some(TypedParams::Image(p)) => (p.prompt, p.n, p.size, p.image, p.mask),
+            _ => (
+                self.base.last_message_text().to_owned(),
+                1,
+                None,
+                None,
+                None,
             ),
-            _ => (self.base.last_message_text(), 1, None, None, None),
         };
-        require_non_empty(prompt, "image prompt")?;
-        let mut body = json!({"model": param.model_name, "prompt": prompt, "n": n});
+        require_non_empty(&prompt, "image prompt")?;
+        let mut body = json!({"model": model, "n": n});
+        body["prompt"] = prompt.into();
         if let Some(s) = size {
-            body["size"] = json!(s);
+            body["size"] = s.into();
         }
+        // base64 image/mask payloads move — json! would re-copy megabytes
         let (path, is_edit) = if let Some(img) = image {
-            body["image"] = json!(img);
+            body["image"] = img.into();
             if let Some(m) = mask {
-                body["mask"] = json!(m);
+                body["mask"] = m.into();
             }
             ("/v1/images/edits", true)
         } else {
@@ -377,7 +379,7 @@ impl ModelEngine for ImageEngine {
         let verb = if is_edit { "edited" } else { "generated" };
         Ok(family_outcome(
             format!("{count} image(s) {verb}"),
-            &param.model_name,
+            &model,
             v,
             status,
         ))
@@ -409,10 +411,10 @@ impl AudioEngine {
 impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
+        let model = self.base.model_name()?.to_owned();
         let (path, body) = match self.kind {
             AudioKind::Tts => {
-                let (input, voice, format) = match &param.typed {
+                let (input, voice, format) = match &self.base.param()?.typed {
                     Some(TypedParams::AudioTts(p)) => (
                         p.input.as_str(),
                         p.voice.as_deref(),
@@ -421,7 +423,7 @@ impl ModelEngine for AudioEngine {
                     _ => (self.base.last_message_text(), None, None),
                 };
                 require_non_empty(input, "tts input")?;
-                let mut b = json!({"model": param.model_name, "input": input});
+                let mut b = json!({"model": model, "input": input});
                 if let Some(v) = voice {
                     b["voice"] = json!(v);
                 }
@@ -431,27 +433,27 @@ impl ModelEngine for AudioEngine {
                 ("/v1/audio/speech", b)
             }
             AudioKind::Stt => {
-                let (audio, language, translate) = match &param.typed {
-                    Some(TypedParams::AudioStt(p)) => {
-                        (p.audio_b64.as_str(), p.language.as_deref(), p.translate)
-                    }
-                    _ => ("", None, false),
+                let (audio, language, translate) = match self.base.take_typed() {
+                    Some(TypedParams::AudioStt(p)) => (p.audio_b64, p.language, p.translate),
+                    _ => (String::new(), None, false),
                 };
-                require_non_empty(audio, "stt audio_b64")?;
+                require_non_empty(&audio, "stt audio_b64")?;
                 let path = if translate {
                     "/v1/audio/translations"
                 } else {
                     "/v1/audio/transcriptions"
                 };
-                (
-                    path,
-                    json!({"model": param.model_name, "audio_b64": audio, "language": language}),
-                )
+                // the base64 payload moves — json! would re-copy megabytes
+                // (measured ~75us/MB per request)
+                let mut b = json!({"model": model, "language": language});
+                b["audio_b64"] = audio.into();
+                (path, b)
             }
-            AudioKind::Other => (
-                "/v1/audio/other",
-                json!({"model": param.model_name, "raw": param.raw}),
-            ),
+            AudioKind::Other => {
+                let mut b = json!({"model": model});
+                b["raw"] = self.base.take_raw();
+                ("/v1/audio/other", b)
+            }
         };
         let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
         let (status, v) = self.base.round_trip(&url, body).await?;
@@ -462,7 +464,7 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        Ok(family_outcome(message, &param.model_name, v, status))
+        Ok(family_outcome(message, &model, v, status))
     }
 }
 
@@ -593,8 +595,8 @@ impl ModelEngine for RerankEngine {
     /// Cohere/Jina-compatible rerank: `{model, query, documents, top_n?}` →
     /// `{results: [{index, relevance_score}]}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let Some(TypedParams::Rerank(p)) = &param.typed else {
+        let model = self.base.model_name()?.to_owned();
+        let Some(TypedParams::Rerank(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("rerank params are required"));
         };
         require_non_empty(&p.query, "rerank query")?;
@@ -603,11 +605,10 @@ impl ModelEngine for RerankEngine {
                 "rerank documents must not be empty",
             ));
         }
-        let mut body = json!({
-            "model": param.model_name,
-            "query": p.query,
-            "documents": p.documents,
-        });
+        // the document set moves — json! would re-copy every string
+        let mut body = json!({"model": model});
+        body["query"] = p.query.into();
+        body["documents"] = Value::Array(p.documents.into_iter().map(Value::String).collect());
         if let Some(n) = p.top_n {
             body["top_n"] = json!(n);
         }
@@ -620,7 +621,7 @@ impl ModelEngine for RerankEngine {
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
-        let mut out = family_outcome(format!("{n} results"), &param.model_name, v, status);
+        let mut out = family_outcome(format!("{n} results"), &model, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
         Ok(out)
@@ -645,8 +646,10 @@ impl ModelEngine for PassthroughEngine {
     /// Dedicated integration surfaces: request body passed through as-is,
     /// placeholder protocol (byte-level alignment deferred).
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let body = json!({"model": param.model_name, "payload": param.raw});
+        let model = self.base.model_name()?.to_owned();
+        // the arbitrary vendor blob moves — json! would re-copy it whole
+        let mut body = json!({"model": model});
+        body["payload"] = self.base.take_raw();
         let (status, v) = self
             .base
             .round_trip(
@@ -662,12 +665,7 @@ impl ModelEngine for PassthroughEngine {
         } else {
             "error"
         };
-        Ok(family_outcome(
-            message.to_owned(),
-            &param.model_name,
-            v,
-            status,
-        ))
+        Ok(family_outcome(message.to_owned(), &model, v, status))
     }
 }
 
