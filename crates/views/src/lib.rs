@@ -1027,7 +1027,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         .unwrap_or_default();
     let latency = started.elapsed();
     let user_id = ctx.effective_user_id();
-    let decisions = ctx.decision_lines().collect::<Vec<_>>().join("; ");
+    let decisions = ctx.decisions_line();
     let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
@@ -2621,7 +2621,6 @@ async fn chat_completions(
     let request = GatewayRequest {
         is_online: true,
         stream: body.stream,
-        ak: ak.ak.clone(),
         message: messages,
         model_param_v2: Some(param),
         user_id,
@@ -3021,7 +3020,6 @@ async fn messages(
         is_online: true,
         stream: body.stream,
         preserve_anthropic_wire: true,
-        ak: ak.ak.clone(),
         message: body
             .messages
             .into_iter()
@@ -3358,7 +3356,6 @@ async fn run_family(
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
-        ak: ak.ak.clone(),
         message: messages,
         model_param_v2: Some(param),
         user_id,
@@ -3434,7 +3431,7 @@ async fn completions(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     // prompt: string or [string] (OpenAI accepts both)
     let prompt = match body.get_mut("prompt").map(Value::take) {
         Some(Value::String(s)) => s,
@@ -3515,7 +3512,6 @@ async fn responses(
     let request = GatewayRequest {
         is_online: true,
         stream,
-        ak: ak.ak.clone(),
         model_param_v2: Some(param),
         user_id,
         ..Default::default()
@@ -3651,7 +3647,7 @@ async fn embeddings(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let input = string_or_string_array(body.get_mut("input").map(Value::take));
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
@@ -3682,7 +3678,7 @@ async fn images_generations(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() {
         return error_response(400, "model and prompt are required");
@@ -3716,7 +3712,7 @@ async fn images_edits(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
     let image = gw_engines::engine::take_string(&mut body, "/image").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() || image.is_empty() {
@@ -3832,7 +3828,7 @@ async fn audio_transcribe(
     translate: bool,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let audio = gw_engines::engine::take_string(&mut body, "/audio_b64").unwrap_or_default();
     if model.is_empty() || audio.is_empty() {
         return error_response(400, "model and audio_b64 are required");
@@ -3879,7 +3875,7 @@ async fn moderations(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let input = string_or_string_array(body.get_mut("input").map(Value::take));
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
@@ -3907,8 +3903,8 @@ async fn rerank(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let query = body["query"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
+    let query = gw_engines::engine::take_string(&mut body, "/query").unwrap_or_default();
     let documents: Vec<String> = match body.get_mut("documents").map(Value::take) {
         Some(Value::Array(a)) => a
             .into_iter()
@@ -3962,9 +3958,9 @@ async fn batches_submit(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    ApiJson(body): ApiJson<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
-    let mut model = body["model"].as_str().unwrap_or_default().to_owned();
+    let mut model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
     let hint = user_header(&headers);
@@ -4346,7 +4342,6 @@ mod tests {
             is_online: true,
             stream: true,
             request_id: "req-dlp-disconnect".into(),
-            ak: "k".into(),
             message: vec![ChatMsg::text("user", "hi")],
             model_param_v2: Some(ModelParamV2::with_name(
                 gw_consts::Protocol::OpenaiChat,

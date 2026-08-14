@@ -237,11 +237,7 @@ impl DagNode for CacheLookup {
         };
         // online non-streaming cache_ttl models only; batch items bypass —
         // a hit is free (unbilled) and batches promise per-item billing
-        let Some(ttl) = ctx
-            .cfg
-            .find_model(&param.model_name)
-            .and_then(|m| m.cache_ttl_seconds)
-        else {
+        let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
             return Ok(());
         };
         if !ctx.request.buffered_online() {
@@ -256,7 +252,7 @@ impl DagNode for CacheLookup {
             ctx.cache_hit = true;
             ctx.outcome = Some(gw_engines::EngineOutcome::ok(cached));
         } else {
-            ctx.decide("cache_lookup", "miss".to_owned());
+            ctx.decide("cache_lookup", "miss");
         }
         ctx.cache_key = Some(key);
         Ok(())
@@ -832,10 +828,7 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
                 outcome.response.raw_usage = None;
                 outcome.response.aborted = true;
             }
-            ctx.decide(
-                "delivery",
-                "client closed before buffered stream".to_owned(),
-            );
+            ctx.decide("delivery", "client closed before buffered stream");
             Ok(())
         }
     }
@@ -929,21 +922,14 @@ impl DagNode for CacheStore {
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
-        let Some(ttl) = ctx
-            .cfg
-            .find_model(&param.model_name)
-            .and_then(|m| m.cache_ttl_seconds)
-        else {
+        let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
             return Ok(());
         };
         // The general response cache can outlive the ten-minute thinking
         // consistency window and may be Redis-backed. Never persist raw
         // thinking signatures or redacted-thinking data through that cache.
         if outcome.response.has_protected_anthropic_content() {
-            ctx.decide(
-                "cache_store",
-                "skipped protected anthropic thinking".to_owned(),
-            );
+            ctx.decide("cache_store", "skipped protected anthropic thinking");
             return Ok(());
         }
         if outcome.http_code == 200
@@ -1007,6 +993,10 @@ pub fn default_layers() -> Vec<Layer> {
 }
 
 /// The provider a model is bound to in config, if any.
+fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {
+    cfg.find_model(model_name).and_then(|m| m.cache_ttl_seconds)
+}
+
 fn model_provider(ctx: &DagContext) -> Option<&str> {
     let name = &ctx.request.model_param_v2.as_ref()?.model_name;
     ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())

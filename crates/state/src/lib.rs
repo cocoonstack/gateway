@@ -420,7 +420,7 @@ impl AccountPool {
         let candidates: Vec<&Arc<Account>> = self
             .accounts
             .iter()
-            .filter(|a| a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want))
+            .filter(|a| serves(a, p, provider))
             .collect();
         let checks =
             futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
@@ -461,29 +461,35 @@ impl AccountPool {
         provider: Option<&str>,
         is_excluded: impl Fn(&str) -> bool,
     ) -> Option<Arc<Account>> {
-        let candidates: Vec<&Arc<Account>> = self
+        let eligible = |a: &&Arc<Account>| serves(a, p, provider) && !is_excluded(&a.name);
+        // pass 1 finds the preferred tier (PTU when any) and its best priority;
+        // pass 2 materializes only that tier's ties for the round-robin pick
+        let mut has_ptu = false;
+        let mut best = None;
+        for a in self.accounts.iter().filter(|a| eligible(a)) {
+            if a.is_ptu() && !has_ptu {
+                has_ptu = true;
+                best = None;
+            }
+            if has_ptu && !a.is_ptu() {
+                continue;
+            }
+            best = Some(best.map_or(a.priority, |b: i32| b.min(a.priority)));
+        }
+        let best = best?;
+        let top: Vec<&Arc<Account>> = self
             .accounts
             .iter()
-            .filter(|a| {
-                a.protocols.contains(&p)
-                    && !is_excluded(&a.name)
-                    && provider.is_none_or(|want| a.provider == want)
-            })
-            .collect();
-        let tier: Vec<&Arc<Account>> = {
-            let ptu: Vec<&Arc<Account>> =
-                candidates.iter().copied().filter(|a| a.is_ptu()).collect();
-            if ptu.is_empty() { candidates } else { ptu }
-        };
-        let best = tier.iter().map(|a| a.priority).min()?;
-        let top: Vec<&Arc<Account>> = tier
-            .iter()
-            .copied()
-            .filter(|a| a.priority == best)
+            .filter(|a| eligible(a) && a.is_ptu() == has_ptu && a.priority == best)
             .collect();
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % top.len();
         Some(Arc::clone(top[idx]))
     }
+}
+
+/// Whether `a` can serve protocol `p`, honoring a model's provider binding.
+fn serves(a: &Arc<Account>, p: Protocol, provider: Option<&str>) -> bool {
+    a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want)
 }
 
 /// Fixed-window token accounting, for AK-level TPM and (at amount 1) QPM.
@@ -634,12 +640,16 @@ impl RedisResponseCache {
     }
 }
 
+fn redis_cache_key(key: &str) -> String {
+    format!("gw:cache:{key}")
+}
+
 #[async_trait::async_trait]
 impl ResponseCache for RedisResponseCache {
     async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
         let mut conn = self.conn.clone();
         let raw: Option<String> = redis::cmd("GET")
-            .arg(format!("gw:cache:{key}"))
+            .arg(redis_cache_key(key))
             .query_async(&mut conn)
             .await
             .ok()
@@ -659,7 +669,7 @@ impl ResponseCache for RedisResponseCache {
         };
         let mut conn = self.conn.clone();
         if let Err(e) = redis::cmd("SET")
-            .arg(format!("gw:cache:{key}"))
+            .arg(redis_cache_key(&key))
             .arg(raw)
             .arg("PX")
             .arg(ttl.as_millis() as u64)

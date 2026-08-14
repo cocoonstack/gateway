@@ -186,7 +186,6 @@ impl OfflineHandler {
             }
             let request = GatewayRequest {
                 is_online: false,
-                ak: ak.ak.clone(),
                 message: item.messages,
                 user_id: (!item.user.is_empty()).then_some(item.user),
                 model_param_v2: Some(ModelParamV2::with_name(

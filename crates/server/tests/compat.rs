@@ -53,14 +53,38 @@ fn canonical_openai_parses_into_protocol_structs() {
     assert_eq!(resp.usage.total_tokens, 21);
 }
 
+/// The Anthropic response contract, typed here so a field rename in what the
+/// gateway emits fails this suite (production hand-builds the JSON).
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlock {
+    Text {
+        text: String,
+    },
+    #[allow(dead_code)]
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct MessagesResponse {
+    #[serde(rename = "type")]
+    kind: String,
+    content: Vec<ContentBlock>,
+    usage: gw_protocol::anthropic::AnthUsage,
+}
+
 #[test]
 fn canonical_anthropic_parses_into_protocol_structs() {
-    let resp: gw_protocol::anthropic::MessagesResponse =
+    let resp: MessagesResponse =
         serde_json::from_str(ANTHROPIC_MSG_CANONICAL).expect("canonical anthropic parses");
     assert_eq!(resp.kind, "message");
     assert!(matches!(
         &resp.content[0],
-        gw_protocol::anthropic::ContentBlock::Text { text } if text == "Hello!"
+        ContentBlock::Text { text } if text == "Hello!"
     ));
     assert_eq!(resp.usage.input_tokens, 12);
 }

@@ -83,8 +83,17 @@ impl DagContext {
             .attributed_user(self.request.user_id.as_deref().unwrap_or_default())
     }
 
-    /// The decision trail as `"stage: detail"` lines.
-    pub fn decision_lines(&self) -> impl Iterator<Item = String> + '_ {
-        self.decisions.iter().map(|(n, w)| format!("{n}: {w}"))
+    /// The decision trail as one `"stage: detail; …"` line.
+    pub fn decisions_line(&self) -> String {
+        let mut out = String::new();
+        for (n, w) in &self.decisions {
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str(n);
+            out.push_str(": ");
+            out.push_str(w);
+        }
+        out
     }
 }

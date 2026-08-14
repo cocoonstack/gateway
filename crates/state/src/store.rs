@@ -22,7 +22,7 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
 /// Per-call token ceiling: usage is floored at 0 upstream but not capped, so
 /// clamping keeps a hostile count from overflowing downstream accumulators.
 /// Far above any real response, so real traffic is never clamped.
-pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
+const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
 /// Prune the SQL ledger every Nth insert instead of per write (the cap becomes
 /// approximate by at most this many rows, saving a round-trip per billing).
@@ -652,6 +652,15 @@ struct MemoryLedger {
     request_ids: HashSet<String>,
 }
 
+/// First epoch second NOT yet folded into the rollup: rows at or above it are
+/// still the ledger's to report.
+fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
+    rollup
+        .keys()
+        .next_back()
+        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+}
+
 /// In-process store: append-only ledger, DashMap-backed files and batches.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
@@ -743,10 +752,7 @@ impl Store for MemoryStore {
             ));
         }
         // watermark first: rollup-then-records is the lock order advance uses
-        let watermark = lock(&self.rollup)
-            .keys()
-            .next_back()
-            .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
+        let watermark = rollup_watermark(&lock(&self.rollup));
         let mut ledger = lock(&self.ledger);
         if !ledger.request_ids.insert(r.request_id.clone()) {
             return Ok(());
@@ -838,10 +844,7 @@ impl Store for MemoryStore {
                         .or_insert_with(|| row.clone());
                 }
             }
-            rollup
-                .keys()
-                .next_back()
-                .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+            rollup_watermark(&rollup)
         };
         let ledger = lock(&self.ledger);
         let records = &ledger.rows;
@@ -879,10 +882,7 @@ impl Store for MemoryStore {
                         .absorb(row);
                 }
             }
-            rollup
-                .keys()
-                .next_back()
-                .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+            rollup_watermark(&rollup)
         };
         let ledger = lock(&self.ledger);
         let records = &ledger.rows;
@@ -902,10 +902,7 @@ impl Store for MemoryStore {
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut rollup = lock(&self.rollup);
-        let watermark = rollup
-            .keys()
-            .next_back()
-            .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
+        let watermark = rollup_watermark(&rollup);
         let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
         let mut fresh = BTreeMap::new();
         {

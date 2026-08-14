@@ -970,6 +970,7 @@ dependencies = [
  "gw-task",
  "gw-views",
  "metrics-exporter-prometheus",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.26.2",

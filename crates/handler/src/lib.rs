@@ -192,7 +192,7 @@ impl OnlineHandler {
                             &mut ctx,
                             "degrade would change a pinned thinking model: denied",
                             "content requires degraded serving, but signed thinking pins the requested model",
-                            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                            gw_consts::ErrCode::EMPTY_RESP,
                         );
                         return Ok(ctx);
                     }
@@ -217,7 +217,7 @@ impl OnlineHandler {
                                 &mut ctx,
                                 "degrade without a fallback: denied",
                                 "content requires degraded serving; no fallback model configured",
-                                gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                                gw_consts::ErrCode::EMPTY_RESP,
                             );
                             return Ok(ctx);
                         }
@@ -225,12 +225,7 @@ impl OnlineHandler {
                 }
                 Moderation::Deny(reason) => {
                     emit_security_event(&ctx, "moderation", "block", 1).await;
-                    deny_moderation(
-                        &mut ctx,
-                        "denied",
-                        reason,
-                        gw_consts::ErrCode::EMPTY_RESP.value() as i32,
-                    );
+                    deny_moderation(&mut ctx, "denied", reason, gw_consts::ErrCode::EMPTY_RESP);
                     return Ok(ctx);
                 }
                 Moderation::Unavailable => {
@@ -238,7 +233,7 @@ impl OnlineHandler {
                         &mut ctx,
                         "moderator unavailable: denied",
                         MODERATION_UNAVAILABLE,
-                        gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
+                        gw_consts::ErrCode::SYSTEM_ERROR,
                     );
                     return Ok(ctx);
                 }
@@ -548,9 +543,17 @@ async fn note_abuse(ctx: &DagContext) {
 
 /// Record a moderation denial: decision line + content-filter outcome. Event
 /// emission stays at the call sites (`Unavailable` deliberately records none).
-fn deny_moderation(ctx: &mut DagContext, decision: &str, reason: impl Into<String>, code: i32) {
-    ctx.decide("moderation", decision.to_owned());
-    ctx.outcome = Some(content_filter_outcome(Block::blocked(reason, code)));
+fn deny_moderation(
+    ctx: &mut DagContext,
+    decision: &str,
+    reason: impl Into<String>,
+    code: gw_consts::ErrCode,
+) {
+    ctx.decide("moderation", decision);
+    ctx.outcome = Some(content_filter_outcome(Block::blocked(
+        reason,
+        code.value() as i32,
+    )));
 }
 
 /// The 200-with-`content_filter` outcome every pre-stage denial returns.

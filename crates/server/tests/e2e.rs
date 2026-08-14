@@ -1408,7 +1408,11 @@ async fn security_block_and_dlp_redaction() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert_eq!(j["choices"][0]["finish_reason"], "content_filter");
-    let resp = app.clone().oneshot(internal_get("/internal/ledger")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(internal_get("/internal/ledger"))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["count"], 0, "blocked is not billed");
 
     let resp = app
@@ -1431,7 +1435,10 @@ async fn security_block_and_dlp_redaction() {
 #[tokio::test]
 async fn internal_accounts_view() {
     let app = app();
-    let resp = app.oneshot(internal_get("/internal/accounts")).await.unwrap();
+    let resp = app
+        .oneshot(internal_get("/internal/accounts"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert!(j["count"].as_u64().unwrap() >= 10);
@@ -3889,7 +3896,10 @@ async fn ledger_pagination_limits_records_not_count() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    let resp = app.oneshot(internal_get("/internal/ledger?limit=2")).await.unwrap();
+    let resp = app
+        .oneshot(internal_get("/internal/ledger?limit=2"))
+        .await
+        .unwrap();
     let j = body_json(resp).await;
     assert_eq!(j["count"], 3, "count reports the total");
     assert_eq!(

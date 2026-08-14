@@ -16,7 +16,6 @@ pub struct GatewayRequest {
     /// model resolution, unlike `model_param_v2.protocol`.
     pub preserve_anthropic_wire: bool,
     pub model_param_v2: Option<ModelParamV2>,
-    pub ak: String,
     pub is_online: bool,
     /// End-user attribution from request metadata (OpenAI `user` / Anthropic
     /// `metadata.user_id` / `x-gw-user`); only trusted when the key is shared —

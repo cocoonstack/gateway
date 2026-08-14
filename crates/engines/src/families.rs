@@ -448,7 +448,10 @@ impl ModelEngine for AudioEngine {
                 };
                 require_non_empty(&audio, "stt audio_b64")?;
                 b.insert("audio_b64".into(), audio.into());
-                b.insert("language".into(), language.map_or(Value::Null, Value::String));
+                b.insert(
+                    "language".into(),
+                    language.map_or(Value::Null, Value::String),
+                );
                 if translate {
                     "/v1/audio/translations"
                 } else {

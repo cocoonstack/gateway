@@ -18,16 +18,8 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
-    /// Flatten to plain text (text parts joined; non-text parts skipped).
-    pub fn text(&self) -> String {
-        match self {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Parts(parts) => parts_text(parts),
-        }
-    }
-
-    /// [`text`](Self::text) plus the surrendered raw parts; the Text form
-    /// moves its string out instead of cloning.
+    /// Plain text (text parts joined; non-text parts skipped) plus the
+    /// surrendered raw parts; the Text form moves its string out.
     pub fn into_text_and_parts(self) -> (String, Option<Vec<Value>>) {
         match self {
             MessageContent::Text(s) => (s, None),
@@ -325,7 +317,12 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
         assert_eq!(req.model, "gpt-4o");
         assert!(!req.stream);
-        assert_eq!(req.messages[0].content.as_ref().unwrap().text(), "hi");
+        let (text, parts) = req.messages[0]
+            .content
+            .clone()
+            .unwrap()
+            .into_text_and_parts();
+        assert_eq!((text.as_str(), parts), ("hi", None));
         assert_eq!(req.extra.get("seed").unwrap().as_i64().unwrap(), 7);
     }
 
@@ -336,8 +333,10 @@ mod tests {
             {"type":"image_url","image_url":{"url":"data:image/png;base64,xx"}},
             {"type":"text","text":"what is it?"}]}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
-        let c = req.messages[0].content.as_ref().unwrap();
-        assert_eq!(c.text(), "look: what is it?");
+        let c = req.messages[0].content.clone().unwrap();
+        let (text, parts) = c.into_text_and_parts();
+        assert_eq!(text, "look: what is it?");
+        assert_eq!(parts.unwrap().len(), 3);
     }
 
     #[test]
