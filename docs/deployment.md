@@ -25,6 +25,7 @@ GW_CONFIG=/etc/gateway.yaml ./target/release/gw
 | `GW_PORT` | override `listen.port` |
 | `GW_TRANSPORT` | `mock` (zero egress) / `http` (no mock) / unset (auto-route) |
 | `GW_CONTENT_KEY` | 64 hex chars (32 bytes); seals retained content at rest. Without it, `full` retention stores redacted text instead of raw |
+| `GW_ADMIN_TOKEN` | global admin bearer named by the default config's `admin.token_env`; unset leaves `/admin/*` and `/internal/*` answering 404 |
 | `RUST_LOG` | log level, e.g. `info`, `gw_views=debug` |
 | provider key vars | named by each account's `api_key_env` |
 
