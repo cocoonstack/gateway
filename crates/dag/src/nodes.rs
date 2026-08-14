@@ -718,7 +718,7 @@ impl DagNode for CostCalc {
 
 /// What the HTTP view delivered from an outbound-DLP buffered stream.
 pub enum StreamDelivery {
-    Complete(i64),
+    Complete,
     Partial(i64),
     None,
 }
@@ -795,18 +795,8 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
         return Ok(());
     }
     ctx.billing_deferred = false;
-    if ctx.quota_reserved.is_none() && ctx.tpm_reserved.is_none() {
-        return Ok(());
-    }
     match delivery {
-        StreamDelivery::Complete(completion)
-            if ctx.outcome.as_ref().is_some_and(|outcome| {
-                outcome.response.aborted && outcome.response.completion_tokens == 0
-            }) =>
-        {
-            bill_aborted_stream(ctx, Some(completion)).await
-        }
-        StreamDelivery::Complete(_) => CostCalc.execute(ctx).await,
+        StreamDelivery::Complete => CostCalc.execute(ctx).await,
         StreamDelivery::Partial(completion) => {
             {
                 let outcome = ctx

@@ -57,6 +57,8 @@ impl BillingLedger {
         }
     }
 
+    // try_send, never send: a full repair queue must not couple the serve
+    // path to store recovery — the overflow row is dropped loudly instead.
     async fn write(&self, record: &BillingRecord) {
         let Err(e) = self.store.ledger_add(record).await else {
             return;
@@ -66,9 +68,11 @@ impl BillingLedger {
             tracing::error!(error = %e, "billing ledger write failed");
             return;
         };
-        tracing::error!(error = %e, "billing ledger write failed; queued for repair");
-        if repair.send(record.clone()).await.is_err() {
-            tracing::error!("billing ledger repair worker stopped");
+        match repair.try_send(record.clone()) {
+            Ok(()) => tracing::error!(error = %e, "billing ledger write failed; queued for repair"),
+            Err(_) => {
+                tracing::error!(error = %e, "billing ledger write failed; repair queue unavailable, row dropped")
+            }
         }
     }
 }

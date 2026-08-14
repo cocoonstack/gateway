@@ -2716,7 +2716,7 @@ fn spawn_stream_pipeline(
                             delivered = delivered.saturating_add(tokens);
                         }
                         let delivery = if complete {
-                            gw_dag::StreamDelivery::Complete(delivered)
+                            gw_dag::StreamDelivery::Complete
                         } else if delivered > 0 {
                             gw_dag::StreamDelivery::Partial(delivered)
                         } else {

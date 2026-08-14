@@ -471,7 +471,7 @@ pub async fn complete_buffered_stream(
     delivery: gw_dag::StreamDelivery,
 ) -> GResult<()> {
     let terminal = match &delivery {
-        gw_dag::StreamDelivery::Complete(_) => terminal_plain_body("success", 200, false),
+        gw_dag::StreamDelivery::Complete => terminal_plain_body("success", 200, false),
         gw_dag::StreamDelivery::Partial(_) => terminal_plain_body("client_closed", 499, true),
         gw_dag::StreamDelivery::None => terminal_plain_body("client_closed", 499, false),
     };
