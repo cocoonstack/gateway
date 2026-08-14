@@ -1075,8 +1075,16 @@ async fn list_models(State(s): State<AppState>, Authed(ak): Authed) -> Response 
     Json(resp).into_response()
 }
 
-/// Local billing ledger snapshot.
-async fn ledger(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+/// Local billing ledger snapshot. Global-token only: the raw rows span every
+/// tenant and carry the operator's vendor-cost margin basis.
+async fn ledger(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
@@ -1085,7 +1093,11 @@ async fn ledger(State(s): State<AppState>, Query(q): Query<HashMap<String, Strin
 }
 
 /// Account pool view (name/provider/tier/priority/served model family).
-async fn accounts(State(s): State<AppState>) -> Json<Value> {
+/// Global-token only: account names and health are operator internals.
+async fn accounts(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
     let cfg = s.handler.cfg();
     let health = &s.handler.state().health;
     let mut data: Vec<Value> = Vec::with_capacity(cfg.accounts.len());
@@ -1101,7 +1113,7 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
     }
     let mut resp = json!({ "count": data.len() });
     resp["accounts"] = Value::Array(data);
-    Json(resp)
+    Json(resp).into_response()
 }
 
 /// The `x-gw-user` attribution hint; surfaces fall back to the body's own user

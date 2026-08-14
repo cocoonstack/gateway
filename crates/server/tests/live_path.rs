@@ -86,9 +86,12 @@ async fn spawn_vendor() -> String {
 }
 
 fn gateway(vendor_url: &str) -> Router {
+    // SAFETY: written before any request; the value is constant across tests.
+    unsafe { std::env::set_var("GW_LIVE_PATH_ADMIN", "live-operator") };
     let yaml = format!(
         r#"
 listen: {{ host: 127.0.0.1, port: 0 }}
+admin: {{ token_env: GW_LIVE_PATH_ADMIN }}
 access_keys:
   - {{ ak: ak-live, product: demo, qps: 100, daily_token_quota: 1000000 }}
   - {{ ak: ak-tight, product: demo, qps: 1, daily_token_quota: 1000000 }}
@@ -145,6 +148,7 @@ async fn full_pipeline_over_real_http() {
         .oneshot(
             Request::builder()
                 .uri("/internal/ledger")
+                .header("authorization", "Bearer live-operator")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -231,6 +235,7 @@ async fn claude_messages_over_real_http() {
         .oneshot(
             Request::builder()
                 .uri("/internal/ledger")
+                .header("authorization", "Bearer live-operator")
                 .body(Body::empty())
                 .unwrap(),
         )

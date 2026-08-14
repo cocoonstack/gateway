@@ -37,7 +37,8 @@ request.
 
 ## Billing ledger
 
-`GET /internal/ledger?limit=N` returns the most recent `N` billing records,
+`GET /internal/ledger?limit=N` (global admin token) returns the most recent
+`N` billing records,
 oldest-first within the page; `count` is always the true total, independent of
 the page size. Records persist when a SQLite or Postgres store is configured
 and can be capped with `storage.ledger_max_rows`. Each record carries
