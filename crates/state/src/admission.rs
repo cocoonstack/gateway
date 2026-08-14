@@ -57,8 +57,8 @@ impl BillingLedger {
         }
     }
 
-    // try_send, never send: a full repair queue must not couple the serve
-    // path to store recovery — the overflow row is dropped loudly instead.
+    // Backpressure only after the bounded repair queue fills: every accepted
+    // bill remains owned until the store recovers instead of being dropped.
     async fn write(&self, record: &BillingRecord) {
         let Err(e) = self.store.ledger_add(record).await else {
             return;
@@ -68,11 +68,9 @@ impl BillingLedger {
             tracing::error!(error = %e, "billing ledger write failed");
             return;
         };
-        match repair.try_send(record.clone()) {
-            Ok(()) => tracing::error!(error = %e, "billing ledger write failed; queued for repair"),
-            Err(_) => {
-                tracing::error!(error = %e, "billing ledger write failed; repair queue unavailable, row dropped")
-            }
+        tracing::error!(error = %e, "billing ledger write failed; queued for repair");
+        if repair.send(record.clone()).await.is_err() {
+            tracing::error!("billing ledger repair worker stopped");
         }
     }
 }
@@ -333,17 +331,13 @@ pub async fn settle_and_bill(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn billing_ledger_repairs_failed_writes() {
-        let store = Arc::new(crate::MemoryStore::default());
-        store.fail_next_ledger_writes(2);
-        let ledger = BillingLedger::repairing(store.clone());
-        let record = BillingRecord {
+    fn record(request_id: impl Into<String>) -> BillingRecord {
+        BillingRecord {
             ak: "ak".into(),
             product: "p".into(),
             tenant: "default".into(),
             user_id: "u".into(),
-            request_id: "req-repair".into(),
+            request_id: request_id.into(),
             created_at_epoch_secs: 1,
             model: "m".into(),
             served_model: "m".into(),
@@ -356,7 +350,15 @@ mod tests {
             vendor_cost_micros: 0,
             ptu_spillover: false,
             estimated: false,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn billing_ledger_repairs_failed_writes() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(2);
+        let ledger = BillingLedger::repairing(store.clone());
+        let record = record("req-repair");
         ledger.write(&record).await;
         let (count, rows) = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -371,5 +373,53 @@ mod tests {
         .expect("ledger repair did not finish");
         assert_eq!(count, 1);
         assert_eq!(rows[0].request_id, "req-repair");
+    }
+
+    #[tokio::test]
+    async fn billing_ledger_backpressures_at_capacity_then_repairs_every_row() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(usize::MAX);
+        let ledger = BillingLedger::repairing(store.clone());
+        let repair = ledger.repair.as_ref().unwrap();
+
+        ledger.write(&record("req-0")).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while repair.capacity() != LEDGER_REPAIR_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("repair worker did not take the first row");
+
+        for i in 1..=LEDGER_REPAIR_CAPACITY {
+            ledger.write(&record(format!("req-{i}"))).await;
+        }
+        assert_eq!(repair.capacity(), 0);
+
+        let blocked_record = record(format!("req-{}", LEDGER_REPAIR_CAPACITY + 1));
+        let mut blocked = Box::pin(ledger.write(&blocked_record));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), blocked.as_mut())
+                .await
+                .is_err(),
+            "a full queue must apply backpressure"
+        );
+
+        store.fail_next_ledger_writes(0);
+        tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("queue did not resume after store recovery");
+
+        let expected = LEDGER_REPAIR_CAPACITY + 2;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.ledger_snapshot(usize::MAX).await.unwrap().0 == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued ledger rows were not repaired");
     }
 }

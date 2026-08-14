@@ -791,6 +791,9 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
         return Ok(());
     }
     ctx.billing_deferred = false;
+    if ctx.quota_reserved.is_none() && ctx.tpm_reserved.is_none() {
+        return Ok(());
+    }
     match delivery {
         StreamDelivery::Complete => CostCalc.execute(ctx).await,
         StreamDelivery::Partial(completion) => {

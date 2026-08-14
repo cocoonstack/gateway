@@ -1416,6 +1416,29 @@ async fn security_block_and_dlp_redaction() {
     assert_eq!(body_json(resp).await["count"], 0, "blocked is not billed");
 
     let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"tell me forbiddenword"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stream = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(stream.contains("content_filter"), "{stream}");
+    let resp = app
+        .clone()
+        .oneshot(internal_get("/internal/ledger"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["count"],
+        0,
+        "streaming block is not billed"
+    );
+
+    let resp = app
         .oneshot(post(
             "/v1/chat/completions",
             Some("ak-demo-123"),
