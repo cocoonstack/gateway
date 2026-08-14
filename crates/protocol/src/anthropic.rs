@@ -54,17 +54,6 @@ pub struct InMessage {
     pub content: Value,
 }
 
-impl InMessage {
-    /// Flatten the content to plain text (string form or text blocks).
-    pub fn text(&self) -> String {
-        match &self.content {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks_text(blocks),
-            _ => String::new(),
-        }
-    }
-}
-
 /// Joined text of the `text`/untyped blocks in an Anthropic content array.
 pub fn blocks_text(blocks: &[Value]) -> String {
     blocks
@@ -72,19 +61,6 @@ pub fn blocks_text(blocks: &[Value]) -> String {
         .filter(|b| b["type"] == "text" || b.get("type").is_none())
         .filter_map(|b| b["text"].as_str())
         .collect()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -96,18 +72,6 @@ pub struct AnthUsage {
     pub cache_read_input_tokens: i64,
     #[serde(default)]
     pub cache_creation_input_tokens: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessagesResponse {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String, // "message"
-    pub role: String, // "assistant"
-    pub model: String,
-    pub content: Vec<ContentBlock>,
-    pub stop_reason: String,
-    pub usage: AnthUsage,
 }
 
 /// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
@@ -156,14 +120,15 @@ mod tests {
     }
 
     #[test]
-    fn content_string_and_blocks() {
-        let m: InMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
-        assert_eq!(m.text(), "hi");
+    fn content_blocks_flatten_to_text() {
         let m: InMessage = serde_json::from_str(
             r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#,
         )
         .unwrap();
-        assert_eq!(m.text(), "ab");
+        let Value::Array(blocks) = &m.content else {
+            panic!("blocks form")
+        };
+        assert_eq!(blocks_text(blocks), "ab");
     }
 
     #[test]
@@ -176,19 +141,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.system_text().unwrap(), "ab");
-    }
-
-    #[test]
-    fn content_block_tagging() {
-        let b = ContentBlock::ToolUse {
-            id: "tu-1".into(),
-            name: "get_weather".into(),
-            input: json!({"city":"sf"}),
-        };
-        let v = serde_json::to_value(&b).unwrap();
-        assert_eq!(v["type"], "tool_use");
-        assert_eq!(v["name"], "get_weather");
-        let t: ContentBlock = serde_json::from_value(json!({"type":"text","text":"x"})).unwrap();
-        assert!(matches!(t, ContentBlock::Text { text } if text == "x"));
     }
 }

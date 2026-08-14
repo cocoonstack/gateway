@@ -86,6 +86,11 @@ impl Base {
         }
     }
 
+    /// Move the typed params out (single-use — the run(&mut self) contract).
+    pub fn take_typed(&mut self) -> Option<gw_models::TypedParams> {
+        self.request.model_param_v2.as_mut()?.typed.take()
+    }
+
     /// The last message's content — the free-text fallback the non-chat
     /// families use when typed params are absent.
     pub fn last_message_text(&self) -> &str {
@@ -249,15 +254,6 @@ pub(crate) fn body_bytes(body: &Value) -> GResult<Vec<u8>> {
         .map_err(|e| GatewayError::internal("serialize request body").with_source(e))
 }
 
-fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-    {
-        headers.insert(0, ("content-type".into(), "application/json".into()));
-    }
-}
-
 /// Merge the raw passthrough bag into a wire body; typed fields stay
 /// authoritative (`or_insert`), and the extras move in.
 pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, raw: Value) {
@@ -265,6 +261,15 @@ pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, 
         for (k, v) in extra {
             body.entry(k).or_insert(v);
         }
+    }
+}
+
+fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        headers.insert(0, ("content-type".into(), "application/json".into()));
     }
 }
 

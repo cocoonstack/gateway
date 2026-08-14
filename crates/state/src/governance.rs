@@ -165,7 +165,8 @@ impl RedisGovernance {
         {
             Ok(v) => v == 1,
             Err(e) => {
-                tracing::warn!(error = %e, key, "redis reserve failed; admitting");
+                let key_id = crate::access_key_fingerprint(&key);
+                tracing::warn!(error = %e, key_id, "redis reserve failed; admitting");
                 true
             }
         }
@@ -191,7 +192,8 @@ impl RedisGovernance {
             Ok(v) => v,
             Err(e) => {
                 // fail open, but loudly — a persistent outage would otherwise silently disable limits
-                tracing::warn!(error = %e, key, "redis governance unavailable; limit skipped");
+                let key_id = crate::access_key_fingerprint(key);
+                tracing::warn!(error = %e, key_id, "redis governance unavailable; limit skipped");
                 0
             }
         }
@@ -225,7 +227,8 @@ impl Governance for RedisGovernance {
         {
             Ok(v) => v.unwrap_or(0),
             Err(e) => {
-                tracing::warn!(error = %e, ak, "redis quota read failed; treating as 0");
+                let ak_id = crate::access_key_fingerprint(ak);
+                tracing::warn!(error = %e, ak_id, "redis quota read failed; treating as 0");
                 0
             }
         }
@@ -270,29 +273,27 @@ impl Governance for RedisGovernance {
         limit: i64,
         window: Duration,
     ) -> bool {
-        self.reserve_capped(
-            format!("gw:tpm:{key}"),
-            amount,
-            limit,
-            window.as_millis() as i64,
-        )
-        .await
+        self.reserve_capped(tpm_key(key), amount, limit, window.as_millis() as i64)
+            .await
     }
     async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
         if delta == 0 {
             return;
         }
-        settle_floored(&self.conn, &format!("gw:tpm:{key}"), delta, window).await;
+        settle_floored(&self.conn, &tpm_key(key), delta, window).await;
     }
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
-        self.incr_window(&format!("gw:tpm:{key}"), tokens, window)
-            .await;
+        self.incr_window(&tpm_key(key), tokens, window).await;
     }
 }
 
 /// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
 /// rollover is implicit and identical across replicas. Callers pass the
 /// admission time so a reserve and its settle hit the same day.
+fn tpm_key(key: &str) -> String {
+    format!("gw:tpm:{key}")
+}
+
 fn quota_key_at(key: &str, at_epoch_secs: i64) -> String {
     format!("gw:quota:{}:{key}", at_epoch_secs / 86_400)
 }
@@ -328,7 +329,8 @@ async fn settle_floored(
         .invoke_async::<i64>(&mut conn)
         .await
     {
-        tracing::warn!(error = %e, key, "redis settle failed");
+        let key_id = crate::access_key_fingerprint(key);
+        tracing::warn!(error = %e, key_id, "redis settle failed");
     }
 }
 

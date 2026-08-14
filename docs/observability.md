@@ -26,7 +26,8 @@ status codes, protocol/stage names) — no per-key or per-model cardinality.
 
 One structured line per successfully served request goes to stdout (via
 `tracing`; control level with `RUST_LOG`), carrying `surface`, `request_id`,
-`ak`, `product`, `user_id`, `model`, `protocol`, `account`, `prompt_tokens`,
+`ak_id` (a stable SHA-256 fingerprint, never the bearer credential), `product`,
+`user_id`, `model`, `protocol`, `account`, `prompt_tokens`,
 `completion_tokens`, `total_tokens`, `latency_ms`, and `decisions` — the
 pipeline's routing trail for that request (quota fallback, variant pick,
 degrade, DLP/moderation outcomes). Errored requests are
@@ -36,7 +37,8 @@ request.
 
 ## Billing ledger
 
-`GET /internal/ledger?limit=N` returns the most recent `N` billing records,
+`GET /internal/ledger?limit=N` (global admin token) returns the most recent
+`N` billing records,
 oldest-first within the page; `count` is always the true total, independent of
 the page size. Records persist when a SQLite or Postgres store is configured
 and can be capped with `storage.ledger_max_rows`. Each record carries
@@ -46,6 +48,10 @@ access key, product, `tenant`, `user_id` (effective end user), the requested
 account, token counts, charged `cost_micros` and `vendor_cost_micros`,
 `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag (set
 when counts came from an aborted stream rather than a vendor usage payload).
+Writes are idempotent by `request_id`; a transient store failure is held in a
+bounded repair queue and retried until the durable backend accepts it. A full
+queue applies backpressure to settlement until the repair worker makes room,
+so an accepted billing row is not discarded.
 Per-user usage additionally rolls into durable minute buckets every minute, so
 `GET /admin/usage/users` stays correct after `ledger_max_rows` pruning (see
 [Governance](governance.md#per-user-attribution-and-billing)).

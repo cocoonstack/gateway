@@ -237,11 +237,7 @@ impl DagNode for CacheLookup {
         };
         // online non-streaming cache_ttl models only; batch items bypass —
         // a hit is free (unbilled) and batches promise per-item billing
-        let Some(ttl) = ctx
-            .cfg
-            .find_model(&param.model_name)
-            .and_then(|m| m.cache_ttl_seconds)
-        else {
+        let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
             return Ok(());
         };
         if !ctx.request.buffered_online() {
@@ -256,7 +252,7 @@ impl DagNode for CacheLookup {
             ctx.cache_hit = true;
             ctx.outcome = Some(gw_engines::EngineOutcome::ok(cached));
         } else {
-            ctx.decide("cache_lookup", "miss".to_owned());
+            ctx.decide("cache_lookup", "miss");
         }
         ctx.cache_key = Some(key);
         Ok(())
@@ -672,36 +668,19 @@ impl DagNode for CostCalc {
         &["common_usage"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        // fail loud: silently skipping here would serve a response unbilled
         let outcome = ctx
             .outcome
             .as_ref()
             .ok_or_else(|| GatewayError::internal("cost_calc without an engine outcome"))?;
+        if ctx.billing_deferred {
+            return Ok(());
+        }
         let resp = &outcome.response;
         // An aborted stream delivered text but never the final usage frame — bill it.
         // Gate on completion_tokens==0, not total: Anthropic reports input up front,
         // output only in the final message_delta the break skipped.
         if resp.aborted && resp.completion_tokens == 0 {
-            let enc = gw_models::token_estimate::default_encoder();
-            let param = ctx.request.model_param_v2.as_ref();
-            let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
-                gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
-                _ => None,
-            });
-            let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-            let pt = if resp.prompt_tokens > 0 {
-                resp.prompt_tokens
-            } else {
-                gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
-            };
-            let ct = enc.encode_len(&resp.message) as i64;
-            let rate = gw_state::model_token_rate(
-                &ctx.cfg,
-                served_model(ctx.request.model_param_v2.as_ref()),
-            );
-            let tokens = BillTokens::weighted(pt, ct, &rate);
-            ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, tokens, true).await;
+            return bill_aborted_stream(ctx, None).await;
         }
         let rate =
             gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
@@ -731,6 +710,13 @@ impl DagNode for CostCalc {
         };
         bill(ctx, tokens, false).await
     }
+}
+
+/// What the HTTP view delivered from an outbound-DLP buffered stream.
+pub enum StreamDelivery {
+    Complete,
+    Partial(i64),
+    None,
 }
 
 /// Token counts for one bill: vendor-reported sides plus the weighted billable
@@ -764,6 +750,93 @@ impl BillTokens {
     }
 }
 
+async fn bill_aborted_stream(
+    ctx: &mut DagContext,
+    delivered_completion: Option<i64>,
+) -> GResult<()> {
+    let response = &ctx
+        .outcome
+        .as_ref()
+        .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
+        .response;
+    let enc = gw_models::token_estimate::default_encoder();
+    let param = ctx.request.model_param_v2.as_ref();
+    let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
+        gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
+        _ => None,
+    });
+    let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+    let prompt = if response.prompt_tokens > 0 {
+        response.prompt_tokens
+    } else {
+        gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
+    };
+    let completion = delivered_completion
+        .unwrap_or_else(|| enc.encode_len(&response.message) as i64)
+        .max(0);
+    let rate =
+        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
+    ctx.decide(
+        "cost_calc",
+        format!("aborted stream, billed {prompt}+{completion}"),
+    );
+    bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
+}
+
+/// Close the deferred reserve/billing lifecycle after the view replays a
+/// buffered stream. A pre-delivery disconnect refunds; a partial delivery uses
+/// the same estimated-token path as an interrupted live stream.
+pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
+    if !ctx.billing_deferred {
+        return Ok(());
+    }
+    ctx.billing_deferred = false;
+    if ctx.quota_reserved.is_none() && ctx.tpm_reserved.is_none() {
+        return Ok(());
+    }
+    match delivery {
+        StreamDelivery::Complete => CostCalc.execute(ctx).await,
+        StreamDelivery::Partial(completion) => {
+            {
+                let outcome = ctx
+                    .outcome
+                    .as_mut()
+                    .ok_or_else(|| GatewayError::internal("stream delivery without an outcome"))?;
+                let response = &mut outcome.response;
+                response.message.clear();
+                response.completion_tokens = 0;
+                response.total_tokens = response.prompt_tokens;
+                response.common_usage = None;
+                response.raw_usage = None;
+                response.aborted = true;
+            }
+            bill_aborted_stream(ctx, Some(completion)).await
+        }
+        StreamDelivery::None => {
+            ctx.state
+                .governance
+                .refund_reserves(
+                    &ctx.ak.ak,
+                    ctx.quota_reserved.take().unwrap_or(0),
+                    ctx.tpm_reserved.take(),
+                    ctx.quota_at,
+                )
+                .await;
+            if let Some(outcome) = ctx.outcome.as_mut() {
+                outcome.response.message.clear();
+                outcome.response.prompt_tokens = 0;
+                outcome.response.completion_tokens = 0;
+                outcome.response.total_tokens = 0;
+                outcome.response.common_usage = None;
+                outcome.response.raw_usage = None;
+                outcome.response.aborted = true;
+            }
+            ctx.decide("delivery", "client closed before buffered stream");
+            Ok(())
+        }
+    }
+}
+
 /// Settle reserves and write the ledger for one served request via the shared
 /// [`admission::settle_and_bill`] orchestration. `estimated` marks a bill from
 /// an aborted stream's estimated counts rather than a vendor usage payload.
@@ -785,8 +858,7 @@ async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GRes
         ctx.model_quota_key.take(),
     );
     let record = admission::settle_and_bill(
-        ctx.state.governance.as_ref(),
-        ctx.state.store.as_ref(),
+        ctx.state.as_ref(),
         &ctx.cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {
@@ -853,21 +925,14 @@ impl DagNode for CacheStore {
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
-        let Some(ttl) = ctx
-            .cfg
-            .find_model(&param.model_name)
-            .and_then(|m| m.cache_ttl_seconds)
-        else {
+        let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
             return Ok(());
         };
         // The general response cache can outlive the ten-minute thinking
         // consistency window and may be Redis-backed. Never persist raw
         // thinking signatures or redacted-thinking data through that cache.
         if outcome.response.has_protected_anthropic_content() {
-            ctx.decide(
-                "cache_store",
-                "skipped protected anthropic thinking".to_owned(),
-            );
+            ctx.decide("cache_store", "skipped protected anthropic thinking");
             return Ok(());
         }
         if outcome.http_code == 200
@@ -931,6 +996,10 @@ pub fn default_layers() -> Vec<Layer> {
 }
 
 /// The provider a model is bound to in config, if any.
+fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {
+    cfg.find_model(model_name).and_then(|m| m.cache_ttl_seconds)
+}
+
 fn model_provider(ctx: &DagContext) -> Option<&str> {
     let name = &ctx.request.model_param_v2.as_ref()?.model_name;
     ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())

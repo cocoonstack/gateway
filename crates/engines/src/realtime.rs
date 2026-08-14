@@ -85,6 +85,22 @@ pub fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
     !is_gemini_realtime(provider) && frame["type"] == "response.created"
 }
 
+/// Text and opaque payload units carried by one OpenAI-dialect output-delta
+/// frame. Opaque units count base64 quanta.
+pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
+    let frame_type = frame["type"].as_str().unwrap_or_default();
+    let Some(delta) = frame["delta"].as_str() else {
+        return (None, 0);
+    };
+    if delta_is_text(frame_type) {
+        (Some(delta), 0)
+    } else if frame_type.contains("audio") {
+        (None, delta.len().div_ceil(4))
+    } else {
+        (None, 0)
+    }
+}
+
 /// Per-dialect turn boundary → the turn's (input, output) tokens: `Some((0, 0))`
 /// for a cancelled/empty turn (so its reservation settles instead of orphaning),
 /// `None` for a non-boundary frame. Keyed by provider so every dialect is metered.
@@ -145,6 +161,14 @@ mod tests {
             frame["item"]["content"][1]["audio"], "AAAA1381234567890AAA",
             "audio payloads are never rewritten"
         );
+    }
+
+    #[test]
+    fn output_delta_distinguishes_text_from_audio() {
+        let text = json!({"type":"response.output_text.delta","delta":"hello"});
+        assert_eq!(realtime_output_delta(&text), (Some("hello"), 0));
+        let audio = json!({"type":"response.output_audio.delta","delta":"YWJjZA=="});
+        assert_eq!(realtime_output_delta(&audio), (None, 2));
     }
 
     #[test]

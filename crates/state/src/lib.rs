@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use gw_config::GatewayConfig;
 use gw_consts::Protocol;
 use gw_models::Account;
+use sha2::{Digest, Sha256};
 
 pub mod admission;
 pub mod alerts;
@@ -419,7 +420,7 @@ impl AccountPool {
         let candidates: Vec<&Arc<Account>> = self
             .accounts
             .iter()
-            .filter(|a| a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want))
+            .filter(|a| serves(a, p, provider))
             .collect();
         let checks =
             futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
@@ -460,29 +461,35 @@ impl AccountPool {
         provider: Option<&str>,
         is_excluded: impl Fn(&str) -> bool,
     ) -> Option<Arc<Account>> {
-        let candidates: Vec<&Arc<Account>> = self
+        let eligible = |a: &&Arc<Account>| serves(a, p, provider) && !is_excluded(&a.name);
+        // pass 1 finds the preferred tier (PTU when any) and its best priority;
+        // pass 2 materializes only that tier's ties for the round-robin pick
+        let mut has_ptu = false;
+        let mut best = None;
+        for a in self.accounts.iter().filter(|a| eligible(a)) {
+            if a.is_ptu() && !has_ptu {
+                has_ptu = true;
+                best = None;
+            }
+            if has_ptu && !a.is_ptu() {
+                continue;
+            }
+            best = Some(best.map_or(a.priority, |b: i32| b.min(a.priority)));
+        }
+        let best = best?;
+        let top: Vec<&Arc<Account>> = self
             .accounts
             .iter()
-            .filter(|a| {
-                a.protocols.contains(&p)
-                    && !is_excluded(&a.name)
-                    && provider.is_none_or(|want| a.provider == want)
-            })
-            .collect();
-        let tier: Vec<&Arc<Account>> = {
-            let ptu: Vec<&Arc<Account>> =
-                candidates.iter().copied().filter(|a| a.is_ptu()).collect();
-            if ptu.is_empty() { candidates } else { ptu }
-        };
-        let best = tier.iter().map(|a| a.priority).min()?;
-        let top: Vec<&Arc<Account>> = tier
-            .iter()
-            .copied()
-            .filter(|a| a.priority == best)
+            .filter(|a| eligible(a) && a.is_ptu() == has_ptu && a.priority == best)
             .collect();
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % top.len();
         Some(Arc::clone(top[idx]))
     }
+}
+
+/// Whether `a` can serve protocol `p`, honoring a model's provider binding.
+fn serves(a: &Arc<Account>, p: Protocol, provider: Option<&str>) -> bool {
+    a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want)
 }
 
 /// Fixed-window token accounting, for AK-level TPM and (at amount 1) QPM.
@@ -633,12 +640,16 @@ impl RedisResponseCache {
     }
 }
 
+fn redis_cache_key(key: &str) -> String {
+    format!("gw:cache:{key}")
+}
+
 #[async_trait::async_trait]
 impl ResponseCache for RedisResponseCache {
     async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
         let mut conn = self.conn.clone();
         let raw: Option<String> = redis::cmd("GET")
-            .arg(format!("gw:cache:{key}"))
+            .arg(redis_cache_key(key))
             .query_async(&mut conn)
             .await
             .ok()
@@ -658,7 +669,7 @@ impl ResponseCache for RedisResponseCache {
         };
         let mut conn = self.conn.clone();
         if let Err(e) = redis::cmd("SET")
-            .arg(format!("gw:cache:{key}"))
+            .arg(redis_cache_key(&key))
             .arg(raw)
             .arg("PX")
             .arg(ttl.as_millis() as u64)
@@ -704,6 +715,7 @@ pub struct GatewayState {
     pub governance: Arc<dyn Governance>,
     /// Durable records (ledger/files/batches); sqlite/postgres when configured.
     pub store: Arc<dyn Store>,
+    billing: admission::BillingLedger,
     /// Account health (cooldown/recovery); Redis for fleet-wide cooldown.
     pub health: Arc<dyn HealthStore>,
     /// Request-level response cache: in-process by default, Redis when shared.
@@ -718,11 +730,13 @@ pub struct GatewayState {
 
 impl Default for GatewayState {
     fn default() -> Self {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::default());
         Self {
             auth: Arc::new(AkAuth::default()),
             pool: AccountPool::default(),
             governance: Arc::new(MemoryGovernance::default()),
-            store: Arc::new(MemoryStore::default()),
+            store: store.clone(),
+            billing: admission::BillingLedger::direct(store),
             health: Arc::new(AccountHealth::default()),
             cache: Arc::new(MemoryResponseCache::default()),
             avail: Arc::new(avail::MemoryAvail::default()),
@@ -797,7 +811,7 @@ impl GatewayState {
             match RedisGovernance::connect(&cfg.storage.redis_url).await {
                 Ok(g) => {
                     state.governance = Arc::new(g);
-                    tracing::info!(url = %cfg.storage.redis_url, "governance = redis");
+                    tracing::info!("governance = redis");
                 }
                 Err(e) => tracing::error!(error = %e, "redis connect failed; staying in-process"),
             }
@@ -820,6 +834,7 @@ impl GatewayState {
                 }
             }
         }
+        state.billing = admission::BillingLedger::repairing(state.store.clone());
         Ok(state)
     }
 
@@ -833,6 +848,7 @@ impl GatewayState {
             pool: AccountPool::from_config(cfg),
             governance: prev.governance.clone(),
             store: prev.store.clone(),
+            billing: prev.billing.clone(),
             health: prev.health.clone(),
             cache: prev.cache.clone(),
             avail: prev.avail.clone(),
@@ -893,6 +909,29 @@ impl std::fmt::Debug for SharedConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SharedConfig")
     }
+}
+
+/// Current unix seconds (0 if the clock reads before the epoch).
+pub fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Unix milliseconds; erasure markers use this so an erase-then-resubmit in
+/// the same second isn't misjudged as pre-erasure content.
+pub fn epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Stable SHA-256 identifier for correlating an access key in logs.
+pub fn access_key_fingerprint(ak: &str) -> String {
+    let digest = Sha256::digest(ak.as_bytes());
+    format!("sha256:{}", hex::encode(&digest[..16]))
 }
 
 /// The entry for `key`, inserting `init()` on first use — the key String is
@@ -962,23 +1001,6 @@ pub(crate) async fn redis_connect(url: &str) -> Result<redis::aio::ConnectionMan
         .map_err(|e| format!("redis connect: {e}"))
 }
 
-/// Current unix seconds (0 if the clock reads before the epoch).
-pub fn epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Unix milliseconds; erasure markers use this so an erase-then-resubmit in
-/// the same second isn't misjudged as pre-erasure content.
-pub fn epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1023,14 @@ mod tests {
             suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
         }
+    }
+
+    #[test]
+    fn access_key_fingerprint_is_stable_without_exposing_the_key() {
+        let fingerprint = access_key_fingerprint("ak-secret");
+        assert_eq!(fingerprint, "sha256:41d7cef0ff97ad3b306ff0a0fff45d54");
+        assert!(!fingerprint.contains("ak-secret"));
+        assert_ne!(fingerprint, access_key_fingerprint("ak-other"));
     }
 
     #[test]

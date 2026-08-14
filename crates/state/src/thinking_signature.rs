@@ -48,12 +48,15 @@ impl ReviewVerdict {
     }
 }
 
+/// The (user-scope, model) pair one audited request runs under.
 #[derive(Debug, Clone)]
 pub struct AuditContext {
     scope: Digest,
     model: String,
 }
 
+/// Remembers what signed thinking each scope was actually served, so a
+/// tool-loop continuation can be audited against it.
 #[derive(Clone)]
 pub struct ThinkingSignatureAudit {
     inner: Arc<AuditInner>,
@@ -74,6 +77,7 @@ impl Default for ThinkingSignatureAudit {
 }
 
 impl ThinkingSignatureAudit {
+    /// Audit with the default ten-minute consistency window.
     pub fn new() -> Self {
         Self::with_ttl(THINKING_SIGNATURE_TTL)
     }
@@ -184,7 +188,7 @@ impl ThinkingSignatureAudit {
         let fingerprint = self.sequence_fingerprint(&context, &sequence.blocks);
         let mut saw_match = false;
         for tool_id in result_ids {
-            let anchor_present = sequence.tool_ids.iter().any(|id| id == tool_id);
+            let anchor_present = sequence.tool_ids.contains(&tool_id);
             match self.review_anchor(&context, tool_id, anchor_present, fingerprint) {
                 ReviewVerdict::Match => saw_match = true,
                 ReviewVerdict::Mismatch => {
@@ -454,27 +458,32 @@ fn finalize_digest(mac: HmacSha256) -> Digest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ProtectedBlock {
-    Thinking { thinking: String, signature: String },
-    RedactedThinking { data: String },
+enum ProtectedBlock<'a> {
+    Thinking {
+        thinking: &'a str,
+        signature: &'a str,
+    },
+    RedactedThinking {
+        data: &'a str,
+    },
 }
 
 #[derive(Debug, Default)]
-struct ProtectedSequence {
-    blocks: Vec<ProtectedBlock>,
-    tool_ids: Vec<String>,
+struct ProtectedSequence<'a> {
+    blocks: Vec<ProtectedBlock<'a>>,
+    tool_ids: Vec<&'a str>,
     has_opaque_proof: bool,
     invalid: bool,
 }
 
-impl ProtectedSequence {
-    fn from_content(content: &[Value]) -> Self {
+impl<'a> ProtectedSequence<'a> {
+    fn from_content(content: &'a [Value]) -> Self {
         let mut sequence = Self::default();
         sequence.append_content(content);
         sequence
     }
 
-    fn append_content(&mut self, content: &[Value]) {
+    fn append_content(&mut self, content: &'a [Value]) {
         for block in content {
             match block.get("type").and_then(Value::as_str) {
                 Some("thinking") => {
@@ -507,12 +516,11 @@ impl ProtectedSequence {
     }
 }
 
-fn bounded_string(value: Option<&Value>) -> String {
+fn bounded_string(value: Option<&Value>) -> &str {
     value
         .and_then(Value::as_str)
         .filter(|value| value.len() <= MAX_OPAQUE_FIELD)
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn invalid_bounded_string(value: Option<&Value>) -> bool {
@@ -586,6 +594,8 @@ impl CapturedBlock {
     }
 }
 
+/// Accumulates a live stream's signed thinking blocks so the finished turn
+/// registers just like a buffered one.
 pub struct ThinkingStreamCapture {
     audit: ThinkingSignatureAudit,
     context: AuditContext,
@@ -607,6 +617,7 @@ impl ThinkingStreamCapture {
         }
     }
 
+    /// Fold one outbound SSE event into the capture.
     pub fn observe(&mut self, event: &Value) {
         if self.disabled || self.registered {
             return;
@@ -649,16 +660,16 @@ impl ThinkingStreamCapture {
         }
         let captured = match block.get("type").and_then(Value::as_str) {
             Some("thinking") => CapturedBlock::Thinking {
-                thinking: bounded_string(block.get("thinking")),
-                signature: bounded_string(block.get("signature")),
+                thinking: bounded_string(block.get("thinking")).to_owned(),
+                signature: bounded_string(block.get("signature")).to_owned(),
                 complete: false,
             },
             Some("redacted_thinking") => CapturedBlock::RedactedThinking {
-                data: bounded_string(block.get("data")),
+                data: bounded_string(block.get("data")).to_owned(),
                 complete: false,
             },
             Some("tool_use") => CapturedBlock::ToolUse {
-                id: bounded_string(block.get("id")),
+                id: bounded_string(block.get("id")).to_owned(),
                 complete: false,
             },
             _ => CapturedBlock::Ignored,
@@ -730,8 +741,7 @@ impl ThinkingStreamCapture {
             return;
         }
         let mut sequence = ProtectedSequence::default();
-        // registration is terminal — move the captured strings, don't copy them
-        for block in std::mem::take(&mut self.blocks).into_values() {
+        for block in self.blocks.values() {
             match block {
                 CapturedBlock::Thinking {
                     thinking,
@@ -757,6 +767,9 @@ impl ThinkingStreamCapture {
             }
         }
         self.audit.remember_sequence(&self.context, &sequence);
+        drop(sequence);
+        self.blocks.clear();
+        self.captured_bytes = 0;
         self.registered = true;
     }
 

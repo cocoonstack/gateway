@@ -106,7 +106,7 @@ impl OnlineHandler {
         let result = self.run_inner(request, ak, &snap, retention).await;
         let settled_here = match result.as_ref() {
             Err(_) => true,
-            Ok(ctx) => !ctx.request.buffered_online(),
+            Ok(ctx) => !ctx.request.buffered_online() && !ctx.billing_deferred,
         };
         if settled_here && let Some((retention, subject)) = terminal {
             let body = terminal_result_body(result.as_ref());
@@ -140,6 +140,7 @@ impl OnlineHandler {
             request,
             ak,
         );
+        ctx.billing_deferred = dlp && ctx.request.is_online && ctx.request.stream;
         // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
         for hit in &scan.hits {
             emit_security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count).await;
@@ -191,7 +192,7 @@ impl OnlineHandler {
                             &mut ctx,
                             "degrade would change a pinned thinking model: denied",
                             "content requires degraded serving, but signed thinking pins the requested model",
-                            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                            gw_consts::ErrCode::EMPTY_RESP,
                         );
                         return Ok(ctx);
                     }
@@ -216,7 +217,7 @@ impl OnlineHandler {
                                 &mut ctx,
                                 "degrade without a fallback: denied",
                                 "content requires degraded serving; no fallback model configured",
-                                gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                                gw_consts::ErrCode::EMPTY_RESP,
                             );
                             return Ok(ctx);
                         }
@@ -224,12 +225,7 @@ impl OnlineHandler {
                 }
                 Moderation::Deny(reason) => {
                     emit_security_event(&ctx, "moderation", "block", 1).await;
-                    deny_moderation(
-                        &mut ctx,
-                        "denied",
-                        reason,
-                        gw_consts::ErrCode::EMPTY_RESP.value() as i32,
-                    );
+                    deny_moderation(&mut ctx, "denied", reason, gw_consts::ErrCode::EMPTY_RESP);
                     return Ok(ctx);
                 }
                 Moderation::Unavailable => {
@@ -237,7 +233,7 @@ impl OnlineHandler {
                         &mut ctx,
                         "moderator unavailable: denied",
                         MODERATION_UNAVAILABLE,
-                        gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
+                        gw_consts::ErrCode::SYSTEM_ERROR,
                     );
                     return Ok(ctx);
                 }
@@ -463,6 +459,31 @@ pub async fn persist_terminal_response(ctx: &DagContext, http_status: u16) {
     .await;
 }
 
+/// Settle billing and terminal retention after an outbound-DLP buffered stream
+/// has been replayed by the HTTP view.
+pub async fn complete_buffered_stream(
+    ctx: &mut DagContext,
+    delivery: gw_dag::StreamDelivery,
+) -> GResult<()> {
+    let terminal = match &delivery {
+        gw_dag::StreamDelivery::Complete => terminal_plain_body("success", 200, false),
+        gw_dag::StreamDelivery::Partial(_) => terminal_plain_body("client_closed", 499, true),
+        gw_dag::StreamDelivery::None => terminal_plain_body("client_closed", 499, false),
+    };
+    gw_dag::settle_deferred_stream(ctx, delivery).await?;
+    let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
+        return Ok(());
+    };
+    let subject = TerminalSubject {
+        request_id: ctx.request.request_id.clone(),
+        ak: ctx.ak.ak.clone(),
+        user_id: ctx.effective_user_id().to_owned(),
+        tenant: ctx.ak.tenant.clone(),
+    };
+    persist_terminal(ctx.state.store.as_ref(), &subject, retention, terminal).await;
+    Ok(())
+}
+
 /// Count one admission rejection against the key's daily abuse counter and
 /// suspend it when a configured tier trips. Deny-path only, so the serving
 /// path never pays for it; the day-scoped quota counter is fleet-shared.
@@ -494,7 +515,8 @@ async fn note_abuse(ctx: &DagContext) {
         ..Default::default()
     };
     if let Err(e) = ctx.state.auth.patch(&ctx.ak.ak, &patch).await {
-        tracing::warn!(error = %e, ak = %ctx.ak.ak, "abuse suspension patch failed");
+        let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
+        tracing::warn!(error = %e, ak_id, "abuse suspension patch failed");
         return;
     }
     let summary = format!(
@@ -521,9 +543,17 @@ async fn note_abuse(ctx: &DagContext) {
 
 /// Record a moderation denial: decision line + content-filter outcome. Event
 /// emission stays at the call sites (`Unavailable` deliberately records none).
-fn deny_moderation(ctx: &mut DagContext, decision: &str, reason: impl Into<String>, code: i32) {
-    ctx.decide("moderation", decision.to_owned());
-    ctx.outcome = Some(content_filter_outcome(Block::blocked(reason, code)));
+fn deny_moderation(
+    ctx: &mut DagContext,
+    decision: &str,
+    reason: impl Into<String>,
+    code: gw_consts::ErrCode,
+) {
+    ctx.decide("moderation", decision);
+    ctx.outcome = Some(content_filter_outcome(Block::blocked(
+        reason,
+        code.value() as i32,
+    )));
 }
 
 /// The 200-with-`content_filter` outcome every pre-stage denial returns.
@@ -2044,6 +2074,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlp_partial_replay_bills_only_delivered_text() {
+        let h = OnlineHandler::new(handler().config.clone(), Arc::new(PiiStream));
+        let mut request = chat_req("gpt-4o", "hello");
+        request.stream = true;
+        let mut ctx = h.run(request, ak(&h).await).await.unwrap();
+        assert_eq!(
+            h.state().store.ledger_snapshot(10).await.unwrap().0,
+            0,
+            "billing waits for the buffered replay"
+        );
+
+        complete_buffered_stream(&mut ctx, gw_dag::StreamDelivery::Partial(2))
+            .await
+            .unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(10).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger[0].estimated);
+        assert!(ledger[0].completion_tokens > 0);
+        assert!(ctx.outcome.as_ref().unwrap().response.aborted);
+    }
+
+    #[tokio::test]
     async fn dlp_buffer_keeps_clean_native_chunks_for_lossless_replay() {
         let h = handler();
         assert!(h.cfg().security.dlp_redact, "default config has DLP on");
@@ -2513,14 +2565,10 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
-        let mut st = GatewayState::from_config(&cfg);
-        st.store = Arc::new(
-            gw_state::PostgresStore::connect(&url)
-                .await
-                .expect("pg store"),
-        );
-        let state = Arc::new(st);
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.storage.postgres_url = url;
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::build(&cfg).await.expect("pg state"));
         let online = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, state.clone()),
             Arc::new(gw_engines::MockTransport),

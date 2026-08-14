@@ -20,7 +20,9 @@ use gw_config::GatewayConfig;
 use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
-use gw_engines::realtime::{is_response_create, realtime_turn_started, realtime_usage};
+use gw_engines::realtime::{
+    is_response_create, realtime_output_delta, realtime_turn_started, realtime_usage,
+};
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
@@ -361,6 +363,33 @@ impl RealtimeAdmit {
     }
 }
 
+struct RealtimeTurn {
+    admit: RealtimeAdmit,
+    delivered_output_tokens: i64,
+}
+
+impl RealtimeTurn {
+    fn new(admit: RealtimeAdmit) -> Self {
+        Self {
+            admit,
+            delivered_output_tokens: 0,
+        }
+    }
+
+    fn record_text(&mut self, text: &str) {
+        let tokens = gw_models::token_estimate::default_encoder().encode_len(text);
+        self.record_units(i64::try_from(tokens).unwrap_or(i64::MAX));
+    }
+
+    fn estimated_output_tokens(&self) -> Option<i64> {
+        (self.delivered_output_tokens > 0).then_some(self.delivered_output_tokens)
+    }
+
+    fn record_units(&mut self, units: i64) {
+        self.delivered_output_tokens = self.delivered_output_tokens.saturating_add(units);
+    }
+}
+
 /// The REST admission chain applied per realtime generation via the shared
 /// [`admission`] checks, with the key re-fetched each turn so mid-session
 /// bans/de-entitlements take effect. Denials carry the rendering class
@@ -470,6 +499,7 @@ async fn bill_realtime_turn(
     account: &str,
     it: i64,
     ot: i64,
+    estimated: bool,
 ) {
     let ak = &admit.ak;
     // clamp parts and total so a hostile count can't overflow shared counters
@@ -486,8 +516,7 @@ async fn bill_realtime_turn(
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
     admission::settle_and_bill(
-        state.governance.as_ref(),
-        state.store.as_ref(),
+        state,
         cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {
@@ -506,7 +535,7 @@ async fn bill_realtime_turn(
                 billable_completion: bc,
                 total,
                 ptu_spillover: false,
-                estimated: false,
+                estimated,
             },
             reserved: admit.reserved,
             tpm_reserved: admit.tpm_reserved,
@@ -523,9 +552,23 @@ async fn bill_realtime_turn(
         total,
     )
     .await;
-    state.avail.record(&m.requested, true);
+    if !estimated {
+        state.avail.record(&m.requested, true);
+    }
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot as u64);
+}
+
+async fn settle_realtime_abort(
+    turn: RealtimeTurn,
+    m: &RtModel,
+    mt: gw_consts::Protocol,
+    account: &str,
+) {
+    match turn.estimated_output_tokens() {
+        Some(output) => bill_realtime_turn(&turn.admit, m, mt, account, 0, output, true).await,
+        None => turn.admit.refund().await,
+    }
 }
 
 /// One mock realtime session.
@@ -573,6 +616,7 @@ async fn realtime_session(
                         continue;
                     }
                 };
+                let mut turn = RealtimeTurn::new(admit);
                 let input = ev["text"].as_str().unwrap_or_default();
                 let reply = format!("[mock-realtime:{}] you said: {input}", rtm.served);
                 let (it, ot) = (
@@ -584,17 +628,27 @@ async fn realtime_session(
                     .find(|&i| reply.is_char_boundary(i))
                     .unwrap_or(0);
                 let (a, b) = reply.split_at(mid);
-                let _ = socket
-                    .send(send(json!({"type":"response.delta","delta": a})))
-                    .await;
-                let _ = socket
-                    .send(send(json!({"type":"response.delta","delta": b})))
-                    .await;
-                let _ = socket
+                for delta in [a, b] {
+                    if socket
+                        .send(send(json!({"type":"response.delta","delta": delta})))
+                        .await
+                        .is_err()
+                    {
+                        settle_realtime_abort(turn, &rtm, mt, &account).await;
+                        return;
+                    }
+                    turn.record_text(delta);
+                }
+                if socket
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
-                    .await;
-                bill_realtime_turn(&admit, &rtm, mt, &account, it, ot).await;
+                    .await
+                    .is_err()
+                {
+                    bill_realtime_turn(&turn.admit, &rtm, mt, &account, it, ot, false).await;
+                    return;
+                }
+                bill_realtime_turn(&turn.admit, &rtm, mt, &account, it, ot, false).await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -705,7 +759,7 @@ async fn realtime_bridge(
     let mut recognized = 0u64;
     // the one admitted turn awaiting settle (the OpenAI dialect allows a single
     // active response); refunded on exit so its reserve never leaks
-    let mut pending: Option<RealtimeAdmit> = None;
+    let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
     // outbound DLP redactions summed within a turn, recorded once at its boundary
@@ -747,7 +801,7 @@ async fn realtime_bridge(
                     if is_response_create(&frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
-                                pending = Some(admit);
+                                pending = Some(RealtimeTurn::new(admit));
                                 generations += 1;
                             }
                             Err((class, denied)) => {
@@ -789,6 +843,7 @@ async fn realtime_bridge(
                 let mut relay = true;
                 let mut redacted: Option<String> = None;
                 let mut turn_ended = false;
+                let mut output_units = 0;
                 match frame {
                     Some(mut v) => {
                         if suppress {
@@ -801,7 +856,7 @@ async fn realtime_bridge(
                         // response.create — gate it here like a manual one
                         else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
-                                Ok(admit) => pending = Some(admit),
+                                Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
                                 Err((class, denied)) => {
                                     let _ = up_tx
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
@@ -817,8 +872,20 @@ async fn realtime_bridge(
                             // turn boundary — settle the admitted turn;
                             // a boundary with no gated turn bills unreserved
                             match pending.take() {
-                                Some(a) => {
-                                    bill_realtime_turn(&a, &rtm, mt, &account.name, it, ot).await
+                                Some(turn) if it.saturating_add(ot) > 0 => {
+                                    bill_realtime_turn(
+                                        &turn.admit,
+                                        &rtm,
+                                        mt,
+                                        &account.name,
+                                        it,
+                                        ot,
+                                        false,
+                                    )
+                                    .await
+                                }
+                                Some(turn) => {
+                                    settle_realtime_abort(turn, &rtm, mt, &account.name).await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
                                     // re-authenticate so billing uses the key's current
@@ -847,6 +914,7 @@ async fn realtime_bridge(
                                         &account.name,
                                         it,
                                         ot,
+                                        false,
                                     )
                                     .await
                                 }
@@ -869,6 +937,17 @@ async fn realtime_bridge(
                         if n > 0 {
                             redacted = Some(v.to_string());
                         }
+                        if relay {
+                            let (text, opaque) = realtime_output_delta(&v);
+                            output_units = text.map_or(0, |text| {
+                                let tokens = gw_models::token_estimate::default_encoder()
+                                    .encode_len(text);
+                                i64::try_from(tokens).unwrap_or(i64::MAX)
+                            });
+                            output_units = output_units.saturating_add(
+                                i64::try_from(opaque).unwrap_or(i64::MAX),
+                            );
+                        }
                         // per-token events would be too hot: sum the turn, record once at its boundary
                         out_redacted += n as i64;
                         if turn_ended {
@@ -877,7 +956,15 @@ async fn realtime_bridge(
                         }
                     }
                     // a denied turn's non-JSON output (e.g. audio deltas) is dropped too
-                    None => relay = !suppress,
+                    None => {
+                        relay = !suppress;
+                        if relay {
+                            let opaque = raw_bytes
+                                .as_ref()
+                                .map_or(0, |bytes| bytes.len().div_ceil(4));
+                            output_units = i64::try_from(opaque).unwrap_or(i64::MAX);
+                        }
+                    }
                 }
                 if relay {
                     let out = match (redacted, was_text, raw_text, raw_bytes) {
@@ -890,12 +977,15 @@ async fn realtime_bridge(
                     if cl_tx.send(out).await.is_err() {
                         break;
                     }
+                    if let Some(turn) = pending.as_mut() {
+                        turn.record_units(output_units);
+                    }
                 }
             },
         }
     }
-    if let Some(a) = pending {
-        a.refund().await;
+    if let Some(turn) = pending {
+        settle_realtime_abort(turn, &rtm, mt, &account.name).await;
     }
     // a turn aborted before its boundary (upstream drop) still applied its
     // redactions per frame — flush the pending count so the audit isn't lost
@@ -937,14 +1027,15 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         .unwrap_or_default();
     let latency = started.elapsed();
     let user_id = ctx.effective_user_id();
-    let decisions = ctx.decision_lines().collect::<Vec<_>>().join("; ");
+    let decisions = ctx.decisions_line();
+    let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
         target: "access",
         surface,
         request_id = %ctx.request.request_id,
-        ak = %ctx.ak.ak,
+        ak_id,
         product = %ctx.ak.product,
         user_id,
         model = %model,
@@ -984,8 +1075,16 @@ async fn list_models(State(s): State<AppState>, Authed(ak): Authed) -> Response 
     Json(resp).into_response()
 }
 
-/// Local billing ledger snapshot.
-async fn ledger(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+/// Local billing ledger snapshot. Global-token only: the raw rows span every
+/// tenant and carry the operator's vendor-cost margin basis.
+async fn ledger(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
@@ -994,7 +1093,11 @@ async fn ledger(State(s): State<AppState>, Query(q): Query<HashMap<String, Strin
 }
 
 /// Account pool view (name/provider/tier/priority/served model family).
-async fn accounts(State(s): State<AppState>) -> Json<Value> {
+/// Global-token only: account names and health are operator internals.
+async fn accounts(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
     let cfg = s.handler.cfg();
     let health = &s.handler.state().health;
     let mut data: Vec<Value> = Vec::with_capacity(cfg.accounts.len());
@@ -1010,7 +1113,7 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
     }
     let mut resp = json!({ "count": data.len() });
     resp["accounts"] = Value::Array(data);
-    Json(resp)
+    Json(resp).into_response()
 }
 
 /// The `x-gw-user` attribution hint; surfaces fall back to the body's own user
@@ -2518,7 +2621,6 @@ async fn chat_completions(
     let request = GatewayRequest {
         is_online: true,
         stream: body.stream,
-        ak: ak.ak.clone(),
         message: messages,
         model_param_v2: Some(param),
         user_id,
@@ -2582,16 +2684,19 @@ fn spawn_stream_pipeline(
     started: Instant,
 ) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
-    let dlp = s.handler.cfg().security_for(&ak.tenant).redacts_output();
-    if !dlp {
+    let buffer_output = s.handler.cfg().security_for(&ak.tenant).redacts_output();
+    if !buffer_output {
         request.stream_tx = Some(tx.clone());
     }
     let handler = s.handler.clone();
     tokio::spawn(async move {
         match handler.run(request, ak).await {
-            Ok(ctx) => {
-                log_access(surface, &ctx, started);
-                if let Some(outcome) = ctx.outcome {
+            Ok(mut ctx) => {
+                let dlp = ctx.billing_deferred;
+                if !dlp {
+                    log_access(surface, &ctx, started);
+                }
+                if let Some(outcome) = ctx.outcome.as_mut() {
                     let usage_totals = (
                         outcome.response.prompt_tokens,
                         outcome.response.completion_tokens,
@@ -2610,9 +2715,35 @@ fn spawn_stream_pipeline(
                         common_usage,
                         ..Default::default()
                     });
-                    for c in tail {
-                        if tx.send(c).await.is_err() {
-                            break; // client went away; billing already happened
+                    if dlp {
+                        let mut delivered = 0i64;
+                        let mut complete = true;
+                        for chunk in tail {
+                            let tokens = stream_chunk_output_tokens(&chunk);
+                            if tx.send(chunk).await.is_err() {
+                                complete = false;
+                                break;
+                            }
+                            delivered = delivered.saturating_add(tokens);
+                        }
+                        let delivery = if complete {
+                            gw_dag::StreamDelivery::Complete
+                        } else if delivered > 0 {
+                            gw_dag::StreamDelivery::Partial(delivered)
+                        } else {
+                            gw_dag::StreamDelivery::None
+                        };
+                        if let Err(e) =
+                            gw_handler::complete_buffered_stream(&mut ctx, delivery).await
+                        {
+                            tracing::error!(error = %e, "buffered stream settlement failed");
+                        }
+                        log_access(surface, &ctx, started);
+                    } else {
+                        for chunk in tail {
+                            if tx.send(chunk).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2776,15 +2907,15 @@ fn chat_stream_response(
 }
 
 /// Chunks for an engine that returned a buffered response.
-fn synth_chunks(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
-    let mut resp = outcome.response;
+fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let resp = &mut outcome.response;
     let mut chunks = if outcome.chunks.is_empty() && !resp.message.is_empty() {
         vec![gw_engines::StreamChunk {
-            delta: resp.message,
+            delta: std::mem::take(&mut resp.message),
             ..Default::default()
         }]
     } else {
-        outcome.chunks
+        std::mem::take(&mut outcome.chunks)
     };
     if let Some(tc) = resp.tool_calls.take()
         && !chunks.iter().any(|c| c.tool_calls.is_some())
@@ -2805,15 +2936,17 @@ fn synth_chunks(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChu
 
 /// The stream tail under outbound DLP: unlike [`synth_chunks`] it never replays
 /// the raw pre-redaction deltas, so no unmasked text ever leaves.
-fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
-    let mut resp = outcome.response;
+fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let resp = &mut outcome.response;
     if resp.anthropic_content.is_some() {
-        return gw_engines::anthropic_native_chunks(&resp, None);
+        let chunks = gw_engines::anthropic_native_chunks(resp, None);
+        resp.anthropic_content = None;
+        return chunks;
     }
     let mut chunks = Vec::new();
     if !resp.message.is_empty() {
         chunks.push(gw_engines::StreamChunk {
-            delta: resp.message,
+            delta: std::mem::take(&mut resp.message),
             ..Default::default()
         });
     }
@@ -2828,6 +2961,25 @@ fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::S
         ..Default::default()
     });
     chunks
+}
+
+fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
+    let encoder = gw_models::token_estimate::default_encoder();
+    let mut tokens = encoder.encode_len(&chunk.delta) as i64;
+    if let Some(tool_calls) = &chunk.tool_calls {
+        tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
+    }
+    if let Some(event) = &chunk.anthropic_event {
+        for field in ["text", "thinking", "partial_json"] {
+            if let Some(value) = event["delta"][field].as_str() {
+                tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
+            }
+        }
+        if let Some(name) = event["content_block"]["name"].as_str() {
+            tokens = tokens.saturating_add(encoder.encode_len(name) as i64);
+        }
+    }
+    gw_state::clamp_tokens(tokens)
 }
 
 /// POST /v1/messages (Anthropic-compatible surface, stream + non-stream)
@@ -2868,7 +3020,6 @@ async fn messages(
         is_online: true,
         stream: body.stream,
         preserve_anthropic_wire: true,
-        ak: ak.ak.clone(),
         message: body
             .messages
             .into_iter()
@@ -3205,7 +3356,6 @@ async fn run_family(
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
-        ak: ak.ak.clone(),
         message: messages,
         model_param_v2: Some(param),
         user_id,
@@ -3281,7 +3431,7 @@ async fn completions(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     // prompt: string or [string] (OpenAI accepts both)
     let prompt = match body.get_mut("prompt").map(Value::take) {
         Some(Value::String(s)) => s,
@@ -3362,7 +3512,6 @@ async fn responses(
     let request = GatewayRequest {
         is_online: true,
         stream,
-        ak: ak.ak.clone(),
         model_param_v2: Some(param),
         user_id,
         ..Default::default()
@@ -3498,7 +3647,7 @@ async fn embeddings(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let input = string_or_string_array(body.get_mut("input").map(Value::take));
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
@@ -3529,7 +3678,7 @@ async fn images_generations(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() {
         return error_response(400, "model and prompt are required");
@@ -3563,7 +3712,7 @@ async fn images_edits(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
     let image = gw_engines::engine::take_string(&mut body, "/image").unwrap_or_default();
     if model.is_empty() || prompt.is_empty() || image.is_empty() {
@@ -3679,7 +3828,7 @@ async fn audio_transcribe(
     translate: bool,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let audio = gw_engines::engine::take_string(&mut body, "/audio_b64").unwrap_or_default();
     if model.is_empty() || audio.is_empty() {
         return error_response(400, "model and audio_b64 are required");
@@ -3726,7 +3875,7 @@ async fn moderations(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let input = string_or_string_array(body.get_mut("input").map(Value::take));
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
@@ -3754,8 +3903,8 @@ async fn rerank(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let query = body["query"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
+    let query = gw_engines::engine::take_string(&mut body, "/query").unwrap_or_default();
     let documents: Vec<String> = match body.get_mut("documents").map(Value::take) {
         Some(Value::Array(a)) => a
             .into_iter()
@@ -3809,9 +3958,9 @@ async fn batches_submit(
     State(s): State<AppState>,
     headers: HeaderMap,
     Authed(ak): Authed,
-    ApiJson(body): ApiJson<Value>,
+    ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
-    let mut model = body["model"].as_str().unwrap_or_default().to_owned();
+    let mut model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
     let hint = user_header(&headers);
@@ -3996,6 +4145,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DelayedDlpStream {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for DelayedDlpStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            self.release.notified().await;
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n"
+                        .to_vec(),
+                ),
+            })
+        }
+    }
+
     #[test]
     fn unsealed_content_passes_plaintext_and_nulls_unopenable() {
         assert_eq!(
@@ -4151,6 +4322,57 @@ mod tests {
             .unwrap();
         assert_eq!(by_user.len(), 1);
         assert!(by_user[0].total_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn dlp_disconnect_before_replay_refunds_and_marks_terminal() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: true}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a, provider: openai, protocols: [openai-chat]}]\ntenants: [{name: t, retention: {content: redacted, days: 1}}]\naccess_keys: [{ak: k, tenant: t, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app_state = AppState::new(
+            cfg,
+            state.clone(),
+            Arc::new(DelayedDlpStream {
+                release: release.clone(),
+            }),
+        );
+        let ak = state.auth.authenticate("k").await.unwrap();
+        let request = GatewayRequest {
+            is_online: true,
+            stream: true,
+            request_id: "req-dlp-disconnect".into(),
+            message: vec![ChatMsg::text("user", "hi")],
+            model_param_v2: Some(ModelParamV2::with_name(
+                gw_consts::Protocol::OpenaiChat,
+                "m",
+            )),
+            ..Default::default()
+        };
+        drop(spawn_stream_pipeline(
+            &app_state,
+            request,
+            ak,
+            "test",
+            Instant::now(),
+        ));
+        release.notify_one();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let rows = state.store.content_for("req-dlp-disconnect").await.unwrap();
+                if let Some(row) = rows.into_iter().find(|row| row.kind == "terminal") {
+                    break serde_json::from_str::<Value>(&row.content).unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal result");
+        assert_eq!(terminal["state"], "client_closed");
+        assert_eq!(terminal["stream_committed"], false);
+        assert_eq!(state.store.ledger_snapshot(10).await.unwrap().0, 0);
+        assert_eq!(state.governance.quota_used("k").await, 0);
     }
 
     #[tokio::test]
@@ -5082,6 +5304,7 @@ mod tests {
             "acc",
             30,
             70,
+            false,
         )
         .await;
         assert_eq!(used().await, 100, "settled to actual (30 + 70)");
@@ -5105,6 +5328,7 @@ mod tests {
             "acc",
             0,
             0,
+            false,
         )
         .await;
         assert_eq!(used().await, 100, "zero-usage turn refunds its reserve");
@@ -5139,6 +5363,7 @@ mod tests {
             "acc",
             100,
             100,
+            false,
         )
         .await;
         let (_, ledger) = s
@@ -5243,6 +5468,7 @@ mod tests {
             "acc",
             100,
             100,
+            false,
         )
         .await;
 
@@ -5278,6 +5504,7 @@ mod tests {
             "acc",
             40,
             60,
+            false,
         )
         .await;
 
@@ -5302,6 +5529,7 @@ mod tests {
             "acc",
             10,
             20,
+            false,
         )
         .await;
 
@@ -5317,6 +5545,29 @@ mod tests {
             !users.contains("mallory"),
             "spoofed hint never overrides owner"
         );
+    }
+
+    #[test]
+    fn partial_stream_estimate_covers_visible_output_only() {
+        let text = gw_engines::StreamChunk {
+            delta: "hello".into(),
+            ..Default::default()
+        };
+        let tool = gw_engines::StreamChunk {
+            tool_calls: Some(json!([{"function":{"name":"lookup","arguments":"{}"}}])),
+            ..Default::default()
+        };
+        let native = gw_engines::StreamChunk {
+            anthropic_event: Some(json!({
+                "type":"content_block_delta",
+                "delta":{"type":"text_delta","text":"answer"}
+            })),
+            ..Default::default()
+        };
+        assert!(stream_chunk_output_tokens(&text) > 0);
+        assert!(stream_chunk_output_tokens(&tool) > 0);
+        assert!(stream_chunk_output_tokens(&native) > 0);
+        assert_eq!(stream_chunk_output_tokens(&Default::default()), 0);
     }
 
     #[test]

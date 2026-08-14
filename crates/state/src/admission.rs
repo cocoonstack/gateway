@@ -4,10 +4,76 @@
 //! two admission paths cannot drift. Denials carry the user-facing message;
 //! callers wrap it in their own wire shape.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use gw_config::GatewayConfig;
+use tokio::sync::mpsc;
 
 use crate::store::{BillingInput, BillingRecord, Store, billing_record};
-use crate::{AkInfo, Governance, clamp_tokens};
+use crate::{AkInfo, GatewayState, Governance, clamp_tokens};
+
+const LEDGER_REPAIR_CAPACITY: usize = 1_024;
+const LEDGER_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const LEDGER_RETRY_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub(crate) struct BillingLedger {
+    store: Arc<dyn Store>,
+    repair: Option<mpsc::Sender<BillingRecord>>,
+}
+
+impl BillingLedger {
+    pub(crate) fn direct(store: Arc<dyn Store>) -> Self {
+        Self {
+            store,
+            repair: None,
+        }
+    }
+
+    pub(crate) fn repairing(store: Arc<dyn Store>) -> Self {
+        let (repair, mut pending) = mpsc::channel::<BillingRecord>(LEDGER_REPAIR_CAPACITY);
+        let worker_store = store.clone();
+        // The bounded worker owns accepted repairs through caller cancellation.
+        tokio::spawn(async move {
+            while let Some(record) = pending.recv().await {
+                let mut delay = LEDGER_RETRY_INITIAL;
+                loop {
+                    match worker_store.ledger_add(&record).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            metrics::counter!("gateway_ledger_write_failures_total").increment(1);
+                            tracing::error!(error = %e, "billing ledger repair failed; retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = delay.saturating_mul(2).min(LEDGER_RETRY_MAX);
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            store,
+            repair: Some(repair),
+        }
+    }
+
+    // Backpressure only after the bounded repair queue fills: every accepted
+    // bill remains owned until the store recovers instead of being dropped.
+    async fn write(&self, record: &BillingRecord) {
+        let Err(e) = self.store.ledger_add(record).await else {
+            return;
+        };
+        metrics::counter!("gateway_ledger_write_failures_total").increment(1);
+        let Some(repair) = &self.repair else {
+            tracing::error!(error = %e, "billing ledger write failed");
+            return;
+        };
+        tracing::error!(error = %e, "billing ledger write failed; queued for repair");
+        if repair.send(record.clone()).await.is_err() {
+            tracing::error!("billing ledger repair worker stopped");
+        }
+    }
+}
 
 fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(deny()) }
@@ -23,10 +89,6 @@ fn product_qpm_key(product: &str) -> String {
 
 fn model_qpm_key(model: &str) -> String {
     format!("model:{model}")
-}
-
-pub fn model_quota_key(ak: &str, model: &str) -> String {
-    format!("{ak}|{model}")
 }
 
 /// The per-user daily-budget counter key, namespaced by tenant so the same
@@ -78,6 +140,10 @@ pub async fn consume_user_budget(
         gov.quota_consume(&user_budget_key(tenant, user), total)
             .await;
     }
+}
+
+pub fn model_quota_key(ak: &str, model: &str) -> String {
+    format!("{ak}|{model}")
 }
 
 /// The per-(AK, model) daily cap: AK override, else tenant default, else none.
@@ -225,14 +291,14 @@ pub struct SettleInput<'a> {
 
 /// Settle admission reserves to actuals, accrue the per-(AK, model) counter,
 /// and write the ledger — one round of concurrent independent ops. Token
-/// counts are clamped before metering; a ledger write failure is logged and
-/// counted, never surfaced (the response was already served).
+/// counts are clamped before metering; a transient ledger failure is handed to
+/// a bounded queue for asynchronous, idempotent repair.
 pub async fn settle_and_bill(
-    gov: &dyn Governance,
-    store: &dyn Store,
+    state: &GatewayState,
     cfg: &GatewayConfig,
     s: SettleInput<'_>,
 ) -> BillingRecord {
+    let gov = state.governance.as_ref();
     let total = clamp_tokens(s.billing.total);
     let record = billing_record(cfg, &s.billing);
     let settle_daily = gov.quota_settle(s.billing.ak, total - s.reserved, s.reserved_at);
@@ -256,12 +322,104 @@ pub async fn settle_and_bill(
             None => {}
         }
     };
-    let write_ledger = async {
-        if let Err(e) = store.ledger_add(&record).await {
-            metrics::counter!("gateway_ledger_write_failures_total").increment(1);
-            tracing::error!(error = %e, "billing ledger write failed");
-        }
-    };
+    let write_ledger = state.billing.write(&record);
     tokio::join!(settle_daily, consume_model, settle_tpm, write_ledger);
     record
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(request_id: impl Into<String>) -> BillingRecord {
+        BillingRecord {
+            ak: "ak".into(),
+            product: "p".into(),
+            tenant: "default".into(),
+            user_id: "u".into(),
+            request_id: request_id.into(),
+            created_at_epoch_secs: 1,
+            model: "m".into(),
+            served_model: "m".into(),
+            protocol: "openai-chat".into(),
+            account: "a".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost_micros: 0,
+            vendor_cost_micros: 0,
+            ptu_spillover: false,
+            estimated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn billing_ledger_repairs_failed_writes() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(2);
+        let ledger = BillingLedger::repairing(store.clone());
+        let record = record("req-repair");
+        ledger.write(&record).await;
+        let (count, rows) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = store.ledger_snapshot(usize::MAX).await.unwrap();
+                if snapshot.0 == 1 {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ledger repair did not finish");
+        assert_eq!(count, 1);
+        assert_eq!(rows[0].request_id, "req-repair");
+    }
+
+    #[tokio::test]
+    async fn billing_ledger_backpressures_at_capacity_then_repairs_every_row() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(usize::MAX);
+        let ledger = BillingLedger::repairing(store.clone());
+        let repair = ledger.repair.as_ref().unwrap();
+
+        ledger.write(&record("req-0")).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while repair.capacity() != LEDGER_REPAIR_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("repair worker did not take the first row");
+
+        for i in 1..=LEDGER_REPAIR_CAPACITY {
+            ledger.write(&record(format!("req-{i}"))).await;
+        }
+        assert_eq!(repair.capacity(), 0);
+
+        let blocked_record = record(format!("req-{}", LEDGER_REPAIR_CAPACITY + 1));
+        let mut blocked = Box::pin(ledger.write(&blocked_record));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), blocked.as_mut())
+                .await
+                .is_err(),
+            "a full queue must apply backpressure"
+        );
+
+        store.fail_next_ledger_writes(0);
+        tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("queue did not resume after store recovery");
+
+        let expected = LEDGER_REPAIR_CAPACITY + 2;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.ledger_snapshot(usize::MAX).await.unwrap().0 == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued ledger rows were not repaired");
+    }
 }

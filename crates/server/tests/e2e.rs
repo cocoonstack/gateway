@@ -88,16 +88,27 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
 
 #[tokio::test]
 async fn admin_reload_is_gated_and_swaps_keys_live() {
-    let r = app()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/reload")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // an admin-less config keeps the whole admin surface indistinguishable
+    // from a missing route (the shared app() now names an admin token env)
+    let no_admin = GatewayConfig::from_yaml(
+        "listen: {host: h, port: 0}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a, provider: openai, protocols: [openai-chat]}]\naccess_keys: [{ak: k, product: p, qps: 1, daily_token_quota: 1}]",
+    )
+    .unwrap();
+    let no_admin_state = Arc::new(GatewayState::from_config(&no_admin));
+    let r = gw_views::app(gw_views::AppState::new(
+        Arc::new(no_admin),
+        no_admin_state,
+        Arc::new(gw_engines::MockTransport),
+    ))
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
     const V1: &str = r#"
@@ -631,6 +642,21 @@ fn get_authed(uri: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// Operator read against the global-token-gated /internal/* surface.
+fn internal_get(uri: &str) -> Request<Body> {
+    static TOKEN: std::sync::LazyLock<&str> = std::sync::LazyLock::new(|| {
+        // SAFETY: written once with a process-constant value; every later
+        // reader observes the same string, so no concurrent-write hazard.
+        unsafe { std::env::set_var("GW_ADMIN_TOKEN", "e2e-operator-token") };
+        "e2e-operator-token"
+    });
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {}", *TOKEN))
+        .body(Body::empty())
+        .expect("request")
+}
+
 const CHAT_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello e2e"}]}"#;
 
 #[tokio::test]
@@ -735,7 +761,7 @@ async fn tenant_price_override_and_vendor_cost_reach_the_ledger() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    let r = app.oneshot(get_authed("/internal/ledger")).await.unwrap();
+    let r = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     let j = body_json(r).await;
     let rec = j["records"]
         .as_array()
@@ -1114,7 +1140,7 @@ async fn model_quota_degrades_to_fallback() {
         "over-quota call is served by the fallback model"
     );
 
-    let resp = app.oneshot(get_authed("/internal/ledger")).await.unwrap();
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     let last = j["records"]
         .as_array()
@@ -1360,7 +1386,7 @@ async fn ptu_failover_spills_to_paygo() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     let rec = j["records"].as_array().unwrap().last().unwrap();
     assert_eq!(rec["account"], "mock-hunyuan-paygo");
@@ -1382,8 +1408,35 @@ async fn security_block_and_dlp_redaction() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert_eq!(j["choices"][0]["finish_reason"], "content_filter");
-    let resp = app.clone().oneshot(get("/internal/ledger")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(internal_get("/internal/ledger"))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["count"], 0, "blocked is not billed");
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"tell me forbiddenword"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stream = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(stream.contains("content_filter"), "{stream}");
+    let resp = app
+        .clone()
+        .oneshot(internal_get("/internal/ledger"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["count"],
+        0,
+        "streaming block is not billed"
+    );
 
     let resp = app
         .oneshot(post(
@@ -1405,7 +1458,10 @@ async fn security_block_and_dlp_redaction() {
 #[tokio::test]
 async fn internal_accounts_view() {
     let app = app();
-    let resp = app.oneshot(get("/internal/accounts")).await.unwrap();
+    let resp = app
+        .oneshot(internal_get("/internal/accounts"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert!(j["count"].as_u64().unwrap() >= 10);
@@ -1436,7 +1492,7 @@ async fn chat_non_stream_full_pipeline_bills_the_ledger() {
     let total = j["usage"]["total_tokens"].as_i64().unwrap();
     assert!(total > 0);
 
-    let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     assert_eq!(j["count"], 1);
     let rec = &j["records"][0];
@@ -1925,7 +1981,7 @@ async fn bespoke_ernie_full_pipeline() {
             .unwrap()
             .contains("[mock-ernie] you said: 你好文心")
     );
-    let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     let j = body_json(resp).await;
     assert_eq!(j["records"][0]["protocol"], "ernie");
     assert!(j["records"][0]["cost_micros"].as_i64().unwrap() > 0);
@@ -1953,7 +2009,7 @@ async fn request_cache_hits_and_skips_billing() {
         j1["choices"][0]["message"]["content"],
         j2["choices"][0]["message"]["content"]
     );
-    let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(resp).await["count"], 1);
 }
 
@@ -2285,7 +2341,7 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
 "#;
     let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
-    let app = gw_views::app(AppState::new(cfg, state, Arc::new(PiiStream)));
+    let app = gw_views::app(AppState::new(cfg, state.clone(), Arc::new(PiiStream)));
 
     let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let resp = app
@@ -2301,6 +2357,12 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
     assert!(
         !text.contains("leak@evil.com"),
         "raw PII must never reach the client over the stream: {text}"
+    );
+    let (_, ledger) = state.store.ledger_snapshot(10).await.unwrap();
+    assert_eq!(
+        ledger.len(),
+        1,
+        "a fully replayed DLP stream is billed once"
     );
 }
 
@@ -2471,7 +2533,7 @@ async fn legacy_completions_full_pipeline() {
         "must not be chat-shaped"
     );
     assert!(j["usage"]["total_tokens"].as_i64().unwrap() > 0);
-    let led = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let led = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(led).await["count"], 1);
 }
 
@@ -2511,7 +2573,7 @@ async fn responses_api_full_pipeline() {
             .contains("you said: summarize the quarter")
     );
     assert!(j["usage"]["input_tokens"].as_i64().unwrap() > 0);
-    let led = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let led = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     assert_eq!(body_json(led).await["count"], 1);
 }
 
@@ -2622,7 +2684,7 @@ async fn cache_key_distinguishes_raw_passthrough_params() {
         .await
         .unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
-    let resp = app.oneshot(get("/internal/ledger")).await.unwrap();
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
     assert_eq!(
         body_json(resp).await["count"],
         2,
@@ -2664,7 +2726,8 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
 
     let body = r#"{"model":"cachem","messages":[{"role":"user","content":"cache me"}]}"#;
     let count = |app: Router| async move {
-        body_json(app.oneshot(get("/internal/ledger")).await.unwrap()).await["count"]
+        let ledger = admin("GET", "/internal/ledger", Some("cg-secret"), None);
+        body_json(app.oneshot(ledger).await.unwrap()).await["count"]
             .as_i64()
             .unwrap()
     };
@@ -2762,7 +2825,7 @@ async fn account_cooldown_and_recovery() {
     let spark_health = async |app: &Router| {
         let r = app
             .clone()
-            .oneshot(get("/internal/accounts"))
+            .oneshot(internal_get("/internal/accounts"))
             .await
             .unwrap();
         let j = body_json(r).await;
@@ -2928,25 +2991,31 @@ async fn realtime_bridges_to_a_real_upstream_websocket() {
             let _ = socket
                 .send(send(serde_json::json!({"type":"session.created","session":{"vendor":"fake"}})))
                 .await;
+            let mut turn = 0;
             while let Some(Ok(M::Text(t))) = socket.recv().await {
                 let Ok(v) = serde_json::from_str::<Value>(&t) else {
                     continue;
                 };
                 if v["type"] == "response.create" {
+                    turn += 1;
                     let _ = socket
-                        .send(send(
-                            serde_json::json!({"type":"response.output_text.delta","delta":"bridge "}),
-                        ))
+                        .send(send(serde_json::json!({
+                            "type":"response.output_text.delta",
+                            "delta": if turn == 1 { "bridge " } else { "partial output" },
+                        })))
                         .await;
-                    let _ = socket
-                        .send(send(
-                            serde_json::json!({"type":"response.output_text.delta","delta":"ok"}),
-                        ))
-                        .await;
-                    let _ = socket
-                        .send(send(serde_json::json!({"type":"response.done",
-                            "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}})))
-                        .await;
+                    if turn == 1 {
+                        let _ = socket
+                            .send(send(serde_json::json!({
+                                "type":"response.output_text.delta",
+                                "delta":"ok",
+                            })))
+                            .await;
+                        let _ = socket
+                            .send(send(serde_json::json!({"type":"response.done",
+                                "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}})))
+                            .await;
+                    }
                 }
             }
         })
@@ -3022,6 +3091,43 @@ models:
     assert_eq!(records[0].model, "rt-model");
     assert_eq!(records[0].account, "rt-vendor");
     assert_eq!(records[0].total_tokens, 13);
+
+    ws.send(Message::text(
+        serde_json::json!({"type":"response.create"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let partial = ws.next().await.unwrap().unwrap();
+    let partial: Value = serde_json::from_str(partial.to_text().unwrap()).unwrap();
+    assert_eq!(partial["type"], "response.output_text.delta");
+    assert_eq!(partial["delta"], "partial output");
+    ws.close(None).await.unwrap();
+
+    let (count, records) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+            if snapshot.0 == 2 {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted turn was never settled");
+    assert_eq!(count, 2);
+    let aborted = &records[1];
+    assert!(aborted.estimated);
+    assert_eq!(aborted.prompt_tokens, 0);
+    assert!(aborted.completion_tokens > 0);
+    assert_ne!(aborted.request_id, records[0].request_id);
+    assert_eq!(
+        state.governance.quota_used("ak-rt").await,
+        records
+            .iter()
+            .map(|record| record.total_tokens)
+            .sum::<i64>(),
+        "the delivered partial output must not be refunded"
+    );
 }
 
 #[tokio::test]
@@ -3813,7 +3919,10 @@ async fn ledger_pagination_limits_records_not_count() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    let resp = app.oneshot(get("/internal/ledger?limit=2")).await.unwrap();
+    let resp = app
+        .oneshot(internal_get("/internal/ledger?limit=2"))
+        .await
+        .unwrap();
     let j = body_json(resp).await;
     assert_eq!(j["count"], 3, "count reports the total");
     assert_eq!(

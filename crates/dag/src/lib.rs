@@ -11,4 +11,4 @@ pub mod nodes;
 
 pub use context::DagContext;
 pub use executor::{DagNode, Layer, Plan, run};
-pub use nodes::default_layers;
+pub use nodes::{StreamDelivery, default_layers, settle_deferred_stream};

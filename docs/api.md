@@ -146,8 +146,10 @@ phone numbers, and credential masking — redacts text fields in both directions
 buffer). Every hit is audited without prompt text; per-user attribution comes
 from the `x-gw-user` hint captured at connect. Each generation re-checks the
 key, so a key banned, expired, or revoked (or a model de-entitled) mid-session
-stops generating. An endpoint-less account serves a local mock session (OpenAI
-Realtime event shape) for offline development.
+stops generating. If a turn delivers output but disconnects before its usage
+boundary, the delivered text or audio is billed from an estimate; a turn that
+delivered nothing is refunded. An endpoint-less account serves a local mock
+session (OpenAI Realtime event shape) for offline development.
 
 ## Introspection
 
@@ -155,12 +157,14 @@ Realtime event shape) for offline development.
 |--------|------|-------|
 | GET | `/health` | liveness |
 | GET | `/metrics` | Prometheus registry (see [Observability](observability.md)) |
-| GET | `/internal/ledger` | billing records; `?limit=N` returns the N most recent (oldest-first within the page; `count` is the total) |
-| GET | `/internal/accounts` | account pool view with health |
+| GET | `/internal/ledger` | billing records; `?limit=N` returns the N most recent (oldest-first within the page; `count` is the total); global admin token only |
+| GET | `/internal/accounts` | account pool view with health; global admin token only |
 
-`/internal/*` is an operator surface: keep it off the public load balancer
-(the sample nginx config in [multi-instance](multi-instance.md) restricts it
-to the operator network).
+`/internal/*` is an operator surface: it answers only to the global admin
+bearer (`admin.token_env`; 404 until that env var is set), and the raw rows
+span every tenant. Keep it off the public load balancer regardless (the sample
+nginx config in [multi-instance](multi-instance.md) restricts it to the
+operator network).
 
 ## Admin (dynamic config)
 

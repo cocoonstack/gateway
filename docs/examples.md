@@ -116,7 +116,9 @@ curl -s localhost:8080/v1/batches/$BID -H 'authorization: Bearer ak-demo-123'
 
 ```bash
 curl -s localhost:8080/metrics | grep gateway_
-curl -s 'localhost:8080/internal/ledger?limit=5'   # operator surface, no key check — keep it off the public LB
+export GW_ADMIN_TOKEN=change-me                    # names the global admin bearer (see conf/gateway.yaml)
+curl -s -H "Authorization: Bearer $GW_ADMIN_TOKEN" \
+  'localhost:8080/internal/ledger?limit=5'         # operator surface — global token + private network
 ```
 
 ## Going live against a real provider

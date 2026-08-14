@@ -29,6 +29,7 @@ gw-models = { workspace = true }
 gw-consts = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tower = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 gw-protocol = { workspace = true }
 # ws e2e: loopback connection, zero egress

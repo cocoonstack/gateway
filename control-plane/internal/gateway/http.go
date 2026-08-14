@@ -144,7 +144,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 			var accounts struct {
 				Accounts []Account `json:"accounts"`
 			}
-			if err := c.doJSON(ctx, target, http.MethodGet, "/internal/accounts", nil, &accounts, ""); err != nil {
+			if err := c.doJSON(ctx, target, http.MethodGet, "/internal/accounts", nil, &accounts, c.adminToken); err != nil {
 				instance.Status = "degraded"
 				instance.Error = err.Error()
 			} else {

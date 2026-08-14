@@ -43,7 +43,7 @@ impl ClaudeEngine {
         body.insert("messages".into(), Value::Array(messages));
         body.insert("stream".into(), self.base.request.stream.into());
         let mut max_tokens = 1024;
-        if let Some(p) = self.base.chat_params() {
+        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
             }
@@ -53,15 +53,15 @@ impl ClaudeEngine {
             if let Some(t) = p.top_p {
                 body.insert("top_p".into(), json!(t));
             }
-            if let Some(tools) = &p.tools {
+            if let Some(tools) = p.tools {
                 body.insert("tools".into(), normalize_tools_anthropic(tools));
             }
-            if let Some(tc) = &p.tool_choice {
-                body.insert("tool_choice".into(), tc.clone());
+            if let Some(tc) = p.tool_choice {
+                body.insert("tool_choice".into(), tc);
             }
             // Anthropic's field is `stop_sequences` (array), not OpenAI's `stop`
-            if let Some(stop) = &p.stop {
-                body.insert("stop_sequences".into(), stop.clone());
+            if let Some(stop) = p.stop {
+                body.insert("stop_sequences".into(), stop);
             }
         }
         body.insert("max_tokens".into(), json!(max_tokens));
@@ -297,21 +297,22 @@ pub fn anthropic_native_chunks(
 /// Tool definitions in the anthropic wire shape. Cross-protocol requests carry
 /// OpenAI-shaped defs ({type:"function", function:{name, parameters}}) —
 /// flatten those; native defs pass through.
-fn normalize_tools_anthropic(tools: &Value) -> Value {
-    let Some(arr) = tools.as_array() else {
-        return tools.clone();
+fn normalize_tools_anthropic(tools: Value) -> Value {
+    let arr = match tools {
+        Value::Array(arr) => arr,
+        other => return other,
     };
     Value::Array(
-        arr.iter()
-            .map(|t| {
-                if let Some(f) = t.get("function") {
+        arr.into_iter()
+            .map(|mut t| {
+                if let Some(f) = t.get_mut("function") {
                     json!({
-                        "name": f["name"],
-                        "description": f["description"],
-                        "input_schema": f["parameters"],
+                        "name": f["name"].take(),
+                        "description": f["description"].take(),
+                        "input_schema": f["parameters"].take(),
                     })
                 } else {
-                    t.clone()
+                    t
                 }
             })
             .collect(),
@@ -394,7 +395,10 @@ impl SseState {
             "content_block_delta" => {
                 if let Some(t) = v["delta"]["text"].as_str() {
                     self.full.push_str(t);
-                    native_chunk.delta = t.to_owned();
+                    // native consumers read the event; the delta would be dead weight
+                    if !self.preserve_native {
+                        native_chunk.delta = t.to_owned();
+                    }
                     if let Some(block) = self.open_native.as_mut()
                         && let Some(Value::String(text)) = block.get_mut("text")
                     {
