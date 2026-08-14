@@ -4,7 +4,7 @@
 //! real SigV4 Authorization header.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
@@ -77,26 +77,21 @@ impl ModelEngine for ErnieEngine {
     /// Request {messages,[temperature]}; response {result, usage{...}, is_truncated}.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // ernie's system is a top-level field; read it before the turns move
-        let system = self.base.system_text();
-        // move owned values into the body — json! interpolation would deep-copy them
-        let messages: Vec<Value> = std::mem::take(&mut self.base.request.message)
-            .into_iter()
+        let messages: Vec<Value> = self
+            .base
+            .request
+            .message
+            .iter()
             .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
-                let mut msg = Map::new();
-                let role = if m.role == gw_consts::role::AI {
-                    "assistant"
-                } else {
-                    "user"
-                };
-                msg.insert("role".into(), role.into());
-                msg.insert("content".into(), m.content.into());
-                Value::Object(msg)
+                json!({"role": if m.role == gw_consts::role::AI {"assistant"} else {"user"},
+                             "content": m.content})
             })
             .collect();
         let mut body = json!({});
         body["messages"] = Value::Array(messages);
+        // ernie's system is a top-level field (system turns are filtered above)
+        let system = self.base.system_text();
         if !system.is_empty() {
             body["system"] = system.into();
         }
@@ -143,26 +138,21 @@ impl ModelEngine for MinimaxV1Engine {
     /// response {reply, usage{total_tokens}, base_resp{status_code,status_msg}}.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // v1 carries the system instruction as top-level `prompt` + role_meta;
-        // read it before the turns move
-        let system = self.base.system_text();
-        let messages: Vec<Value> = std::mem::take(&mut self.base.request.message)
-            .into_iter()
+        let messages: Vec<Value> = self
+            .base
+            .request
+            .message
+            .iter()
             .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
-                let mut msg = Map::new();
-                let sender = if m.role == gw_consts::role::AI {
-                    "BOT"
-                } else {
-                    "USER"
-                };
-                msg.insert("sender_type".into(), sender.into());
-                msg.insert("text".into(), m.content.into());
-                Value::Object(msg)
+                json!({"sender_type": if m.role == gw_consts::role::AI {"BOT"} else {"USER"},
+                       "text": m.content})
             })
             .collect();
         let mut body = json!({"model": model});
         body["messages"] = Value::Array(messages);
+        // v1 carries the system instruction as top-level `prompt` + role_meta
+        let system = self.base.system_text();
         if !system.is_empty() {
             body["prompt"] = system.into();
             body["role_meta"] = json!({"user_name": "USER", "bot_name": "BOT"});
@@ -205,22 +195,19 @@ impl ModelEngine for CohereEngine {
     /// response {text, finish_reason, meta{tokens{input_tokens,output_tokens}}}.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // cohere's system slot is `preamble`; read it before the turns move
-        let system = self.base.system_text();
-        // move owned values into the body — json! interpolation would deep-copy them
-        let mut history: Vec<Value> = std::mem::take(&mut self.base.request.message)
-            .into_iter()
+        let mut history: Vec<Value> = self
+            .base
+            .request
+            .message
+            .iter()
             .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
-                let mut turn = Map::new();
                 let role = if m.role == gw_consts::role::AI {
                     "CHATBOT"
                 } else {
                     "USER"
                 };
-                turn.insert("role".into(), role.into());
-                turn.insert("message".into(), m.content.into());
-                Value::Object(turn)
+                json!({"role": role, "message": m.content})
             })
             .collect();
         let message = history
@@ -230,6 +217,8 @@ impl ModelEngine for CohereEngine {
         let mut body = json!({});
         body["message"] = message;
         body["chat_history"] = Value::Array(history);
+        // cohere's system slot is `preamble` (system turns are filtered above)
+        let system = self.base.system_text();
         if !system.is_empty() {
             body["preamble"] = system.into();
         }
@@ -319,23 +308,18 @@ impl ModelEngine for LlamaEngine {
 base_engine!(DashScopeEngine);
 
 impl DashScopeEngine {
-    fn build_body(&mut self, stream: bool) -> GResult<Value> {
+    fn build_body(&self, stream: bool) -> GResult<Value> {
         let model = self.base.model_name()?.to_owned();
-        // move owned turns into the body — json! interpolation would deep-copy them
-        let messages: Vec<Value> = std::mem::take(&mut self.base.request.message)
-            .into_iter()
+        let messages: Vec<Value> = self
+            .base
+            .request
+            .message
+            .iter()
             .map(|m| {
-                let mut msg = Map::new();
-                let role = if m.role == gw_consts::role::AI {
-                    "assistant"
-                } else if m.role == gw_consts::role::SYSTEM {
-                    "system"
-                } else {
-                    "user"
-                };
-                msg.insert("role".into(), role.into());
-                msg.insert("content".into(), m.content.into());
-                Value::Object(msg)
+                json!({"role": if m.role == gw_consts::role::AI {"assistant"}
+                                 else if m.role == gw_consts::role::SYSTEM {"system"}
+                                 else {"user"},
+                       "content": m.content})
             })
             .collect();
         let mut parameters = json!({"result_format": "message"});
@@ -354,7 +338,6 @@ impl DashScopeEngine {
                 parameters["max_tokens"] = json!(mt);
             }
         }
-        // move owned values into the body — json! interpolation would deep-copy them
         let mut body = json!({"model": model, "input": {}});
         body["input"]["messages"] = Value::Array(messages);
         body["parameters"] = parameters;

@@ -378,7 +378,7 @@ impl RealtimeTurn {
 
     fn record_text(&mut self, text: &str) {
         let tokens = gw_models::token_estimate::default_encoder().encode_len(text);
-        self.record_units(i64::try_from(tokens).unwrap_or(i64::MAX));
+        self.record_units(tokens as i64);
     }
 
     fn estimated_output_tokens(&self) -> Option<i64> {
@@ -942,11 +942,9 @@ async fn realtime_bridge(
                             output_units = text.map_or(0, |text| {
                                 let tokens = gw_models::token_estimate::default_encoder()
                                     .encode_len(text);
-                                i64::try_from(tokens).unwrap_or(i64::MAX)
+                                tokens as i64
                             });
-                            output_units = output_units.saturating_add(
-                                i64::try_from(opaque).unwrap_or(i64::MAX),
-                            );
+                            output_units = output_units.saturating_add(opaque as i64);
                         }
                         // per-token events would be too hot: sum the turn, record once at its boundary
                         out_redacted += n as i64;
@@ -962,7 +960,7 @@ async fn realtime_bridge(
                             let opaque = raw_bytes
                                 .as_ref()
                                 .map_or(0, |bytes| bytes.len().div_ceil(4));
-                            output_units = i64::try_from(opaque).unwrap_or(i64::MAX);
+                            output_units = opaque as i64;
                         }
                     }
                 }
