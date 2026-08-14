@@ -785,8 +785,7 @@ async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GRes
         ctx.model_quota_key.take(),
     );
     let record = admission::settle_and_bill(
-        ctx.state.governance.as_ref(),
-        ctx.state.store.as_ref(),
+        ctx.state.as_ref(),
         &ctx.cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {

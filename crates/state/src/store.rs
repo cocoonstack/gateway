@@ -646,10 +646,18 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     }
 }
 
+#[derive(Debug, Default)]
+struct MemoryLedger {
+    rows: Vec<BillingRecord>,
+    request_ids: HashSet<String>,
+}
+
 /// In-process store: append-only ledger, DashMap-backed files and batches.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    records: Mutex<Vec<BillingRecord>>,
+    ledger: Mutex<MemoryLedger>,
+    #[cfg(test)]
+    ledger_failures: AtomicUsize,
     /// Minute buckets keyed by (minute, tenant, user, model); see
     /// [`Store::usage_rollup_advance`].
     rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
@@ -672,6 +680,11 @@ impl MemoryStore {
             ledger_max_rows: max_rows,
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_ledger_writes(&self, count: usize) {
+        self.ledger_failures.store(count, Ordering::Relaxed);
     }
 }
 
@@ -717,40 +730,62 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+        #[cfg(test)]
+        if self
+            .ledger_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            return Err(gw_models::GatewayError::internal(
+                "injected ledger write failure",
+            ));
+        }
         // watermark first: rollup-then-records is the lock order advance uses
         let watermark = lock(&self.rollup)
             .keys()
             .next_back()
             .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
-        let mut records = lock(&self.records);
-        records.push(r.clone());
-        if self.ledger_max_rows > 0 && records.len() > self.ledger_max_rows {
+        let mut ledger = lock(&self.ledger);
+        if !ledger.request_ids.insert(r.request_id.clone()) {
+            return Ok(());
+        }
+        ledger.rows.push(r.clone());
+        if self.ledger_max_rows > 0 && ledger.rows.len() > self.ledger_max_rows {
             // spare rows the rollup hasn't folded yet — lost here means lost
             // from usage forever; the cap yields to billing integrity. A full
             // scan, not a prefix cut: completion order can wedge a young row
             // ahead of prunable ones, which must not defeat the cap.
-            let mut excess = records.len() - self.ledger_max_rows;
-            records.retain(|r| {
+            let mut excess = ledger.rows.len() - self.ledger_max_rows;
+            let mut removed = Vec::new();
+            ledger.rows.retain(|r| {
                 if excess > 0 && r.created_at_epoch_secs < watermark {
                     excess -= 1;
+                    removed.push(r.request_id.clone());
                     false
                 } else {
                     true
                 }
             });
+            for request_id in removed {
+                ledger.request_ids.remove(&request_id);
+            }
         }
         Ok(())
     }
 
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
-        let records = lock(&self.records);
+        let ledger = lock(&self.ledger);
+        let records = &ledger.rows;
         let total = records.len();
         let page = records[total.saturating_sub(limit)..].to_vec();
         Ok((total, page))
     }
 
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
-        let records = lock(&self.records);
+        let ledger = lock(&self.ledger);
+        let records = &ledger.rows;
         let mut rollup: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
         for r in records.iter() {
             if tenant.is_some_and(|t| t != r.tenant) {
@@ -808,7 +843,8 @@ impl Store for MemoryStore {
                 .next_back()
                 .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
         };
-        let records = lock(&self.records);
+        let ledger = lock(&self.ledger);
+        let records = &ledger.rows;
         let tail = records.iter().filter(|r| {
             r.created_at_epoch_secs >= since.max(watermark)
                 && r.created_at_epoch_secs <= until
@@ -848,7 +884,8 @@ impl Store for MemoryStore {
                 .next_back()
                 .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
         };
-        let records = lock(&self.records);
+        let ledger = lock(&self.ledger);
+        let records = &ledger.rows;
         for r in records.iter().filter(|r| {
             r.created_at_epoch_secs >= since.max(watermark)
                 && r.created_at_epoch_secs <= until
@@ -872,7 +909,8 @@ impl Store for MemoryStore {
         let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
         let mut fresh = BTreeMap::new();
         {
-            let records = lock(&self.records);
+            let ledger = lock(&self.ledger);
+            let records = &ledger.rows;
             for r in records
                 .iter()
                 .filter(|r| r.created_at_epoch_secs >= lo && r.created_at_epoch_secs < hi)
@@ -1212,6 +1250,7 @@ impl SqliteStore {
                 created_at_epoch_secs INTEGER NOT NULL DEFAULT 0,
                 estimated INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
             "CREATE TABLE IF NOT EXISTS erasures (
                 tenant TEXT NOT NULL, user_id TEXT NOT NULL,
                 erased_at_epoch_millis INTEGER NOT NULL,
@@ -1343,7 +1382,8 @@ macro_rules! sql_store_impl {
                      prompt_tokens, completion_tokens, total_tokens, cost_micros,
                      vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
                      estimated)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (request_id) DO NOTHING"
                 ))
                 .bind(&r.ak)
                 .bind(&r.product)
@@ -2022,6 +2062,7 @@ impl PostgresStore {
                 created_at_epoch_secs BIGINT NOT NULL DEFAULT 0,
                 estimated BOOLEAN NOT NULL DEFAULT FALSE)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
                 minute_epoch BIGINT NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
                 model TEXT NOT NULL, requests BIGINT NOT NULL,
@@ -2710,6 +2751,8 @@ sql_store_impl!(PostgresStore, postgres, {
 mod tests {
     use super::*;
 
+    static RECORD_SEQ: AtomicUsize = AtomicUsize::new(1);
+
     #[test]
     fn pg_numbered_rewrites_placeholders_in_order() {
         assert_eq!(
@@ -2802,7 +2845,7 @@ mod tests {
             product: "p".into(),
             tenant: "default".into(),
             user_id: "u1".into(),
-            request_id: "req-1".into(),
+            request_id: format!("req-{}", RECORD_SEQ.fetch_add(1, Ordering::Relaxed)),
             created_at_epoch_secs: 1_000,
             model: model.into(),
             served_model: model.into(),
@@ -2873,9 +2916,37 @@ mod tests {
         assert_eq!(got.results[0].message, "ok");
     }
 
+    async fn exercise_idempotent_ledger(store: &dyn Store) {
+        let first = record("first");
+        let mut retry = first.clone();
+        retry.model = "mutated".into();
+        let before = store.ledger_snapshot(usize::MAX).await.unwrap().0;
+        store.ledger_add(&first).await.unwrap();
+        store.ledger_add(&retry).await.unwrap();
+        let (after, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(after, before + 1);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.request_id == first.request_id)
+                .map(|row| row.model.as_str()),
+            Some("first"),
+            "the first completed insert is authoritative"
+        );
+    }
+
     #[tokio::test]
     async fn memory_store_roundtrip() {
         exercise(&MemoryStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn ledger_add_is_idempotent_in_memory_and_sqlite() {
+        exercise_idempotent_ledger(&MemoryStore::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("dedup.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_idempotent_ledger(&store).await;
     }
 
     async fn exercise_audit(store: &dyn Store) {
@@ -3780,6 +3851,7 @@ mod tests {
             return;
         };
         let store = PostgresStore::connect(&url).await.expect("pg connect");
+        exercise_idempotent_ledger(&store).await;
         store.ledger_add(&record("gpt-4o")).await.unwrap();
         let (total, page) = store.ledger_snapshot(5).await.unwrap();
         assert!(total >= 1);

@@ -486,8 +486,7 @@ async fn bill_realtime_turn(
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
     admission::settle_and_bill(
-        state.governance.as_ref(),
-        state.store.as_ref(),
+        state,
         cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {

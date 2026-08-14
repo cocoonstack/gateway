@@ -2514,14 +2514,10 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
-        let mut st = GatewayState::from_config(&cfg);
-        st.store = Arc::new(
-            gw_state::PostgresStore::connect(&url)
-                .await
-                .expect("pg store"),
-        );
-        let state = Arc::new(st);
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.storage.postgres_url = url;
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::build(&cfg).await.expect("pg state"));
         let online = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, state.clone()),
             Arc::new(gw_engines::MockTransport),

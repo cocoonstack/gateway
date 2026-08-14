@@ -705,6 +705,7 @@ pub struct GatewayState {
     pub governance: Arc<dyn Governance>,
     /// Durable records (ledger/files/batches); sqlite/postgres when configured.
     pub store: Arc<dyn Store>,
+    billing: admission::BillingLedger,
     /// Account health (cooldown/recovery); Redis for fleet-wide cooldown.
     pub health: Arc<dyn HealthStore>,
     /// Request-level response cache: in-process by default, Redis when shared.
@@ -719,11 +720,13 @@ pub struct GatewayState {
 
 impl Default for GatewayState {
     fn default() -> Self {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::default());
         Self {
             auth: Arc::new(AkAuth::default()),
             pool: AccountPool::default(),
             governance: Arc::new(MemoryGovernance::default()),
-            store: Arc::new(MemoryStore::default()),
+            store: store.clone(),
+            billing: admission::BillingLedger::direct(store),
             health: Arc::new(AccountHealth::default()),
             cache: Arc::new(MemoryResponseCache::default()),
             avail: Arc::new(avail::MemoryAvail::default()),
@@ -821,6 +824,7 @@ impl GatewayState {
                 }
             }
         }
+        state.billing = admission::BillingLedger::repairing(state.store.clone());
         Ok(state)
     }
 
@@ -834,6 +838,7 @@ impl GatewayState {
             pool: AccountPool::from_config(cfg),
             governance: prev.governance.clone(),
             store: prev.store.clone(),
+            billing: prev.billing.clone(),
             health: prev.health.clone(),
             cache: prev.cache.clone(),
             avail: prev.avail.clone(),
