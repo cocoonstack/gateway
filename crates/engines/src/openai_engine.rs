@@ -225,6 +225,50 @@ fn apply_sse_event(
     Ok(chunks)
 }
 
+/// OpenAI streams tool calls as fragments keyed by `index`: the first fragment
+/// of a call carries id/type/function.name, later ones append to
+/// function.arguments. Overwriting would keep only the last fragment.
+pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
+    let Some(frags) = fragment.as_array() else {
+        return;
+    };
+    let calls = acc.get_or_insert_with(|| Value::Array(Vec::new()));
+    let Some(calls) = calls.as_array_mut() else {
+        return;
+    };
+    for f in frags {
+        // an index-less fragment continues the open call; indices stay contiguous
+        let idx = f["index"]
+            .as_u64()
+            .map_or(calls.len().saturating_sub(1), |i| i as usize)
+            .min(calls.len());
+        if idx == calls.len() {
+            calls.push(json!({"function": {}}));
+        }
+        let call = &mut calls[idx];
+        for key in ["id", "type"] {
+            if let Some(v) = f.get(key).filter(|v| !v.is_null())
+                && call.get(key).is_none()
+            {
+                call[key] = v.clone();
+            }
+        }
+        if let Some(name) = f["function"]["name"].as_str()
+            && call["function"].get("name").is_none()
+        {
+            call["function"]["name"] = json!(name);
+        }
+        if let Some(args) = f["function"]["arguments"].as_str() {
+            // append in place — rebuilding the string per fragment is quadratic
+            if let Value::String(acc) = &mut call["function"]["arguments"] {
+                acc.push_str(args);
+            } else {
+                call["function"]["arguments"] = json!(args);
+            }
+        }
+    }
+}
+
 /// Hold back the `arguments: "{}"` some vendors open a tool call with — the
 /// client would otherwise concatenate it onto the real object that follows.
 fn withhold_block_open_arguments(fragment: &mut Value) {
@@ -272,50 +316,6 @@ fn reemit_withheld_arguments(acc: Option<&mut Value>) -> Option<StreamChunk> {
         tool_calls: Some(Value::Array(withheld)),
         ..Default::default()
     })
-}
-
-/// OpenAI streams tool calls as fragments keyed by `index`: the first fragment
-/// of a call carries id/type/function.name, later ones append to
-/// function.arguments. Overwriting would keep only the last fragment.
-pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
-    let Some(frags) = fragment.as_array() else {
-        return;
-    };
-    let calls = acc.get_or_insert_with(|| Value::Array(Vec::new()));
-    let Some(calls) = calls.as_array_mut() else {
-        return;
-    };
-    for f in frags {
-        // an index-less fragment continues the open call; indices stay contiguous
-        let idx = f["index"]
-            .as_u64()
-            .map_or(calls.len().saturating_sub(1), |i| i as usize)
-            .min(calls.len());
-        if idx == calls.len() {
-            calls.push(json!({"function": {}}));
-        }
-        let call = &mut calls[idx];
-        for key in ["id", "type"] {
-            if let Some(v) = f.get(key).filter(|v| !v.is_null())
-                && call.get(key).is_none()
-            {
-                call[key] = v.clone();
-            }
-        }
-        if let Some(name) = f["function"]["name"].as_str()
-            && call["function"].get("name").is_none()
-        {
-            call["function"]["name"] = json!(name);
-        }
-        if let Some(args) = f["function"]["arguments"].as_str() {
-            // append in place — rebuilding the string per fragment is quadratic
-            if let Value::String(acc) = &mut call["function"]["arguments"] {
-                acc.push_str(args);
-            } else {
-                call["function"]["arguments"] = json!(args);
-            }
-        }
-    }
 }
 
 /// Tool definitions in the OpenAI wire shape. Cross-protocol requests carry

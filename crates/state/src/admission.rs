@@ -93,10 +93,6 @@ fn model_qpm_key(model: &str) -> String {
     format!("model:{model}")
 }
 
-pub fn model_quota_key(ak: &str, model: &str) -> String {
-    format!("{ak}|{model}")
-}
-
 /// The per-user daily-budget counter key, namespaced by tenant so the same
 /// user id under two tenants meters separately.
 fn user_budget_key(tenant: &str, user: &str) -> String {
@@ -146,6 +142,10 @@ pub async fn consume_user_budget(
         gov.quota_consume(&user_budget_key(tenant, user), total)
             .await;
     }
+}
+
+pub fn model_quota_key(ak: &str, model: &str) -> String {
+    format!("{ak}|{model}")
 }
 
 /// The per-(AK, model) daily cap: AK override, else tenant default, else none.

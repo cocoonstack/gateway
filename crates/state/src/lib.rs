@@ -911,6 +911,29 @@ impl std::fmt::Debug for SharedConfig {
     }
 }
 
+/// Current unix seconds (0 if the clock reads before the epoch).
+pub fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Unix milliseconds; erasure markers use this so an erase-then-resubmit in
+/// the same second isn't misjudged as pre-erasure content.
+pub fn epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Stable SHA-256 identifier for correlating an access key in logs.
+pub fn access_key_fingerprint(ak: &str) -> String {
+    let digest = Sha256::digest(ak.as_bytes());
+    format!("sha256:{}", hex::encode(&digest[..16]))
+}
+
 /// The entry for `key`, inserting `init()` on first use — the key String is
 /// allocated only on the miss path.
 fn slot_mut<'a, V>(
@@ -976,29 +999,6 @@ pub(crate) async fn redis_connect(url: &str) -> Result<redis::aio::ConnectionMan
     redis::aio::ConnectionManager::new(client)
         .await
         .map_err(|e| format!("redis connect: {e}"))
-}
-
-/// Current unix seconds (0 if the clock reads before the epoch).
-pub fn epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Unix milliseconds; erasure markers use this so an erase-then-resubmit in
-/// the same second isn't misjudged as pre-erasure content.
-pub fn epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// Stable SHA-256 identifier for correlating an access key in logs.
-pub fn access_key_fingerprint(ak: &str) -> String {
-    let digest = Sha256::digest(ak.as_bytes());
-    format!("sha256:{}", hex::encode(&digest[..16]))
 }
 
 #[cfg(test)]
