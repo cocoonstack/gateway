@@ -54,7 +54,7 @@ impl OpenAiEngine {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
-        if let Some(p) = self.base.chat_params() {
+        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
                     if let Some(v) = $v {
@@ -69,19 +69,19 @@ impl OpenAiEngine {
             put!("frequency_penalty", p.frequency_penalty);
             put!("logprobs", p.logprobs);
             put!("top_logprobs", p.top_logprobs);
-            if let Some(v) = &p.stop {
-                body.insert("stop".into(), v.clone());
+            if let Some(v) = p.stop {
+                body.insert("stop".into(), v);
             }
-            if let Some(v) = &p.tools {
+            if let Some(v) = p.tools {
                 body.insert("tools".into(), normalize_tools_openai(v));
             }
-            if let Some(v) = &p.tool_choice {
-                body.insert("tool_choice".into(), v.clone());
+            if let Some(v) = p.tool_choice {
+                body.insert("tool_choice".into(), v);
             }
-            if let Some(v) = &p.response_format {
-                body.insert("response_format".into(), v.clone());
+            if let Some(v) = p.response_format {
+                body.insert("response_format".into(), v);
             }
-            if let Some(s) = &p.system {
+            if let Some(s) = p.system {
                 // openai surface's system goes through messages; injected here for
                 // cross-protocol (anthropic→openai family) requests
                 let mut msgs = vec![json!({"role": "system", "content": s})];
@@ -131,7 +131,8 @@ impl OpenAiEngine {
         if let Some(calls) = &mut resp.tool_calls {
             crate::engine::normalize_tool_arguments(calls);
         }
-        apply_openai_usage(&mut resp, &v["usage"]);
+        let usage = v.pointer_mut("/usage").map(Value::take).unwrap_or_default();
+        apply_openai_usage(&mut resp, usage);
         Ok(EngineOutcome::with_status(resp, status))
     }
 
@@ -218,8 +219,8 @@ fn apply_sse_event(
             ..Default::default()
         });
     }
-    if v.get("usage").map(|u| !u.is_null()).unwrap_or(false) {
-        apply_openai_usage(resp, &v["usage"]);
+    if let Some(usage) = v.pointer_mut("/usage") {
+        apply_openai_usage(resp, usage.take());
     }
     Ok(chunks)
 }
@@ -320,21 +321,22 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
 /// Tool definitions in the OpenAI wire shape. Cross-protocol requests carry
 /// anthropic-shaped defs ({name, description, input_schema}) — wrap those into
 /// the function envelope; native defs pass through.
-fn normalize_tools_openai(tools: &Value) -> Value {
-    let Some(arr) = tools.as_array() else {
-        return tools.clone();
+fn normalize_tools_openai(tools: Value) -> Value {
+    let arr = match tools {
+        Value::Array(arr) => arr,
+        other => return other,
     };
     Value::Array(
-        arr.iter()
-            .map(|t| {
+        arr.into_iter()
+            .map(|mut t| {
                 if t.get("input_schema").is_some() && t.get("function").is_none() {
                     json!({"type": "function", "function": {
-                        "name": t["name"],
-                        "description": t["description"],
-                        "parameters": t["input_schema"],
+                        "name": t["name"].take(),
+                        "description": t["description"].take(),
+                        "parameters": t["input_schema"].take(),
                     }})
                 } else {
-                    t.clone()
+                    t
                 }
             })
             .collect(),
@@ -342,7 +344,7 @@ fn normalize_tools_openai(tools: &Value) -> Value {
 }
 
 /// Copy token fields + keep the raw usage subtree bytes for the DAG node.
-fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
+fn apply_openai_usage(resp: &mut GatewayResponse, usage: Value) {
     if usage.is_null() {
         return;
     }
@@ -350,7 +352,7 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
     resp.prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);
     resp.completion_tokens = crate::engine::tok(&usage["completion_tokens"]);
     resp.total_tokens = crate::engine::tok(&usage["total_tokens"]);
-    resp.raw_usage = Some(usage.clone());
+    resp.raw_usage = Some(usage);
 }
 
 #[cfg(test)]

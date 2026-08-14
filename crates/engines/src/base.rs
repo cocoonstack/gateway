@@ -86,6 +86,11 @@ impl Base {
         }
     }
 
+    /// Move the typed params out (single-use — the run(&mut self) contract).
+    pub fn take_typed(&mut self) -> Option<gw_models::TypedParams> {
+        self.request.model_param_v2.as_mut()?.typed.take()
+    }
+
     /// The last message's content — the free-text fallback the non-chat
     /// families use when typed params are absent.
     pub fn last_message_text(&self) -> &str {

@@ -4,7 +4,7 @@
 //! deferred to a later fidelity pass.
 
 use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
@@ -15,14 +15,16 @@ use crate::transport::{SharedTransport, UpstreamBody};
 /// images → `{"inlineData":…}`. Non-data image URLs can't be inlined offline
 /// (no fetch), so they're skipped rather than forwarded as an unusable OpenAI
 /// block; without this, multimodal requests silently drop every image.
-fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
-    if let Some(Value::Array(parts)) = &m.parts {
+fn gemini_parts(m: gw_models::ChatMsg) -> Vec<Value> {
+    if let Some(Value::Array(parts)) = m.parts {
         let mut out = Vec::new();
-        for p in parts {
+        for mut p in parts {
             match p["type"].as_str() {
                 Some("text") => {
-                    if let Some(t) = p["text"].as_str() {
-                        out.push(json!({"text": t}));
+                    if p["text"].is_string() {
+                        let mut part = Map::new();
+                        part.insert("text".into(), p["text"].take());
+                        out.push(Value::Object(part));
                     }
                 }
                 Some("image_url") => {
@@ -38,7 +40,9 @@ fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
             return out;
         }
     }
-    vec![json!({"text": m.content})]
+    let mut text = Map::new();
+    text.insert("text".into(), m.content.into());
+    vec![Value::Object(text)]
 }
 
 /// Parse a `data:<mime>;base64,<payload>` URI into `(mime, payload)`.
@@ -64,15 +68,14 @@ impl VertexEngine {
         ]
     }
 
-    fn build_body(&self) -> Value {
+    fn build_body(&mut self) -> Value {
         // system turns go to systemInstruction, never the contents: Gemini has
         // no system content role, and a `user`-role downgrade both loses the
-        // directive's authority and breaks turn alternation
-        let contents: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
+        // directive's authority and breaks turn alternation — read it before
+        // the turns move
+        let system = self.base.system_text();
+        let contents: Vec<Value> = std::mem::take(&mut self.base.request.message)
+            .into_iter()
             .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
                 let role = if m.role == gw_consts::role::AI {
@@ -80,13 +83,15 @@ impl VertexEngine {
                 } else {
                     gw_consts::role::USER
                 };
-                json!({"role": role, "parts": gemini_parts(m)})
+                let mut turn = Map::new();
+                turn.insert("role".into(), role.into());
+                turn.insert("parts".into(), Value::Array(gemini_parts(m)));
+                Value::Object(turn)
             })
             .collect();
         // moved in — json! interpolation would deep-copy the conversation
         let mut body = json!({});
         body["contents"] = Value::Array(contents);
-        let system = self.base.system_text();
         if !system.is_empty() {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
@@ -111,7 +116,7 @@ impl VertexEngine {
 
     /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames decoded
     /// as they arrive and forwarded through `stream_tx` (the live-pump contract).
-    async fn run_stream(&self) -> GResult<EngineOutcome> {
+    async fn run_stream(&mut self) -> GResult<EngineOutcome> {
         let body = self.build_body();
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
@@ -264,16 +269,20 @@ base_engine!(EmbeddingsEngine);
 impl ModelEngine for EmbeddingsEngine {
     /// Merges the openai/ali/vertex embedding engines to the openai shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let input = match &param.typed {
-            Some(TypedParams::Embeddings(p)) => json!(p.input),
-            _ => Value::Array(
-                self.base
-                    .request
-                    .message
-                    .iter()
-                    .map(|m| json!(m.content))
-                    .collect(),
+        let model_name = self.base.model_name()?.to_owned();
+        let (input, dimensions) = match self.base.take_typed() {
+            Some(TypedParams::Embeddings(p)) => (
+                Value::Array(p.input.into_iter().map(Value::String).collect()),
+                p.dimensions,
+            ),
+            _ => (
+                Value::Array(
+                    std::mem::take(&mut self.base.request.message)
+                        .into_iter()
+                        .map(|m| Value::String(m.content))
+                        .collect(),
+                ),
+                None,
             ),
         };
         if input.as_array().is_none_or(|a| a.is_empty()) {
@@ -281,13 +290,13 @@ impl ModelEngine for EmbeddingsEngine {
                 "embeddings input must not be empty",
             ));
         }
-        let mut body = json!({"model": param.model_name});
-        body["input"] = input;
-        if let Some(TypedParams::Embeddings(p)) = &param.typed
-            && let Some(d) = p.dimensions
-        {
-            body["dimensions"] = json!(d);
+        let mut body = Map::new();
+        body.insert("model".into(), model_name.clone().into());
+        body.insert("input".into(), input);
+        if let Some(d) = dimensions {
+            body.insert("dimensions".into(), d.into());
         }
+        let body = Value::Object(body);
         let (status, v) = self
             .base
             .round_trip(
@@ -300,7 +309,7 @@ impl ModelEngine for EmbeddingsEngine {
             .await?;
         let pt = crate::engine::tok(&v["usage"]["prompt_tokens"]);
         let resp = GatewayResponse {
-            model: param.model_name.clone(),
+            model: model_name,
             prompt_tokens: pt,
             total_tokens: pt,
             raw_usage: (!v["usage"].is_null()).then(|| v["usage"].clone()),
@@ -347,38 +356,41 @@ base_engine!(ImageEngine);
 impl ModelEngine for ImageEngine {
     /// Merges the dalle/wanx/flux/stability/... engines to the images/generations shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let (prompt, n, size, image, mask) = match &param.typed {
-            Some(TypedParams::Image(p)) => (
-                p.prompt.as_str(),
-                p.n,
-                p.size.as_deref(),
-                p.image.as_deref(),
-                p.mask.as_deref(),
+        let model_name = self.base.model_name()?.to_owned();
+        let (prompt, n, size, image, mask) = match self.base.take_typed() {
+            Some(TypedParams::Image(p)) => (p.prompt, p.n, p.size, p.image, p.mask),
+            _ => (
+                self.base.last_message_text().to_owned(),
+                1,
+                None,
+                None,
+                None,
             ),
-            _ => (self.base.last_message_text(), 1, None, None, None),
         };
-        require_non_empty(prompt, "image prompt")?;
-        let mut body = json!({"model": param.model_name, "prompt": prompt, "n": n});
+        require_non_empty(&prompt, "image prompt")?;
+        let mut body = Map::new();
+        body.insert("model".into(), model_name.clone().into());
+        body.insert("prompt".into(), prompt.into());
+        body.insert("n".into(), n.into());
         if let Some(s) = size {
-            body["size"] = json!(s);
+            body.insert("size".into(), s.into());
         }
         let (path, is_edit) = if let Some(img) = image {
-            body["image"] = json!(img);
+            body.insert("image".into(), img.into());
             if let Some(m) = mask {
-                body["mask"] = json!(m);
+                body.insert("mask".into(), m.into());
             }
             ("/v1/images/edits", true)
         } else {
             ("/v1/images/generations", false)
         };
         let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
-        let (status, v) = self.base.round_trip(&url, body).await?;
+        let (status, v) = self.base.round_trip(&url, Value::Object(body)).await?;
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
         Ok(family_outcome(
             format!("{count} image(s) {verb}"),
-            &param.model_name,
+            &model_name,
             v,
             status,
         ))
@@ -410,52 +422,46 @@ impl AudioEngine {
 impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let (path, body) = match self.kind {
+        let model_name = self.base.model_name()?.to_owned();
+        let mut b = Map::new();
+        b.insert("model".into(), model_name.clone().into());
+        let path = match self.kind {
             AudioKind::Tts => {
-                let (input, voice, format) = match &param.typed {
-                    Some(TypedParams::AudioTts(p)) => (
-                        p.input.as_str(),
-                        p.voice.as_deref(),
-                        p.response_format.as_deref(),
-                    ),
-                    _ => (self.base.last_message_text(), None, None),
+                let (input, voice, format) = match self.base.take_typed() {
+                    Some(TypedParams::AudioTts(p)) => (p.input, p.voice, p.response_format),
+                    _ => (self.base.last_message_text().to_owned(), None, None),
                 };
-                require_non_empty(input, "tts input")?;
-                let mut b = json!({"model": param.model_name, "input": input});
+                require_non_empty(&input, "tts input")?;
+                b.insert("input".into(), input.into());
                 if let Some(v) = voice {
-                    b["voice"] = json!(v);
+                    b.insert("voice".into(), v.into());
                 }
                 if let Some(f) = format {
-                    b["response_format"] = json!(f);
+                    b.insert("response_format".into(), f.into());
                 }
-                ("/v1/audio/speech", b)
+                "/v1/audio/speech"
             }
             AudioKind::Stt => {
-                let (audio, language, translate) = match &param.typed {
-                    Some(TypedParams::AudioStt(p)) => {
-                        (p.audio_b64.as_str(), p.language.as_deref(), p.translate)
-                    }
-                    _ => ("", None, false),
+                let (audio, language, translate) = match self.base.take_typed() {
+                    Some(TypedParams::AudioStt(p)) => (p.audio_b64, p.language, p.translate),
+                    _ => (String::new(), None, false),
                 };
-                require_non_empty(audio, "stt audio_b64")?;
-                let path = if translate {
+                require_non_empty(&audio, "stt audio_b64")?;
+                b.insert("audio_b64".into(), audio.into());
+                b.insert("language".into(), language.map_or(Value::Null, Value::String));
+                if translate {
                     "/v1/audio/translations"
                 } else {
                     "/v1/audio/transcriptions"
-                };
-                (
-                    path,
-                    json!({"model": param.model_name, "audio_b64": audio, "language": language}),
-                )
+                }
             }
-            AudioKind::Other => (
-                "/v1/audio/other",
-                json!({"model": param.model_name, "raw": param.raw}),
-            ),
+            AudioKind::Other => {
+                b.insert("raw".into(), self.base.take_raw());
+                "/v1/audio/other"
+            }
         };
         let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
-        let (status, v) = self.base.round_trip(&url, body).await?;
+        let (status, v) = self.base.round_trip(&url, Value::Object(b)).await?;
         let message = match self.kind {
             AudioKind::Stt => v["text"].as_str().unwrap_or_default().to_owned(),
             _ => format!(
@@ -463,7 +469,7 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        Ok(family_outcome(message, &param.model_name, v, status))
+        Ok(family_outcome(message, &model_name, v, status))
     }
 }
 
@@ -550,8 +556,8 @@ base_engine!(ModerationsEngine);
 impl ModelEngine for ModerationsEngine {
     /// OpenAI moderations shape: `{model, input: [..]}` → per-input verdicts.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let Some(TypedParams::Moderation(p)) = &param.typed else {
+        let model_name = self.base.model_name()?.to_owned();
+        let Some(TypedParams::Moderation(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("moderations params are required"));
         };
         if p.input.is_empty() {
@@ -559,7 +565,13 @@ impl ModelEngine for ModerationsEngine {
                 "moderations input must not be empty",
             ));
         }
-        let body = json!({"model": param.model_name, "input": p.input});
+        let mut body = Map::new();
+        body.insert("model".into(), model_name.clone().into());
+        body.insert(
+            "input".into(),
+            Value::Array(p.input.into_iter().map(Value::String).collect()),
+        );
+        let body = Value::Object(body);
         let (status, v) = self
             .base
             .round_trip(
@@ -580,7 +592,7 @@ impl ModelEngine for ModerationsEngine {
             .unwrap_or(0);
         Ok(family_outcome(
             format!("{flagged} flagged"),
-            &param.model_name,
+            &model_name,
             v,
             status,
         ))
@@ -594,8 +606,8 @@ impl ModelEngine for RerankEngine {
     /// Cohere/Jina-compatible rerank: `{model, query, documents, top_n?}` →
     /// `{results: [{index, relevance_score}]}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let Some(TypedParams::Rerank(p)) = &param.typed else {
+        let model_name = self.base.model_name()?.to_owned();
+        let Some(TypedParams::Rerank(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("rerank params are required"));
         };
         require_non_empty(&p.query, "rerank query")?;
@@ -604,14 +616,17 @@ impl ModelEngine for RerankEngine {
                 "rerank documents must not be empty",
             ));
         }
-        let mut body = json!({
-            "model": param.model_name,
-            "query": p.query,
-            "documents": p.documents,
-        });
+        let mut body = Map::new();
+        body.insert("model".into(), model_name.clone().into());
+        body.insert("query".into(), p.query.into());
+        body.insert(
+            "documents".into(),
+            Value::Array(p.documents.into_iter().map(Value::String).collect()),
+        );
         if let Some(n) = p.top_n {
-            body["top_n"] = json!(n);
+            body.insert("top_n".into(), n.into());
         }
+        let body = Value::Object(body);
         let (status, v) = self
             .base
             .round_trip(
@@ -621,7 +636,7 @@ impl ModelEngine for RerankEngine {
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
-        let mut out = family_outcome(format!("{n} results"), &param.model_name, v, status);
+        let mut out = family_outcome(format!("{n} results"), &model_name, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
         Ok(out)
@@ -646,8 +661,10 @@ impl ModelEngine for PassthroughEngine {
     /// Dedicated integration surfaces: request body passed through as-is,
     /// placeholder protocol (byte-level alignment deferred).
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let body = json!({"model": param.model_name, "payload": param.raw});
+        let model_name = self.base.model_name()?.to_owned();
+        let mut body = Map::new();
+        body.insert("model".into(), model_name.clone().into());
+        body.insert("payload".into(), self.base.take_raw());
         let (status, v) = self
             .base
             .round_trip(
@@ -655,7 +672,7 @@ impl ModelEngine for PassthroughEngine {
                     "{}/v1/passthrough",
                     self.base.base_url("mock://api.vendor.com")
                 ),
-                body,
+                Value::Object(body),
             )
             .await?;
         let message = if v["ok"].as_bool().unwrap_or(false) {
@@ -663,12 +680,7 @@ impl ModelEngine for PassthroughEngine {
         } else {
             "error"
         };
-        Ok(family_outcome(
-            message.to_owned(),
-            &param.model_name,
-            v,
-            status,
-        ))
+        Ok(family_outcome(message.to_owned(), &model_name, v, status))
     }
 }
 
