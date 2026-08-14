@@ -441,22 +441,7 @@ pub fn new_request_id() -> String {
 /// Persist the final HTTP result for an online non-streaming request after its
 /// view has finished rendering the response.
 pub async fn persist_terminal_response(ctx: &DagContext, http_status: u16) {
-    let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
-        return;
-    };
-    let subject = TerminalSubject {
-        request_id: ctx.request.request_id.clone(),
-        ak: ctx.ak.ak.clone(),
-        user_id: ctx.effective_user_id().to_owned(),
-        tenant: ctx.ak.tenant.clone(),
-    };
-    persist_terminal(
-        ctx.state.store.as_ref(),
-        &subject,
-        retention,
-        terminal_status_body(http_status),
-    )
-    .await;
+    persist_ctx_terminal(ctx, || terminal_status_body(http_status)).await;
 }
 
 /// Settle billing and terminal retention after an outbound-DLP buffered stream
@@ -471,8 +456,13 @@ pub async fn complete_buffered_stream(
         gw_dag::StreamDelivery::None => terminal_plain_body("client_closed", 499, false),
     };
     gw_dag::settle_deferred_stream(ctx, delivery).await?;
+    persist_ctx_terminal(ctx, || terminal).await;
+    Ok(())
+}
+
+async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_json::Value) {
     let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
-        return Ok(());
+        return;
     };
     let subject = TerminalSubject {
         request_id: ctx.request.request_id.clone(),
@@ -480,8 +470,7 @@ pub async fn complete_buffered_stream(
         user_id: ctx.effective_user_id().to_owned(),
         tenant: ctx.ak.tenant.clone(),
     };
-    persist_terminal(ctx.state.store.as_ref(), &subject, retention, terminal).await;
-    Ok(())
+    persist_terminal(ctx.state.store.as_ref(), &subject, retention, body()).await;
 }
 
 /// Count one admission rejection against the key's daily abuse counter and
