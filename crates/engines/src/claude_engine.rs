@@ -358,8 +358,6 @@ pub fn anthropic_native_chunks(
         .collect()
 }
 
-/// A `role: "tool"` message as a `tool_result` block; empty output omits
-/// `content` rather than sending an empty text, which the upstream rejects.
 /// An OpenAI-dialect effort/budget as `(thinking, output_config, budget)` in
 /// this model's dialect; `none` or unknown vocabulary leaves the model default.
 fn map_thinking(
@@ -392,6 +390,8 @@ fn map_thinking(
     Some((thinking, Some(json!({"effort": effort})), budget))
 }
 
+/// A `role: "tool"` message as a `tool_result` block; empty output omits
+/// `content` rather than sending an empty text, which the upstream rejects.
 fn tool_result_block(tool_use_id: Option<String>, content: Value) -> Value {
     let mut block = Map::new();
     block.insert("type".into(), "tool_result".into());

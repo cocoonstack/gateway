@@ -1160,7 +1160,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     }
 
     let t = RecordingTransport::new(OPENAI_OK);
-    let req = reasoning_req(
+    let mut req = reasoning_req(
         Protocol::OpenaiChat,
         "gpt-5",
         gw_models::ReasoningParam {
@@ -1168,9 +1168,33 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
             ..Default::default()
         },
     );
+    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().and_then(|p| p.typed.as_mut()) {
+        p.max_tokens = Some(700);
+    }
     let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert!(b.get("reasoning_effort").is_none());
+    assert_eq!(
+        b["max_completion_tokens"], 700,
+        "the cap follows the model family, not the reasoning request"
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = reasoning_req(
+        Protocol::OpenaiChat,
+        "deepseek-v4",
+        gw_models::ReasoningParam {
+            effort: Some("high".to_owned()),
+            ..Default::default()
+        },
+    );
+    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().and_then(|p| p.typed.as_mut()) {
+        p.max_tokens = Some(700);
+    }
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["reasoning_effort"], "high");
+    assert_eq!(b["max_tokens"], 700, "compatible vendors keep max_tokens");
     assert!(b.get("max_completion_tokens").is_none());
 }
 
@@ -1187,8 +1211,23 @@ async fn openai_history_replays_reasoning_and_folds_native_thinking_blocks() {
         {"type":"redacted_thinking","data":"blob"},
         {"type":"text","text":"answer"}
     ]));
-    req.message
-        .extend([assistant, ChatMsg::text("user", "and?"), native]);
+    let mut tool_turn = ChatMsg::text("assistant", String::new());
+    tool_turn.parts = Some(serde_json::json!([
+        {"type":"thinking","thinking":"need the time","signature":""},
+        {"type":"tool_use","id":"toolu_1","name":"now","input":{"tz":"UTC"}}
+    ]));
+    let mut tool_result = ChatMsg::text("user", String::new());
+    tool_result.parts = Some(serde_json::json!([
+        {"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"12:00"}]},
+        {"type":"text","text":"thanks, and in Paris?"}
+    ]));
+    req.message.extend([
+        assistant,
+        ChatMsg::text("user", "and?"),
+        native,
+        tool_turn,
+        tool_result,
+    ]);
     let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     let messages = b["messages"].as_array().unwrap();
@@ -1199,4 +1238,19 @@ async fn openai_history_replays_reasoning_and_folds_native_thinking_blocks() {
         messages[4]["content"],
         serde_json::json!([{"type":"text","text":"answer"}])
     );
+    assert_eq!(messages[5]["role"], "assistant");
+    assert_eq!(messages[5]["content"], Value::Null);
+    assert_eq!(messages[5]["reasoning_content"], "need the time");
+    assert_eq!(
+        messages[5]["tool_calls"],
+        serde_json::json!([{"index":0,"id":"toolu_1","type":"function",
+            "function":{"name":"now","arguments":"{\"tz\":\"UTC\"}"}}])
+    );
+    assert_eq!(
+        messages[6],
+        serde_json::json!({"role":"tool","tool_call_id":"toolu_1","content":"12:00"})
+    );
+    assert_eq!(messages[7]["role"], "user");
+    assert_eq!(messages[7]["content"][0]["text"], "thanks, and in Paris?");
+    assert_eq!(messages.len(), 8);
 }

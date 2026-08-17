@@ -18,45 +18,48 @@ impl OpenAiEngine {
     /// multimodal parts win over flat text; assistant tool_calls and tool
     /// results pass through losslessly.
     fn wire_messages(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.base.request.message)
-            .into_iter()
-            .map(|m| {
-                let mut msg = Map::new();
-                let assistant = m.role == gw_consts::role::AI;
-                msg.insert("role".into(), m.role.into());
-                let mut reasoning_content = m.reasoning_content;
-                // OpenAI: assistant tool-call turns carry content: null
-                let content = match (m.parts, m.content) {
-                    (Some(Value::Array(parts)), _) if assistant => {
-                        // native-surface thinking blocks are reasoning prose on this wire
-                        Value::Array(strip_thinking_blocks(parts, &mut reasoning_content))
+        let mut out = Vec::new();
+        for m in std::mem::take(&mut self.base.request.message) {
+            match m.parts {
+                // a Messages-surface turn: thinking, tool_use and tool_result
+                // blocks have OpenAI counterparts of their own
+                Some(Value::Array(parts)) if parts.iter().any(is_native_block) => {
+                    native_turn(&m.role, parts, m.reasoning_content, &mut out);
+                }
+                parts => {
+                    let mut msg = Map::new();
+                    msg.insert("role".into(), m.role.into());
+                    // OpenAI: assistant tool-call turns carry content: null
+                    let content = match (parts, m.content) {
+                        (Some(parts), _) => parts,
+                        (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
+                        (None, c) => c.into(),
+                    };
+                    msg.insert("content".into(), content);
+                    if let Some(tc) = m.tool_calls {
+                        msg.insert("tool_calls".into(), tc);
                     }
-                    (Some(parts), _) => parts,
-                    (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
-                    (None, c) => c.into(),
-                };
-                msg.insert("content".into(), content);
-                if let Some(tc) = m.tool_calls {
-                    msg.insert("tool_calls".into(), tc);
+                    if let Some(id) = m.tool_call_id {
+                        msg.insert("tool_call_id".into(), id.into());
+                    }
+                    if let Some(reasoning) = m.reasoning_content {
+                        msg.insert("reasoning_content".into(), reasoning.into());
+                    }
+                    if let Some(details) = m.reasoning_details {
+                        msg.insert("reasoning_details".into(), details);
+                    }
+                    out.push(Value::Object(msg));
                 }
-                if let Some(id) = m.tool_call_id {
-                    msg.insert("tool_call_id".into(), id.into());
-                }
-                if let Some(reasoning) = reasoning_content {
-                    msg.insert("reasoning_content".into(), reasoning.into());
-                }
-                if let Some(details) = m.reasoning_details {
-                    msg.insert("reasoning_details".into(), details);
-                }
-                Value::Object(msg)
-            })
-            .collect()
+            }
+        }
+        out
     }
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let messages = Value::Array(self.wire_messages());
         let param = self.base.param()?;
         let protocol = param.protocol;
+        let reasoning_model = openai_reasoning_model(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), messages);
@@ -77,16 +80,18 @@ impl OpenAiEngine {
             }
             put!("temperature", p.temperature);
             put!("top_p", p.top_p);
-            let effort = p
-                .reasoning
-                .and_then(|reasoning| reasoning_effort(*reasoning));
-            // reasoning models take max_completion_tokens; max_tokens is a 400
-            if effort.is_some() {
+            // OpenAI's reasoning families take max_completion_tokens (max_tokens
+            // is a 400); compatible vendors know max_tokens
+            if reasoning_model {
                 put!("max_completion_tokens", p.max_tokens);
             } else {
                 put!("max_tokens", p.max_tokens);
             }
-            put!("reasoning_effort", effort);
+            put!(
+                "reasoning_effort",
+                p.reasoning
+                    .and_then(|reasoning| reasoning_effort(*reasoning))
+            );
             put!("presence_penalty", p.presence_penalty);
             put!("frequency_penalty", p.frequency_penalty);
             put!("logprobs", p.logprobs);
@@ -420,28 +425,74 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
     Some(gw_protocol::reasoning::budget_effort(budget).to_owned())
 }
 
-/// Drop Anthropic thinking blocks from a replayed assistant turn, folding
-/// their prose into `reasoning_content` when the client sent none.
-fn strip_thinking_blocks(parts: Vec<Value>, reasoning_content: &mut Option<String>) -> Vec<Value> {
-    if !parts.iter().any(is_thinking_block) {
-        return parts;
+/// OpenAI's own reasoning families — o-series and GPT-5 onward.
+fn openai_reasoning_model(model: &str) -> bool {
+    match model.as_bytes() {
+        [b'o', minor, ..] => minor.is_ascii_digit(),
+        [b'g', b'p', b't', b'-', major, ..] => (b'5'..=b'9').contains(major),
+        _ => false,
     }
-    let mut prose = String::new();
-    let kept = parts
-        .into_iter()
-        .filter(|p| match p["type"].as_str() {
-            Some("thinking") => {
-                prose.push_str(p["thinking"].as_str().unwrap_or_default());
-                false
+}
+
+fn is_native_block(block: &Value) -> bool {
+    is_thinking_block(block) || matches!(block["type"].as_str(), Some("tool_use" | "tool_result"))
+}
+
+/// A Messages-surface turn on the OpenAI wire: an assistant turn's thinking
+/// blocks fold into `reasoning_content` (unless the client sent one) and its
+/// `tool_use` blocks become `tool_calls`; a user turn's `tool_result` blocks
+/// become `role: tool` messages ahead of whatever else it carried.
+fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &mut Vec<Value>) {
+    let mut msg = Map::new();
+    msg.insert("role".into(), role.into());
+    let mut content = Vec::new();
+    if role == gw_consts::role::AI {
+        let mut prose = String::new();
+        let mut tool_use = Vec::new();
+        for part in parts {
+            match part["type"].as_str() {
+                Some("thinking") => prose.push_str(part["thinking"].as_str().unwrap_or_default()),
+                Some("redacted_thinking") => {}
+                Some("tool_use") => tool_use.push(part),
+                _ => content.push(part),
             }
-            Some("redacted_thinking") => false,
-            _ => true,
-        })
-        .collect();
-    if reasoning_content.is_none() && !prose.is_empty() {
-        *reasoning_content = Some(prose);
+        }
+        if !tool_use.is_empty() {
+            let calls = gw_protocol::anthropic::tool_use_to_tool_calls(tool_use, &mut 0);
+            msg.insert("tool_calls".into(), Value::Array(calls));
+        }
+        if let Some(reasoning) = reasoning.or((!prose.is_empty()).then_some(prose)) {
+            msg.insert("reasoning_content".into(), reasoning.into());
+        }
+    } else {
+        for mut part in parts {
+            if part["type"] != "tool_result" {
+                content.push(part);
+                continue;
+            }
+            let text = match part["content"].take() {
+                Value::String(text) => text,
+                Value::Array(blocks) => gw_protocol::anthropic::blocks_text(&blocks),
+                _ => String::new(),
+            };
+            out.push(json!({
+                "role": "tool",
+                "tool_call_id": part["tool_use_id"].take(),
+                "content": text,
+            }));
+        }
     }
-    kept
+    // OpenAI: content is null only on a tool-call turn; a turn left with
+    // neither is dropped
+    if content.is_empty() {
+        if !msg.contains_key("tool_calls") {
+            return;
+        }
+        msg.insert("content".into(), Value::Null);
+    } else {
+        msg.insert("content".into(), Value::Array(content));
+    }
+    out.push(Value::Object(msg));
 }
 
 fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {

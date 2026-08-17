@@ -458,8 +458,11 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     );
     let upstream = cross_protocol.lock().unwrap().take().unwrap();
     assert_eq!(upstream["reasoning_effort"], "low");
-    assert_eq!(upstream["max_completion_tokens"], 128);
-    assert!(upstream.get("thinking").is_none() && upstream.get("max_tokens").is_none());
+    assert_eq!(
+        upstream["max_tokens"], 128,
+        "not an OpenAI reasoning family"
+    );
+    assert!(upstream.get("thinking").is_none() && upstream.get("output_config").is_none());
     assert_eq!(hits.swap(0, Ordering::Relaxed), 1);
 
     let seed = json!({

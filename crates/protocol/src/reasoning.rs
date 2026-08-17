@@ -18,20 +18,21 @@ pub enum ThinkingDialect {
     /// which predates the `display` knob.
     Adaptive,
     /// Adaptive with `display: summarized`, so the reasoning prose comes back:
-    /// 4.7+, the 5 family, Fable, Mythos, and any unrecognized model.
+    /// 4.7+, the 5 family, Fable, Mythos, and any unrecognized Claude model.
     AdaptiveSummarized,
 }
 
 /// Reasoning effort → thinking budget in tokens; `None` for `none` and for
 /// unknown vocabulary. Fixed per level, not a share of `max_tokens`: Anthropic
 /// renders the budget into the prompt, so a moving budget thrashes the cache.
+/// `max` stays under the 64K output cap with the answer budget on top.
 pub fn effort_budget(effort: &str) -> Option<i64> {
     Some(match effort {
         "minimal" | "low" => 1024,
         "medium" => 4096,
         "high" => 16384,
-        "xhigh" => 32768,
-        "max" => 65536,
+        "xhigh" => 24576,
+        "max" => 32768,
         _ => return None,
     })
 }
@@ -46,9 +47,10 @@ pub fn budget_effort(budget: i64) -> &'static str {
     }
 }
 
-/// The thinking dialect of an Anthropic model, by name.
+/// The thinking dialect of a model on the Anthropic wire, by name. Vendors
+/// speaking that wire (MiniMax, GLM, Kimi) cloned the budget dialect.
 pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
-    if model.contains("claude-3") {
+    if !model.starts_with("claude") || model.starts_with("claude-3") {
         return ThinkingDialect::Budget;
     }
     let Some(rest) = model.find("-4-").map(|i| &model[i + 3..]) else {
@@ -82,18 +84,27 @@ pub fn thinking_block_to_detail(mut block: Value, index: usize) -> Option<Value>
     match block["type"].as_str() {
         Some("thinking") => {
             detail.insert("type".into(), "reasoning.text".into());
-            detail.insert("text".into(), block["thinking"].take());
+            detail.insert("text".into(), take_string_or_empty(&mut block, "thinking"));
             detail.insert("signature".into(), block["signature"].take());
         }
         Some("redacted_thinking") => {
             detail.insert("type".into(), "reasoning.encrypted".into());
-            detail.insert("data".into(), block["data"].take());
+            detail.insert("data".into(), take_string_or_empty(&mut block, "data"));
         }
         _ => return None,
     }
     detail.insert("format".into(), FORMAT_ANTHROPIC.into());
     detail.insert("index".into(), index.into());
     Some(Value::Object(detail))
+}
+
+/// `display: omitted` may leave the prose out; a missing string is `""`, not
+/// `null`, on either wire.
+fn take_string_or_empty(block: &mut Value, key: &str) -> Value {
+    match block.get_mut(key).map(Value::take) {
+        Some(value @ Value::String(_)) => value,
+        _ => Value::String(String::new()),
+    }
 }
 
 /// Inverse of [`thinking_block_to_detail`] for a replayed unit: only signed
@@ -156,7 +167,8 @@ mod tests {
             ("claude-sonnet-5", AdaptiveSummarized),
             ("claude-fable-5", AdaptiveSummarized),
             ("claude-mythos-5", AdaptiveSummarized),
-            ("MiniMax-M3", AdaptiveSummarized),
+            ("claude-opus-5-1", AdaptiveSummarized),
+            ("MiniMax-M3", Budget),
         ] {
             assert_eq!(anthropic_thinking_dialect(model), want, "{model}");
         }

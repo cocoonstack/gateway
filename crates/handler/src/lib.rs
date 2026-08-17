@@ -326,9 +326,19 @@ impl OnlineHandler {
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
             // Raw decoded deltas are pre-redaction. Drop them when either the
             // normalized response was rewritten or a native-only payload
-            // (for example a citation) hit DLP. Clean native events survive.
+            // (for example a citation) hit DLP. Clean native events survive;
+            // so do the signed reasoning units the strip pass kept, which
+            // only the chunks carry on the chat surface.
             if dlp && (n > 0 || native_event_hits > 0) {
-                outcome.chunks.clear();
+                for chunk in outcome.chunks.drain(..) {
+                    if let Some(units) = chunk.reasoning_details {
+                        outcome
+                            .response
+                            .reasoning_details
+                            .get_or_insert_default()
+                            .extend(units);
+                    }
+                }
             }
             n.max(native_event_hits)
         } else {
@@ -2157,6 +2167,58 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct ClaudeCleanThinkingPiiAnswerStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ClaudeCleanThinkingPiiAnswerStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            let sse = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"clean\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail jane@corp.com\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_surface_dlp_buffered_stream_keeps_clean_signed_reasoning() {
+        let base = handler();
+        let h = OnlineHandler::new(
+            base.config.clone(),
+            Arc::new(ClaudeCleanThinkingPiiAnswerStream),
+        );
+        let mut request = chat_req("claude-sonnet", "clean input");
+        request.stream = true;
+        let context = h.run(request, ak(&h).await).await.unwrap();
+        let outcome = context.outcome.expect("a served outcome, not a failure");
+
+        assert!(outcome.chunks.is_empty(), "raw deltas must be dropped");
+        assert_eq!(outcome.response.message, "mail [REDACTED_EMAIL]");
+        assert_eq!(outcome.response.reasoning, "clean");
+        assert_eq!(
+            outcome.response.reasoning_details,
+            Some(vec![serde_json::json!({
+                "type":"reasoning.text","text":"clean","signature":"opaque",
+                "format":"anthropic-claude-v1","index":0
+            })])
+        );
     }
 
     #[tokio::test]

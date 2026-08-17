@@ -48,19 +48,6 @@ impl GatewayRequest {
         self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")
     }
 
-    /// Whether any message carries a top-level Anthropic protected-thinking
-    /// block. These blocks are valid only on the native `/v1/messages`
-    /// surface routed to an Anthropic-messages engine.
-    pub fn has_anthropic_thinking_blocks(&self) -> bool {
-        self.message.iter().any(|message| {
-            message
-                .parts
-                .as_ref()
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
-        })
-    }
-
     /// Whether the request explicitly engages reasoning: the typed reasoning
     /// request, or an Anthropic `thinking` riding the chat surface's
     /// passthrough bag with a type other than `disabled` — a routine SDK

@@ -2988,6 +2988,15 @@ fn text_chunks(resp: &mut gw_models::GatewayResponse) -> Vec<gw_engines::StreamC
     chunks
 }
 
+/// A native event's type as its SSE event name. An upstream-controlled name
+/// that is missing or CR/LF-bearing cannot become one (axum asserts): the
+/// caller drops the frame and keeps the stream alive.
+fn native_event_kind(event: &Value) -> Option<&str> {
+    event["type"]
+        .as_str()
+        .filter(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']))
+}
+
 /// Chunks for an engine that returned a buffered response.
 fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let resp = &mut outcome.response;
@@ -3380,13 +3389,7 @@ fn messages_stream_response(
                         if let Some(capture) = self.thinking_capture.as_mut() {
                             capture.observe(&event);
                         }
-                        // Upstream-controlled name: a missing or CR/LF-bearing
-                        // type cannot become an SSE event name (axum asserts)
-                        // — drop the frame, keep the stream alive.
-                        let valid = event["type"]
-                            .as_str()
-                            .is_some_and(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']));
-                        if !valid {
+                        if native_event_kind(&event).is_none() {
                             return false;
                         }
                         if event["type"] == "message_start" {
@@ -3686,7 +3689,7 @@ fn responses_stream_response(
             }
             self.created = true;
             self.seq += 1;
-            self.queue.push_back(Event::default().data(
+            self.queue.push_back(Event::default().event("response.created").data(
                 json!({"type":"response.created","response":{"model":self.model,"status":"in_progress"}})
                     .to_string(),
             ));
@@ -3722,13 +3725,7 @@ fn responses_stream_response(
                 }
                 Some(mut c) => {
                     if let Some(event) = c.native_event.take() {
-                        // Upstream-controlled name: a missing or CR/LF-bearing
-                        // type cannot become an SSE event name (axum asserts)
-                        // — drop the frame, keep the stream alive.
-                        let Some(kind) = event["type"]
-                            .as_str()
-                            .filter(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']))
-                        else {
+                        let Some(kind) = native_event_kind(&event) else {
                             return false;
                         };
                         self.created = true;
@@ -3741,7 +3738,7 @@ fn responses_stream_response(
                     if !c.delta.is_empty() {
                         self.seq += 1;
                         self.queue.push_back(
-                            Event::default().data(
+                            Event::default().event("response.output_text.delta").data(
                                 json!({"type":"response.output_text.delta","delta":c.delta})
                                     .to_string(),
                             ),
@@ -3756,7 +3753,7 @@ fn responses_stream_response(
                     if !self.native {
                         self.seq += 1;
                         self.queue.push_back(
-                            Event::default().data(
+                            Event::default().event("response.completed").data(
                                 json!({"type":"response.completed","response":{
                                     "model": self.model, "status": self.status,
                                     "usage": responses_usage(pt, ct, tt, c.common_usage),
