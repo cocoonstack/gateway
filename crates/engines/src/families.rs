@@ -892,10 +892,17 @@ impl ResponsesEngine {
 
     /// Non-streaming Responses reply: full `output` array + `usage`.
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let v: Value = serde_json::from_slice(bytes)
+        let mut v: Value = serde_json::from_slice(bytes)
             .map_err(|e| GatewayError::internal("parse responses reply").with_source(e))?;
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
+        }
+        // the verbatim body must not leak the served variant either
+        if let Some(requested) = self.base.model_override()
+            && let Some(body) = v.as_object_mut()
+            && body.contains_key("model")
+        {
+            body.insert("model".to_owned(), requested.into());
         }
         let (text, tool_calls) = responses_output(&v);
         let (input, output, common_usage) = responses_usage(&v["usage"]);
@@ -1459,16 +1466,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     fn responses_body_uses_the_routed_model() {
         let mut request = req(Protocol::Responses, "gpt-5-served", None);
         let param = request.model_param_v2.as_mut().unwrap();
         param.raw = json!({"model": "gpt-5-public", "input": "go"});
         param.fallback_from = Some("gpt-5-public".to_owned());
-
         let mut engine = ResponsesEngine::new(request, Arc::new(MockTransport));
-
         assert_eq!(engine.build_body().unwrap()["model"], "gpt-5-served");
+    }
+
+    #[test]
+    fn responses_reply_names_the_requested_model() {
+        let mut request = req(Protocol::Responses, "gpt-5-served", None);
+        let param = request.model_param_v2.as_mut().unwrap();
+        param.raw = json!({"input": "go"});
+        param.fallback_from = Some("gpt-5-public".to_owned());
+        let engine = ResponsesEngine::new(request, Arc::new(MockTransport));
+        let out = engine
+            .parse_json(
+                200,
+                br#"{"id":"r","object":"response","model":"gpt-5-served-2026","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            )
+            .unwrap();
+        assert_eq!(out.response.response_v2.unwrap()["model"], "gpt-5-public");
     }
 
     #[tokio::test]
