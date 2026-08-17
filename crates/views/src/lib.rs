@@ -105,7 +105,6 @@ impl AppState {
     }
 }
 
-/// Build the application router.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -218,7 +217,7 @@ fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
 async fn realtime_ws(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
+    Query(mut q): Query<HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
     // one consistent snapshot for the whole accept decision (cfg + state)
@@ -239,7 +238,7 @@ async fn realtime_ws(
             }
         }
     };
-    let Some(model) = q.get("model").cloned() else {
+    let Some(model) = q.remove("model") else {
         return error_response(400, "model query param is required");
     };
     let model_conf = snap.cfg.find_model(&model);
@@ -266,12 +265,15 @@ async fn realtime_ws(
     let served = match model_conf {
         Some(conf) if !conf.variants.is_empty() => {
             let sticky = ak.attributed_user(&hint);
+            let generated;
             let key = if sticky.is_empty() {
-                gw_handler::new_request_id()
+                generated = gw_handler::new_request_id();
+                generated.as_str()
             } else {
-                sticky.to_owned()
+                sticky
             };
-            gw_config::pick_variant(&conf.variants, &key).model.clone()
+            gw_config::pick_variant(&conf.variants, key)
+                .map_or_else(|| model.clone(), |v| v.model.clone())
         }
         _ => model.clone(),
     };
@@ -925,10 +927,9 @@ async fn realtime_bridge(
                         }
                         // outbound DLP, per frame (a span straddling deltas is
                         // beyond a relay that cannot buffer)
-                        let cfg = s.handler.cfg();
                         let n = if relay {
                             gw_handler::plugins::dlp_redact_realtime_frame(
-                                cfg.security_for(&ak.tenant),
+                                s.handler.cfg().security_for(&ak.tenant),
                                 &mut v,
                             )
                         } else {
@@ -3075,7 +3076,7 @@ fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
 async fn messages(
     State(s): State<AppState>,
     headers: HeaderMap,
-    AnthJson(body): AnthJson<MessagesRequest>,
+    AnthJson(mut body): AnthJson<MessagesRequest>,
 ) -> Response {
     let started = Instant::now();
     let ak = match authenticate(&s, &headers).await {
@@ -3183,7 +3184,10 @@ async fn messages(
                 }));
             }
             if !outcome.response.message.is_empty() {
-                blocks.push(json!({"type":"text","text":outcome.response.message}));
+                blocks.push(json!({
+                    "type":"text",
+                    "text":Value::String(std::mem::take(&mut outcome.response.message))
+                }));
             }
             blocks.extend(anthropic_tool_blocks(outcome.response.tool_calls.take()));
             blocks
@@ -3192,19 +3196,19 @@ async fn messages(
     if let Some(context) = thinking_context.as_ref() {
         thinking_audit.remember_content(context, &content);
     }
-    let response = (
-        StatusCode::OK,
-        Json(json!({
-            "id": next_id("msg"),
-            "type": "message",
-            "role": "assistant",
-            "model": outcome.response.model,
-            "content": content,
-            "stop_reason": finish_anthropic(outcome.response.finish_reason),
-            "usage": usage,
-        })),
-    )
-        .into_response();
+    // built by hand: json! would deep-copy the content blocks
+    let mut body = serde_json::Map::with_capacity(7);
+    body.insert("id".into(), next_id("msg").into());
+    body.insert("type".into(), "message".into());
+    body.insert("role".into(), "assistant".into());
+    body.insert("model".into(), Value::String(outcome.response.model));
+    body.insert("content".into(), Value::Array(content));
+    body.insert(
+        "stop_reason".into(),
+        finish_anthropic(outcome.response.finish_reason).into(),
+    );
+    body.insert("usage".into(), json!(usage));
+    let response = (StatusCode::OK, Json(Value::Object(body))).into_response();
     terminal_response(&ctx, response).await
 }
 
@@ -3539,7 +3543,7 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
     }
 }
 
-/// The engine's native payload, or a 500 naming the engine that returned none.
+/// The engine's native payload; a blocked outcome is the client's 400.
 /// A pre-stage content block answers 400 with the block message — these
 /// surfaces have no in-band content_filter shape, and falling through would
 /// misreport the block as an engine failure.
@@ -3894,16 +3898,24 @@ async fn audio_speech(
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let input = gw_engines::engine::take_string(&mut body, "/input").unwrap_or_default();
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
     }
-    let format = body["response_format"].as_str().unwrap_or("mp3").to_owned();
+    let format = body["response_format"].as_str().unwrap_or("mp3");
+    let content_type = match format {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        _ => "audio/mpeg",
+    };
     let typed = TypedParams::AudioTts(TtsParams {
         input,
         voice: body["voice"].as_str().map(str::to_owned),
-        response_format: Some(format.clone()),
+        response_format: Some(format.to_owned()),
     });
     let mut ctx = match run_family(
         &s,
@@ -3928,14 +3940,6 @@ async fn audio_speech(
     let Some(b64) = payload.as_ref().and_then(|v| v["audio_b64"].as_str()) else {
         let response = error_response(500, "tts engine returned no audio");
         return terminal_response(&ctx, response).await;
-    };
-    let content_type = match format.as_str() {
-        "wav" => "audio/wav",
-        "pcm" => "audio/pcm",
-        "opus" => "audio/opus",
-        "aac" => "audio/aac",
-        "flac" => "audio/flac",
-        _ => "audio/mpeg",
     };
     let response = match base64::engine::general_purpose::STANDARD.decode(b64) {
         Ok(bytes) => (StatusCode::OK, [("content-type", content_type)], bytes).into_response(),
@@ -4059,16 +4063,7 @@ async fn rerank(
     let started = Instant::now();
     let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let query = gw_engines::engine::take_string(&mut body, "/query").unwrap_or_default();
-    let documents: Vec<String> = match body.get_mut("documents").map(Value::take) {
-        Some(Value::Array(a)) => a
-            .into_iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        _ => vec![],
-    };
+    let documents = string_or_string_array(body.get_mut("documents").map(Value::take));
     if model.is_empty() || query.is_empty() || documents.is_empty() {
         return error_response(400, "model, query, and documents are required");
     }

@@ -1005,7 +1005,6 @@ fn redact(text: &str) -> Option<(String, usize)> {
     let n = chars.len();
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
 
-    // span = (start, end_exclusive, replacement)
     let mut spans: Vec<(usize, usize, &str)> = Vec::new();
 
     for (i, &c) in chars.iter().enumerate() {

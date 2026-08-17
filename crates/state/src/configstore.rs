@@ -74,7 +74,7 @@ impl PostgresConfigStore {
             "SELECT id, EXTRACT(EPOCH FROM created_at)::BIGINT
              FROM gw_config ORDER BY id DESC LIMIT $1",
         )
-        .bind(limit as i64)
+        .bind(limit.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("list config versions", e))?;

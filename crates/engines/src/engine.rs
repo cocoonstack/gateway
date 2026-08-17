@@ -123,7 +123,7 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
             e["http_code"]
                 .as_str()
                 .and_then(|s| s.parse::<u16>().ok())
-                .or_else(|| e["code"].as_u64().map(|c| c as u16))
+                .or_else(|| e["code"].as_u64().and_then(|c| u16::try_from(c).ok()))
                 .or_else(|| e["code"].as_str().and_then(|s| s.parse::<u16>().ok()))
         })
         .filter(|c| *c >= 400)
@@ -149,7 +149,10 @@ pub fn normalize_tool_arguments(calls: &mut Value) {
         return;
     };
     for call in calls {
-        let Some(Value::String(args)) = call.pointer_mut("/function/arguments") else {
+        let Some(Value::String(args)) = call
+            .get_mut("function")
+            .and_then(|function| function.get_mut("arguments"))
+        else {
             continue;
         };
         let trimmed = args.trim_start();

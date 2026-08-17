@@ -35,16 +35,11 @@ pub struct MessagesRequest {
 }
 
 impl MessagesRequest {
-    /// Flatten the system prompt (string or text blocks) to plain text.
-    pub fn system_text(&self) -> Option<String> {
-        let sys = self.system.as_ref()?;
-        let text = match sys {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|b| b["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(""),
+    /// Take the system prompt (string or text blocks) as plain text.
+    pub fn system_text(&mut self) -> Option<String> {
+        let text = match self.system.take()? {
+            Value::String(s) => s,
+            Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect(),
             _ => return None,
         };
         (!text.is_empty()).then_some(text)
@@ -262,10 +257,10 @@ mod tests {
 
     #[test]
     fn system_flattening() {
-        let r: MessagesRequest =
+        let mut r: MessagesRequest =
             serde_json::from_str(r#"{"model":"m","system":"be brief","messages":[]}"#).unwrap();
         assert_eq!(r.system_text().unwrap(), "be brief");
-        let r: MessagesRequest = serde_json::from_str(
+        let mut r: MessagesRequest = serde_json::from_str(
             r#"{"model":"m","system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"messages":[]}"#,
         )
         .unwrap();

@@ -111,7 +111,10 @@ impl OpenAiEngine {
             if let Some(s) = p.system {
                 // openai surface's system goes through messages; injected here for
                 // cross-protocol (anthropic→openai family) requests
-                let mut msgs = vec![json!({"role": "system", "content": s})];
+                let mut system = Map::with_capacity(2);
+                system.insert("role".into(), "system".into());
+                system.insert("content".into(), Value::String(s));
+                let mut msgs = vec![Value::Object(system)];
                 if let Some(Value::Array(existing)) = body.remove("messages") {
                     msgs.extend(existing);
                 }
@@ -124,10 +127,9 @@ impl OpenAiEngine {
         Ok(UpstreamRequest {
             protocol,
             method: "POST".to_owned(),
-            url: format!(
-                "{}/v1/chat/completions",
-                self.base.base_url("mock://api.openai.com")
-            ),
+            url: self
+                .base
+                .openai_url("mock://api.openai.com", "chat/completions"),
             headers: self.base.bearer_headers(),
             body: crate::base::body_bytes(&Value::Object(body))?,
             stream: self.base.request.stream,
@@ -387,12 +389,16 @@ fn normalize_tools_openai(tools: Value) -> Value {
     Value::Array(
         arr.into_iter()
             .map(|mut t| {
+                // built by hand: json! would deep-copy the schema
                 if t.get("input_schema").is_some() && t.get("function").is_none() {
-                    json!({"type": "function", "function": {
-                        "name": t["name"].take(),
-                        "description": t["description"].take(),
-                        "parameters": t["input_schema"].take(),
-                    }})
+                    let mut function = Map::with_capacity(3);
+                    function.insert("name".into(), t["name"].take());
+                    function.insert("description".into(), t["description"].take());
+                    function.insert("parameters".into(), t["input_schema"].take());
+                    let mut tool = Map::with_capacity(2);
+                    tool.insert("type".into(), "function".into());
+                    tool.insert("function".into(), Value::Object(function));
+                    Value::Object(tool)
                 } else {
                     t
                 }
@@ -480,11 +486,11 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
                 Value::Array(blocks) => gw_protocol::anthropic::blocks_text(&blocks),
                 _ => String::new(),
             };
-            out.push(json!({
-                "role": "tool",
-                "tool_call_id": part["tool_use_id"].take(),
-                "content": text,
-            }));
+            let mut result = Map::with_capacity(3);
+            result.insert("role".into(), "tool".into());
+            result.insert("tool_call_id".into(), part["tool_use_id"].take());
+            result.insert("content".into(), Value::String(text));
+            out.push(Value::Object(result));
         }
     }
     // OpenAI: content is null only on a tool-call turn; a turn left with
@@ -507,7 +513,7 @@ fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {
     }
 }
 
-/// Copy token fields + keep the raw usage subtree bytes for the DAG node.
+/// Copy token fields + keep the raw usage subtree for the DAG node.
 fn apply_openai_usage(resp: &mut GatewayResponse, usage: Value) {
     if usage.is_null() {
         return;

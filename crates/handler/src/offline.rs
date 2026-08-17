@@ -144,16 +144,11 @@ impl OfflineHandler {
                 match store.batch_item_snapshot(id, index).await {
                     Ok(Some(fresh)) => item = fresh,
                     Ok(None) | Err(_) => {
-                        let result = BatchItemResult {
+                        let result = failed_item(
                             index,
-                            ok: false,
-                            message: "item unavailable at dispatch".into(),
-                            total_tokens: 0,
-                            user: match ak.owner_override() {
-                                Some(owner) => owner.to_owned(),
-                                None => item.user,
-                            },
-                        };
+                            "item unavailable at dispatch".into(),
+                            ak.attributed_user(&item.user).to_owned(),
+                        );
                         if let Err(e) = store.batch_push_result(id, result).await {
                             tracing::error!(error = %e, batch = %id, "batch result write failed");
                         }
@@ -172,13 +167,7 @@ impl OfflineHandler {
                     .await
                     .unwrap_or(true);
             if erased_mid_batch || item.messages.is_empty() {
-                let result = BatchItemResult {
-                    index,
-                    ok: false,
-                    message: "item content erased".into(),
-                    total_tokens: 0,
-                    user,
-                };
+                let result = failed_item(index, "item content erased".into(), user);
                 if let Err(e) = store.batch_push_result(id, result).await {
                     tracing::error!(error = %e, batch = %id, "batch result write failed");
                 }
@@ -199,13 +188,6 @@ impl OfflineHandler {
             let online = self.online.clone();
             let item_ak = ak.clone();
             let ran = tokio::spawn(async move { online.run(request, item_ak).await }).await;
-            let fail = |message: String| BatchItemResult {
-                index,
-                ok: false,
-                message,
-                total_tokens: 0,
-                user: String::new(),
-            };
             let result = match ran {
                 Ok(Ok(ctx)) => match ctx.outcome {
                     Some(out) => BatchItemResult {
@@ -213,14 +195,13 @@ impl OfflineHandler {
                         ok: true,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
-                        user: String::new(),
+                        user,
                     },
-                    None => fail("pipeline produced no outcome".into()),
+                    None => failed_item(index, "pipeline produced no outcome".into(), user),
                 },
-                Ok(Err(e)) => fail(e.to_string()),
-                Err(join_err) => fail(format!("item task failed: {join_err}")),
+                Ok(Err(e)) => failed_item(index, e.to_string(), user),
+                Err(join_err) => failed_item(index, format!("item task failed: {join_err}"), user),
             };
-            let result = BatchItemResult { user, ..result };
             // if we lost the claim mid-run, don't persist — the new owner is authoritative
             if lost.load(Relaxed) {
                 break;
@@ -292,5 +273,15 @@ impl OfflineHandler {
                 }
             }
         }
+    }
+}
+
+fn failed_item(index: usize, message: String, user: String) -> BatchItemResult {
+    BatchItemResult {
+        index,
+        ok: false,
+        message,
+        total_tokens: 0,
+        user,
     }
 }

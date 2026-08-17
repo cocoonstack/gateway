@@ -90,19 +90,7 @@ impl OnlineHandler {
         // one consistent snapshot for the whole request
         let snap = self.config.load();
         let retention = active_retention(&snap.cfg, &ak.tenant);
-        let terminal = retention.map(|retention| {
-            (
-                retention,
-                TerminalSubject {
-                    request_id: request.request_id.clone(),
-                    ak: ak.ak.clone(),
-                    user_id: ak
-                        .attributed_user(request.user_id.as_deref().unwrap_or_default())
-                        .to_owned(),
-                    tenant: ak.tenant.clone(),
-                },
-            )
-        });
+        let terminal = retention.map(|retention| (retention, TerminalSubject::new(&ak, &request)));
         let result = self.run_inner(request, ak, &snap, retention).await;
         let settled_here = match result.as_ref() {
             Err(_) => true,
@@ -475,12 +463,7 @@ async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_jso
     let Some(retention) = active_retention(&ctx.cfg, &ctx.ak.tenant) else {
         return;
     };
-    let subject = TerminalSubject {
-        request_id: ctx.request.request_id.clone(),
-        ak: ctx.ak.ak.clone(),
-        user_id: ctx.effective_user_id().to_owned(),
-        tenant: ctx.ak.tenant.clone(),
-    };
+    let subject = TerminalSubject::new(&ctx.ak, &ctx.request);
     persist_terminal(ctx.state.store.as_ref(), &subject, retention, body()).await;
 }
 
@@ -604,6 +587,19 @@ struct TerminalSubject {
     ak: String,
     user_id: String,
     tenant: String,
+}
+
+impl TerminalSubject {
+    fn new(ak: &AkInfo, request: &GatewayRequest) -> Self {
+        Self {
+            request_id: request.request_id.clone(),
+            ak: ak.ak.clone(),
+            user_id: ak
+                .attributed_user(request.user_id.as_deref().unwrap_or_default())
+                .to_owned(),
+            tenant: ak.tenant.clone(),
+        }
+    }
 }
 
 /// Persist one lifecycle result row (no provider message or user content).

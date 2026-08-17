@@ -148,17 +148,17 @@ pub struct VariantConf {
 /// Cumulative-weight pick over a model's variants, keyed by a stable hash so
 /// every instance (REST DAG and realtime handshake alike) maps the same key
 /// to the same bucket with no shared state.
-pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> &'a VariantConf {
+pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
     let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
     let mut roll = fnv1a(key) % total.max(1);
     for v in variants {
         if roll < u64::from(v.weight) {
-            return v;
+            return Some(v);
         }
         roll -= u64::from(v.weight);
     }
-    // unreachable (weights validated >= 1); quiets the type checker
-    &variants[0]
+    // weights are validated >= 1, so only an empty list falls through
+    variants.first()
 }
 
 /// FNV-1a 64: deterministic across processes and releases (std's hasher is
@@ -1583,12 +1583,16 @@ tenants: [{name: t1}, {name: t1}]
                 weight: 1,
             },
         ];
-        let first = pick_variant(&variants, "user-1").model.clone();
+        let first = pick_variant(&variants, "user-1").unwrap().model.clone();
         for _ in 0..10 {
-            assert_eq!(pick_variant(&variants, "user-1").model, first, "sticky");
+            assert_eq!(
+                pick_variant(&variants, "user-1").unwrap().model,
+                first,
+                "sticky"
+            );
         }
         let hits = (0..1000)
-            .filter(|i| pick_variant(&variants, &format!("user-{i}")).model == "b")
+            .filter(|i| pick_variant(&variants, &format!("user-{i}")).unwrap().model == "b")
             .count();
         assert!(
             (40..250).contains(&hits),

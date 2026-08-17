@@ -265,16 +265,21 @@ base_engine!(EmbeddingsEngine);
 impl ModelEngine for EmbeddingsEngine {
     /// Merges the openai/ali/vertex embedding engines to the openai shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let input = match &param.typed {
-            Some(TypedParams::Embeddings(p)) => json!(p.input),
-            _ => Value::Array(
-                self.base
-                    .request
-                    .message
-                    .iter()
-                    .map(|m| json!(m.content))
-                    .collect(),
+        let model = self.base.model_name()?.to_owned();
+        // the batch moves: json! would re-copy every input string
+        let (input, dimensions) = match self.base.take_typed() {
+            Some(TypedParams::Embeddings(p)) => (
+                Value::Array(p.input.into_iter().map(Value::String).collect()),
+                p.dimensions,
+            ),
+            _ => (
+                Value::Array(
+                    std::mem::take(&mut self.base.request.message)
+                        .into_iter()
+                        .map(|m| Value::String(m.content))
+                        .collect(),
+                ),
+                None,
             ),
         };
         if input.as_array().is_none_or(|a| a.is_empty()) {
@@ -282,26 +287,21 @@ impl ModelEngine for EmbeddingsEngine {
                 "embeddings input must not be empty",
             ));
         }
-        let mut body = json!({"model": param.model_name});
+        let mut body = json!({"model": model});
         body["input"] = input;
-        if let Some(TypedParams::Embeddings(p)) = &param.typed
-            && let Some(d) = p.dimensions
-        {
+        if let Some(d) = dimensions {
             body["dimensions"] = json!(d);
         }
         let (status, v) = self
             .base
             .round_trip(
-                &format!(
-                    "{}/v1/embeddings",
-                    self.base.base_url("mock://api.openai.com")
-                ),
+                &self.base.openai_url("mock://api.openai.com", "embeddings"),
                 body,
             )
             .await?;
         let pt = crate::engine::tok(&v["usage"]["prompt_tokens"]);
         let resp = GatewayResponse {
-            model: param.model_name.clone(),
+            model,
             prompt_tokens: pt,
             total_tokens: pt,
             raw_usage: (!v["usage"].is_null()).then(|| v["usage"].clone()),
@@ -360,7 +360,6 @@ impl ModelEngine for ImageEngine {
             ),
         };
         require_non_empty(&prompt, "image prompt")?;
-        let base = self.base.base_url("mock://api.openai.com");
         let (status, v, is_edit) = if let Some(image) = image {
             // edits upload the source (and mask) as files
             let image = decode_b64(&image, "image")?;
@@ -388,7 +387,14 @@ impl ModelEngine for ImageEngine {
             ];
             let reply = self
                 .base
-                .send_bytes(&format!("{base}/v1/images/edits"), headers, body, false)
+                .send_bytes(
+                    &self
+                        .base
+                        .openai_url("mock://api.openai.com", "images/edits"),
+                    headers,
+                    body,
+                    false,
+                )
                 .await?;
             let (status, v) = crate::base::parse_json_reply(reply)?;
             (status, v, true)
@@ -400,7 +406,12 @@ impl ModelEngine for ImageEngine {
             }
             let (status, v) = self
                 .base
-                .round_trip(&format!("{base}/v1/images/generations"), body)
+                .round_trip(
+                    &self
+                        .base
+                        .openai_url("mock://api.openai.com", "images/generations"),
+                    body,
+                )
                 .await?;
             (status, v, false)
         };
@@ -453,7 +464,6 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let base = self.base.base_url("mock://api.openai.com");
         let (status, v) = match self.kind {
             AudioKind::Tts => {
                 let (input, voice, format) = match &self.base.param()?.typed {
@@ -475,7 +485,9 @@ impl ModelEngine for AudioEngine {
                 let reply = self
                     .base
                     .send_upstream(
-                        &format!("{base}/v1/audio/speech"),
+                        &self
+                            .base
+                            .openai_url("mock://api.openai.com", "audio/speech"),
                         self.base.bearer_headers(),
                         b,
                         false,
@@ -503,9 +515,9 @@ impl ModelEngine for AudioEngine {
                 require_non_empty(&audio, "stt audio_b64")?;
                 let audio = decode_b64(&audio, "audio_b64")?;
                 let path = if translate {
-                    "/v1/audio/translations"
+                    "audio/translations"
                 } else {
-                    "/v1/audio/transcriptions"
+                    "audio/transcriptions"
                 };
                 let mut form = Form::new(&audio);
                 form.text("model", &model);
@@ -524,7 +536,12 @@ impl ModelEngine for AudioEngine {
                 ];
                 let reply = self
                     .base
-                    .send_bytes(&format!("{base}{path}"), headers, body, false)
+                    .send_bytes(
+                        &self.base.openai_url("mock://api.openai.com", path),
+                        headers,
+                        body,
+                        false,
+                    )
                     .await?;
                 crate::base::parse_json_reply(reply)?
             }
@@ -532,7 +549,10 @@ impl ModelEngine for AudioEngine {
                 let mut b = json!({"model": model});
                 b["raw"] = self.base.take_raw();
                 self.base
-                    .round_trip(&format!("{base}/v1/audio/other"), b)
+                    .round_trip(
+                        &self.base.openai_url("mock://api.openai.com", "audio/other"),
+                        b,
+                    )
                     .await?
             }
         };
@@ -659,10 +679,7 @@ impl ModelEngine for ModerationsEngine {
         let (status, v) = self
             .base
             .round_trip(
-                &format!(
-                    "{}/v1/moderations",
-                    self.base.base_url("mock://api.openai.com")
-                ),
+                &self.base.openai_url("mock://api.openai.com", "moderations"),
                 body,
             )
             .await?;
@@ -792,10 +809,7 @@ impl ModelEngine for CompletionsEngine {
         let (status, mut v) = self
             .base
             .round_trip(
-                &format!(
-                    "{}/v1/completions",
-                    self.base.base_url("mock://api.openai.com")
-                ),
+                &self.base.openai_url("mock://api.openai.com", "completions"),
                 body,
             )
             .await?;
@@ -836,23 +850,20 @@ impl ResponsesEngine {
     /// Native passthrough: the client's Responses-shaped body moves through
     /// verbatim, with `model` ensured.
     fn build_body(&mut self) -> GResult<Value> {
-        let model_name = self.base.param()?.model_name.clone();
         let mut body = match self.base.take_raw() {
             raw @ Value::Object(_) => raw,
             _ => json!({}),
         };
-        if let Some(map) = body.as_object_mut() {
-            map.entry("model".to_owned())
-                .or_insert_with(|| json!(model_name));
+        if let Some(map) = body.as_object_mut()
+            && !map.contains_key("model")
+        {
+            map.insert("model".to_owned(), self.base.model_name()?.into());
         }
         Ok(body)
     }
 
     fn url(&self) -> String {
-        format!(
-            "{}/v1/responses",
-            self.base.base_url("mock://api.openai.com")
-        )
+        self.base.openai_url("mock://api.openai.com", "responses")
     }
 
     /// Streaming Responses pumped live: delta frames forwarded through

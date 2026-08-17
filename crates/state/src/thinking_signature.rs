@@ -531,7 +531,7 @@ fn invalid_bounded_string(value: Option<&Value>) -> bool {
     }
 }
 
-fn tool_result_ids(message: &ChatMsg) -> HashSet<&str> {
+fn tool_result_ids(message: &ChatMsg) -> impl Iterator<Item = &str> {
     message
         .parts
         .as_ref()
@@ -540,7 +540,6 @@ fn tool_result_ids(message: &ChatMsg) -> HashSet<&str> {
         .flatten()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
         .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
-        .collect()
 }
 
 #[derive(Debug)]

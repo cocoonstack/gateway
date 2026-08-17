@@ -60,9 +60,7 @@ impl DagNode for ModelQuotaGate {
         if under {
             return Ok(());
         }
-        // Reasoning output and its continuations must use one model. The model
-        // quota is a soft routing trigger, so preserve the requested route
-        // just as we do when no fallback is configured.
+        // reasoning replay pins one model; over quota then reads like "no fallback configured"
         if ctx.request.pins_reasoning_route() {
             ctx.decide(
                 "model_quota",
@@ -196,11 +194,14 @@ impl DagNode for VariantSelect {
             "" => ctx.request.request_id.as_str(),
             user => user,
         };
-        let target = gw_config::pick_variant(&conf.variants, key).model.clone();
-        if target == param.model_name {
-            ctx.decide("variant_select", format!("{target} (self)"));
+        let Some(target) = gw_config::pick_variant(&conf.variants, key) else {
+            return Ok(());
+        };
+        if target.model == param.model_name {
+            ctx.decide("variant_select", format!("{} (self)", target.model));
             return Ok(());
         }
+        let target = target.model.clone();
         let decision = format!("{} -> {target}", param.model_name);
         if let Some(param) = ctx.request.model_param_v2.as_mut() {
             param.fallback_from = Some(std::mem::replace(&mut param.model_name, target));
@@ -226,8 +227,7 @@ impl DagNode for CacheLookup {
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
-        // online non-streaming cache_ttl models only; batch items bypass —
-        // a hit is free (unbilled) and batches promise per-item billing
+        // batch items bypass: a free (unbilled) hit would break their per-item billing
         let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
             return Ok(());
         };

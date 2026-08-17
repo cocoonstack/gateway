@@ -49,12 +49,12 @@ fn aws_headers(
 /// agree. Raw extras merge before signing so the signature covers the exact
 /// bytes sent — and the body serializes once, not per layer.
 async fn bedrock_invoke(base: &mut Base, uri: &str, mut body: Value) -> GResult<(u16, Value)> {
-    let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
-    let host = root.split_once("://").map(|(_, h)| h).unwrap_or(&root);
     if let Some(obj) = body.as_object_mut() {
         let raw = base.take_raw();
         crate::base::merge_raw_extras_owned(obj, raw);
     }
+    let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
+    let host = root.split_once("://").map(|(_, h)| h).unwrap_or(root);
     let payload = crate::base::body_bytes(&body)?;
     let creds = base.aws_credentials();
     let headers = aws_headers(

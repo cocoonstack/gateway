@@ -333,17 +333,18 @@ pub fn anthropic_native_chunks(
                 }
                 _ => {}
             }
-            events.push(json!({
-                "type":"content_block_start",
-                "index":index,
-                "content_block":start
-            }));
+            // built by hand: json! would deep-copy the moved blocks
+            let mut event = Map::with_capacity(3);
+            event.insert("type".into(), "content_block_start".into());
+            event.insert("index".into(), index.into());
+            event.insert("content_block".into(), start);
+            events.push(Value::Object(event));
             for delta in deltas {
-                events.push(json!({
-                    "type":"content_block_delta",
-                    "index":index,
-                    "delta":delta
-                }));
+                let mut event = Map::with_capacity(3);
+                event.insert("type".into(), "content_block_delta".into());
+                event.insert("index".into(), index.into());
+                event.insert("delta".into(), delta);
+                events.push(Value::Object(event));
             }
             events.push(json!({"type":"content_block_stop","index":index}));
         }
@@ -480,12 +481,13 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
     Value::Array(
         arr.into_iter()
             .map(|mut t| {
+                // built by hand: json! would deep-copy the schema
                 if let Some(f) = t.get_mut("function") {
-                    json!({
-                        "name": f["name"].take(),
-                        "description": f["description"].take(),
-                        "input_schema": f["parameters"].take(),
-                    })
+                    let mut tool = Map::with_capacity(3);
+                    tool.insert("name".into(), f["name"].take());
+                    tool.insert("description".into(), f["description"].take());
+                    tool.insert("input_schema".into(), f["parameters"].take());
+                    Value::Object(tool)
                 } else {
                     t
                 }
@@ -506,10 +508,9 @@ struct SseState {
     usage: Map<String, Value>,
     tool_blocks: Vec<Value>,
     native_blocks: Vec<Value>,
-    /// the in-flight block: every block natively, thinking blocks on the chat surface
+    /// the in-flight non-tool block: every block natively, thinking blocks on the chat surface
     open_native: Option<Value>,
     open_native_index: usize,
-    open_native_input: String,
     /// in-flight tool_use block: (skeleton from content_block_start,
     /// accumulated input_json_delta fragments)
     open_tool: Option<(Value, String)>,
@@ -528,7 +529,6 @@ impl SseState {
             native_blocks: Vec::new(),
             open_native: None,
             open_native_index: 0,
-            open_native_input: String::new(),
             open_tool: None,
         }
     }
@@ -570,15 +570,14 @@ impl SseState {
             }
             "content_block_start" => {
                 let index = v["index"].as_u64().unwrap_or_default() as usize;
-                if self.preserve_native {
+                if v["content_block"]["type"] == "tool_use" {
+                    // one open block for both the native replay and tool_calls
+                    self.open_tool = Some((v["content_block"].clone(), String::new()));
+                } else if self.preserve_native {
                     self.open_native = Some(v["content_block"].clone());
-                    self.open_native_input.clear();
                 } else if is_thinking_block(&v["content_block"]) {
                     self.open_native = Some(v["content_block"].take());
                     self.open_native_index = index;
-                }
-                if v["content_block"]["type"] == "tool_use" {
-                    self.open_tool = Some((v["content_block"].clone(), String::new()));
                 }
             }
             "content_block_delta" => {
@@ -617,18 +616,10 @@ impl SseState {
                     && let Some((_, buf)) = self.open_tool.as_mut()
                 {
                     buf.push_str(pj);
-                    if self.preserve_native {
-                        self.open_native_input.push_str(pj);
-                    }
                 }
             }
             "content_block_stop" => {
-                if let Some(mut block) = self.open_native.take() {
-                    if block["type"] == "tool_use"
-                        && let Ok(parsed) = serde_json::from_str::<Value>(&self.open_native_input)
-                    {
-                        block["input"] = parsed;
-                    }
+                if let Some(block) = self.open_native.take() {
                     if self.preserve_native {
                         self.native_blocks.push(block);
                     } else {
@@ -640,10 +631,12 @@ impl SseState {
                             .map(|detail| vec![detail]);
                     }
                 }
-                self.open_native_input.clear();
                 if let Some((mut block, buf)) = self.open_tool.take() {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
                         block["input"] = parsed;
+                    }
+                    if self.preserve_native {
+                        self.native_blocks.push(block.clone());
                     }
                     native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
                     self.tool_blocks.push(block);
