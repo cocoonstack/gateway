@@ -23,6 +23,15 @@ impl Base {
         self.request.account_name().to_owned()
     }
 
+    /// The client's requested name when a variant/fallback served the call;
+    /// native events must not leak the served model.
+    pub fn model_override(&self) -> Option<&str> {
+        self.request
+            .model_param_v2
+            .as_ref()
+            .and_then(|param| param.fallback_from.as_deref())
+    }
+
     pub fn replay_account(&self) -> Option<Arc<gw_models::Account>> {
         self.request
             .account

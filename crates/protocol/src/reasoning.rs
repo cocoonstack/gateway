@@ -9,11 +9,22 @@ use serde_json::{Map, Value};
 /// can verify them.
 pub const FORMAT_ANTHROPIC: &str = "anthropic-claude-v1";
 
-/// Reasoning effort → thinking budget in tokens (Anthropic `budget_tokens`,
-/// also the answer-budget top-up for adaptive models); `None` for `none`
-/// (thinking off) and for unknown vocabulary. Fixed per level, not a share of
-/// `max_tokens`: Anthropic renders the budget into the prompt, so a budget
-/// that moved with `max_tokens` would thrash the prompt cache.
+/// How an Anthropic model generation takes a thinking request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDialect {
+    /// `thinking: {type: enabled, budget_tokens}` — Claude 3.x, 4, 4.1, 4.5.
+    Budget,
+    /// `thinking: {type: adaptive}` + `output_config.effort` — Claude 4.6,
+    /// which predates the `display` knob.
+    Adaptive,
+    /// Adaptive with `display: summarized`, so the reasoning prose comes back:
+    /// 4.7+, the 5 family, Fable, Mythos, and any unrecognized model.
+    AdaptiveSummarized,
+}
+
+/// Reasoning effort → thinking budget in tokens; `None` for `none` and for
+/// unknown vocabulary. Fixed per level, not a share of `max_tokens`: Anthropic
+/// renders the budget into the prompt, so a moving budget thrashes the cache.
 pub fn effort_budget(effort: &str) -> Option<i64> {
     Some(match effort {
         "minimal" | "low" => 1024,
@@ -35,19 +46,6 @@ pub fn budget_effort(budget: i64) -> &'static str {
     }
 }
 
-/// How an Anthropic model generation takes a thinking request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThinkingDialect {
-    /// `thinking: {type: enabled, budget_tokens}` — Claude 3.x, 4, 4.1, 4.5.
-    Budget,
-    /// `thinking: {type: adaptive}` + `output_config.effort` — Claude 4.6,
-    /// which predates the `display` knob.
-    Adaptive,
-    /// Adaptive with `display: summarized`, so the reasoning prose comes back:
-    /// 4.7+, the 5 family, Fable, Mythos, and any unrecognized model.
-    AdaptiveSummarized,
-}
-
 /// The thinking dialect of an Anthropic model, by name.
 pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
     if model.contains("claude-3") {
@@ -65,6 +63,15 @@ pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
         },
         _ => ThinkingDialect::Budget,
     }
+}
+
+/// Whether a content block is Anthropic thinking (`thinking` /
+/// `redacted_thinking`).
+pub fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block["type"].as_str(),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 /// An Anthropic `thinking` / `redacted_thinking` block as a `reasoning_details`

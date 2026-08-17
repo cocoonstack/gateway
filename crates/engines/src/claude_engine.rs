@@ -3,7 +3,7 @@
 //! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
-use gw_protocol::reasoning::ThinkingDialect;
+use gw_protocol::reasoning::{ThinkingDialect, is_thinking_block};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -31,8 +31,7 @@ impl ClaudeEngine {
             } else {
                 "user"
             };
-            // replayed signed reasoning leads the turn: Claude requires its
-            // thinking blocks ahead of the tool_use they produced
+            // Claude wants replayed thinking blocks ahead of the tool_use they produced
             let thinking: Vec<Value> = match m.reasoning_details {
                 Some(Value::Array(details)) => details
                     .into_iter()
@@ -40,19 +39,15 @@ impl ClaudeEngine {
                     .collect(),
                 _ => Vec::new(),
             };
-            let content = match m.tool_calls {
-                Some(Value::Array(calls)) => {
-                    let mut blocks = thinking;
-                    blocks.extend(content_blocks(content));
+            let content = if thinking.is_empty() && m.tool_calls.is_none() {
+                content
+            } else {
+                let mut blocks = thinking;
+                blocks.extend(content_blocks(content));
+                if let Some(Value::Array(calls)) = m.tool_calls {
                     blocks.extend(gw_protocol::anthropic::tool_calls_to_tool_use(calls));
-                    Value::Array(blocks)
                 }
-                _ if !thinking.is_empty() => {
-                    let mut blocks = thinking;
-                    blocks.extend(content_blocks(content));
-                    Value::Array(blocks)
-                }
-                _ => content,
+                Value::Array(blocks)
             };
             push_turn(&mut messages, role, content);
         }
@@ -66,17 +61,12 @@ impl ClaudeEngine {
         }
         let param = self.base.param()?;
         let protocol = param.protocol;
-        // an Anthropic `thinking` in the chat surface's passthrough bag is the
-        // client's own contract; it wins over an effort mapping
-        let client_thinking = param.raw.get("thinking").is_some();
-        let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), Value::Array(messages));
         body.insert("stream".into(), self.base.request.stream.into());
         let mut max_tokens = 1024;
-        // gateway-mapped thinking owns the sampling and token knobs the client
-        // set without knowing they would conflict; client thinking is verbatim
+        // only gateway-mapped thinking drops the sampling knobs Anthropic rejects
         let mut mapped = false;
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             if let Some(mt) = p.max_tokens {
@@ -84,10 +74,12 @@ impl ClaudeEngine {
             }
             if let Some(reasoning) = p.reasoning {
                 let reasoning = *reasoning;
+                let param = self.base.param()?;
+                // a client-sent thinking passthrough wins over an effort mapping
                 if reasoning.thinking.is_none()
-                    && !client_thinking
+                    && param.raw.get("thinking").is_none()
                     && let Some((thinking, output_config, budget)) = map_thinking(
-                        dialect,
+                        gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name),
                         reasoning.effort.as_deref(),
                         reasoning.budget_tokens,
                     )
@@ -219,13 +211,7 @@ impl ClaudeEngine {
         };
         let mut outcome = EngineOutcome::with_status(resp, status);
         if self.base.request.stream && self.base.request.preserve_anthropic_wire {
-            let model_override = self
-                .base
-                .request
-                .model_param_v2
-                .as_ref()
-                .and_then(|param| param.fallback_from.as_deref());
-            outcome.chunks = anthropic_native_chunks(&outcome.response, model_override);
+            outcome.chunks = anthropic_native_chunks(&outcome.response, self.base.model_override());
         }
         Ok(outcome)
     }
@@ -236,12 +222,7 @@ impl ClaudeEngine {
             is_messages_protocol: true,
             ..Default::default()
         };
-        let model_override = self
-            .base
-            .request
-            .model_param_v2
-            .as_ref()
-            .and_then(|param| param.fallback_from.clone());
+        let model_override = self.base.model_override().map(str::to_owned);
         let mut st = SseState::new(self.base.request.preserve_anthropic_wire, model_override);
         let r = crate::pump::pump_sse(
             "anthropic",
@@ -379,11 +360,8 @@ pub fn anthropic_native_chunks(
 
 /// A `role: "tool"` message as a `tool_result` block; empty output omits
 /// `content` rather than sending an empty text, which the upstream rejects.
-/// An OpenAI-dialect reasoning request as this model's thinking config:
-/// `(thinking, output_config, budget)`. Budget-only models get
-/// `enabled` + `budget_tokens`; adaptive models get `adaptive` + an
-/// `output_config.effort` (`minimal` folds into `low`). `none`, or vocabulary
-/// neither side knows, leaves thinking to the model's default.
+/// An OpenAI-dialect effort/budget as `(thinking, output_config, budget)` in
+/// this model's dialect; `none` or unknown vocabulary leaves the model default.
 fn map_thinking(
     dialect: ThinkingDialect,
     effort: Option<&str>,
@@ -412,13 +390,6 @@ fn map_thinking(
         Some(effort) => effort,
     };
     Some((thinking, Some(json!({"effort": effort})), budget))
-}
-
-fn is_thinking_block(block: &Value) -> bool {
-    matches!(
-        block["type"].as_str(),
-        Some("thinking" | "redacted_thinking")
-    )
 }
 
 fn tool_result_block(tool_use_id: Option<String>, content: Value) -> Value {
@@ -521,13 +492,11 @@ struct SseState {
     full: String,
     input: i64,
     output: i64,
-    /// the vendor usage object, message_start's overlaid by message_delta's,
-    /// for the CommonUsage step (cache and thinking tokens ride there)
+    /// message_start's usage overlaid by message_delta's, for the CommonUsage step
     usage: Map<String, Value>,
     tool_blocks: Vec<Value>,
     native_blocks: Vec<Value>,
-    /// the in-flight block: every block on the native surface, thinking
-    /// blocks (the client's reasoning units) on the chat surface
+    /// the in-flight block: every block natively, thinking blocks on the chat surface
     open_native: Option<Value>,
     open_native_index: usize,
     open_native_input: String,
@@ -586,7 +555,8 @@ impl SseState {
                     .unwrap_or_default()
                     .to_owned();
                 self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
-                self.overlay_usage(&v["message"]["usage"]);
+                let usage = v.get_mut("message").and_then(|m| m.get_mut("usage"));
+                self.overlay_usage(usage);
             }
             "content_block_start" => {
                 let index = v["index"].as_u64().unwrap_or_default() as usize;
@@ -594,8 +564,6 @@ impl SseState {
                     self.open_native = Some(v["content_block"].clone());
                     self.open_native_input.clear();
                 } else if is_thinking_block(&v["content_block"]) {
-                    // the block itself is the client's reasoning unit; only its
-                    // signature is still to come
                     self.open_native = Some(v["content_block"].take());
                     self.open_native_index = index;
                 }
@@ -616,16 +584,19 @@ impl SseState {
                         text.push_str(t);
                     }
                 }
-                if let Some(t) = v["delta"]["thinking"].as_str() {
-                    if let Some(block) = self.open_native.as_mut()
-                        && let Some(Value::String(thinking)) = block.get_mut("thinking")
-                    {
-                        thinking.push_str(t);
+                // the native event keeps its delta; the chat surface moves it out
+                if self.preserve_native {
+                    if let Some(t) = v["delta"]["thinking"].as_str() {
+                        self.append_thinking(t);
                     }
-                    if !self.preserve_native {
-                        resp.reasoning.push_str(t);
-                        native_chunk.reasoning = t.to_owned();
-                    }
+                } else if let Some(Value::String(t)) = v
+                    .get_mut("delta")
+                    .and_then(|delta| delta.get_mut("thinking"))
+                    .map(Value::take)
+                {
+                    self.append_thinking(&t);
+                    resp.reasoning.push_str(&t);
+                    native_chunk.reasoning = t;
                 }
                 if let Some(signature) = v["delta"]["signature"].as_str()
                     && let Some(block) = self.open_native.as_mut()
@@ -679,7 +650,8 @@ impl SseState {
                 if let Some(it) = v["usage"]["input_tokens"].as_i64() {
                     self.input = it;
                 }
-                self.overlay_usage(&v["usage"]);
+                let usage = v.get_mut("usage");
+                self.overlay_usage(usage);
             }
             // message_stop and forward-compatible events carry no normalized
             // fields; they reach the client only via the native event below.
@@ -716,11 +688,25 @@ impl SseState {
         }
     }
 
-    fn overlay_usage(&mut self, usage: &Value) {
-        if let Some(usage) = usage.as_object() {
+    fn append_thinking(&mut self, t: &str) {
+        if let Some(block) = self.open_native.as_mut()
+            && let Some(Value::String(thinking)) = block.get_mut("thinking")
+        {
+            thinking.push_str(t);
+        }
+    }
+
+    /// The native event keeps its usage; the chat surface moves it out.
+    fn overlay_usage(&mut self, usage: Option<&mut Value>) {
+        let usage = match usage {
+            Some(usage) if self.preserve_native => usage.clone(),
+            Some(usage) => usage.take(),
+            None => return,
+        };
+        if let Value::Object(usage) = usage {
             for (key, value) in usage {
                 if !value.is_null() {
-                    self.usage.insert(key.clone(), value.clone());
+                    self.usage.insert(key, value);
                 }
             }
         }

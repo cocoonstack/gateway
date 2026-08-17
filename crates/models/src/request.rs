@@ -83,15 +83,18 @@ impl GatewayRequest {
         )
     }
 
-    /// Whether this request must stay on its requested model. Reasoning
-    /// output replays only against the model that produced it (Anthropic
-    /// signatures, OpenAI encrypted reasoning), so both the request that
-    /// engages reasoning and the continuation carrying its output are pinned:
-    /// variants and fallback policy must not move either.
+    /// Whether this request must stay on its requested model: reasoning output
+    /// replays only against the model that produced it, so the request that
+    /// engages reasoning and the continuation carrying its output both pin.
     pub fn pins_reasoning_route(&self) -> bool {
         self.reasoning_engaged()
-            || self.has_anthropic_thinking_blocks()
-            || self.message.iter().any(|m| m.reasoning_details.is_some())
+            || self.message.iter().any(|m| {
+                m.reasoning_details.is_some()
+                    || m.parts
+                        .as_ref()
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
+            })
     }
 }
 

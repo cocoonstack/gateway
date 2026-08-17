@@ -2969,25 +2969,30 @@ fn chat_stream_response(
     )
 }
 
+/// The reasoning and message text of a buffered response as chunks, moved out.
+fn text_chunks(resp: &mut gw_models::GatewayResponse) -> Vec<gw_engines::StreamChunk> {
+    let mut chunks = Vec::new();
+    if !resp.reasoning.is_empty() || resp.reasoning_details.is_some() {
+        chunks.push(gw_engines::StreamChunk {
+            reasoning: std::mem::take(&mut resp.reasoning),
+            reasoning_details: resp.reasoning_details.take(),
+            ..Default::default()
+        });
+    }
+    if !resp.message.is_empty() {
+        chunks.push(gw_engines::StreamChunk {
+            delta: std::mem::take(&mut resp.message),
+            ..Default::default()
+        });
+    }
+    chunks
+}
+
 /// Chunks for an engine that returned a buffered response.
 fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let resp = &mut outcome.response;
     let mut chunks = if outcome.chunks.is_empty() {
-        let mut chunks = Vec::new();
-        if !resp.reasoning.is_empty() || resp.reasoning_details.is_some() {
-            chunks.push(gw_engines::StreamChunk {
-                reasoning: std::mem::take(&mut resp.reasoning),
-                reasoning_details: resp.reasoning_details.take(),
-                ..Default::default()
-            });
-        }
-        if !resp.message.is_empty() {
-            chunks.push(gw_engines::StreamChunk {
-                delta: std::mem::take(&mut resp.message),
-                ..Default::default()
-            });
-        }
-        chunks
+        text_chunks(resp)
     } else {
         std::mem::take(&mut outcome.chunks)
     };
@@ -3017,22 +3022,7 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         resp.anthropic_content = None;
         return chunks;
     }
-    let mut chunks = Vec::new();
-    // reasoning prose is redacted like the message; signed units survive only
-    // when the strip pass left them
-    if !resp.reasoning.is_empty() || resp.reasoning_details.is_some() {
-        chunks.push(gw_engines::StreamChunk {
-            reasoning: std::mem::take(&mut resp.reasoning),
-            reasoning_details: resp.reasoning_details.take(),
-            ..Default::default()
-        });
-    }
-    if !resp.message.is_empty() {
-        chunks.push(gw_engines::StreamChunk {
-            delta: std::mem::take(&mut resp.message),
-            ..Default::default()
-        });
-    }
+    let mut chunks = text_chunks(resp);
     if let Some(tc) = resp.tool_calls.take() {
         chunks.push(gw_engines::StreamChunk {
             tool_calls: Some(tc),
@@ -3049,7 +3039,9 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
     let encoder = gw_models::token_estimate::default_encoder();
     let mut tokens = encoder.encode_len(&chunk.delta) as i64;
-    tokens = tokens.saturating_add(encoder.encode_len(&chunk.reasoning) as i64);
+    if !chunk.reasoning.is_empty() {
+        tokens = tokens.saturating_add(encoder.encode_len(&chunk.reasoning) as i64);
+    }
     if let Some(tool_calls) = &chunk.tool_calls {
         tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
     }
@@ -3237,6 +3229,12 @@ fn messages_stream_response(
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
     let rx = spawn_stream_pipeline(&s, request, ak, "messages", started);
 
+    #[derive(Clone, Copy, PartialEq)]
+    enum BlockKind {
+        Text,
+        Thinking,
+    }
+
     struct St {
         queue: VecDeque<Event>,
         id: String,
@@ -3270,25 +3268,34 @@ fn messages_stream_response(
             ));
         }
 
-        fn open_text(&mut self) -> usize {
-            if let Some(idx) = self.text_idx {
+        /// A text or (for a non-Anthropic model's reasoning prose) unsigned
+        /// thinking block; thinking precedes text, so opening text closes it.
+        fn open_block(&mut self, kind: BlockKind) -> usize {
+            if let Some(idx) = *self.slot(kind) {
                 return idx;
             }
-            self.close_thinking();
+            if kind == BlockKind::Text {
+                self.close_block(BlockKind::Thinking);
+            }
             let idx = self.next_idx;
             self.next_idx += 1;
-            self.text_idx = Some(idx);
+            *self.slot(kind) = Some(idx);
+            let content_block = match kind {
+                BlockKind::Text => json!({"type":"text","text":""}),
+                BlockKind::Thinking => json!({"type":"thinking","thinking":"","signature":""}),
+            };
             self.queue.push_back(Self::ev(
                 "content_block_start",
-                json!({"type":"content_block_start","index":idx,
-                       "content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_start","index":idx,"content_block":content_block}),
             ));
             idx
         }
 
-        fn close_text(&mut self) {
-            self.close_thinking();
-            if let Some(idx) = self.text_idx.take() {
+        fn close_block(&mut self, kind: BlockKind) {
+            if kind == BlockKind::Text {
+                self.close_block(BlockKind::Thinking);
+            }
+            if let Some(idx) = self.slot(kind).take() {
                 self.queue.push_back(Self::ev(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":idx}),
@@ -3296,36 +3303,17 @@ fn messages_stream_response(
             }
         }
 
-        /// A non-Anthropic model's reasoning prose as an unsigned thinking
-        /// block ahead of the answer.
-        fn open_thinking(&mut self) -> usize {
-            if let Some(idx) = self.thinking_idx {
-                return idx;
-            }
-            let idx = self.next_idx;
-            self.next_idx += 1;
-            self.thinking_idx = Some(idx);
-            self.queue.push_back(Self::ev(
-                "content_block_start",
-                json!({"type":"content_block_start","index":idx,
-                       "content_block":{"type":"thinking","thinking":"","signature":""}}),
-            ));
-            idx
-        }
-
-        fn close_thinking(&mut self) {
-            if let Some(idx) = self.thinking_idx.take() {
-                self.queue.push_back(Self::ev(
-                    "content_block_stop",
-                    json!({"type":"content_block_stop","index":idx}),
-                ));
+        fn slot(&mut self, kind: BlockKind) -> &mut Option<usize> {
+            match kind {
+                BlockKind::Text => &mut self.text_idx,
+                BlockKind::Thinking => &mut self.thinking_idx,
             }
         }
 
         /// The wire pattern clients expect for a tool_use block: empty `input`
         /// in the start frame, the arguments as one input_json_delta, stop.
         fn emit_tool_block(&mut self, block: &Value) {
-            self.close_text();
+            self.close_block(BlockKind::Text);
             let idx = self.next_idx;
             self.next_idx += 1;
             self.queue.push_back(Self::ev(
@@ -3356,7 +3344,7 @@ fn messages_stream_response(
                     self.emit_tool_block(&block);
                 }
             }
-            self.close_text();
+            self.close_block(BlockKind::Text);
             let stop = self
                 .pending_finish
                 .take()
@@ -3418,7 +3406,7 @@ fn messages_stream_response(
                     }
                     if !c.reasoning.is_empty() {
                         self.ensure_message_start();
-                        let idx = self.open_thinking();
+                        let idx = self.open_block(BlockKind::Thinking);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
                             json!({"type":"content_block_delta","index":idx,
@@ -3427,7 +3415,7 @@ fn messages_stream_response(
                     }
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
-                        let idx = self.open_text();
+                        let idx = self.open_block(BlockKind::Text);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
                             json!({"type":"content_block_delta","index":idx,
@@ -3671,11 +3659,9 @@ async fn responses(
     terminal_response(&ctx, response).await
 }
 
-/// Streaming /v1/responses: the vendor's own event sequence forwarded verbatim
-/// (reasoning items, function calls, encrypted content); a synthesized
-/// created/delta/completed sequence only for engines that returned a buffered
-/// non-native reply. Live for real vendors, buffered-then-redacted when
-/// outbound DLP is on.
+/// Streaming /v1/responses: the vendor's event sequence forwarded verbatim; a
+/// synthesized created/delta/completed sequence only for a buffered non-native
+/// reply. Live for real vendors, buffered-then-redacted when outbound DLP is on.
 fn responses_stream_response(
     s: AppState,
     request: GatewayRequest,

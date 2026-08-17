@@ -1037,7 +1037,6 @@ async fn anthropic_budget_and_client_thinking_precedence() {
     assert_eq!(b["output_config"], serde_json::json!({"effort":"high"}));
     assert_eq!(b["max_tokens"], 12000 + 1024);
 
-    // the chat surface's own `thinking` passthrough wins over an effort
     let t = RecordingTransport::new(CLAUDE_OK);
     let mut req = reasoning_req(
         Protocol::AnthropicMessages,
@@ -1057,7 +1056,6 @@ async fn anthropic_budget_and_client_thinking_precedence() {
     assert_eq!(b["top_k"], 5);
     assert_eq!(b["max_tokens"], 1024);
 
-    // the native surface's typed thinking + output_config go through verbatim
     let t = RecordingTransport::new(CLAUDE_OK);
     let req = reasoning_req(
         Protocol::AnthropicMessages,
@@ -1129,7 +1127,6 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     assert!(b.get("max_tokens").is_none());
     assert_eq!(b["temperature"], 0.2, "the OpenAI wire keeps its own knobs");
 
-    // the native surface's thinking budget becomes an effort; output_config wins
     for (reasoning, want) in [
         (
             gw_models::ReasoningParam {

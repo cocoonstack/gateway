@@ -4,6 +4,7 @@
 //! `raw_usage` for the CommonUsage DAG node.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_protocol::reasoning::is_thinking_block;
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -27,8 +28,7 @@ impl OpenAiEngine {
                 // OpenAI: assistant tool-call turns carry content: null
                 let content = match (m.parts, m.content) {
                     (Some(Value::Array(parts)), _) if assistant => {
-                        // a native-surface turn replays its thinking blocks; the
-                        // OpenAI wire knows them only as reasoning prose
+                        // native-surface thinking blocks are reasoning prose on this wire
                         Value::Array(strip_thinking_blocks(parts, &mut reasoning_content))
                     }
                     (Some(parts), _) => parts,
@@ -224,8 +224,9 @@ fn apply_sse_event(
         .get_mut("choices")
         .and_then(|choices| choices.get_mut(0))
         .and_then(|choice| choice.get_mut("delta"))
+        .and_then(Value::as_object_mut)
     {
-        if let Some(Value::String(text)) = delta.get_mut("content").map(Value::take)
+        if let Some(text) = take_str(delta, "content")
             && !text.is_empty()
         {
             full.push_str(&text);
@@ -235,14 +236,10 @@ fn apply_sse_event(
                 ..Default::default()
             });
         }
-        let reasoning = match delta.get_mut("reasoning_content").map(Value::take) {
-            Some(Value::String(text)) => text,
-            _ => match delta.get_mut("reasoning").map(Value::take) {
-                Some(Value::String(text)) => text,
-                _ => String::new(),
-            },
-        };
-        let reasoning_details = match delta.get_mut("reasoning_details").map(Value::take) {
+        let reasoning = take_str(delta, "reasoning_content")
+            .or_else(|| take_str(delta, "reasoning"))
+            .unwrap_or_default();
+        let reasoning_details = match delta.remove("reasoning_details") {
             Some(Value::Array(details)) => Some(details),
             _ => None,
         };
@@ -254,10 +251,7 @@ fn apply_sse_event(
                 ..Default::default()
             });
         }
-        tool_calls = delta
-            .get_mut("tool_calls")
-            .map(Value::take)
-            .filter(|t| !t.is_null());
+        tool_calls = delta.remove("tool_calls").filter(|t| !t.is_null());
     }
     if let Some(mut tool_calls) = tool_calls {
         withhold_block_open_arguments(&mut tool_calls);
@@ -402,7 +396,6 @@ fn normalize_tools_openai(tools: Value) -> Value {
     )
 }
 
-/// Copy token fields + keep the raw usage subtree bytes for the DAG node.
 /// The request's `reasoning_effort`: the client's own, else derived from an
 /// Anthropic-dialect request — `output_config.effort` (same vocabulary), a
 /// `thinking` budget, or an OpenRouter budget. `adaptive` without an effort
@@ -430,10 +423,7 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
 /// Drop Anthropic thinking blocks from a replayed assistant turn, folding
 /// their prose into `reasoning_content` when the client sent none.
 fn strip_thinking_blocks(parts: Vec<Value>, reasoning_content: &mut Option<String>) -> Vec<Value> {
-    if !parts
-        .iter()
-        .any(|p| matches!(p["type"].as_str(), Some("thinking" | "redacted_thinking")))
-    {
+    if !parts.iter().any(is_thinking_block) {
         return parts;
     }
     let mut prose = String::new();
@@ -461,6 +451,7 @@ fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {
     }
 }
 
+/// Copy token fields + keep the raw usage subtree bytes for the DAG node.
 fn apply_openai_usage(resp: &mut GatewayResponse, usage: Value) {
     if usage.is_null() {
         return;

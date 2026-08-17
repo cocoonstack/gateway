@@ -784,8 +784,7 @@ fn walk_native_event(
         }
         return hits;
     }
-    // Responses text/summary deltas: joined per output item so a pattern split
-    // across frames still matches
+    // Responses deltas join per output item so a pattern split across frames matches
     if let Some(index) = event["output_index"].as_u64()
         && let Some(text) = event["delta"].as_str()
     {
@@ -930,21 +929,15 @@ pub fn strip_unservable_thinking(
         }
         0
     };
-    let native = response
+    let mut native = response
         .anthropic_content
         .as_mut()
         .and_then(serde_json::Value::as_array_mut);
-    let native = match native {
-        Some(blocks) => {
-            for block in blocks.iter_mut() {
-                if block.as_object().is_some_and(is_signed_thinking_block) {
-                    walk_signed_prose(block, &mut |text, _| visit(text));
-                }
-            }
-            Some(blocks)
+    for block in native.iter_mut().flat_map(|blocks| blocks.iter_mut()) {
+        if block.as_object().is_some_and(is_signed_thinking_block) {
+            walk_signed_prose(block, &mut |text, _| visit(text));
         }
-        None => None,
-    };
+    }
     let signed_reasoning = has_signed_unit(response.reasoning_details.as_deref())
         || chunks
             .iter()
@@ -1721,8 +1714,6 @@ mod tests {
                 .contains("[REDACTED_EMAIL]")
         );
 
-        // outbound: the signed unit's prose cannot be redacted, so reasoning is
-        // stripped as a whole — non-stream via the response, stream via chunks
         let mut response = GatewayResponse {
             message: "clean".to_owned(),
             reasoning: "prose jane@corp.com".to_owned(),
@@ -1747,7 +1738,6 @@ mod tests {
         assert_eq!(strip_unservable_thinking(&sec(), &mut streamed, &chunks), 1);
         assert!(streamed.reasoning.is_empty());
 
-        // unsigned reasoning prose is plain text: redacted, not stripped
         let mut unsigned = GatewayResponse {
             reasoning: "prose jane@corp.com".to_owned(),
             ..Default::default()

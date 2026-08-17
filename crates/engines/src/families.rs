@@ -760,16 +760,6 @@ impl ResponsesEngine {
         )
     }
 
-    /// The client's requested name when a variant/fallback served the call;
-    /// native events must not leak the served model.
-    fn model_override(&self) -> Option<&str> {
-        self.base
-            .request
-            .model_param_v2
-            .as_ref()
-            .and_then(|param| param.fallback_from.as_deref())
-    }
-
     /// Streaming Responses pumped live: delta frames forwarded through
     /// `stream_tx` as they arrive; `response.completed` carries final usage.
     async fn run_stream(&mut self) -> GResult<EngineOutcome> {
@@ -786,7 +776,7 @@ impl ResponsesEngine {
         };
         crate::pump::reject_json_error("responses", status, &reply.body)?;
         let mut full = String::new();
-        let model_override = self.model_override();
+        let model_override = self.base.model_override();
         let r = crate::pump::pump_sse(
             "responses",
             reply.body,
@@ -841,7 +831,7 @@ impl ResponsesEngine {
         };
         let mut full = String::new();
         let mut chunks = Vec::new();
-        let model_override = self.model_override();
+        let model_override = self.base.model_override();
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
@@ -929,11 +919,9 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame to the accumulating response. Every frame
-/// moves out as a native event for the Responses view to forward verbatim
-/// (reasoning items, function calls and all); text is accumulated from
-/// `response.output_text.delta` and the final usage/status read from
-/// `response.completed`.
+/// Apply one Responses SSE frame: every frame moves out as a native event for
+/// the view to forward verbatim; text accumulates from `output_text.delta`,
+/// usage/status come from `response.completed`.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,

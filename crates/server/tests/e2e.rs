@@ -432,8 +432,6 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         }),
     ));
 
-    // thinking on an OpenAI model crosses over as a reasoning effort, and
-    // the reasoning prose comes back as an unsigned thinking block
     let cross = json!({
         "model":"gpt-test",
         "max_tokens":128,
@@ -2766,7 +2764,6 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         assert!(upstream.get("reasoning_effort").is_none());
     }
 
-    // the client replays the assistant turn as it received it
     let mut history = first["messages"].as_array().unwrap().clone();
     let mut assistant = message.clone();
     assistant["role"] = "assistant".into();
