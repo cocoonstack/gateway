@@ -196,9 +196,8 @@ impl Transport for HttpTransport {
             }
         };
         let status = resp.status().as_u16();
-        // an error status is a body to parse, never a stream — Google answers a
-        // failed streamGenerateContent with text/event-stream and a bare JSON
-        // error, which would decode as an empty, successful stream
+        // an error status is a body to parse, never a stream: Google sends a failed
+        // streamGenerateContent as text/event-stream carrying a bare JSON error
         let is_sse = status < 400
             && resp
                 .headers()

@@ -564,7 +564,6 @@ impl MockTransport {
     }
 
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        // transcription uploads are multipart with a `file` part
         if req.url.ends_with("/audio/transcriptions") {
             let language = Self::form_field(&req.body, "language");
             return Self::ok_json(

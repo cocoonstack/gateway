@@ -361,7 +361,6 @@ impl ModelEngine for ImageEngine {
         };
         require_non_empty(&prompt, "image prompt")?;
         let (status, v, is_edit) = if let Some(image) = image {
-            // edits upload the source (and mask) as files
             let image = decode_b64(&image, "image")?;
             let mut form = Form::new(&image);
             form.text("model", &model);
@@ -417,7 +416,7 @@ impl ModelEngine for ImageEngine {
         };
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
-        // gpt-image usage: input/output tokens (image + text details)
+        // gpt-image reports input/output tokens
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
