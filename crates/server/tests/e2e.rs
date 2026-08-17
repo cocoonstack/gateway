@@ -4136,6 +4136,7 @@ access_keys: [{ak: ak-cache, product: demo, qps: 100, daily_token_quota: 1000000
 models:
   - {name: claude-cached, protocol: anthropic-messages, prompt_cache: true}
   - {name: claude-plain, protocol: anthropic-messages}
+  - {name: claude-split, protocol: anthropic-messages, variants: [{model: claude-cached, weight: 1}]}
 accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
 "#;
     let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -4143,7 +4144,11 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     let fixture = Arc::new(CaptureFixture::default());
     let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
 
-    for (model, cached) in [("claude-cached", true), ("claude-plain", false)] {
+    for (model, cached) in [
+        ("claude-cached", true),
+        ("claude-plain", false),
+        ("claude-split", true), // the served variant's knob, not the public name's
+    ] {
         let body = json!({"model":model,"max_tokens":32,
             "messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hello"}]});
         let resp = app
@@ -4156,7 +4161,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let sent = fixture.body.lock().unwrap().clone().expect("upstream body");
+        let sent = fixture.body.lock().unwrap().take().expect("upstream body");
         let marked = sent["system"][0]["cache_control"]["type"] == "ephemeral"
             && sent["messages"][0]["content"][0]["cache_control"]["type"] == "ephemeral";
         assert_eq!(marked, cached, "{model}: {sent}");

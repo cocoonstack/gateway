@@ -126,7 +126,8 @@ pub struct ModelConf {
     /// Weighted routing split across other declared models (canary/gray);
     /// empty = this name serves itself. A self-referencing entry keeps a
     /// share on this model. Once routed, the variant's own qpm/cache/
-    /// token_rate apply — model-level limits guard backend capacity.
+    /// token_rate/prompt_cache apply — model-level limits guard backend
+    /// capacity.
     #[serde(default)]
     pub variants: Vec<VariantConf>,
 }

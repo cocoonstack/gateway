@@ -112,9 +112,7 @@ impl DagNode for ResolveModel {
             .as_mut()
             .ok_or_else(|| GatewayError::bad_request("request missing model param"))?;
         let name = &param.model_name;
-        let mut prompt_cache = false;
         let mt = if let Some(conf) = ctx.cfg.find_model(name) {
-            prompt_cache = conf.prompt_cache;
             conf.protocol().ok_or_else(|| {
                 GatewayError::internal(format!("config maps `{name}` to unknown type"))
             })?
@@ -134,7 +132,6 @@ impl DagNode for ResolveModel {
         }
         let decision = format!("{name} -> {mt}");
         param.protocol = mt;
-        ctx.request.prompt_cache = prompt_cache;
         ctx.decide("resolve_model", decision);
         Ok(())
     }
@@ -344,7 +341,12 @@ impl DagNode for SelectAccount {
             .request
             .protocol()
             .ok_or_else(|| GatewayError::internal("select_account before resolve_model"))?;
-        let provider = model_provider(ctx);
+        // post-variant: the served model's knobs ride the provider lookup
+        let conf = ctx
+            .cfg
+            .find_model(served_model(ctx.request.model_param_v2.as_ref()));
+        ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
+        let provider = conf.and_then(|m| m.provider.as_deref());
         let account = ctx
             .state
             .pool
