@@ -28,7 +28,7 @@ use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
     ModelParamV2, SttParams, TtsParams, TypedParams,
 };
-use gw_protocol::anthropic::{AnthUsage, MessagesRequest};
+use gw_protocol::anthropic::{AnthUsage, MessagesRequest, tool_use_to_tool_calls};
 use gw_protocol::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
 };
@@ -2477,6 +2477,15 @@ fn finish_or_stop(fr: &str) -> &str {
     if fr.is_empty() { "stop" } else { fr }
 }
 
+/// Engine tool calls in OpenAI wire shape: the anthropic engine hands over
+/// native `tool_use` blocks, the OpenAI engines already-shaped calls.
+fn openai_tool_calls(calls: Value) -> Vec<Value> {
+    match calls {
+        Value::Array(a) => tool_use_to_tool_calls(&a),
+        _ => Vec::new(),
+    }
+}
+
 /// finish_reason mapping, anthropic → openai.
 fn finish_openai(fr: &str) -> String {
     match fr {
@@ -2651,8 +2660,24 @@ async fn chat_completions(
 
     if let Some(tc) = outcome.response.tool_calls.take() {
         let calls: Vec<gw_protocol::openai::ToolCall> =
-            serde_json::from_value(tc).unwrap_or_default();
-        let resp = ChatCompletionResponse::tool_calls(id, created, model_out, calls, usage);
+            match serde_json::from_value(Value::Array(openai_tool_calls(tc))) {
+                Ok(calls) => calls,
+                Err(e) => {
+                    let response = error_response(
+                        502,
+                        format!("engine tool calls do not render as OpenAI tool_calls: {e}"),
+                    );
+                    return terminal_response(&ctx, response).await;
+                }
+            };
+        let resp = ChatCompletionResponse::tool_calls(
+            id,
+            created,
+            model_out,
+            std::mem::take(&mut outcome.response.message),
+            calls,
+            usage,
+        );
         let response = (StatusCode::OK, Json(resp)).into_response();
         return terminal_response(&ctx, response).await;
     }
@@ -2846,15 +2871,11 @@ fn chat_stream_response(
                         }
                     }
                     if let Some(tc) = c.tool_calls.take() {
-                        let calls = match tc {
-                            Value::Array(a) => a,
-                            _ => Vec::new(),
-                        };
                         let chunk = ChatCompletionChunk::tool_calls(
                             &self.id,
                             self.created,
                             &self.model,
-                            calls,
+                            openai_tool_calls(tc),
                         );
                         if let Ok(payload) = serde_json::to_string(&chunk) {
                             self.queue.push_back(Event::default().data(payload));

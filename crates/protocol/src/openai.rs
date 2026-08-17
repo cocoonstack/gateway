@@ -168,11 +168,13 @@ impl ChatCompletionResponse {
         )
     }
 
-    /// Assistant turn that is a tool call (content null, finish_reason=tool_calls).
+    /// Assistant turn that is a tool call (finish_reason=tool_calls); any
+    /// text the model emitted alongside rides in `content`, else null.
     pub fn tool_calls(
         id: impl Into<String>,
         created: i64,
         model: impl Into<String>,
+        content: String,
         calls: Vec<ToolCall>,
         usage: Usage,
     ) -> Self {
@@ -182,7 +184,7 @@ impl ChatCompletionResponse {
             model,
             ChatMessage {
                 role: "assistant".to_owned(),
-                content: None,
+                content: (!content.is_empty()).then_some(MessageContent::Text(content)),
                 tool_calls: Some(calls),
                 ..Default::default()
             },
@@ -351,6 +353,7 @@ mod tests {
             "id",
             1,
             "m",
+            String::new(),
             vec![ToolCall {
                 id: "call-1".into(),
                 kind: "function".into(),
@@ -368,6 +371,17 @@ mod tests {
             v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "get_weather"
         );
+
+        let with_text = ChatCompletionResponse::tool_calls(
+            "id",
+            1,
+            "m",
+            "Looking first.".into(),
+            vec![],
+            Usage::default(),
+        );
+        let v = serde_json::to_value(&with_text).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Looking first.");
     }
 
     #[test]
