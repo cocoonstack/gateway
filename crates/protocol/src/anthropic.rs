@@ -4,7 +4,7 @@
 //! and tools. The streaming event sequence is emitted by the views layer.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessagesRequest {
@@ -77,18 +77,24 @@ pub struct AnthUsage {
 /// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
 /// Anthropic `tool_use` content blocks. `arguments` is a JSON string on the
 /// OpenAI wire; it parses into the block's structured `input` (kept verbatim
-/// when unparseable). Entries without a `function` are skipped.
-pub fn tool_calls_to_tool_use(calls: &[Value]) -> Vec<Value> {
+/// when unparseable). Entries without a `function` object are skipped.
+pub fn tool_calls_to_tool_use(calls: Vec<Value>) -> Vec<Value> {
     calls
-        .iter()
-        .filter(|c| c.get("function").is_some())
-        .map(|c| {
-            let f = &c["function"];
-            let input = f["arguments"]
-                .as_str()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .unwrap_or_else(|| f["arguments"].clone());
-            serde_json::json!({"type": "tool_use", "id": c["id"], "name": f["name"], "input": input})
+        .into_iter()
+        .filter_map(|mut c| {
+            let Some(Value::Object(mut f)) = c.get_mut("function").map(Value::take) else {
+                return None;
+            };
+            let input = match f.remove("arguments") {
+                Some(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+                other => other.unwrap_or_default(),
+            };
+            let mut block = Map::new();
+            block.insert("type".into(), "tool_use".into());
+            block.insert("id".into(), c["id"].take());
+            block.insert("name".into(), f.remove("name").unwrap_or_default());
+            block.insert("input".into(), input);
+            Some(Value::Object(block))
         })
         .collect()
 }
@@ -147,7 +153,7 @@ mod tests {
         assert_eq!(calls[3]["index"], 1);
         assert_eq!(calls[3]["function"]["arguments"], "{}");
         assert_eq!(index, 2);
-        let back = tool_calls_to_tool_use(&calls);
+        let back = tool_calls_to_tool_use(calls);
         assert_eq!(back[0]["input"], json!({"command":"ls -la"}));
     }
 
@@ -159,7 +165,7 @@ mod tests {
             json!({"id":"call_2","function":{"name":"raw","arguments":"not json"}}),
             json!({"type":"tool_use","id":"native"}),
         ];
-        let blocks = tool_calls_to_tool_use(&calls);
+        let blocks = tool_calls_to_tool_use(calls);
         assert_eq!(blocks.len(), 2, "no-function entries are skipped");
         assert_eq!(blocks[0]["type"], "tool_use");
         assert_eq!(blocks[0]["id"], "call_1");

@@ -19,21 +19,26 @@ impl ClaudeEngine {
             if m.role == gw_consts::role::SYSTEM {
                 continue;
             }
+            let content = m.parts.unwrap_or(Value::String(m.content));
+            if m.role == gw_consts::role::TOOL {
+                let block = tool_result_block(m.tool_call_id, content);
+                push_turn(&mut messages, "user", Value::Array(vec![block]));
+                continue;
+            }
             let role = if m.role == gw_consts::role::AI {
                 "assistant"
             } else {
                 "user"
             };
-            // preserve multimodal content blocks, mirroring the OpenAI path's `parts`
-            let content = match m.parts {
-                Some(parts) => parts,
-                None => Value::String(m.content),
+            let content = match m.tool_calls {
+                Some(Value::Array(calls)) => {
+                    let mut blocks = content_blocks(content);
+                    blocks.extend(gw_protocol::anthropic::tool_calls_to_tool_use(calls));
+                    Value::Array(blocks)
+                }
+                _ => content,
             };
-            // built by hand — json! interpolation would deep-copy the moved content
-            let mut msg = Map::new();
-            msg.insert("role".into(), role.into());
-            msg.insert("content".into(), content);
-            messages.push(Value::Object(msg));
+            push_turn(&mut messages, role, content);
         }
 
         let param = self.base.param()?;
@@ -292,6 +297,61 @@ pub fn anthropic_native_chunks(
             ..Default::default()
         })
         .collect()
+}
+
+/// A `role: "tool"` message as a `tool_result` block; empty output omits
+/// `content` rather than sending an empty text, which the upstream rejects.
+fn tool_result_block(tool_use_id: Option<String>, content: Value) -> Value {
+    let mut block = Map::new();
+    block.insert("type".into(), "tool_result".into());
+    block.insert("tool_use_id".into(), tool_use_id.unwrap_or_default().into());
+    if !is_empty_content(&content) {
+        block.insert("content".into(), content);
+    }
+    Value::Object(block)
+}
+
+fn is_empty_content(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text.is_empty(),
+        Value::Array(blocks) => blocks.is_empty(),
+        _ => true,
+    }
+}
+
+fn content_blocks(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(blocks) => blocks,
+        Value::String(text) if !text.is_empty() => {
+            let mut block = Map::new();
+            block.insert("type".into(), "text".into());
+            block.insert("text".into(), Value::String(text));
+            vec![Value::Object(block)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Append a turn; empty content is dropped and same-role neighbours merge into
+/// one block list, since the anthropic wire alternates roles and rejects empty
+/// turns.
+fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
+    if is_empty_content(&content) {
+        return;
+    }
+    if let Some(last) = messages.last_mut()
+        && last["role"] == role
+    {
+        let mut blocks = content_blocks(last["content"].take());
+        blocks.extend(content_blocks(content));
+        last["content"] = Value::Array(blocks);
+        return;
+    }
+    // built by hand — json! interpolation would deep-copy the moved content
+    let mut msg = Map::new();
+    msg.insert("role".into(), role.into());
+    msg.insert("content".into(), content);
+    messages.push(Value::Object(msg));
 }
 
 /// Tool definitions in the anthropic wire shape. Cross-protocol requests carry

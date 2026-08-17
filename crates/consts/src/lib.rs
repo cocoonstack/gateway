@@ -19,6 +19,7 @@ pub mod role {
     pub const AI: &str = "assistant";
     pub const MODEL: &str = "model";
     pub const SYSTEM: &str = "system";
+    pub const TOOL: &str = "tool";
     pub const STORAGE: &str = "storage";
 }
 

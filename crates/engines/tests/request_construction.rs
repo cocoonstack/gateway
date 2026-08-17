@@ -796,3 +796,105 @@ async fn search_request_shape() {
     assert_eq!(b["count"], 5);
     assert!(t.url().contains("/search"), "url: {}", t.url());
 }
+
+#[tokio::test]
+async fn anthropic_chat_history_tool_round_trip() {
+    let t = RecordingTransport::new(
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut call = ChatMsg::text("assistant", "I'll list them.");
+    call.tool_calls = Some(serde_json::json!([
+        {"id":"toolu_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}},
+        {"id":"toolu_2","type":"function","function":{"name":"shell","arguments":"{\"command\":\"mkdir -p /tmp/x\"}"}}
+    ]));
+    let mut result1 = ChatMsg::text("tool", "a.txt");
+    result1.tool_call_id = Some("toolu_1".into());
+    let mut result2 = ChatMsg::text("tool", "");
+    result2.tool_call_id = Some("toolu_2".into());
+    let req = GatewayRequest {
+        message: vec![
+            ChatMsg::text("user", "list files"),
+            call,
+            result1,
+            result2,
+            ChatMsg::text("user", "Time is almost up."),
+        ],
+        model_param_v2: Some(ModelParamV2::with_name(
+            Protocol::AnthropicMessages,
+            "claude-sonnet",
+        )),
+        ..Default::default()
+    };
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let msgs = t.body_json()["messages"].clone();
+    assert_eq!(msgs.as_array().unwrap().len(), 3, "turns: {msgs}");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["content"], "list files");
+
+    let assistant = &msgs[1];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"][0]["type"], "text");
+    assert_eq!(assistant["content"][0]["text"], "I'll list them.");
+    assert_eq!(assistant["content"][1]["type"], "tool_use");
+    assert_eq!(assistant["content"][1]["id"], "toolu_1");
+    assert_eq!(assistant["content"][1]["name"], "shell");
+    assert_eq!(assistant["content"][1]["input"]["command"], "ls");
+    assert_eq!(assistant["content"][2]["id"], "toolu_2");
+
+    let results = &msgs[2];
+    assert_eq!(results["role"], "user");
+    let blocks = results["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 3, "results turn: {results}");
+    assert_eq!(blocks[0]["type"], "tool_result");
+    assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
+    assert_eq!(blocks[0]["content"], "a.txt");
+    assert_eq!(blocks[1]["tool_use_id"], "toolu_2");
+    assert!(
+        blocks[1].get("content").is_none(),
+        "empty tool output must omit content: {}",
+        blocks[1]
+    );
+    assert_eq!(blocks[2]["type"], "text");
+    assert_eq!(blocks[2]["text"], "Time is almost up.");
+}
+
+#[tokio::test]
+async fn anthropic_chat_history_drops_empty_turns_and_alternates() {
+    let t = RecordingTransport::new(
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut silent_call = ChatMsg::text("assistant", "");
+    silent_call.tool_calls = Some(serde_json::json!([
+        {"id":"toolu_9","type":"function","function":{"name":"shell","arguments":"{}"}}
+    ]));
+    let mut result = ChatMsg::text("tool", "done");
+    result.tool_call_id = Some("toolu_9".into());
+    let req = GatewayRequest {
+        message: vec![
+            ChatMsg::text("user", "first"),
+            ChatMsg::text("assistant", ""),
+            ChatMsg::text("user", "again"),
+            silent_call,
+            result,
+        ],
+        model_param_v2: Some(ModelParamV2::with_name(
+            Protocol::AnthropicMessages,
+            "claude-sonnet",
+        )),
+        ..Default::default()
+    };
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let msgs = t.body_json()["messages"].clone();
+    let roles: Vec<&str> = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "turns: {msgs}");
+    assert_eq!(msgs[0]["content"][0]["text"], "first");
+    assert_eq!(msgs[0]["content"][1]["text"], "again");
+    assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+    assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(msgs[2]["content"][0]["tool_use_id"], "toolu_9");
+}

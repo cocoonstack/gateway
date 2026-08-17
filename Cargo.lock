@@ -903,6 +903,7 @@ dependencies = [
  "futures",
  "gw-consts",
  "gw-models",
+ "gw-protocol",
  "hex",
  "hmac 0.12.1",
  "metrics",
