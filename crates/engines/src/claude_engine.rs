@@ -19,8 +19,10 @@ impl ClaudeEngine {
             if m.role == gw_consts::role::SYSTEM {
                 continue;
             }
+            let content = m.parts.unwrap_or(Value::String(m.content));
             if m.role == gw_consts::role::TOOL {
-                push_turn(&mut messages, "user", vec![tool_result_block(m)]);
+                let block = tool_result_block(m.tool_call_id, content);
+                push_turn(&mut messages, "user", Value::Array(vec![block]));
                 continue;
             }
             let role = if m.role == gw_consts::role::AI {
@@ -28,19 +30,15 @@ impl ClaudeEngine {
             } else {
                 "user"
             };
-            // preserve multimodal content blocks, mirroring the OpenAI path's `parts`
-            let content = match m.parts {
-                Some(parts) => parts,
-                None => Value::String(m.content),
-            };
-            match m.tool_calls {
-                Some(Value::Array(calls)) if role == "assistant" => {
+            let content = match m.tool_calls {
+                Some(Value::Array(calls)) => {
                     let mut blocks = content_blocks(content);
-                    blocks.extend(gw_protocol::anthropic::tool_calls_to_tool_use(&calls));
-                    push_turn(&mut messages, role, blocks);
+                    blocks.extend(gw_protocol::anthropic::tool_calls_to_tool_use(calls));
+                    Value::Array(blocks)
                 }
-                _ => push_turn_content(&mut messages, role, content),
-            }
+                _ => content,
+            };
+            push_turn(&mut messages, role, content);
         }
 
         let param = self.base.param()?;
@@ -301,79 +299,58 @@ pub fn anthropic_native_chunks(
         .collect()
 }
 
-/// An OpenAI `role: "tool"` message as the anthropic `tool_result` block; a
-/// silent command has no content field rather than an empty one, which the
-/// upstream rejects.
-fn tool_result_block(m: gw_models::ChatMsg) -> Value {
+/// A `role: "tool"` message as a `tool_result` block; empty output omits
+/// `content` rather than sending an empty text, which the upstream rejects.
+fn tool_result_block(tool_use_id: Option<String>, content: Value) -> Value {
     let mut block = Map::new();
     block.insert("type".into(), "tool_result".into());
-    block.insert(
-        "tool_use_id".into(),
-        m.tool_call_id.unwrap_or_default().into(),
-    );
-    match m.parts {
-        Some(parts) => {
-            block.insert("content".into(), parts);
-        }
-        None if !m.content.is_empty() => {
-            block.insert("content".into(), m.content.into());
-        }
-        None => {}
+    block.insert("tool_use_id".into(), tool_use_id.unwrap_or_default().into());
+    if !is_empty_content(&content) {
+        block.insert("content".into(), content);
     }
     Value::Object(block)
 }
 
-/// Content as anthropic blocks: a string becomes one text block (none when
-/// empty), an array is already blocks.
+fn is_empty_content(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text.is_empty(),
+        Value::Array(blocks) => blocks.is_empty(),
+        _ => true,
+    }
+}
+
 fn content_blocks(content: Value) -> Vec<Value> {
     match content {
         Value::Array(blocks) => blocks,
-        Value::String(text) if !text.is_empty() => vec![json!({"type": "text", "text": text})],
+        Value::String(text) if !text.is_empty() => {
+            let mut block = Map::new();
+            block.insert("type".into(), "text".into());
+            block.insert("text".into(), Value::String(text));
+            vec![Value::Object(block)]
+        }
         _ => Vec::new(),
     }
 }
 
-/// Append a turn whose content stays in its wire form (string or blocks);
-/// consecutive same-role turns merge, since the anthropic wire alternates.
-fn push_turn_content(messages: &mut Vec<Value>, role: &str, content: Value) {
-    if messages.last().is_some_and(|m| m["role"] == role) {
-        push_turn(messages, role, content_blocks(content));
+/// Append a turn; empty content is dropped and same-role neighbours merge into
+/// one block list, since the anthropic wire alternates roles and rejects empty
+/// turns.
+fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
+    if is_empty_content(&content) {
         return;
     }
-    let empty = match &content {
-        Value::String(text) => text.is_empty(),
-        Value::Array(blocks) => blocks.is_empty(),
-        _ => true,
-    };
-    if empty {
+    if let Some(last) = messages.last_mut()
+        && last["role"] == role
+    {
+        let mut blocks = content_blocks(last["content"].take());
+        blocks.extend(content_blocks(content));
+        last["content"] = Value::Array(blocks);
         return;
     }
     // built by hand — json! interpolation would deep-copy the moved content
     let mut msg = Map::new();
     msg.insert("role".into(), role.into());
     msg.insert("content".into(), content);
-    messages.push(Value::Object(msg));
-}
-
-/// Append blocks to the turn for `role`, merging into a trailing turn of the
-/// same role (its string content is promoted to a text block first). Empty
-/// turns are dropped: the upstream rejects them.
-fn push_turn(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
-    if blocks.is_empty() {
-        return;
-    }
-    if let Some(last) = messages.last_mut()
-        && last["role"] == role
-    {
-        let existing = content_blocks(last["content"].take());
-        let mut merged = existing;
-        merged.extend(blocks);
-        last["content"] = Value::Array(merged);
-        return;
-    }
-    let mut msg = Map::new();
-    msg.insert("role".into(), role.into());
-    msg.insert("content".into(), Value::Array(blocks));
     messages.push(Value::Object(msg));
 }
 

@@ -3137,7 +3137,7 @@ fn anthropic_tool_blocks(tool_calls: Option<Value>) -> Vec<Value> {
             .filter(|b| b["type"] == "tool_use")
             .collect()
     } else {
-        gw_protocol::anthropic::tool_calls_to_tool_use(&blocks)
+        gw_protocol::anthropic::tool_calls_to_tool_use(blocks)
     }
 }
 

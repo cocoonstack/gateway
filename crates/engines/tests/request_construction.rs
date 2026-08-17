@@ -895,6 +895,6 @@ async fn anthropic_chat_history_drops_empty_turns_and_alternates() {
     assert_eq!(msgs[0]["content"][0]["text"], "first");
     assert_eq!(msgs[0]["content"][1]["text"], "again");
     assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
-    assert!(msgs[1]["content"].as_array().unwrap().len() == 1);
+    assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
     assert_eq!(msgs[2]["content"][0]["tool_use_id"], "toolu_9");
 }
