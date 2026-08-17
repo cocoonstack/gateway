@@ -112,7 +112,9 @@ impl DagNode for ResolveModel {
             .as_mut()
             .ok_or_else(|| GatewayError::bad_request("request missing model param"))?;
         let name = &param.model_name;
+        let mut prompt_cache = false;
         let mt = if let Some(conf) = ctx.cfg.find_model(name) {
+            prompt_cache = conf.prompt_cache;
             conf.protocol().ok_or_else(|| {
                 GatewayError::internal(format!("config maps `{name}` to unknown type"))
             })?
@@ -132,6 +134,7 @@ impl DagNode for ResolveModel {
         }
         let decision = format!("{name} -> {mt}");
         param.protocol = mt;
+        ctx.request.prompt_cache = prompt_cache;
         ctx.decide("resolve_model", decision);
         Ok(())
     }

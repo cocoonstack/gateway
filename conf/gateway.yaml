@@ -163,6 +163,10 @@ models:
     # Optional per-model knobs (uncomment to use):
     #   billing weights per token component (cache reads cheaper, writes dearer)
     # token_rate: {read_cache: 0.1, write_cache: 1.25}
+    #   anthropic-messages models: mark the system prompt and the latest user
+    #   turn as prompt-cache breakpoints, so multi-turn prefixes bill at the
+    #   cache-read rate (pair with token_rate)
+    # prompt_cache: true
     #   weighted canary split across declared same-protocol models, sticky per user
     # variants: [{model: cached-mini, weight: 90}, {model: qpm-mini, weight: 10}]
   - name: spark-lite # e2e: account cooldown (sole account stays down -> cooldown -> recovers on expiry)

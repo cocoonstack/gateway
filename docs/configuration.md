@@ -107,6 +107,7 @@ models:
     token_rate:                      # optional per-component billing weights
       read_cache: 0.1                #   cache reads at 10% of the input price
       write_cache: 1.25              #   (prompt/completion/reasoning default 1.0)
+    prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
       - {model: gpt-4o-next, weight: 10}
@@ -114,7 +115,12 @@ models:
 
 `token_rate` weights scale cost and quota consumption per token component; the
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
-is the weighted platform total. `variants` splits a public name across other
+is the weighted platform total. `prompt_cache` (anthropic-messages models)
+marks the system prompt and the latest user turn as Anthropic prompt-cache
+breakpoints, so each turn of a conversation re-reads its prefix at the
+cache-read rate; a prompt below the vendor's minimum cacheable length is
+simply not cached, and a long one-shot prompt pays the cache-write premium
+once, which is why the knob is per model and off by default. `variants` splits a public name across other
 declared same-protocol models (one level): entitlement and the per-(AK, model)
 daily counter judge the public name, billing prices the served variant, and
 the response echoes the requested name. Selection hashes the effective user,

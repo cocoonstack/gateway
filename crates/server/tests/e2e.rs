@@ -4098,3 +4098,67 @@ accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messag
         assert_eq!(calls[1]["function"]["arguments"], "{}");
     }
 }
+
+#[tokio::test]
+async fn model_prompt_cache_knob_reaches_the_anthropic_wire() {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CaptureFixture {
+        body: Mutex<Option<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for CaptureFixture {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            *self.body.lock().unwrap() = Some(serde_json::from_slice(&request.body).unwrap());
+            let response = json!({
+                "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+                "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+                "usage":{"input_tokens":10,"output_tokens":1}
+            });
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&response).unwrap().into(),
+                ),
+            })
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {dlp_redact: false, detect_secrets: false}
+access_keys: [{ak: ak-cache, product: demo, qps: 100, daily_token_quota: 1000000}]
+models:
+  - {name: claude-cached, protocol: anthropic-messages, prompt_cache: true}
+  - {name: claude-plain, protocol: anthropic-messages}
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let fixture = Arc::new(CaptureFixture::default());
+    let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
+
+    for (model, cached) in [("claude-cached", true), ("claude-plain", false)] {
+        let body = json!({"model":model,"max_tokens":32,
+            "messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hello"}]});
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/v1/chat/completions",
+                Some("ak-cache"),
+                &body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent = fixture.body.lock().unwrap().clone().expect("upstream body");
+        let marked = sent["system"][0]["cache_control"]["type"] == "ephemeral"
+            && sent["messages"][0]["content"][0]["cache_control"]["type"] == "ephemeral";
+        assert_eq!(marked, cached, "{model}: {sent}");
+    }
+}

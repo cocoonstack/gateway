@@ -118,6 +118,11 @@ pub struct ModelConf {
     /// Billing weights per token component; None = every component at 1.0.
     #[serde(default)]
     pub token_rate: Option<TokenRateConf>,
+    /// Anthropic prompt caching: mark the system prompt and the latest user
+    /// turn as cache breakpoints, so a multi-turn conversation's prefix bills
+    /// at the cache-read rate. Pair with `token_rate`.
+    #[serde(default)]
+    pub prompt_cache: bool,
     /// Weighted routing split across other declared models (canary/gray);
     /// empty = this name serves itself. A self-referencing entry keeps a
     /// share on this model. Once routed, the variant's own qpm/cache/

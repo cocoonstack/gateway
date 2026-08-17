@@ -9,6 +9,8 @@ use crate::base::base_engine;
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::transport::{UpstreamBody, UpstreamRequest};
 
+const CACHE_CONTROL: &str = "ephemeral";
+
 base_engine!(ClaudeEngine);
 
 impl ClaudeEngine {
@@ -70,8 +72,18 @@ impl ClaudeEngine {
             }
         }
         body.insert("max_tokens".into(), json!(max_tokens));
+        if self.base.request.prompt_cache {
+            mark_cache_breakpoint(&mut body);
+        }
         if !system_text.is_empty() {
-            body.insert("system".into(), system_text.into());
+            body.insert(
+                "system".into(),
+                if self.base.request.prompt_cache {
+                    json!([{"type": "text", "text": system_text, "cache_control": {"type": CACHE_CONTROL}}])
+                } else {
+                    system_text.into()
+                },
+            );
         }
         let raw = self.base.take_raw();
         crate::base::merge_raw_extras_owned(&mut body, raw);
@@ -352,6 +364,27 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     msg.insert("role".into(), role.into());
     msg.insert("content".into(), content);
     messages.push(Value::Object(msg));
+}
+
+/// Anthropic prompt caching: a breakpoint on the last block of the latest
+/// user turn caches everything before it (tools, system, history), so each
+/// turn of a conversation re-reads the previous prefix at the cache rate.
+fn mark_cache_breakpoint(body: &mut Map<String, Value>) {
+    let Some(Value::Array(messages)) = body.get_mut("messages") else {
+        return;
+    };
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if last["role"] != "user" {
+        return;
+    }
+    let content = last["content"].take();
+    let mut blocks = content_blocks(content);
+    if let Some(block) = blocks.last_mut() {
+        block["cache_control"] = json!({"type": CACHE_CONTROL});
+    }
+    last["content"] = Value::Array(blocks);
 }
 
 /// Tool definitions in the anthropic wire shape. Cross-protocol requests carry
