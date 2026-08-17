@@ -61,6 +61,32 @@ impl GatewayRequest {
         {
             return true;
         }
+        if param.protocol == gw_consts::Protocol::Responses {
+            let reasoning = param
+                .raw
+                .get("reasoning")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|reasoning| {
+                    reasoning
+                        .get("effort")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|effort| effort != "none")
+                        || reasoning
+                            .get("max_tokens")
+                            .and_then(serde_json::Value::as_i64)
+                            .is_some_and(|budget| budget > 0)
+                        || reasoning.get("enabled").and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                });
+            let replay = param
+                .raw
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"));
+            if reasoning || replay {
+                return true;
+            }
+        }
         matches!(
             param
                 .raw
