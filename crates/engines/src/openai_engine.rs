@@ -138,29 +138,40 @@ impl OpenAiEngine {
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
+        // one walk to the first choice; JSON-pointer lookups allocate per call
+        let mut choice = v
+            .get_mut("choices")
+            .and_then(|choices| choices.get_mut(0))
+            .map(Value::take)
+            .unwrap_or_default();
+        let mut message = match choice.get_mut("message").map(Value::take) {
+            Some(Value::Object(message)) => message,
+            _ => Map::new(),
+        };
         let mut resp = GatewayResponse {
-            message: crate::engine::take_string(&mut v, "/choices/0/message/content")
+            message: take_str(&mut message, "content").unwrap_or_default(),
+            reasoning: take_str(&mut message, "reasoning_content")
+                .or_else(|| take_str(&mut message, "reasoning"))
                 .unwrap_or_default(),
-            reasoning: crate::engine::take_string(&mut v, "/choices/0/message/reasoning_content")
-                .or_else(|| crate::engine::take_string(&mut v, "/choices/0/message/reasoning"))
-                .unwrap_or_default(),
-            reasoning_details: match v.pointer_mut("/choices/0/message/reasoning_details") {
-                Some(Value::Array(details)) => Some(std::mem::take(details)),
+            reasoning_details: match message.remove("reasoning_details") {
+                Some(Value::Array(details)) => Some(details),
                 _ => None,
             },
-            tool_calls: v
-                .pointer_mut("/choices/0/message/tool_calls")
-                .map(Value::take)
-                .filter(|t| !t.is_null()),
-            model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
-            finish_reason: crate::engine::take_string(&mut v, "/choices/0/finish_reason")
-                .unwrap_or_default(),
+            tool_calls: message.remove("tool_calls").filter(|t| !t.is_null()),
+            model: match v.get_mut("model").map(Value::take) {
+                Some(Value::String(model)) => model,
+                _ => String::new(),
+            },
+            finish_reason: match choice.get_mut("finish_reason").map(Value::take) {
+                Some(Value::String(finish)) => finish,
+                _ => String::new(),
+            },
             ..Default::default()
         };
         if let Some(calls) = &mut resp.tool_calls {
             crate::engine::normalize_tool_arguments(calls);
         }
-        let usage = v.pointer_mut("/usage").map(Value::take).unwrap_or_default();
+        let usage = v.get_mut("usage").map(Value::take).unwrap_or_default();
         apply_openai_usage(&mut resp, usage);
         Ok(EngineOutcome::with_status(resp, status))
     }
@@ -267,7 +278,7 @@ fn apply_sse_event(
             ..Default::default()
         });
     }
-    if let Some(usage) = v.pointer_mut("/usage") {
+    if let Some(usage) = v.get_mut("usage") {
         apply_openai_usage(resp, usage.take());
     }
     Ok(chunks)
@@ -441,6 +452,13 @@ fn strip_thinking_blocks(parts: Vec<Value>, reasoning_content: &mut Option<Strin
         *reasoning_content = Some(prose);
     }
     kept
+}
+
+fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {
+    match object.remove(key) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
 }
 
 fn apply_openai_usage(resp: &mut GatewayResponse, usage: Value) {

@@ -3,6 +3,7 @@
 //! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_protocol::reasoning::ThinkingDialect;
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -68,7 +69,7 @@ impl ClaudeEngine {
         // an Anthropic `thinking` in the chat surface's passthrough bag is the
         // client's own contract; it wins over an effort mapping
         let client_thinking = param.raw.get("thinking").is_some();
-        let adaptive_model = gw_protocol::reasoning::anthropic_adaptive_model(&param.model_name);
+        let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), Value::Array(messages));
@@ -86,7 +87,7 @@ impl ClaudeEngine {
                 if reasoning.thinking.is_none()
                     && !client_thinking
                     && let Some((thinking, output_config, budget)) = map_thinking(
-                        adaptive_model,
+                        dialect,
                         reasoning.effort.as_deref(),
                         reasoning.budget_tokens,
                     )
@@ -384,7 +385,7 @@ pub fn anthropic_native_chunks(
 /// `output_config.effort` (`minimal` folds into `low`). `none`, or vocabulary
 /// neither side knows, leaves thinking to the model's default.
 fn map_thinking(
-    adaptive_model: bool,
+    dialect: ThinkingDialect,
     effort: Option<&str>,
     budget: Option<i64>,
 ) -> Option<(Value, Option<Value>, i64)> {
@@ -393,22 +394,24 @@ fn map_thinking(
         return None;
     }
     let budget = budget.or_else(|| effort.and_then(effort_budget))?;
-    if !adaptive_model {
-        return Some((
-            json!({"type": "enabled", "budget_tokens": budget}),
-            None,
-            budget,
-        ));
-    }
+    let thinking = match dialect {
+        ThinkingDialect::Budget => {
+            return Some((
+                json!({"type": "enabled", "budget_tokens": budget}),
+                None,
+                budget,
+            ));
+        }
+        ThinkingDialect::Adaptive => json!({"type": "adaptive"}),
+        ThinkingDialect::AdaptiveSummarized => {
+            json!({"type": "adaptive", "display": "summarized"})
+        }
+    };
     let effort = match effort {
         Some("minimal") | None => budget_effort(budget),
         Some(effort) => effort,
     };
-    Some((
-        json!({"type": "adaptive"}),
-        Some(json!({"effort": effort})),
-        budget,
-    ))
+    Some((thinking, Some(json!({"effort": effort})), budget))
 }
 
 fn is_thinking_block(block: &Value) -> bool {
@@ -518,6 +521,9 @@ struct SseState {
     full: String,
     input: i64,
     output: i64,
+    /// the vendor usage object, message_start's overlaid by message_delta's,
+    /// for the CommonUsage step (cache and thinking tokens ride there)
+    usage: Map<String, Value>,
     tool_blocks: Vec<Value>,
     native_blocks: Vec<Value>,
     /// the in-flight block: every block on the native surface, thinking
@@ -538,6 +544,7 @@ impl SseState {
             full: String::new(),
             input: 0,
             output: 0,
+            usage: Map::new(),
             tool_blocks: Vec::new(),
             native_blocks: Vec::new(),
             open_native: None,
@@ -579,6 +586,7 @@ impl SseState {
                     .unwrap_or_default()
                     .to_owned();
                 self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
+                self.overlay_usage(&v["message"]["usage"]);
             }
             "content_block_start" => {
                 let index = v["index"].as_u64().unwrap_or_default() as usize;
@@ -671,6 +679,7 @@ impl SseState {
                 if let Some(it) = v["usage"]["input_tokens"].as_i64() {
                     self.input = it;
                 }
+                self.overlay_usage(&v["usage"]);
             }
             // message_stop and forward-compatible events carry no normalized
             // fields; they reach the client only via the native event below.
@@ -702,9 +711,19 @@ impl SseState {
         resp.prompt_tokens = input;
         resp.completion_tokens = output;
         crate::engine::fill_total_if_zero(resp);
-        resp.common_usage = Some(gw_models::CommonUsage::from_openai_parts(
-            input, output, 0, 0,
-        ));
+        if !self.usage.is_empty() {
+            resp.raw_usage = Some(Value::Object(self.usage));
+        }
+    }
+
+    fn overlay_usage(&mut self, usage: &Value) {
+        if let Some(usage) = usage.as_object() {
+            for (key, value) in usage {
+                if !value.is_null() {
+                    self.usage.insert(key.clone(), value.clone());
+                }
+            }
+        }
     }
 }
 

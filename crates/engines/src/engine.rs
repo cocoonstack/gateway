@@ -76,12 +76,21 @@ pub fn tok(v: &Value) -> i64 {
     v.as_i64().unwrap_or(0).max(0)
 }
 
-/// Move the string at `ptr` (JSON Pointer) out of `v`; `None` when the path is
-/// absent or not a string. `pointer_mut`, not `IndexMut` — indexing a hostile
-/// non-object reply would panic.
+/// Move the string at `ptr` (a static, unescaped JSON Pointer) out of `v`;
+/// `None` when the path is absent or not a string. Walks the segments
+/// directly — `pointer_mut` allocates per segment to unescape, on every call
+/// — and never indexes, so a hostile non-object reply cannot panic.
 pub fn take_string(v: &mut Value, ptr: &str) -> Option<String> {
-    match v.pointer_mut(ptr).map(Value::take) {
-        Some(Value::String(s)) => Some(s),
+    let mut cur = v;
+    for segment in ptr.split('/').skip(1) {
+        cur = match cur {
+            Value::Object(map) => map.get_mut(segment)?,
+            Value::Array(items) => items.get_mut(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    match cur.take() {
+        Value::String(s) => Some(s),
         _ => None,
     }
 }

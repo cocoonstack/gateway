@@ -1001,7 +1001,10 @@ async fn anthropic_effort_maps_by_model_generation_and_owns_the_conflicting_knob
     }
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    assert_eq!(b["thinking"], serde_json::json!({"type":"adaptive"}));
+    assert_eq!(
+        b["thinking"],
+        serde_json::json!({"type":"adaptive","display":"summarized"})
+    );
     assert_eq!(b["output_config"], serde_json::json!({"effort":"low"}));
     assert_eq!(b["max_tokens"], 8192, "client cap above the budget stays");
 

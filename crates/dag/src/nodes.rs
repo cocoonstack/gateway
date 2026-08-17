@@ -180,9 +180,6 @@ impl DagNode for VariantSelect {
         &["tenant_entitlement"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.request.pins_reasoning_route() {
-            return Ok(());
-        }
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
@@ -192,7 +189,7 @@ impl DagNode for VariantSelect {
         let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
             return Ok(());
         };
-        if conf.variants.is_empty() {
+        if conf.variants.is_empty() || ctx.request.pins_reasoning_route() {
             return Ok(());
         }
         let key = match ctx.effective_user_id() {

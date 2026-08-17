@@ -35,21 +35,35 @@ pub fn budget_effort(budget: i64) -> &'static str {
     }
 }
 
-/// Whether an Anthropic model takes adaptive thinking (`thinking.type:
-/// adaptive` + `output_config.effort`) rather than a `budget_tokens`: Claude
-/// 3.x, 4, 4.1 and 4.5 are budget-only; 4.6 accepts both; every later or
-/// unrecognized model — 4.7+, the 5 family, Fable, Mythos — is adaptive.
-pub fn anthropic_adaptive_model(model: &str) -> bool {
+/// How an Anthropic model generation takes a thinking request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDialect {
+    /// `thinking: {type: enabled, budget_tokens}` — Claude 3.x, 4, 4.1, 4.5.
+    Budget,
+    /// `thinking: {type: adaptive}` + `output_config.effort` — Claude 4.6,
+    /// which predates the `display` knob.
+    Adaptive,
+    /// Adaptive with `display: summarized`, so the reasoning prose comes back:
+    /// 4.7+, the 5 family, Fable, Mythos, and any unrecognized model.
+    AdaptiveSummarized,
+}
+
+/// The thinking dialect of an Anthropic model, by name.
+pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
     if model.contains("claude-3") {
-        return false;
+        return ThinkingDialect::Budget;
     }
     let Some(rest) = model.find("-4-").map(|i| &model[i + 3..]) else {
-        return true;
+        return ThinkingDialect::AdaptiveSummarized;
     };
     // "-4-<minor>-…" versus "-4-<yyyymmdd>" (Claude 4.0)
     match rest.as_bytes() {
-        [minor, b'-', ..] | [minor] if minor.is_ascii_digit() => *minor >= b'6',
-        _ => false,
+        [minor, b'-', ..] | [minor] if minor.is_ascii_digit() => match minor {
+            b'0'..=b'5' => ThinkingDialect::Budget,
+            b'6' => ThinkingDialect::Adaptive,
+            _ => ThinkingDialect::AdaptiveSummarized,
+        },
+        _ => ThinkingDialect::Budget,
     }
 }
 
@@ -122,25 +136,22 @@ mod tests {
 
     #[test]
     fn anthropic_model_generations_pick_their_thinking_dialect() {
-        for budget_only in [
-            "claude-3-7-sonnet-20250219",
-            "claude-opus-4-20250514",
-            "claude-opus-4-1-20250805",
-            "claude-sonnet-4-5-20250929",
-            "claude-haiku-4-5",
+        use ThinkingDialect::*;
+        for (model, want) in [
+            ("claude-3-7-sonnet-20250219", Budget),
+            ("claude-opus-4-20250514", Budget),
+            ("claude-opus-4-1-20250805", Budget),
+            ("claude-sonnet-4-5-20250929", Budget),
+            ("claude-haiku-4-5", Budget),
+            ("claude-opus-4-6", Adaptive),
+            ("claude-sonnet-4-6-20260301", Adaptive),
+            ("claude-opus-4-8", AdaptiveSummarized),
+            ("claude-sonnet-5", AdaptiveSummarized),
+            ("claude-fable-5", AdaptiveSummarized),
+            ("claude-mythos-5", AdaptiveSummarized),
+            ("MiniMax-M3", AdaptiveSummarized),
         ] {
-            assert!(!anthropic_adaptive_model(budget_only), "{budget_only}");
-        }
-        for adaptive in [
-            "claude-opus-4-6",
-            "claude-sonnet-4-6-20260301",
-            "claude-opus-4-8",
-            "claude-sonnet-5",
-            "claude-fable-5",
-            "claude-mythos-5",
-            "MiniMax-M3",
-        ] {
-            assert!(anthropic_adaptive_model(adaptive), "{adaptive}");
+            assert_eq!(anthropic_thinking_dialect(model), want, "{model}");
         }
     }
 

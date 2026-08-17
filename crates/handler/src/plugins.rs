@@ -875,7 +875,9 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
     let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
     let mut hits = redact_field(&mut response.message);
-    hits += redact_field(&mut response.reasoning);
+    if !response.reasoning.is_empty() {
+        hits += redact_field(&mut response.reasoning);
+    }
     if let Some(v) = &mut response.response_v2 {
         hits += walk_json_strings(v, &mut redact_field);
     }

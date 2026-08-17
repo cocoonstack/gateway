@@ -2757,7 +2757,10 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
     {
         let upstream = &seen.lock().unwrap()[0];
-        assert_eq!(upstream["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(
+            upstream["thinking"],
+            json!({"type":"adaptive","display":"summarized"})
+        );
         assert_eq!(upstream["output_config"], json!({"effort":"high"}));
         assert!(upstream.get("temperature").is_none());
         assert!(upstream.get("reasoning_effort").is_none());
