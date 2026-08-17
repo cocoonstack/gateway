@@ -15,6 +15,8 @@ pub struct GatewayRequest {
     /// native SSE events only on that same-protocol surface. This survives
     /// model resolution, unlike `model_param_v2.protocol`.
     pub preserve_anthropic_wire: bool,
+    /// The served model asks for prompt-cache breakpoints (Anthropic engines).
+    pub prompt_cache: bool,
     pub model_param_v2: Option<ModelParamV2>,
     pub is_online: bool,
     /// End-user attribution from request metadata (OpenAI `user` / Anthropic

@@ -41,6 +41,13 @@ impl ClaudeEngine {
             push_turn(&mut messages, role, content);
         }
 
+        let prompt_cache = self.base.request.prompt_cache;
+        if prompt_cache
+            && let Some(last) = messages.last_mut()
+            && last["role"] == "user"
+        {
+            last["content"] = Value::Array(cached_blocks(last["content"].take()));
+        }
         let param = self.base.param()?;
         let protocol = param.protocol;
         let mut body = Map::new();
@@ -71,7 +78,12 @@ impl ClaudeEngine {
         }
         body.insert("max_tokens".into(), json!(max_tokens));
         if !system_text.is_empty() {
-            body.insert("system".into(), system_text.into());
+            let system = if prompt_cache {
+                Value::Array(cached_blocks(Value::String(system_text)))
+            } else {
+                Value::String(system_text)
+            };
+            body.insert("system".into(), system);
         }
         let raw = self.base.take_raw();
         crate::base::merge_raw_extras_owned(&mut body, raw);
@@ -352,6 +364,20 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     msg.insert("role".into(), role.into());
     msg.insert("content".into(), content);
     messages.push(Value::Object(msg));
+}
+
+/// Content as blocks with a prompt-cache breakpoint on the last one; a
+/// breakpoint caches everything before it (tools, system, history), so each
+/// turn of a conversation re-reads the previous prefix at the cache rate. A
+/// breakpoint the client already placed there wins (it may carry a ttl).
+fn cached_blocks(content: Value) -> Vec<Value> {
+    let mut blocks = content_blocks(content);
+    if let Some(Value::Object(block)) = blocks.last_mut() {
+        block
+            .entry("cache_control")
+            .or_insert_with(|| json!({"type": "ephemeral"}));
+    }
+    blocks
 }
 
 /// Tool definitions in the anthropic wire shape. Cross-protocol requests carry

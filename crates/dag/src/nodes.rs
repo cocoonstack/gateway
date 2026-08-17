@@ -341,7 +341,12 @@ impl DagNode for SelectAccount {
             .request
             .protocol()
             .ok_or_else(|| GatewayError::internal("select_account before resolve_model"))?;
-        let provider = model_provider(ctx);
+        // post-variant: the served model's knobs ride the provider lookup
+        let conf = ctx
+            .cfg
+            .find_model(served_model(ctx.request.model_param_v2.as_ref()));
+        ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
+        let provider = conf.and_then(|m| m.provider.as_deref());
         let account = ctx
             .state
             .pool

@@ -898,3 +898,53 @@ async fn anthropic_chat_history_drops_empty_turns_and_alternates() {
     assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
     assert_eq!(msgs[2]["content"][0]["tool_use_id"], "toolu_9");
 }
+
+#[tokio::test]
+async fn anthropic_prompt_cache_marks_system_and_latest_user_turn() {
+    let reply = r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+    let t = RecordingTransport::new(reply);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+    req.message.push(ChatMsg::text("assistant", "hi"));
+    req.message.push(ChatMsg::text("user", "and now?"));
+    req.prompt_cache = true;
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["system"][0]["text"], "be brief");
+    assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+    let msgs = b["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(
+        msgs[0]["content"], "hello",
+        "earlier turns stay unmarked: {msgs:?}"
+    );
+    let last = &msgs[2]["content"];
+    assert_eq!(last[0]["text"], "and now?");
+    assert_eq!(last[0]["cache_control"]["type"], "ephemeral");
+
+    let own = RecordingTransport::new(reply);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+    let mut last = ChatMsg::text("user", "");
+    last.parts = Some(serde_json::json!([
+        {"type": "text", "text": "long-lived", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]));
+    req.message.push(last);
+    req.prompt_cache = true;
+    let _ = ClaudeEngine::new(req, own.clone()).run().await.unwrap();
+    let b = own.body_json();
+    assert_eq!(
+        b["messages"][0]["content"][1]["cache_control"]["ttl"], "1h",
+        "a client-placed breakpoint is kept: {b}"
+    );
+
+    let plain = RecordingTransport::new(reply);
+    let _ = ClaudeEngine::new(
+        chat_req(Protocol::AnthropicMessages, "claude-sonnet"),
+        plain.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
+    let b = plain.body_json();
+    assert_eq!(b["system"], "be brief");
+    assert_eq!(b["messages"][0]["content"], "hello");
+}
