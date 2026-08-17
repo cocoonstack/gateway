@@ -186,7 +186,7 @@ impl OnlineHandler {
                     }
                 }
                 Moderation::Degrade => {
-                    if ctx.request.pins_anthropic_thinking_route() {
+                    if ctx.request.pins_reasoning_route() {
                         emit_security_event(&ctx, "moderation", "block_pinned_thinking", 1).await;
                         deny_moderation(
                             &mut ctx,
@@ -304,7 +304,8 @@ impl OnlineHandler {
             .outcome
             .as_mut()
             .map(|outcome| {
-                let stripped = plugins::strip_unservable_thinking(sec, &mut outcome.response);
+                let stripped =
+                    plugins::strip_unservable_thinking(sec, &mut outcome.response, &outcome.chunks);
                 if stripped > 0 {
                     // the buffered raw events still carry the unservable prose
                     outcome.chunks.clear();
@@ -1503,7 +1504,7 @@ mod tests {
         let continued = h.run(continuation, key).await.unwrap();
         assert!(
             continued.decisions.iter().any(|(node, decision)| {
-                *node == "model_quota" && decision.contains("thinking route pinned")
+                *node == "model_quota" && decision.contains("reasoning route pinned")
             }),
             "over-quota continuation must not fall back: {:?}",
             continued.decisions

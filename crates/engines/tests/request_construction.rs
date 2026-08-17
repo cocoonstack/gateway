@@ -948,3 +948,255 @@ async fn anthropic_prompt_cache_marks_system_and_latest_user_turn() {
     assert_eq!(b["system"], "be brief");
     assert_eq!(b["messages"][0]["content"], "hello");
 }
+
+const CLAUDE_OK: &str = r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+const OPENAI_OK: &str = r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+
+fn reasoning_req(mt: Protocol, name: &str, reasoning: gw_models::ReasoningParam) -> GatewayRequest {
+    let mut req = chat_req(mt, name);
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            temperature: Some(0.2),
+            top_p: Some(0.5),
+            reasoning: Some(Box::new(reasoning)),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"top_k": 5});
+    }
+    req
+}
+
+#[tokio::test]
+async fn anthropic_effort_maps_by_model_generation_and_owns_the_conflicting_knobs() {
+    let effort = |level: &str| gw_models::ReasoningParam {
+        effort: Some(level.to_owned()),
+        ..Default::default()
+    };
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let req = reasoning_req(
+        Protocol::AnthropicMessages,
+        "claude-haiku-4-5",
+        effort("high"),
+    );
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["thinking"],
+        serde_json::json!({"type":"enabled","budget_tokens":16384})
+    );
+    assert!(b.get("output_config").is_none());
+    assert_eq!(b["max_tokens"], 16384 + 1024, "answer budget on top");
+    for knob in ["temperature", "top_p", "top_k"] {
+        assert!(b.get(knob).is_none(), "{knob} conflicts with thinking");
+    }
+
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = reasoning_req(
+        Protocol::AnthropicMessages,
+        "claude-fable-5",
+        effort("minimal"),
+    );
+    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().and_then(|p| p.typed.as_mut()) {
+        p.max_tokens = Some(8192);
+    }
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["thinking"], serde_json::json!({"type":"adaptive"}));
+    assert_eq!(b["output_config"], serde_json::json!({"effort":"low"}));
+    assert_eq!(b["max_tokens"], 8192, "client cap above the budget stays");
+
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let req = reasoning_req(
+        Protocol::AnthropicMessages,
+        "claude-fable-5",
+        effort("none"),
+    );
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert!(b.get("thinking").is_none() && b.get("output_config").is_none());
+    assert_eq!(b["temperature"], 0.2);
+    assert_eq!(b["top_k"], 5);
+}
+
+#[tokio::test]
+async fn anthropic_budget_and_client_thinking_precedence() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let req = reasoning_req(
+        Protocol::AnthropicMessages,
+        "claude-sonnet-5",
+        gw_models::ReasoningParam {
+            budget_tokens: Some(12000),
+            ..Default::default()
+        },
+    );
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["output_config"], serde_json::json!({"effort":"high"}));
+    assert_eq!(b["max_tokens"], 12000 + 1024);
+
+    // the chat surface's own `thinking` passthrough wins over an effort
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = reasoning_req(
+        Protocol::AnthropicMessages,
+        "claude-haiku-4-5",
+        gw_models::ReasoningParam {
+            effort: Some("high".to_owned()),
+            ..Default::default()
+        },
+    );
+    req.model_param_v2.as_mut().unwrap().raw =
+        serde_json::json!({"thinking":{"type":"enabled","budget_tokens":2000},"top_k":5});
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["thinking"]["budget_tokens"], 2000);
+    assert!(b.get("output_config").is_none());
+    assert_eq!(b["temperature"], 0.2, "client thinking is verbatim");
+    assert_eq!(b["top_k"], 5);
+    assert_eq!(b["max_tokens"], 1024);
+
+    // the native surface's typed thinking + output_config go through verbatim
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let req = reasoning_req(
+        Protocol::AnthropicMessages,
+        "claude-fable-5",
+        gw_models::ReasoningParam {
+            thinking: Some(serde_json::json!({"type":"adaptive","display":"summarized"})),
+            output_config: Some(serde_json::json!({"effort":"max"})),
+            ..Default::default()
+        },
+    );
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["thinking"]["display"], "summarized");
+    assert_eq!(b["output_config"]["effort"], "max");
+    assert_eq!(b["temperature"], 0.2);
+}
+
+#[tokio::test]
+async fn anthropic_replays_signed_reasoning_details_ahead_of_the_turn() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-fable-5");
+    let mut assistant = ChatMsg::text("assistant", "calling");
+    assistant.reasoning_content = Some("unsigned prose is not replayable".to_owned());
+    assistant.reasoning_details = Some(serde_json::json!([
+        {"type":"reasoning.text","text":"signed","signature":"sig","format":"anthropic-claude-v1","index":0},
+        {"type":"reasoning.encrypted","data":"blob","format":"anthropic-claude-v1","index":1},
+        {"type":"reasoning.text","text":"unsigned","format":"anthropic-claude-v1","index":2}
+    ]));
+    assistant.tool_calls = Some(serde_json::json!([
+        {"id":"call_1","type":"function","function":{"name":"now","arguments":"{}"}}
+    ]));
+    let mut tool = ChatMsg::text("tool", "12:00");
+    tool.tool_call_id = Some("call_1".to_owned());
+    req.message.extend([assistant, tool]);
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    let turn = &b["messages"][1];
+    assert_eq!(turn["role"], "assistant");
+    assert_eq!(
+        turn["content"],
+        serde_json::json!([
+            {"type":"thinking","thinking":"signed","signature":"sig"},
+            {"type":"redacted_thinking","data":"blob"},
+            {"type":"text","text":"calling"},
+            {"type":"tool_use","id":"call_1","name":"now","input":{}}
+        ])
+    );
+    assert!(turn.get("reasoning_content").is_none());
+}
+
+#[tokio::test]
+async fn openai_reasoning_effort_and_thinking_dialects() {
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-5",
+        gw_models::ReasoningParam {
+            effort: Some("high".to_owned()),
+            ..Default::default()
+        },
+    );
+    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().and_then(|p| p.typed.as_mut()) {
+        p.max_tokens = Some(700);
+    }
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["reasoning_effort"], "high");
+    assert_eq!(b["max_completion_tokens"], 700);
+    assert!(b.get("max_tokens").is_none());
+    assert_eq!(b["temperature"], 0.2, "the OpenAI wire keeps its own knobs");
+
+    // the native surface's thinking budget becomes an effort; output_config wins
+    for (reasoning, want) in [
+        (
+            gw_models::ReasoningParam {
+                thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":6000})),
+                ..Default::default()
+            },
+            "medium",
+        ),
+        (
+            gw_models::ReasoningParam {
+                thinking: Some(serde_json::json!({"type":"adaptive"})),
+                output_config: Some(serde_json::json!({"effort":"xhigh"})),
+                ..Default::default()
+            },
+            "xhigh",
+        ),
+        (
+            gw_models::ReasoningParam {
+                budget_tokens: Some(1024),
+                ..Default::default()
+            },
+            "low",
+        ),
+    ] {
+        let t = RecordingTransport::new(OPENAI_OK);
+        let req = reasoning_req(Protocol::OpenaiChat, "gpt-5", reasoning);
+        let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["reasoning_effort"], want);
+        assert!(b.get("thinking").is_none() && b.get("output_config").is_none());
+    }
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-5",
+        gw_models::ReasoningParam {
+            thinking: Some(serde_json::json!({"type":"disabled"})),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert!(b.get("reasoning_effort").is_none());
+    assert!(b.get("max_completion_tokens").is_none());
+}
+
+#[tokio::test]
+async fn openai_history_replays_reasoning_and_folds_native_thinking_blocks() {
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = chat_req(Protocol::OpenaiChat, "deepseek-v4");
+    let mut assistant = ChatMsg::text("assistant", "sure");
+    assistant.reasoning_content = Some("thought it through".to_owned());
+    assistant.reasoning_details = Some(serde_json::json!([{"type":"reasoning.text","text":"t"}]));
+    let mut native = ChatMsg::text("assistant", String::new());
+    native.parts = Some(serde_json::json!([
+        {"type":"thinking","thinking":"native prose","signature":"sig"},
+        {"type":"redacted_thinking","data":"blob"},
+        {"type":"text","text":"answer"}
+    ]));
+    req.message
+        .extend([assistant, ChatMsg::text("user", "and?"), native]);
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    let messages = b["messages"].as_array().unwrap();
+    assert_eq!(messages[2]["reasoning_content"], "thought it through");
+    assert_eq!(messages[2]["reasoning_details"][0]["text"], "t");
+    assert_eq!(messages[4]["reasoning_content"], "native prose");
+    assert_eq!(
+        messages[4]["content"],
+        serde_json::json!([{"type":"text","text":"answer"}])
+    );
+}

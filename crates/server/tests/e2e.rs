@@ -331,6 +331,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
     #[derive(Debug)]
     struct ThinkingFixture {
         hits: Arc<AtomicUsize>,
+        cross_protocol: Arc<std::sync::Mutex<Option<Value>>>,
     }
 
     #[async_trait::async_trait]
@@ -341,6 +342,21 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
         ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
             self.hits.fetch_add(1, Ordering::Relaxed);
             let request: Value = serde_json::from_slice(&request.body).unwrap();
+            if request.get("reasoning_effort").is_some() {
+                *self.cross_protocol.lock().unwrap() = Some(request);
+                return Ok(gw_engines::transport::UpstreamResponse {
+                    status: 200,
+                    body: gw_engines::transport::UpstreamBody::Json(
+                        serde_json::to_vec(&json!({
+                            "id":"chatcmpl-1","object":"chat.completion","model":"gpt-test",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":"ok","reasoning_content":"weighing"},"finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"completion_tokens_details":{"reasoning_tokens":1}}
+                        }))
+                        .unwrap()
+                        .into(),
+                    ),
+                });
+            }
             let is_seed = request["messages"]
                 .as_array()
                 .is_some_and(|messages| messages.len() == 1);
@@ -406,35 +422,47 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
     let hits = Arc::new(AtomicUsize::new(0));
+    let cross_protocol = Arc::new(std::sync::Mutex::new(None));
     let app = gw_views::app(AppState::new(
         cfg,
         state,
-        Arc::new(ThinkingFixture { hits: hits.clone() }),
+        Arc::new(ThinkingFixture {
+            hits: hits.clone(),
+            cross_protocol: cross_protocol.clone(),
+        }),
     ));
 
-    let wrong_protocol = json!({
+    // thinking on an OpenAI model crosses over as a reasoning effort, and
+    // the reasoning prose comes back as an unsigned thinking block
+    let cross = json!({
         "model":"gpt-test",
         "max_tokens":128,
         "thinking":{"type":"enabled","budget_tokens":1024},
         "messages":[{"role":"user","content":"use the tool"}]
     });
-    let wrong_protocol_response = app
+    let cross_response = app
         .clone()
         .oneshot(post(
             "/v1/messages",
             Some("ak-thinking"),
-            &wrong_protocol.to_string(),
+            &cross.to_string(),
         ))
         .await
         .unwrap();
-    assert_eq!(wrong_protocol_response.status(), StatusCode::BAD_REQUEST);
-    let error = body_json(wrong_protocol_response).await;
-    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(cross_response.status(), StatusCode::OK);
+    let body = body_json(cross_response).await;
     assert_eq!(
-        error["error"]["message"],
-        "native Anthropic thinking requires an anthropic-messages model"
+        body["content"],
+        json!([
+            {"type":"thinking","thinking":"weighing","signature":""},
+            {"type":"text","text":"ok"}
+        ])
     );
-    assert_eq!(hits.load(Ordering::Relaxed), 0, "rejected before dispatch");
+    let upstream = cross_protocol.lock().unwrap().take().unwrap();
+    assert_eq!(upstream["reasoning_effort"], "low");
+    assert_eq!(upstream["max_completion_tokens"], 128);
+    assert!(upstream.get("thinking").is_none() && upstream.get("max_tokens").is_none());
+    assert_eq!(hits.swap(0, Ordering::Relaxed), 1);
 
     let seed = json!({
         "model":"claude-test",
@@ -2623,6 +2651,183 @@ async fn responses_api_streaming_full_pipeline() {
         "assembled: {assembled}"
     );
     assert!(saw_completed_with_usage, "completed frame must carry usage");
+}
+
+#[tokio::test]
+async fn chat_surface_reasoning_round_trips_through_claude() {
+    #[derive(Debug)]
+    struct ClaudeReasoning {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ClaudeReasoning {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let stream = request.stream;
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&request.body).unwrap());
+            if stream {
+                let sse = concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-fable-5\",\"usage\":{\"input_tokens\":10}}}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weigh\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"ing\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-s\"}}\n\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                );
+                return Ok(gw_engines::transport::UpstreamResponse {
+                    status: 200,
+                    body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                });
+            }
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&json!({
+                        "id":"msg_1","type":"message","role":"assistant","model":"claude-fable-5",
+                        "content":[
+                            {"type":"thinking","thinking":"weighing","signature":"sig-1"},
+                            {"type":"redacted_thinking","data":"blob"},
+                            {"type":"tool_use","id":"toolu_1","name":"now","input":{}}
+                        ],
+                        "stop_reason":"tool_use",
+                        "usage":{"input_tokens":10,"output_tokens":8}
+                    }))
+                    .unwrap()
+                    .into(),
+                ),
+            })
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {dlp_redact: false, detect_secrets: false}
+access_keys: [{ak: ak-reason, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: claude-fable-5, protocol: anthropic-messages}]
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(ClaudeReasoning { seen: seen.clone() }),
+    ));
+
+    let first = json!({
+        "model":"claude-fable-5",
+        "reasoning_effort":"high",
+        "temperature":0,
+        "tools":[{"type":"function","function":{"name":"now","parameters":{"type":"object","properties":{}}}}],
+        "messages":[{"role":"user","content":"what time is it?"}]
+    });
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-reason"),
+            &first.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let message = &body["choices"][0]["message"];
+    assert_eq!(message["reasoning_content"], "weighing");
+    assert_eq!(
+        message["reasoning_details"],
+        json!([
+            {"type":"reasoning.text","text":"weighing","signature":"sig-1","format":"anthropic-claude-v1","index":0},
+            {"type":"reasoning.encrypted","data":"blob","format":"anthropic-claude-v1","index":1}
+        ])
+    );
+    assert_eq!(message["tool_calls"][0]["function"]["name"], "now");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    {
+        let upstream = &seen.lock().unwrap()[0];
+        assert_eq!(upstream["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(upstream["output_config"], json!({"effort":"high"}));
+        assert!(upstream.get("temperature").is_none());
+        assert!(upstream.get("reasoning_effort").is_none());
+    }
+
+    // the client replays the assistant turn as it received it
+    let mut history = first["messages"].as_array().unwrap().clone();
+    let mut assistant = message.clone();
+    assistant["role"] = "assistant".into();
+    history.push(assistant);
+    history.push(json!({"role":"tool","tool_call_id":"toolu_1","content":"12:00"}));
+    let second = json!({
+        "model":"claude-fable-5",
+        "reasoning_effort":"high",
+        "stream":true,
+        "tools":first["tools"],
+        "messages":history
+    });
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-reason"),
+            &second.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let deltas: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|f| *f != "[DONE]")
+        .map(|f| serde_json::from_str::<Value>(f).unwrap()["choices"][0]["delta"].clone())
+        .collect();
+    let reasoning: String = deltas
+        .iter()
+        .filter_map(|d| d["reasoning_content"].as_str())
+        .collect();
+    assert_eq!(reasoning, "weighing");
+    let details: Vec<Value> = deltas
+        .iter()
+        .filter_map(|d| d["reasoning_details"].as_array())
+        .flatten()
+        .cloned()
+        .collect();
+    assert_eq!(
+        details,
+        [
+            json!({"type":"reasoning.text","text":"weighing","signature":"sig-s","format":"anthropic-claude-v1","index":0})
+        ]
+    );
+    let content: String = deltas
+        .iter()
+        .filter_map(|d| d["content"].as_str())
+        .collect();
+    assert_eq!(content, "done");
+    {
+        let upstream = &seen.lock().unwrap()[1];
+        assert_eq!(
+            upstream["messages"][1]["content"],
+            json!([
+                {"type":"thinking","thinking":"weighing","signature":"sig-1"},
+                {"type":"redacted_thinking","data":"blob"},
+                {"type":"tool_use","id":"toolu_1","name":"now","input":{}}
+            ])
+        );
+        assert_eq!(upstream["messages"][2]["role"], "user");
+        assert_eq!(upstream["messages"][2]["content"][0]["type"], "tool_result");
+    }
 }
 
 #[tokio::test]

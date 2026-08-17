@@ -21,9 +21,16 @@ impl OpenAiEngine {
             .into_iter()
             .map(|m| {
                 let mut msg = Map::new();
+                let assistant = m.role == gw_consts::role::AI;
                 msg.insert("role".into(), m.role.into());
+                let mut reasoning_content = m.reasoning_content;
                 // OpenAI: assistant tool-call turns carry content: null
                 let content = match (m.parts, m.content) {
+                    (Some(Value::Array(parts)), _) if assistant => {
+                        // a native-surface turn replays its thinking blocks; the
+                        // OpenAI wire knows them only as reasoning prose
+                        Value::Array(strip_thinking_blocks(parts, &mut reasoning_content))
+                    }
                     (Some(parts), _) => parts,
                     (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
                     (None, c) => c.into(),
@@ -34,6 +41,12 @@ impl OpenAiEngine {
                 }
                 if let Some(id) = m.tool_call_id {
                     msg.insert("tool_call_id".into(), id.into());
+                }
+                if let Some(reasoning) = reasoning_content {
+                    msg.insert("reasoning_content".into(), reasoning.into());
+                }
+                if let Some(details) = m.reasoning_details {
+                    msg.insert("reasoning_details".into(), details);
                 }
                 Value::Object(msg)
             })
@@ -64,7 +77,16 @@ impl OpenAiEngine {
             }
             put!("temperature", p.temperature);
             put!("top_p", p.top_p);
-            put!("max_tokens", p.max_tokens);
+            let effort = p
+                .reasoning
+                .and_then(|reasoning| reasoning_effort(*reasoning));
+            // reasoning models take max_completion_tokens; max_tokens is a 400
+            if effort.is_some() {
+                put!("max_completion_tokens", p.max_tokens);
+            } else {
+                put!("max_tokens", p.max_tokens);
+            }
+            put!("reasoning_effort", effort);
             put!("presence_penalty", p.presence_penalty);
             put!("frequency_penalty", p.frequency_penalty);
             put!("logprobs", p.logprobs);
@@ -119,6 +141,13 @@ impl OpenAiEngine {
         let mut resp = GatewayResponse {
             message: crate::engine::take_string(&mut v, "/choices/0/message/content")
                 .unwrap_or_default(),
+            reasoning: crate::engine::take_string(&mut v, "/choices/0/message/reasoning_content")
+                .or_else(|| crate::engine::take_string(&mut v, "/choices/0/message/reasoning"))
+                .unwrap_or_default(),
+            reasoning_details: match v.pointer_mut("/choices/0/message/reasoning_details") {
+                Some(Value::Array(details)) => Some(std::mem::take(details)),
+                _ => None,
+            },
             tool_calls: v
                 .pointer_mut("/choices/0/message/tool_calls")
                 .map(Value::take)
@@ -192,6 +221,25 @@ fn apply_sse_event(
             chunks.push(StreamChunk {
                 delta: text,
                 finish_reason: None,
+                ..Default::default()
+            });
+        }
+        let reasoning = match delta.get_mut("reasoning_content").map(Value::take) {
+            Some(Value::String(text)) => text,
+            _ => match delta.get_mut("reasoning").map(Value::take) {
+                Some(Value::String(text)) => text,
+                _ => String::new(),
+            },
+        };
+        let reasoning_details = match delta.get_mut("reasoning_details").map(Value::take) {
+            Some(Value::Array(details)) => Some(details),
+            _ => None,
+        };
+        if !reasoning.is_empty() || reasoning_details.is_some() {
+            resp.reasoning.push_str(&reasoning);
+            chunks.push(StreamChunk {
+                reasoning,
+                reasoning_details,
                 ..Default::default()
             });
         }
@@ -344,6 +392,57 @@ fn normalize_tools_openai(tools: Value) -> Value {
 }
 
 /// Copy token fields + keep the raw usage subtree bytes for the DAG node.
+/// The request's `reasoning_effort`: the client's own, else derived from an
+/// Anthropic-dialect request — `output_config.effort` (same vocabulary), a
+/// `thinking` budget, or an OpenRouter budget. `adaptive` without an effort
+/// and `disabled` leave the vendor default (`none` is not accepted by every
+/// reasoning model).
+fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
+    if let Some(effort) = reasoning.effort {
+        return Some(effort);
+    }
+    if let Some(Value::String(effort)) = reasoning
+        .output_config
+        .and_then(|mut config| config.get_mut("effort").map(Value::take))
+    {
+        return Some(effort);
+    }
+    let budget = reasoning.budget_tokens.or_else(|| {
+        reasoning
+            .thinking
+            .filter(|thinking| thinking["type"] == "enabled")
+            .and_then(|thinking| thinking["budget_tokens"].as_i64())
+    })?;
+    Some(gw_protocol::reasoning::budget_effort(budget).to_owned())
+}
+
+/// Drop Anthropic thinking blocks from a replayed assistant turn, folding
+/// their prose into `reasoning_content` when the client sent none.
+fn strip_thinking_blocks(parts: Vec<Value>, reasoning_content: &mut Option<String>) -> Vec<Value> {
+    if !parts
+        .iter()
+        .any(|p| matches!(p["type"].as_str(), Some("thinking" | "redacted_thinking")))
+    {
+        return parts;
+    }
+    let mut prose = String::new();
+    let kept = parts
+        .into_iter()
+        .filter(|p| match p["type"].as_str() {
+            Some("thinking") => {
+                prose.push_str(p["thinking"].as_str().unwrap_or_default());
+                false
+            }
+            Some("redacted_thinking") => false,
+            _ => true,
+        })
+        .collect();
+    if reasoning_content.is_none() && !prose.is_empty() {
+        *reasoning_content = Some(prose);
+    }
+    kept
+}
+
 fn apply_openai_usage(resp: &mut GatewayResponse, usage: Value) {
     if usage.is_null() {
         return;
@@ -601,5 +700,70 @@ mod tests {
         let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said:"));
+    }
+
+    #[derive(Debug)]
+    struct Reply(&'static str, bool);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for Reply {
+        async fn send(
+            &self,
+            _req: crate::transport::UpstreamRequest,
+        ) -> gw_models::GResult<crate::transport::UpstreamResponse> {
+            let bytes = self.0.as_bytes().to_vec();
+            Ok(crate::transport::UpstreamResponse {
+                status: 200,
+                body: if self.1 {
+                    UpstreamBody::Sse(bytes)
+                } else {
+                    UpstreamBody::Json(bytes.into())
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn non_stream_captures_reasoning_prose_and_details() {
+        let body = r#"{"model":"deepseek","choices":[{"message":{"content":"391","reasoning_content":"17*23","reasoning_details":[{"type":"reasoning.text","text":"17*23"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let out = OpenAiEngine::new(req(false), Arc::new(Reply(body, false)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.message, "391");
+        assert_eq!(out.response.reasoning, "17*23");
+        assert_eq!(out.response.reasoning_details.unwrap()[0]["text"], "17*23");
+
+        let alias = r#"{"model":"grok","choices":[{"message":{"content":"391","reasoning":"via reasoning"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let out = OpenAiEngine::new(req(false), Arc::new(Reply(alias, false)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.reasoning, "via reasoning");
+        assert!(out.response.reasoning_details.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_forwards_reasoning_deltas_and_details() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"17*\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"23\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"23\",\"index\":0}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"391\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = OpenAiEngine::new(req(true), Arc::new(Reply(sse, true)))
+            .run()
+            .await
+            .unwrap();
+        let reasoning: Vec<&str> = out.chunks.iter().map(|c| c.reasoning.as_str()).collect();
+        assert_eq!(reasoning, ["17*", "23", "", ""]);
+        assert_eq!(
+            out.chunks[1].reasoning_details.as_ref().unwrap()[0]["text"],
+            "23"
+        );
+        assert_eq!(out.chunks[2].delta, "391");
+        assert_eq!(out.response.reasoning, "17*23");
+        assert_eq!(out.response.message, "391");
     }
 }

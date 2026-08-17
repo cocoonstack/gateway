@@ -30,10 +30,25 @@ impl ClaudeEngine {
             } else {
                 "user"
             };
+            // replayed signed reasoning leads the turn: Claude requires its
+            // thinking blocks ahead of the tool_use they produced
+            let thinking: Vec<Value> = match m.reasoning_details {
+                Some(Value::Array(details)) => details
+                    .into_iter()
+                    .filter_map(gw_protocol::reasoning::detail_to_thinking_block)
+                    .collect(),
+                _ => Vec::new(),
+            };
             let content = match m.tool_calls {
                 Some(Value::Array(calls)) => {
-                    let mut blocks = content_blocks(content);
+                    let mut blocks = thinking;
+                    blocks.extend(content_blocks(content));
                     blocks.extend(gw_protocol::anthropic::tool_calls_to_tool_use(calls));
+                    Value::Array(blocks)
+                }
+                _ if !thinking.is_empty() => {
+                    let mut blocks = thinking;
+                    blocks.extend(content_blocks(content));
                     Value::Array(blocks)
                 }
                 _ => content,
@@ -50,20 +65,56 @@ impl ClaudeEngine {
         }
         let param = self.base.param()?;
         let protocol = param.protocol;
+        // an Anthropic `thinking` in the chat surface's passthrough bag is the
+        // client's own contract; it wins over an effort mapping
+        let client_thinking = param.raw.get("thinking").is_some();
+        let adaptive_model = gw_protocol::reasoning::anthropic_adaptive_model(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), Value::Array(messages));
         body.insert("stream".into(), self.base.request.stream.into());
         let mut max_tokens = 1024;
+        // gateway-mapped thinking owns the sampling and token knobs the client
+        // set without knowing they would conflict; client thinking is verbatim
+        let mut mapped = false;
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
             }
-            if let Some(t) = p.temperature {
-                body.insert("temperature".into(), json!(t));
+            if let Some(reasoning) = p.reasoning {
+                let reasoning = *reasoning;
+                if reasoning.thinking.is_none()
+                    && !client_thinking
+                    && let Some((thinking, output_config, budget)) = map_thinking(
+                        adaptive_model,
+                        reasoning.effort.as_deref(),
+                        reasoning.budget_tokens,
+                    )
+                {
+                    body.insert("thinking".into(), thinking);
+                    if let Some(output_config) = output_config {
+                        body.insert("output_config".into(), output_config);
+                    }
+                    // the answer budget rides on top of the thinking budget
+                    if max_tokens <= budget {
+                        max_tokens = budget.saturating_add(max_tokens);
+                    }
+                    mapped = true;
+                }
+                if let Some(thinking) = reasoning.thinking {
+                    body.insert("thinking".into(), thinking);
+                }
+                if let Some(output_config) = reasoning.output_config {
+                    body.insert("output_config".into(), output_config);
+                }
             }
-            if let Some(t) = p.top_p {
-                body.insert("top_p".into(), json!(t));
+            if !mapped {
+                if let Some(t) = p.temperature {
+                    body.insert("temperature".into(), json!(t));
+                }
+                if let Some(t) = p.top_p {
+                    body.insert("top_p".into(), json!(t));
+                }
             }
             if let Some(tools) = p.tools {
                 body.insert("tools".into(), normalize_tools_anthropic(tools));
@@ -85,7 +136,10 @@ impl ClaudeEngine {
             };
             body.insert("system".into(), system);
         }
-        let raw = self.base.take_raw();
+        let mut raw = self.base.take_raw();
+        if mapped && let Some(extra) = raw.as_object_mut() {
+            extra.remove("top_k");
+        }
         crate::base::merge_raw_extras_owned(&mut body, raw);
 
         Ok(UpstreamRequest {
@@ -116,15 +170,24 @@ impl ClaudeEngine {
         }
         let preserve_native = self.base.request.preserve_anthropic_wire;
         let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut reasoning_details: Vec<Value> = Vec::new();
         let mut tool_use: Vec<Value> = Vec::new();
         let mut content = v.get_mut("content").map(Value::take);
         if let Some(Value::Array(blocks)) = &mut content {
-            for b in blocks {
+            for (index, b) in blocks.iter_mut().enumerate() {
                 match b["type"].as_str() {
                     Some("text") => text.push_str(b["text"].as_str().unwrap_or_default()),
                     // the block stays in `content` only when the native wire is kept
                     Some("tool_use") => {
                         tool_use.push(if preserve_native { b.clone() } else { b.take() })
+                    }
+                    Some("thinking" | "redacted_thinking") if !preserve_native => {
+                        reasoning.push_str(b["thinking"].as_str().unwrap_or_default());
+                        reasoning_details.extend(gw_protocol::reasoning::thinking_block_to_detail(
+                            b.take(),
+                            index,
+                        ));
                     }
                     _ => {}
                 }
@@ -136,6 +199,8 @@ impl ClaudeEngine {
         let raw_usage = v.get_mut("usage").map(Value::take).filter(|u| !u.is_null());
         let resp = GatewayResponse {
             message: text,
+            reasoning,
+            reasoning_details: (!reasoning_details.is_empty()).then_some(reasoning_details),
             tool_calls: if tool_use.is_empty() {
                 None
             } else {
@@ -313,6 +378,46 @@ pub fn anthropic_native_chunks(
 
 /// A `role: "tool"` message as a `tool_result` block; empty output omits
 /// `content` rather than sending an empty text, which the upstream rejects.
+/// An OpenAI-dialect reasoning request as this model's thinking config:
+/// `(thinking, output_config, budget)`. Budget-only models get
+/// `enabled` + `budget_tokens`; adaptive models get `adaptive` + an
+/// `output_config.effort` (`minimal` folds into `low`). `none`, or vocabulary
+/// neither side knows, leaves thinking to the model's default.
+fn map_thinking(
+    adaptive_model: bool,
+    effort: Option<&str>,
+    budget: Option<i64>,
+) -> Option<(Value, Option<Value>, i64)> {
+    use gw_protocol::reasoning::{budget_effort, effort_budget};
+    if effort == Some("none") {
+        return None;
+    }
+    let budget = budget.or_else(|| effort.and_then(effort_budget))?;
+    if !adaptive_model {
+        return Some((
+            json!({"type": "enabled", "budget_tokens": budget}),
+            None,
+            budget,
+        ));
+    }
+    let effort = match effort {
+        Some("minimal") | None => budget_effort(budget),
+        Some(effort) => effort,
+    };
+    Some((
+        json!({"type": "adaptive"}),
+        Some(json!({"effort": effort})),
+        budget,
+    ))
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block["type"].as_str(),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
 fn tool_result_block(tool_use_id: Option<String>, content: Value) -> Value {
     let mut block = Map::new();
     block.insert("type".into(), "tool_result".into());
@@ -415,7 +520,10 @@ struct SseState {
     output: i64,
     tool_blocks: Vec<Value>,
     native_blocks: Vec<Value>,
+    /// the in-flight block: every block on the native surface, thinking
+    /// blocks (the client's reasoning units) on the chat surface
     open_native: Option<Value>,
+    open_native_index: usize,
     open_native_input: String,
     /// in-flight tool_use block: (skeleton from content_block_start,
     /// accumulated input_json_delta fragments)
@@ -433,6 +541,7 @@ impl SseState {
             tool_blocks: Vec::new(),
             native_blocks: Vec::new(),
             open_native: None,
+            open_native_index: 0,
             open_native_input: String::new(),
             open_tool: None,
         }
@@ -441,6 +550,8 @@ impl SseState {
     fn push_visible(chunks: &mut Vec<StreamChunk>, chunk: StreamChunk) {
         if chunk.native_event.is_some()
             || !chunk.delta.is_empty()
+            || !chunk.reasoning.is_empty()
+            || chunk.reasoning_details.is_some()
             || chunk.tool_calls.is_some()
             || chunk.finish_reason.is_some()
         {
@@ -452,7 +563,7 @@ impl SseState {
     /// by value so the native forward is a move, not a per-event deep clone.
     fn apply(
         &mut self,
-        v: Value,
+        mut v: Value,
         status: u16,
         resp: &mut GatewayResponse,
     ) -> GResult<Vec<StreamChunk>> {
@@ -470,9 +581,15 @@ impl SseState {
                 self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
             }
             "content_block_start" => {
+                let index = v["index"].as_u64().unwrap_or_default() as usize;
                 if self.preserve_native {
                     self.open_native = Some(v["content_block"].clone());
                     self.open_native_input.clear();
+                } else if is_thinking_block(&v["content_block"]) {
+                    // the block itself is the client's reasoning unit; only its
+                    // signature is still to come
+                    self.open_native = Some(v["content_block"].take());
+                    self.open_native_index = index;
                 }
                 if v["content_block"]["type"] == "tool_use" {
                     self.open_tool = Some((v["content_block"].clone(), String::new()));
@@ -491,11 +608,16 @@ impl SseState {
                         text.push_str(t);
                     }
                 }
-                if let Some(t) = v["delta"]["thinking"].as_str()
-                    && let Some(block) = self.open_native.as_mut()
-                    && let Some(Value::String(thinking)) = block.get_mut("thinking")
-                {
-                    thinking.push_str(t);
+                if let Some(t) = v["delta"]["thinking"].as_str() {
+                    if let Some(block) = self.open_native.as_mut()
+                        && let Some(Value::String(thinking)) = block.get_mut("thinking")
+                    {
+                        thinking.push_str(t);
+                    }
+                    if !self.preserve_native {
+                        resp.reasoning.push_str(t);
+                        native_chunk.reasoning = t.to_owned();
+                    }
                 }
                 if let Some(signature) = v["delta"]["signature"].as_str()
                     && let Some(block) = self.open_native.as_mut()
@@ -518,7 +640,16 @@ impl SseState {
                     {
                         block["input"] = parsed;
                     }
-                    self.native_blocks.push(block);
+                    if self.preserve_native {
+                        self.native_blocks.push(block);
+                    } else {
+                        native_chunk.reasoning_details =
+                            gw_protocol::reasoning::thinking_block_to_detail(
+                                block,
+                                self.open_native_index,
+                            )
+                            .map(|detail| vec![detail]);
+                    }
                 }
                 self.open_native_input.clear();
                 if let Some((mut block, buf)) = self.open_tool.take() {
@@ -685,6 +816,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_surface_turns_thinking_blocks_into_reasoning() {
+        let body = br#"{
+            "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet",
+            "content":[
+                {"type":"thinking","thinking":"private reasoning","signature":"opaque-signature"},
+                {"type":"redacted_thinking","data":"opaque-redacted-data"},
+                {"type":"text","text":"answer"},
+                {"type":"tool_use","id":"tool-1","name":"probe","input":{"ok":true}}
+            ],
+            "stop_reason":"tool_use","usage":{"input_tokens":11,"output_tokens":7}
+        }"#;
+        let outcome = ClaudeEngine::new(base_req(), Arc::new(JsonReply(body)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(outcome.response.message, "answer");
+        assert_eq!(outcome.response.reasoning, "private reasoning");
+        assert_eq!(
+            outcome.response.reasoning_details,
+            Some(vec![
+                json!({"type":"reasoning.text","text":"private reasoning","signature":"opaque-signature","format":"anthropic-claude-v1","index":0}),
+                json!({"type":"reasoning.encrypted","data":"opaque-redacted-data","format":"anthropic-claude-v1","index":1}),
+            ])
+        );
+        assert!(outcome.response.anthropic_content.is_none());
+        assert_eq!(outcome.response.tool_calls.unwrap()[0]["name"], "probe");
+    }
+
+    #[tokio::test]
     async fn streaming_request_preserves_thinking_when_upstream_returns_json() {
         let body = br#"{
             "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet",
@@ -773,26 +933,48 @@ mod tests {
     }
 
     #[test]
-    fn cross_protocol_stream_drops_native_only_chunks() {
+    fn cross_protocol_stream_turns_thinking_into_reasoning_chunks() {
         let mut state = SseState::new(false, None);
         let mut response = GatewayResponse::default();
+        let mut chunks = Vec::new();
         for event in [
             json!({"type":"message_start","message":{"model":"claude-sonnet","usage":{"input_tokens":1}}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"priv"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ate"}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque"}}),
             json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"blob"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"content_block_stop","index":2}),
             json!({"type":"message_stop"}),
         ] {
-            assert!(
-                state.apply(event, 200, &mut response).unwrap().is_empty(),
-                "native-only events must not commit a non-Anthropic stream"
-            );
+            chunks.extend(state.apply(event, 200, &mut response).unwrap());
         }
+        assert!(chunks.iter().all(|c| c.native_event.is_none()));
         assert!(
             state.native_blocks.is_empty() && state.open_native.is_none(),
             "a cross-protocol stream must not buffer a native copy"
         );
+        let reasoning: Vec<&str> = chunks.iter().map(|c| c.reasoning.as_str()).collect();
+        assert_eq!(reasoning, ["priv", "ate", "", "", ""]);
+        let details: Vec<Value> = chunks
+            .iter()
+            .filter_map(|c| c.reasoning_details.clone())
+            .flatten()
+            .collect();
+        assert_eq!(
+            details,
+            [
+                json!({"type":"reasoning.text","text":"private","signature":"opaque","format":"anthropic-claude-v1","index":0}),
+                json!({"type":"reasoning.encrypted","data":"blob","format":"anthropic-claude-v1","index":1}),
+            ]
+        );
+        assert_eq!(chunks[4].delta, "answer");
+        assert_eq!(response.reasoning, "private");
+        assert!(response.reasoning_details.is_none());
     }
 
     #[test]

@@ -13,6 +13,14 @@ pub struct GatewayResponse {
     /// model-requested tool calls (openai tool_calls array / anthropic tool_use blocks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
+    /// reasoning prose on a non-native surface (Anthropic thinking text,
+    /// OpenAI-compatible `reasoning_content`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    /// reasoning units in emission order (`reasoning_details` shape): the
+    /// signed/encrypted proof a later turn replays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<Value>>,
     /// model name reported by the vendor.
     pub model: String,
 
@@ -103,6 +111,11 @@ impl StreamError {
 #[derive(Debug, Default, Clone)]
 pub struct StreamChunk {
     pub delta: String,
+    /// reasoning prose delta.
+    pub reasoning: String,
+    /// completed reasoning units (`reasoning_details` shape) — a signed
+    /// thinking block once its signature arrived, or a vendor's own units.
+    pub reasoning_details: Option<Vec<Value>>,
     /// tool-call delta fragment (vendor wire shape), forwarded as it arrives.
     pub tool_calls: Option<Value>,
     pub finish_reason: Option<String>,

@@ -26,7 +26,7 @@ use gw_engines::realtime::{
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
-    ModelParamV2, SttParams, TtsParams, TypedParams,
+    ModelParamV2, ReasoningParam, SttParams, TtsParams, TypedParams,
 };
 use gw_protocol::anthropic::{AnthUsage, MessagesRequest, tool_use_to_tool_calls};
 use gw_protocol::openai::{
@@ -2571,6 +2571,30 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
     usage
 }
 
+/// The chat surface's reasoning request: OpenAI's flat `reasoning_effort`, or
+/// OpenRouter's `reasoning{effort, max_tokens, enabled}` (`enabled` alone means
+/// the vendor's default depth; `enabled: false` turns it off).
+fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Box<ReasoningParam>> {
+    let mut param = ReasoningParam {
+        effort,
+        ..Default::default()
+    };
+    if let Some(Value::Object(mut reasoning)) = reasoning {
+        if let Some(Value::String(effort)) = reasoning.remove("effort") {
+            param.effort = Some(effort);
+        }
+        param.budget_tokens = reasoning.get("max_tokens").and_then(Value::as_i64);
+        if param.effort.is_none() && param.budget_tokens.is_none() {
+            param.effort = match reasoning.get("enabled").and_then(Value::as_bool) {
+                Some(true) => Some("medium".to_owned()),
+                Some(false) => Some("none".to_owned()),
+                None => None,
+            };
+        }
+    }
+    (param.effort.is_some() || param.budget_tokens.is_some()).then(|| Box::new(param))
+}
+
 /// POST /v1/chat/completions (OpenAI-compatible surface)
 async fn chat_completions(
     State(s): State<AppState>,
@@ -2597,6 +2621,8 @@ async fn chat_completions(
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
                 tool_call_id: m.tool_call_id,
+                reasoning_content: m.reasoning_content,
+                reasoning_details: m.reasoning_details.map(Value::Array),
             }
         })
         .collect();
@@ -2613,6 +2639,7 @@ async fn chat_completions(
         logprobs: body.logprobs,
         top_logprobs: body.top_logprobs,
         system: None,
+        reasoning: chat_reasoning(body.reasoning_effort, body.reasoning),
     });
     let stream_model = body.stream.then(|| body.model.clone());
     let mut param = ModelParamV2::with_name(
@@ -2657,7 +2684,7 @@ async fn chat_completions(
     );
     let model_out = outcome.response.model;
 
-    if let Some(tc) = outcome.response.tool_calls.take() {
+    let mut resp = if let Some(tc) = outcome.response.tool_calls.take() {
         let calls: Vec<gw_protocol::openai::ToolCall> =
             match serde_json::from_value(Value::Array(openai_tool_calls(tc, &mut 0))) {
                 Ok(calls) => calls,
@@ -2669,26 +2696,30 @@ async fn chat_completions(
                     return terminal_response(&ctx, response).await;
                 }
             };
-        let resp = ChatCompletionResponse::tool_calls(
+        ChatCompletionResponse::tool_calls(
             id,
             created,
             model_out,
             outcome.response.message,
             calls,
             usage,
-        );
-        let response = (StatusCode::OK, Json(resp)).into_response();
-        return terminal_response(&ctx, response).await;
+        )
+    } else {
+        ChatCompletionResponse::text(
+            id,
+            created,
+            model_out,
+            outcome.response.message,
+            finish_openai(outcome.response.finish_reason),
+            usage,
+        )
+    };
+    if !outcome.response.reasoning.is_empty() || outcome.response.reasoning_details.is_some() {
+        let message = &mut resp.choices[0].message;
+        message.reasoning_content =
+            (!outcome.response.reasoning.is_empty()).then_some(outcome.response.reasoning);
+        message.reasoning_details = outcome.response.reasoning_details;
     }
-
-    let resp = ChatCompletionResponse::text(
-        id,
-        created,
-        model_out,
-        outcome.response.message,
-        finish_openai(outcome.response.finish_reason),
-        usage,
-    );
     let response = (StatusCode::OK, Json(resp)).into_response();
     terminal_response(&ctx, response).await
 }
@@ -2859,6 +2890,18 @@ fn chat_stream_response(
                     true
                 }
                 Some(mut c) => {
+                    if !c.reasoning.is_empty() || c.reasoning_details.is_some() {
+                        let chunk = ChatCompletionChunk::reasoning(
+                            &self.id,
+                            self.created,
+                            &self.model,
+                            std::mem::take(&mut c.reasoning),
+                            c.reasoning_details.take(),
+                        );
+                        if let Ok(payload) = serde_json::to_string(&chunk) {
+                            self.queue.push_back(Event::default().data(payload));
+                        }
+                    }
                     if !c.delta.is_empty() {
                         let chunk = ChatCompletionChunk::content(
                             &self.id,
@@ -2929,11 +2972,22 @@ fn chat_stream_response(
 /// Chunks for an engine that returned a buffered response.
 fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let resp = &mut outcome.response;
-    let mut chunks = if outcome.chunks.is_empty() && !resp.message.is_empty() {
-        vec![gw_engines::StreamChunk {
-            delta: std::mem::take(&mut resp.message),
-            ..Default::default()
-        }]
+    let mut chunks = if outcome.chunks.is_empty() {
+        let mut chunks = Vec::new();
+        if !resp.reasoning.is_empty() || resp.reasoning_details.is_some() {
+            chunks.push(gw_engines::StreamChunk {
+                reasoning: std::mem::take(&mut resp.reasoning),
+                reasoning_details: resp.reasoning_details.take(),
+                ..Default::default()
+            });
+        }
+        if !resp.message.is_empty() {
+            chunks.push(gw_engines::StreamChunk {
+                delta: std::mem::take(&mut resp.message),
+                ..Default::default()
+            });
+        }
+        chunks
     } else {
         std::mem::take(&mut outcome.chunks)
     };
@@ -2964,6 +3018,15 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         return chunks;
     }
     let mut chunks = Vec::new();
+    // reasoning prose is redacted like the message; signed units survive only
+    // when the strip pass left them
+    if !resp.reasoning.is_empty() || resp.reasoning_details.is_some() {
+        chunks.push(gw_engines::StreamChunk {
+            reasoning: std::mem::take(&mut resp.reasoning),
+            reasoning_details: resp.reasoning_details.take(),
+            ..Default::default()
+        });
+    }
     if !resp.message.is_empty() {
         chunks.push(gw_engines::StreamChunk {
             delta: std::mem::take(&mut resp.message),
@@ -2986,6 +3049,7 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
     let encoder = gw_models::token_estimate::default_encoder();
     let mut tokens = encoder.encode_len(&chunk.delta) as i64;
+    tokens = tokens.saturating_add(encoder.encode_len(&chunk.reasoning) as i64);
     if let Some(tool_calls) = &chunk.tool_calls {
         tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
     }
@@ -3032,6 +3096,13 @@ async fn messages(
         tools: body.tools.map(Value::Array),
         tool_choice: body.tool_choice,
         system,
+        reasoning: (body.thinking.is_some() || body.output_config.is_some()).then(|| {
+            Box::new(ReasoningParam {
+                thinking: body.thinking,
+                output_config: body.output_config,
+                ..Default::default()
+            })
+        }),
         ..Default::default()
     });
     let stream_model = body.stream.then(|| body.model.clone());
@@ -3103,6 +3174,13 @@ async fn messages(
         Some(Value::Array(blocks)) => blocks,
         _ => {
             let mut blocks = Vec::new();
+            if !outcome.response.reasoning.is_empty() {
+                blocks.push(json!({
+                    "type":"thinking",
+                    "thinking":Value::String(std::mem::take(&mut outcome.response.reasoning)),
+                    "signature":""
+                }));
+            }
             if !outcome.response.message.is_empty() {
                 blocks.push(json!({"type":"text","text":outcome.response.message}));
             }
@@ -3165,6 +3243,7 @@ fn messages_stream_response(
         model: String,
         started_msg: bool,
         text_idx: Option<usize>,
+        thinking_idx: Option<usize>,
         next_idx: usize,
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
@@ -3195,6 +3274,7 @@ fn messages_stream_response(
             if let Some(idx) = self.text_idx {
                 return idx;
             }
+            self.close_thinking();
             let idx = self.next_idx;
             self.next_idx += 1;
             self.text_idx = Some(idx);
@@ -3207,7 +3287,34 @@ fn messages_stream_response(
         }
 
         fn close_text(&mut self) {
+            self.close_thinking();
             if let Some(idx) = self.text_idx.take() {
+                self.queue.push_back(Self::ev(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":idx}),
+                ));
+            }
+        }
+
+        /// A non-Anthropic model's reasoning prose as an unsigned thinking
+        /// block ahead of the answer.
+        fn open_thinking(&mut self) -> usize {
+            if let Some(idx) = self.thinking_idx {
+                return idx;
+            }
+            let idx = self.next_idx;
+            self.next_idx += 1;
+            self.thinking_idx = Some(idx);
+            self.queue.push_back(Self::ev(
+                "content_block_start",
+                json!({"type":"content_block_start","index":idx,
+                       "content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ));
+            idx
+        }
+
+        fn close_thinking(&mut self) {
+            if let Some(idx) = self.thinking_idx.take() {
                 self.queue.push_back(Self::ev(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":idx}),
@@ -3309,6 +3416,15 @@ fn messages_stream_response(
                             .push_back(Event::default().event(kind).data(data));
                         return done;
                     }
+                    if !c.reasoning.is_empty() {
+                        self.ensure_message_start();
+                        let idx = self.open_thinking();
+                        self.queue.push_back(St::ev(
+                            "content_block_delta",
+                            json!({"type":"content_block_delta","index":idx,
+                                   "delta":{"type":"thinking_delta","thinking":c.reasoning}}),
+                        ));
+                    }
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
                         let idx = self.open_text();
@@ -3357,6 +3473,7 @@ fn messages_stream_response(
             model,
             started_msg: false,
             text_idx: None,
+            thinking_idx: None,
             next_idx: 0,
             tool_frags: None,
             pending_finish: None,

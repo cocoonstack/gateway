@@ -61,27 +61,37 @@ impl GatewayRequest {
         })
     }
 
-    /// Whether the request explicitly enables thinking. A `thinking` key with
-    /// `{"type":"disabled"}` is a routine SDK serialization and must not
-    /// trigger thinking handling.
-    pub fn anthropic_thinking_enabled(&self) -> bool {
+    /// Whether the request explicitly engages reasoning: the typed reasoning
+    /// request, or an Anthropic `thinking` riding the chat surface's
+    /// passthrough bag with a type other than `disabled` — a routine SDK
+    /// serialization.
+    pub fn reasoning_engaged(&self) -> bool {
+        let Some(param) = self.model_param_v2.as_ref() else {
+            return false;
+        };
+        if let Some(crate::params::TypedParams::Chat(chat)) = param.typed.as_ref()
+            && chat.reasoning.as_ref().is_some_and(|r| r.engaged())
+        {
+            return true;
+        }
         matches!(
-            self.model_param_v2
-                .as_ref()
-                .and_then(|param| param.raw.pointer("/thinking/type"))
+            param
+                .raw
+                .pointer("/thinking/type")
                 .and_then(serde_json::Value::as_str),
             Some("enabled" | "adaptive")
         )
     }
 
-    /// Whether this native Messages request must stay on its requested model.
-    /// The initial extended-thinking request enables the `thinking` option;
-    /// tool continuations carry protected thinking blocks. Pinning both sides
-    /// prevents variants or fallback policy from moving a signed continuation
-    /// to a different model.
-    pub fn pins_anthropic_thinking_route(&self) -> bool {
-        self.preserve_anthropic_wire
-            && (self.has_anthropic_thinking_blocks() || self.anthropic_thinking_enabled())
+    /// Whether this request must stay on its requested model. Reasoning
+    /// output replays only against the model that produced it (Anthropic
+    /// signatures, OpenAI encrypted reasoning), so both the request that
+    /// engages reasoning and the continuation carrying its output are pinned:
+    /// variants and fallback policy must not move either.
+    pub fn pins_reasoning_route(&self) -> bool {
+        self.reasoning_engaged()
+            || self.has_anthropic_thinking_blocks()
+            || self.message.iter().any(|m| m.reasoning_details.is_some())
     }
 }
 
@@ -171,6 +181,13 @@ pub mod domain {
         /// the call id a role:"tool" result message refers back to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tool_call_id: Option<String>,
+        /// assistant reasoning prose replayed by the client (`reasoning_content`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_content: Option<String>,
+        /// assistant reasoning units replayed by the client (`reasoning_details`
+        /// array: signed thinking, encrypted reasoning) in emission order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_details: Option<Value>,
     }
 
     impl ChatMsg {

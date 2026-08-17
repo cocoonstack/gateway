@@ -18,8 +18,8 @@ pub use cost::{
 };
 pub use error::{GResult, GatewayError};
 pub use params::{
-    ChatParams, EmbeddingParams, ImageParams, ModerationParams, RerankParams, SearchParams,
-    SttParams, TtsParams, TypedParams, VideoParams,
+    ChatParams, EmbeddingParams, ImageParams, ModerationParams, ReasoningParam, RerankParams,
+    SearchParams, SttParams, TtsParams, TypedParams, VideoParams,
 };
 pub use request::domain::{Account, ChatMsg};
 pub use request::{BatchItem, GatewayRequest, ModelParamV2};
