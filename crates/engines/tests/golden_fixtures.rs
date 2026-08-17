@@ -353,7 +353,10 @@ async fn flat_error_bodies_surface_for_bespoke_vendors() {
     let err = gw_engines::LlamaEngine::new(
         GatewayRequest {
             message: vec![ChatMsg::text("user", "hi")],
-            model_param_v2: Some(ModelParamV2::with_name(Protocol::AwsLlama, "llama3-70b")),
+            model_param_v2: Some(ModelParamV2::with_name(
+                Protocol::AwsLlama,
+                "meta.llama3-70b-instruct-v1:0",
+            )),
             ..Default::default()
         },
         Arc::new(FixtureTransport {

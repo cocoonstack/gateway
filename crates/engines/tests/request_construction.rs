@@ -342,8 +342,13 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         .header("authorization")
         .expect("sigv4 authorization header");
     assert!(
-        auth.contains("Credential=AKIAREALEXAMPLE123/"),
-        "SigV4 must sign with the real access key, got: {auth}"
+        auth.contains("Credential=AKIAREALEXAMPLE123/") && auth.contains("/eu-west-1/bedrock/"),
+        "SigV4 must sign with the real access key in the endpoint's region, got: {auth}"
+    );
+    assert!(
+        t.url().ends_with("/model/cohere.command-r/invoke"),
+        "url: {}",
+        t.url()
     );
     assert!(
         !auth.contains("AKIDMOCK"),
@@ -525,10 +530,13 @@ async fn system_prompt_reaches_every_bespoke_wire() {
     let cohere = RecordingTransport::new(
         r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
-    CohereEngine::new(chat_req(Protocol::AwsCohere, "command-r"), cohere.clone())
-        .run()
-        .await
-        .unwrap();
+    CohereEngine::new(
+        chat_req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
+        cohere.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
     let cb = cohere.body_json();
     assert_eq!(cb["preamble"], "be brief", "cohere system slot");
     assert!(
@@ -605,10 +613,13 @@ async fn cohere_request_shape_with_sigv4() {
     let t = RecordingTransport::new(
         r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
-    let _ = CohereEngine::new(chat_req(Protocol::AwsCohere, "command-r"), t.clone())
-        .run()
-        .await
-        .unwrap();
+    let _ = CohereEngine::new(
+        chat_req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
     let b = t.body_json();
     assert_eq!(b["message"], "hello");
     assert!(b["chat_history"].is_array());
@@ -626,10 +637,13 @@ async fn llama_request_shape_with_sigv4() {
     let t = RecordingTransport::new(
         r#"{"generation":"ok","prompt_token_count":1,"generation_token_count":1,"stop_reason":"stop"}"#,
     );
-    let _ = LlamaEngine::new(chat_req(Protocol::AwsLlama, "llama3-70b"), t.clone())
-        .run()
-        .await
-        .unwrap();
+    let _ = LlamaEngine::new(
+        chat_req(Protocol::AwsLlama, "meta.llama3-70b-instruct-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
     let b = t.body_json();
     assert!(
         b["prompt"].as_str().unwrap().contains("hello"),
