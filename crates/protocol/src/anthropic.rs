@@ -93,29 +93,26 @@ pub fn tool_calls_to_tool_use(calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Convert Anthropic `tool_use` blocks into OpenAI-shaped tool calls
-/// (`{id, type: "function", function: {name, arguments}}`), the inverse of
-/// [`tool_calls_to_tool_use`]. The block's structured `input` becomes the
-/// JSON-encoded `arguments` string. Entries already carrying a `function`
-/// pass through unchanged, so mixed engine output renders once.
-pub fn tool_use_to_tool_calls(blocks: &[Value]) -> Vec<Value> {
+/// Inverse of [`tool_calls_to_tool_use`]: `input` becomes the JSON-encoded
+/// `arguments`, each converted call takes the next `index` (streamed deltas
+/// accumulate by it); other entries pass through so a misfit fails at the caller.
+pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Value> {
     blocks
-        .iter()
-        .filter_map(|b| {
-            if b.get("function").is_some() {
-                return Some(b.clone());
-            }
+        .into_iter()
+        .map(|mut b| {
             if b["type"] != "tool_use" {
-                return None;
+                return b;
             }
             let arguments = match &b["input"] {
                 Value::Null => "{}".to_owned(),
                 input => input.to_string(),
             };
-            Some(serde_json::json!({
-                "id": b["id"], "type": "function",
-                "function": {"name": b["name"], "arguments": arguments}
-            }))
+            let call = serde_json::json!({
+                "index": *index, "id": b["id"].take(), "type": "function",
+                "function": {"name": b["name"].take(), "arguments": arguments}
+            });
+            *index += 1;
+            call
         })
         .collect()
 }
@@ -130,12 +127,14 @@ mod tests {
     fn tool_use_blocks_convert_to_tool_calls() {
         let blocks = vec![
             json!({"type":"tool_use","id":"toolu_1","name":"shell","input":{"command":"ls -la"}}),
-            json!({"type":"text","text":"I'll list the files."}),
+            json!({"type":"text","text":"kept as is"}),
             json!({"id":"call_9","type":"function","function":{"name":"kept","arguments":"{}"}}),
             json!({"type":"tool_use","id":"toolu_2","name":"noop"}),
         ];
-        let calls = tool_use_to_tool_calls(&blocks);
-        assert_eq!(calls.len(), 3);
+        let mut index = 0;
+        let calls = tool_use_to_tool_calls(blocks, &mut index);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0]["index"], 0);
         assert_eq!(calls[0]["id"], "toolu_1");
         assert_eq!(calls[0]["type"], "function");
         assert_eq!(calls[0]["function"]["name"], "shell");
@@ -143,8 +142,11 @@ mod tests {
             calls[0]["function"]["arguments"],
             "{\"command\":\"ls -la\"}"
         );
-        assert_eq!(calls[1]["id"], "call_9");
-        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["type"], "text");
+        assert_eq!(calls[2]["id"], "call_9");
+        assert_eq!(calls[3]["index"], 1);
+        assert_eq!(calls[3]["function"]["arguments"], "{}");
+        assert_eq!(index, 2);
         let back = tool_calls_to_tool_use(&calls);
         assert_eq!(back[0]["input"], json!({"command":"ls -la"}));
     }

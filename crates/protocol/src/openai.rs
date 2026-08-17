@@ -168,8 +168,7 @@ impl ChatCompletionResponse {
         )
     }
 
-    /// Assistant turn that is a tool call (finish_reason=tool_calls); any
-    /// text the model emitted alongside rides in `content`, else null.
+    /// Tool-call assistant turn (finish_reason=tool_calls); accompanying text rides in `content`.
     pub fn tool_calls(
         id: impl Into<String>,
         created: i64,

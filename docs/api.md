@@ -70,7 +70,9 @@ curl -s localhost:8080/v1/chat/completions \
 Set `"stream": true` for an SSE response. Frames arrive incrementally as the
 upstream produces them; the final frame carries `usage` and `finish_reason`,
 then `data: [DONE]`. Multimodal `content` arrays, `tools`/`tool_choice`, and
-`tool_calls` responses are supported and passed through.
+`tool_calls` responses are supported and passed through. On an
+`anthropic-messages` model the reply's `tool_use` blocks render as
+`tool_calls` (streamed with `index`) and `stop_reason` maps to `finish_reason`.
 
 ## Anthropic-compatible
 

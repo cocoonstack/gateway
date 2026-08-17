@@ -3953,6 +3953,8 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                     "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-s\",\"name\":\"shell\",\"input\":{}}}\n\n",
                     "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
                     "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-s2\",\"name\":\"pwd\",\"input\":{}}}\n\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
                     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8}}\n\n",
                     "data: {\"type\":\"message_stop\"}\n\n",
                 );
@@ -3961,12 +3963,14 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
                 });
             }
+            let mut tool_use =
+                json!({"type":"tool_use","id":"tool-1","name":"shell","input":{"command":"ls"}});
+            if request["messages"][0]["content"] == "broken" {
+                tool_use["id"] = Value::Null;
+            }
             let response = json!({
                 "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
-                "content":[
-                    {"type":"text","text":"I'll list them."},
-                    {"type":"tool_use","id":"tool-1","name":"shell","input":{"command":"ls"}}
-                ],
+                "content":[{"type":"text","text":"I'll list them."}, tool_use],
                 "stop_reason":"tool_use","stop_sequence":null,
                 "usage":{"input_tokens":10,"output_tokens":8}
             });
@@ -3979,16 +3983,53 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
         }
     }
 
-    let yaml = r#"
-listen: {host: 127.0.0.1, port: 0}
-security: {dlp_redact: false, detect_secrets: false}
-access_keys: [{ak: ak-tools, product: demo, qps: 100, daily_token_quota: 1000000}]
-models: [{name: claude-test, protocol: anthropic-messages}]
-accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
-"#;
-    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    let app = gw_views::app(AppState::new(cfg, state, Arc::new(ToolUseFixture)));
+    async fn streamed_tool_calls(
+        app: Router,
+        body: &Value,
+    ) -> (Vec<Value>, Option<String>, String) {
+        let resp = app
+            .oneshot(post(
+                "/v1/chat/completions",
+                Some("ak-tools"),
+                &body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        let mut calls = Vec::new();
+        let mut finish = None;
+        for l in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            if l == "[DONE]" {
+                break;
+            }
+            let v: Value = serde_json::from_str(l).unwrap();
+            if let Some(c) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+                calls.extend(c.iter().cloned());
+            }
+            if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+                finish = Some(fr.to_owned());
+            }
+        }
+        (calls, finish, text)
+    }
+
+    fn app_with(dlp_redact: bool) -> Router {
+        let yaml = format!(
+            r#"
+listen: {{host: 127.0.0.1, port: 0}}
+security: {{dlp_redact: {dlp_redact}, detect_secrets: false}}
+access_keys: [{{ak: ak-tools, product: demo, qps: 100, daily_token_quota: 1000000}}]
+models: [{{name: claude-test, protocol: anthropic-messages}}]
+accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}}]
+"#
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        gw_views::app(AppState::new(cfg, state, Arc::new(ToolUseFixture)))
+    }
+
+    let app = app_with(false);
     let tools = json!([{"type":"function","function":{"name":"shell","description":"run",
         "parameters":{"type":"object","properties":{"command":{"type":"string"}}}}}]);
 
@@ -4016,9 +4057,10 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         "{\"command\":\"ls\"}"
     );
 
-    let body = json!({"model":"claude-test","max_tokens":64,"stream":true,"tools":tools,
-        "messages":[{"role":"user","content":"list files"}]});
+    let body = json!({"model":"claude-test","max_tokens":64,"tools":tools,
+        "messages":[{"role":"user","content":"broken"}]});
     let resp = app
+        .clone()
         .oneshot(post(
             "/v1/chat/completions",
             Some("ak-tools"),
@@ -4026,22 +4068,33 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let text = String::from_utf8(body_bytes(resp).await).unwrap();
-    let mut streamed_calls = Vec::new();
-    for l in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
-        if l == "[DONE]" {
-            break;
-        }
-        let v: Value = serde_json::from_str(l).unwrap();
-        if let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() {
-            streamed_calls.extend(calls.iter().cloned());
-        }
-    }
-    assert_eq!(streamed_calls.len(), 1, "stream frames: {text}");
-    assert_eq!(streamed_calls[0]["function"]["name"], "shell");
-    assert_eq!(
-        streamed_calls[0]["function"]["arguments"],
-        "{\"command\":\"ls\"}"
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let v = body_json(resp).await;
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("do not render as OpenAI tool_calls"),
+        "{v}"
     );
+
+    let body = json!({"model":"claude-test","max_tokens":64,"stream":true,"tools":tools,
+        "messages":[{"role":"user","content":"list files"}]});
+    for buffered in [false, true] {
+        let (calls, finish, text) = streamed_tool_calls(app_with(buffered), &body).await;
+        assert_eq!(
+            finish.as_deref(),
+            Some("tool_calls"),
+            "buffered={buffered}: {text}"
+        );
+        assert_eq!(calls.len(), 2, "buffered={buffered}: {text}");
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["id"], "tool-s");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "shell");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"command\":\"ls\"}");
+        assert_eq!(calls[1]["index"], 1);
+        assert_eq!(calls[1]["function"]["name"], "pwd");
+        assert_eq!(calls[1]["function"]["arguments"], "{}");
+    }
 }

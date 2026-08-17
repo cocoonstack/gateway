@@ -74,8 +74,9 @@ curl -s localhost:8080/v1/chat/completions \
          "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
 ```
 
-The response omits `content` and sets `finish_reason:"tool_calls"` with the
-call in `choices[0].message.tool_calls`.
+The response sets `finish_reason:"tool_calls"` with the call in
+`choices[0].message.tool_calls`; `content` carries any text the model emitted
+alongside and is omitted otherwise.
 
 ## Embeddings, images, audio
 

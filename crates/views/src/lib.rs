@@ -2477,32 +2477,31 @@ fn finish_or_stop(fr: &str) -> &str {
     if fr.is_empty() { "stop" } else { fr }
 }
 
-/// Engine tool calls in OpenAI wire shape: the anthropic engine hands over
-/// native `tool_use` blocks, the OpenAI engines already-shaped calls.
-fn openai_tool_calls(calls: Value) -> Vec<Value> {
+/// Engine tool calls in OpenAI shape: the anthropic engine hands over native `tool_use` blocks.
+fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
     match calls {
-        Value::Array(a) => tool_use_to_tool_calls(&a),
-        _ => Vec::new(),
+        Value::Array(a) => tool_use_to_tool_calls(a, index),
+        other => vec![other],
     }
 }
 
 /// finish_reason mapping, anthropic → openai.
-fn finish_openai(fr: &str) -> String {
-    match fr {
+fn finish_openai(fr: String) -> String {
+    match fr.as_str() {
         "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => "stop".to_owned(),
         "max_tokens" => "length".to_owned(),
         "tool_use" => "tool_calls".to_owned(),
-        other => other.to_owned(),
+        _ => fr,
     }
 }
 
 /// finish_reason mapping, openai → anthropic.
-fn finish_anthropic(fr: &str) -> String {
-    match fr {
+fn finish_anthropic(fr: String) -> String {
+    match fr.as_str() {
         "" | "stop" => "end_turn".to_owned(),
         "length" => "max_tokens".to_owned(),
         "tool_calls" => "tool_use".to_owned(),
-        other => other.to_owned(),
+        _ => fr,
     }
 }
 
@@ -2660,11 +2659,11 @@ async fn chat_completions(
 
     if let Some(tc) = outcome.response.tool_calls.take() {
         let calls: Vec<gw_protocol::openai::ToolCall> =
-            match serde_json::from_value(Value::Array(openai_tool_calls(tc))) {
+            match serde_json::from_value(Value::Array(openai_tool_calls(tc, &mut 0))) {
                 Ok(calls) => calls,
                 Err(e) => {
                     let response = error_response(
-                        502,
+                        500,
                         format!("engine tool calls do not render as OpenAI tool_calls: {e}"),
                     );
                     return terminal_response(&ctx, response).await;
@@ -2674,7 +2673,7 @@ async fn chat_completions(
             id,
             created,
             model_out,
-            std::mem::take(&mut outcome.response.message),
+            outcome.response.message,
             calls,
             usage,
         );
@@ -2687,7 +2686,7 @@ async fn chat_completions(
         created,
         model_out,
         outcome.response.message,
-        finish_openai(&outcome.response.finish_reason),
+        finish_openai(outcome.response.finish_reason),
         usage,
     );
     let response = (StatusCode::OK, Json(resp)).into_response();
@@ -2843,6 +2842,7 @@ fn chat_stream_response(
         created: i64,
         model: String,
         pending_finish: Option<String>,
+        tool_index: usize,
     }
     impl SseEncodeState for St {
         fn queue(&mut self) -> &mut VecDeque<Event> {
@@ -2875,7 +2875,7 @@ fn chat_stream_response(
                             &self.id,
                             self.created,
                             &self.model,
-                            openai_tool_calls(tc),
+                            openai_tool_calls(tc, &mut self.tool_index),
                         );
                         if let Ok(payload) = serde_json::to_string(&chunk) {
                             self.queue.push_back(Event::default().data(payload));
@@ -2883,7 +2883,7 @@ fn chat_stream_response(
                     }
                     if let Some(fr) = c.finish_reason {
                         // held back until usage arrives so the final frame carries both
-                        self.pending_finish = Some(fr);
+                        self.pending_finish = Some(finish_openai(fr));
                     }
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
@@ -2921,6 +2921,7 @@ fn chat_stream_response(
             created: gw_state::epoch_secs(),
             model,
             pending_finish: None,
+            tool_index: 0,
         },
     )
 }
@@ -3116,7 +3117,7 @@ async fn messages(
             "role": "assistant",
             "model": outcome.response.model,
             "content": content,
-            "stop_reason": finish_anthropic(&outcome.response.finish_reason),
+            "stop_reason": finish_anthropic(outcome.response.finish_reason),
             "usage": usage,
         })),
     )
@@ -3328,7 +3329,7 @@ fn messages_stream_response(
                         }
                     }
                     if let Some(fr) = c.finish_reason {
-                        self.pending_finish = Some(finish_anthropic(&fr));
+                        self.pending_finish = Some(finish_anthropic(fr));
                     }
                     if let Some((pt, ct, _)) = c.usage_totals {
                         self.finish(pt, ct, c.common_usage);
@@ -5591,26 +5592,26 @@ mod tests {
 
     #[test]
     fn finish_reason_mapping_both_directions() {
-        assert_eq!(finish_openai("end_turn"), "stop");
-        assert_eq!(finish_openai("stop_sequence"), "stop");
-        assert_eq!(finish_openai(""), "stop");
-        assert_eq!(finish_openai("max_tokens"), "length");
-        assert_eq!(finish_openai("tool_use"), "tool_calls");
-        assert_eq!(finish_openai("refusal"), "refusal");
+        assert_eq!(finish_openai("end_turn".into()), "stop");
+        assert_eq!(finish_openai("stop_sequence".into()), "stop");
+        assert_eq!(finish_openai(String::new()), "stop");
+        assert_eq!(finish_openai("max_tokens".into()), "length");
+        assert_eq!(finish_openai("tool_use".into()), "tool_calls");
+        assert_eq!(finish_openai("refusal".into()), "refusal");
 
-        assert_eq!(finish_anthropic("stop"), "end_turn");
-        assert_eq!(finish_anthropic(""), "end_turn");
-        assert_eq!(finish_anthropic("length"), "max_tokens");
-        assert_eq!(finish_anthropic("tool_calls"), "tool_use");
-        assert_eq!(finish_anthropic("content_filter"), "content_filter");
+        assert_eq!(finish_anthropic("stop".into()), "end_turn");
+        assert_eq!(finish_anthropic(String::new()), "end_turn");
+        assert_eq!(finish_anthropic("length".into()), "max_tokens");
+        assert_eq!(finish_anthropic("tool_calls".into()), "tool_use");
+        assert_eq!(finish_anthropic("content_filter".into()), "content_filter");
 
         for (o, a) in [
             ("stop", "end_turn"),
             ("length", "max_tokens"),
             ("tool_calls", "tool_use"),
         ] {
-            assert_eq!(finish_anthropic(o), a, "openai→anthropic {o}");
-            assert_eq!(finish_openai(a), o, "anthropic→openai {a}");
+            assert_eq!(finish_anthropic(o.into()), a, "openai→anthropic {o}");
+            assert_eq!(finish_openai(a.into()), o, "anthropic→openai {a}");
         }
     }
 
