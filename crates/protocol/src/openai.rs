@@ -71,6 +71,14 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// assistant reasoning prose (DeepSeek-style; the widest-adopted field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// assistant reasoning units in emission order (OpenRouter-style
+    /// `reasoning.text` / `reasoning.encrypted` / `reasoning.summary`), the
+    /// signed/encrypted proof a later turn replays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<Value>>,
 }
 
 impl ChatMessage {
@@ -105,6 +113,11 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<Value>,
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<i64>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// OpenRouter-style `{effort, max_tokens, enabled}`.
+    #[serde(default)]
+    pub reasoning: Option<Value>,
     /// unrecognized fields ride along untouched and are passed through to vendors.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -223,6 +236,10 @@ pub struct ChunkDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +284,28 @@ impl<'a> ChatCompletionChunk<'a> {
             model,
             ChunkDelta {
                 tool_calls: Some(calls),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+    }
+
+    /// Reasoning delta: prose and/or completed units.
+    pub fn reasoning(
+        id: &'a str,
+        created: i64,
+        model: &'a str,
+        text: String,
+        details: Option<Vec<Value>>,
+    ) -> Self {
+        Self::with_delta(
+            id,
+            created,
+            model,
+            ChunkDelta {
+                reasoning_content: (!text.is_empty()).then_some(text),
+                reasoning_details: details,
                 ..Default::default()
             },
             None,

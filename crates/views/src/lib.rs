@@ -26,7 +26,7 @@ use gw_engines::realtime::{
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
-    ModelParamV2, SttParams, TtsParams, TypedParams,
+    ModelParamV2, ReasoningParam, SttParams, TtsParams, TypedParams,
 };
 use gw_protocol::anthropic::{AnthUsage, MessagesRequest, tool_use_to_tool_calls};
 use gw_protocol::openai::{
@@ -2571,6 +2571,30 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
     usage
 }
 
+/// The chat surface's reasoning request: OpenAI's flat `reasoning_effort`, or
+/// OpenRouter's `reasoning{effort, max_tokens, enabled}` (`enabled` alone means
+/// the vendor's default depth; `enabled: false` turns it off).
+fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Box<ReasoningParam>> {
+    let mut param = ReasoningParam {
+        effort,
+        ..Default::default()
+    };
+    if let Some(Value::Object(mut reasoning)) = reasoning {
+        if let Some(Value::String(effort)) = reasoning.remove("effort") {
+            param.effort = Some(effort);
+        }
+        param.budget_tokens = reasoning.get("max_tokens").and_then(Value::as_i64);
+        if param.effort.is_none() && param.budget_tokens.is_none() {
+            param.effort = match reasoning.get("enabled").and_then(Value::as_bool) {
+                Some(true) => Some("medium".to_owned()),
+                Some(false) => Some("none".to_owned()),
+                None => None,
+            };
+        }
+    }
+    (param.effort.is_some() || param.budget_tokens.is_some()).then(|| Box::new(param))
+}
+
 /// POST /v1/chat/completions (OpenAI-compatible surface)
 async fn chat_completions(
     State(s): State<AppState>,
@@ -2597,6 +2621,8 @@ async fn chat_completions(
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
                 tool_call_id: m.tool_call_id,
+                reasoning_content: m.reasoning_content,
+                reasoning_details: m.reasoning_details.map(Value::Array),
             }
         })
         .collect();
@@ -2613,6 +2639,7 @@ async fn chat_completions(
         logprobs: body.logprobs,
         top_logprobs: body.top_logprobs,
         system: None,
+        reasoning: chat_reasoning(body.reasoning_effort, body.reasoning),
     });
     let stream_model = body.stream.then(|| body.model.clone());
     let mut param = ModelParamV2::with_name(
@@ -2657,7 +2684,7 @@ async fn chat_completions(
     );
     let model_out = outcome.response.model;
 
-    if let Some(tc) = outcome.response.tool_calls.take() {
+    let mut resp = if let Some(tc) = outcome.response.tool_calls.take() {
         let calls: Vec<gw_protocol::openai::ToolCall> =
             match serde_json::from_value(Value::Array(openai_tool_calls(tc, &mut 0))) {
                 Ok(calls) => calls,
@@ -2669,26 +2696,30 @@ async fn chat_completions(
                     return terminal_response(&ctx, response).await;
                 }
             };
-        let resp = ChatCompletionResponse::tool_calls(
+        ChatCompletionResponse::tool_calls(
             id,
             created,
             model_out,
             outcome.response.message,
             calls,
             usage,
-        );
-        let response = (StatusCode::OK, Json(resp)).into_response();
-        return terminal_response(&ctx, response).await;
+        )
+    } else {
+        ChatCompletionResponse::text(
+            id,
+            created,
+            model_out,
+            outcome.response.message,
+            finish_openai(outcome.response.finish_reason),
+            usage,
+        )
+    };
+    if !outcome.response.reasoning.is_empty() || outcome.response.reasoning_details.is_some() {
+        let message = &mut resp.choices[0].message;
+        message.reasoning_content =
+            (!outcome.response.reasoning.is_empty()).then_some(outcome.response.reasoning);
+        message.reasoning_details = outcome.response.reasoning_details;
     }
-
-    let resp = ChatCompletionResponse::text(
-        id,
-        created,
-        model_out,
-        outcome.response.message,
-        finish_openai(outcome.response.finish_reason),
-        usage,
-    );
     let response = (StatusCode::OK, Json(resp)).into_response();
     terminal_response(&ctx, response).await
 }
@@ -2859,6 +2890,18 @@ fn chat_stream_response(
                     true
                 }
                 Some(mut c) => {
+                    if !c.reasoning.is_empty() || c.reasoning_details.is_some() {
+                        let chunk = ChatCompletionChunk::reasoning(
+                            &self.id,
+                            self.created,
+                            &self.model,
+                            std::mem::take(&mut c.reasoning),
+                            c.reasoning_details.take(),
+                        );
+                        if let Ok(payload) = serde_json::to_string(&chunk) {
+                            self.queue.push_back(Event::default().data(payload));
+                        }
+                    }
                     if !c.delta.is_empty() {
                         let chunk = ChatCompletionChunk::content(
                             &self.id,
@@ -2926,14 +2969,39 @@ fn chat_stream_response(
     )
 }
 
+/// The reasoning and message text of a buffered response as chunks, moved out.
+fn text_chunks(resp: &mut gw_models::GatewayResponse) -> Vec<gw_engines::StreamChunk> {
+    let mut chunks = Vec::new();
+    if !resp.reasoning.is_empty() || resp.reasoning_details.is_some() {
+        chunks.push(gw_engines::StreamChunk {
+            reasoning: std::mem::take(&mut resp.reasoning),
+            reasoning_details: resp.reasoning_details.take(),
+            ..Default::default()
+        });
+    }
+    if !resp.message.is_empty() {
+        chunks.push(gw_engines::StreamChunk {
+            delta: std::mem::take(&mut resp.message),
+            ..Default::default()
+        });
+    }
+    chunks
+}
+
+/// A native event's type as its SSE event name. An upstream-controlled name
+/// that is missing or CR/LF-bearing cannot become one (axum asserts): the
+/// caller drops the frame and keeps the stream alive.
+fn native_event_kind(event: &Value) -> Option<&str> {
+    event["type"]
+        .as_str()
+        .filter(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']))
+}
+
 /// Chunks for an engine that returned a buffered response.
 fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let resp = &mut outcome.response;
-    let mut chunks = if outcome.chunks.is_empty() && !resp.message.is_empty() {
-        vec![gw_engines::StreamChunk {
-            delta: std::mem::take(&mut resp.message),
-            ..Default::default()
-        }]
+    let mut chunks = if outcome.chunks.is_empty() {
+        text_chunks(resp)
     } else {
         std::mem::take(&mut outcome.chunks)
     };
@@ -2963,13 +3031,7 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         resp.anthropic_content = None;
         return chunks;
     }
-    let mut chunks = Vec::new();
-    if !resp.message.is_empty() {
-        chunks.push(gw_engines::StreamChunk {
-            delta: std::mem::take(&mut resp.message),
-            ..Default::default()
-        });
-    }
+    let mut chunks = text_chunks(resp);
     if let Some(tc) = resp.tool_calls.take() {
         chunks.push(gw_engines::StreamChunk {
             tool_calls: Some(tc),
@@ -2986,10 +3048,17 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
     let encoder = gw_models::token_estimate::default_encoder();
     let mut tokens = encoder.encode_len(&chunk.delta) as i64;
+    if !chunk.reasoning.is_empty() {
+        tokens = tokens.saturating_add(encoder.encode_len(&chunk.reasoning) as i64);
+    }
     if let Some(tool_calls) = &chunk.tool_calls {
         tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
     }
-    if let Some(event) = &chunk.anthropic_event {
+    if let Some(event) = &chunk.native_event {
+        // Anthropic deltas are objects keyed by kind; Responses deltas are strings
+        if let Some(value) = event["delta"].as_str() {
+            tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
+        }
         for field in ["text", "thinking", "partial_json"] {
             if let Some(value) = event["delta"][field].as_str() {
                 tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
@@ -3028,6 +3097,13 @@ async fn messages(
         tools: body.tools.map(Value::Array),
         tool_choice: body.tool_choice,
         system,
+        reasoning: (body.thinking.is_some() || body.output_config.is_some()).then(|| {
+            Box::new(ReasoningParam {
+                thinking: body.thinking,
+                output_config: body.output_config,
+                ..Default::default()
+            })
+        }),
         ..Default::default()
     });
     let stream_model = body.stream.then(|| body.model.clone());
@@ -3099,6 +3175,13 @@ async fn messages(
         Some(Value::Array(blocks)) => blocks,
         _ => {
             let mut blocks = Vec::new();
+            if !outcome.response.reasoning.is_empty() {
+                blocks.push(json!({
+                    "type":"thinking",
+                    "thinking":Value::String(std::mem::take(&mut outcome.response.reasoning)),
+                    "signature":""
+                }));
+            }
             if !outcome.response.message.is_empty() {
                 blocks.push(json!({"type":"text","text":outcome.response.message}));
             }
@@ -3155,12 +3238,19 @@ fn messages_stream_response(
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
     let rx = spawn_stream_pipeline(&s, request, ak, "messages", started);
 
+    #[derive(Clone, Copy, PartialEq)]
+    enum BlockKind {
+        Text,
+        Thinking,
+    }
+
     struct St {
         queue: VecDeque<Event>,
         id: String,
         model: String,
         started_msg: bool,
         text_idx: Option<usize>,
+        thinking_idx: Option<usize>,
         next_idx: usize,
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
@@ -3187,23 +3277,34 @@ fn messages_stream_response(
             ));
         }
 
-        fn open_text(&mut self) -> usize {
-            if let Some(idx) = self.text_idx {
+        /// A text or (for a non-Anthropic model's reasoning prose) unsigned
+        /// thinking block; thinking precedes text, so opening text closes it.
+        fn open_block(&mut self, kind: BlockKind) -> usize {
+            if let Some(idx) = *self.slot(kind) {
                 return idx;
+            }
+            if kind == BlockKind::Text {
+                self.close_block(BlockKind::Thinking);
             }
             let idx = self.next_idx;
             self.next_idx += 1;
-            self.text_idx = Some(idx);
+            *self.slot(kind) = Some(idx);
+            let content_block = match kind {
+                BlockKind::Text => json!({"type":"text","text":""}),
+                BlockKind::Thinking => json!({"type":"thinking","thinking":"","signature":""}),
+            };
             self.queue.push_back(Self::ev(
                 "content_block_start",
-                json!({"type":"content_block_start","index":idx,
-                       "content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_start","index":idx,"content_block":content_block}),
             ));
             idx
         }
 
-        fn close_text(&mut self) {
-            if let Some(idx) = self.text_idx.take() {
+        fn close_block(&mut self, kind: BlockKind) {
+            if kind == BlockKind::Text {
+                self.close_block(BlockKind::Thinking);
+            }
+            if let Some(idx) = self.slot(kind).take() {
                 self.queue.push_back(Self::ev(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":idx}),
@@ -3211,10 +3312,17 @@ fn messages_stream_response(
             }
         }
 
+        fn slot(&mut self, kind: BlockKind) -> &mut Option<usize> {
+            match kind {
+                BlockKind::Text => &mut self.text_idx,
+                BlockKind::Thinking => &mut self.thinking_idx,
+            }
+        }
+
         /// The wire pattern clients expect for a tool_use block: empty `input`
         /// in the start frame, the arguments as one input_json_delta, stop.
         fn emit_tool_block(&mut self, block: &Value) {
-            self.close_text();
+            self.close_block(BlockKind::Text);
             let idx = self.next_idx;
             self.next_idx += 1;
             self.queue.push_back(Self::ev(
@@ -3245,7 +3353,7 @@ fn messages_stream_response(
                     self.emit_tool_block(&block);
                 }
             }
-            self.close_text();
+            self.close_block(BlockKind::Text);
             let stop = self
                 .pending_finish
                 .take()
@@ -3277,17 +3385,11 @@ fn messages_stream_response(
                     true
                 }
                 Some(mut c) => {
-                    if let Some(mut event) = c.anthropic_event.take() {
+                    if let Some(mut event) = c.native_event.take() {
                         if let Some(capture) = self.thinking_capture.as_mut() {
                             capture.observe(&event);
                         }
-                        // Upstream-controlled name: a missing or CR/LF-bearing
-                        // type cannot become an SSE event name (axum asserts)
-                        // — drop the frame, keep the stream alive.
-                        let valid = event["type"]
-                            .as_str()
-                            .is_some_and(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']));
-                        if !valid {
+                        if native_event_kind(&event).is_none() {
                             return false;
                         }
                         if event["type"] == "message_start" {
@@ -3305,9 +3407,18 @@ fn messages_stream_response(
                             .push_back(Event::default().event(kind).data(data));
                         return done;
                     }
+                    if !c.reasoning.is_empty() {
+                        self.ensure_message_start();
+                        let idx = self.open_block(BlockKind::Thinking);
+                        self.queue.push_back(St::ev(
+                            "content_block_delta",
+                            json!({"type":"content_block_delta","index":idx,
+                                   "delta":{"type":"thinking_delta","thinking":c.reasoning}}),
+                        ));
+                    }
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
-                        let idx = self.open_text();
+                        let idx = self.open_block(BlockKind::Text);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
                             json!({"type":"content_block_delta","index":idx,
@@ -3353,6 +3464,7 @@ fn messages_stream_response(
             model,
             started_msg: false,
             text_idx: None,
+            thinking_idx: None,
             next_idx: 0,
             tool_frags: None,
             pending_finish: None,
@@ -3550,8 +3662,9 @@ async fn responses(
     terminal_response(&ctx, response).await
 }
 
-/// Streaming /v1/responses as the Responses SSE dialect; live for real vendors,
-/// buffered-then-redacted when outbound DLP is on.
+/// Streaming /v1/responses: the vendor's event sequence forwarded verbatim; a
+/// synthesized created/delta/completed sequence only for a buffered non-native
+/// reply. Live for real vendors, buffered-then-redacted when outbound DLP is on.
 fn responses_stream_response(
     s: AppState,
     request: GatewayRequest,
@@ -3565,6 +3678,7 @@ fn responses_stream_response(
         queue: VecDeque<Event>,
         model: String,
         created: bool,
+        native: bool,
         status: String,
         seq: u64,
     }
@@ -3575,7 +3689,7 @@ fn responses_stream_response(
             }
             self.created = true;
             self.seq += 1;
-            self.queue.push_back(Event::default().data(
+            self.queue.push_back(Event::default().event("response.created").data(
                 json!({"type":"response.created","response":{"model":self.model,"status":"in_progress"}})
                     .to_string(),
             ));
@@ -3595,7 +3709,7 @@ fn responses_stream_response(
                     // the official Responses error event is flat: no nested
                     // `error` object, sequence_number continues the stream
                     self.queue.push_back(
-                        Event::default().data(
+                        Event::default().event("error").data(
                             json!({
                                 "type": "error",
                                 "code": err.class.code(),
@@ -3609,12 +3723,22 @@ fn responses_stream_response(
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
-                Some(c) => {
+                Some(mut c) => {
+                    if let Some(event) = c.native_event.take() {
+                        let Some(kind) = native_event_kind(&event) else {
+                            return false;
+                        };
+                        self.created = true;
+                        self.native = true;
+                        self.queue
+                            .push_back(Event::default().event(kind).data(event.to_string()));
+                        return false;
+                    }
                     self.ensure_created();
                     if !c.delta.is_empty() {
                         self.seq += 1;
                         self.queue.push_back(
-                            Event::default().data(
+                            Event::default().event("response.output_text.delta").data(
                                 json!({"type":"response.output_text.delta","delta":c.delta})
                                     .to_string(),
                             ),
@@ -3626,16 +3750,18 @@ fn responses_stream_response(
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
                     };
-                    self.seq += 1;
-                    self.queue.push_back(
-                        Event::default().data(
-                            json!({"type":"response.completed","response":{
-                                "model": self.model, "status": self.status,
-                                "usage": responses_usage(pt, ct, tt, c.common_usage),
-                            }})
-                            .to_string(),
-                        ),
-                    );
+                    if !self.native {
+                        self.seq += 1;
+                        self.queue.push_back(
+                            Event::default().event("response.completed").data(
+                                json!({"type":"response.completed","response":{
+                                    "model": self.model, "status": self.status,
+                                    "usage": responses_usage(pt, ct, tt, c.common_usage),
+                                }})
+                                .to_string(),
+                            ),
+                        );
+                    }
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
@@ -3653,6 +3779,7 @@ fn responses_stream_response(
             queue: VecDeque::new(),
             model,
             created: false,
+            native: false,
             seq: 0,
             status: "completed".to_owned(),
         },
@@ -5578,7 +5705,7 @@ mod tests {
             ..Default::default()
         };
         let native = gw_engines::StreamChunk {
-            anthropic_event: Some(json!({
+            native_event: Some(json!({
                 "type":"content_block_delta",
                 "delta":{"type":"text_delta","text":"answer"}
             })),

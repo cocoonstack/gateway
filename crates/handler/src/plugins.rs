@@ -308,9 +308,8 @@ fn for_each_request_text(
     f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
     let mut n = 0;
-    let native = request.preserve_anthropic_wire;
     for msg in &mut request.message {
-        let policy = if native && msg.role == gw_consts::role::AI {
+        let policy = if msg.role == gw_consts::role::AI {
             signed
         } else {
             SignedThinking::Visit
@@ -324,9 +323,9 @@ fn for_each_request_text(
 }
 
 /// The text-bearing fields of one chat turn — flat content, multimodal parts,
-/// and assistant tool_calls, all forwarded to the vendor by the engines — the
-/// ONE per-message field list every scan and rewrite traverses, so a
-/// `ChatMsg` field added here is covered by all of them.
+/// assistant tool_calls and replayed reasoning, all forwarded to the vendor by
+/// the engines — the ONE per-message field list every scan and rewrite
+/// traverses, so a `ChatMsg` field added here is covered by all of them.
 fn for_each_message_text(
     msg: &mut ChatMsg,
     signed: SignedThinking,
@@ -338,6 +337,12 @@ fn for_each_message_text(
     }
     if let Some(tc) = &mut msg.tool_calls {
         n += walk_json_strings(tc, &mut |s| f(s, false));
+    }
+    if let Some(reasoning) = &mut msg.reasoning_content {
+        n += f(reasoning, false);
+    }
+    if let Some(details) = &mut msg.reasoning_details {
+        n += walk_part_text(details, signed, f);
     }
     n
 }
@@ -409,28 +414,30 @@ fn is_media_block(ty: &str) -> bool {
             | "input_file"
             | "file"
             | "document"
+            | "reasoning"
     )
 }
 
 /// Claude signs the complete thinking block, not just the `signature` field.
 /// Rewriting its prose or opaque data invalidates a tool-use continuation.
+/// The chat surface carries the same units as `reasoning.text` /
+/// `reasoning.encrypted` details.
 fn is_signed_thinking_block(block: &serde_json::Map<String, serde_json::Value>) -> bool {
-    match block.get("type").and_then(serde_json::Value::as_str) {
-        Some("thinking") => block
-            .get("signature")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|signature| !signature.is_empty()),
-        Some("redacted_thinking") => block
-            .get("data")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|data| !data.is_empty()),
-        _ => false,
-    }
+    let opaque = match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("thinking" | "reasoning.text") => "signature",
+        Some("redacted_thinking" | "reasoning.encrypted") => "data",
+        _ => return false,
+    };
+    block
+        .get(opaque)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|proof| !proof.is_empty())
 }
 
 /// A media block's payload keys: base64/URL leaves a rewrite would corrupt or
 /// noise could false-match, the nested media containers (`image_url`,
-/// `input_audio`, Chat's `file`), and file-handle references (`file_id`).
+/// `input_audio`, Chat's `file`), file-handle references (`file_id`), and a
+/// Responses reasoning item's `encrypted_content`.
 /// Skipped only inside a [`is_media_block`] object; the same name in a tool
 /// argument, a JSON Schema, or a metadata bag is prose and stays scanned.
 fn is_media_payload_key(k: &str) -> bool {
@@ -445,6 +452,7 @@ fn is_media_payload_key(k: &str) -> bool {
             | "file_id"
             | "file_data"
             | "file_url"
+            | "encrypted_content"
     )
 }
 
@@ -484,7 +492,7 @@ fn walk_signed_prose(
     f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
     let opaque_key = match v.get("type").and_then(serde_json::Value::as_str) {
-        Some("redacted_thinking") => "data",
+        Some("redacted_thinking" | "reasoning.encrypted") => "data",
         _ => "signature",
     };
     let Some(object) = v.as_object_mut() else {
@@ -581,7 +589,7 @@ pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Val
 /// handler rejects the request instead of silently bypassing DLP. `&mut` only
 /// to share the walk; nothing is rewritten.
 pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
-    if (!sec.dlp_redact && !sec.detect_secrets) || !request.preserve_anthropic_wire {
+    if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
     }
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
@@ -590,16 +598,14 @@ pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequ
         if message.role != gw_consts::role::AI {
             continue;
         }
-        let Some(parts) = message
-            .parts
-            .as_mut()
-            .and_then(serde_json::Value::as_array_mut)
-        else {
-            continue;
-        };
-        for block in &mut *parts {
-            if block.as_object().is_some_and(is_signed_thinking_block) {
-                hits += walk_part_value(block, &mut |text| redaction_hits(text, pii, secrets));
+        for units in [message.parts.as_mut(), message.reasoning_details.as_mut()] {
+            let Some(blocks) = units.and_then(serde_json::Value::as_array_mut) else {
+                continue;
+            };
+            for block in blocks {
+                if block.as_object().is_some_and(is_signed_thinking_block) {
+                    hits += walk_part_value(block, &mut |text| redaction_hits(text, pii, secrets));
+                }
             }
         }
     }
@@ -674,14 +680,12 @@ fn redact_secrets(text: &str) -> Option<(String, usize)> {
     (count > 0).then(|| (out.into_owned(), count))
 }
 
-/// DLP probe of native Anthropic SSE events before buffered replay. Signature
-/// deltas and encrypted redacted-thinking data are opaque; text, tool JSON,
-/// citations, and forward-compatible delta payloads remain covered. `&mut`
-/// only to share the walk family; nothing is rewritten.
-pub fn anthropic_event_dlp_hits(
-    sec: &SecurityConf,
-    chunks: &mut [gw_models::StreamChunk],
-) -> usize {
+/// DLP probe of native SSE events (Anthropic Messages, OpenAI Responses)
+/// before buffered replay. Signature deltas and encrypted reasoning data are
+/// opaque; text, tool JSON, citations, reasoning summaries and
+/// forward-compatible delta payloads remain covered. `&mut` only to share the
+/// walk family; nothing is rewritten.
+pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::StreamChunk]) -> usize {
     if !sec.redacts_output() {
         return 0;
     }
@@ -690,8 +694,8 @@ pub fn anthropic_event_dlp_hits(
     let mut scan = |text: &mut String| redaction_hits(text, pii, secrets);
     let mut hits: usize = chunks
         .iter_mut()
-        .filter_map(|chunk| chunk.anthropic_event.as_mut())
-        .map(|event| walk_anthropic_event(event, &mut fragments, &mut scan))
+        .filter_map(|chunk| chunk.native_event.as_mut())
+        .map(|event| walk_native_event(event, &mut fragments, &mut scan))
         .sum();
     if fragments.overflowed {
         return hits.max(1);
@@ -733,7 +737,7 @@ impl EventFragments {
     }
 }
 
-fn walk_anthropic_event(
+fn walk_native_event(
     event: &mut serde_json::Value,
     fragments: &mut EventFragments,
     f: &mut impl FnMut(&mut String) -> usize,
@@ -779,6 +783,13 @@ fn walk_anthropic_event(
             }
         }
         return hits;
+    }
+    // Responses deltas join per output item so a pattern split across frames matches
+    if let Some(index) = event["output_index"].as_u64()
+        && let Some(text) = event["delta"].as_str()
+    {
+        fragments.append(index, event["type"].as_str().unwrap_or_default(), text);
+        return walk_object_excluding(event, &["delta"], f);
     }
     walk_part_value(event, f)
 }
@@ -863,19 +874,28 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
     let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
     let mut hits = redact_field(&mut response.message);
+    if !response.reasoning.is_empty() {
+        hits += redact_field(&mut response.reasoning);
+    }
     if let Some(v) = &mut response.response_v2 {
         hits += walk_json_strings(v, &mut redact_field);
     }
     if let Some(v) = &mut response.tool_calls {
         hits += walk_json_strings(v, &mut redact_field);
     }
-    let native_hits = response
-        .anthropic_content
-        .as_mut()
-        .map(|content| walk_part_text(content, SignedThinking::Skip, &mut |s, _| redact_field(s)))
-        .unwrap_or(0);
-    // Native text normally duplicates normalized fields. Count a native-only
-    // hit when normalized output was clean, without double-counting text.
+    // Native text and reasoning units duplicate the normalized fields. Count
+    // a native-only hit when normalized output was clean, without
+    // double-counting text.
+    let mut native_hits = 0;
+    if let Some(details) = &mut response.reasoning_details {
+        native_hits += details
+            .iter_mut()
+            .map(|d| walk_part_text(d, SignedThinking::Skip, &mut |s, _| redact_field(s)))
+            .sum::<usize>();
+    }
+    if let Some(content) = &mut response.anthropic_content {
+        native_hits += walk_part_text(content, SignedThinking::Skip, &mut |s, _| redact_field(s));
+    }
     if hits == 0 && native_hits > 0 {
         hits = native_hits;
     }
@@ -886,34 +906,44 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
 /// rule hit (the same [`ScanCounts`] verdict a replay would meet inbound) or
 /// a DLP hit nothing can redact without breaking the signature. The client
 /// still gets the redacted normalized turn instead of a hard failure after
-/// the upstream tokens are spent. Returns the hit count; the caller drops
-/// the buffered raw events.
-pub fn strip_unservable_thinking(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
+/// the upstream tokens are spent. Native blocks and the chat surface's signed
+/// reasoning units (whose prose `reasoning` duplicates, so it is scanned
+/// once) are covered alike. Returns the hit count; the caller drops the
+/// buffered raw events.
+pub fn strip_unservable_thinking(
+    sec: &SecurityConf,
+    response: &mut GatewayResponse,
+    chunks: &[gw_models::StreamChunk],
+) -> usize {
     let dlp = sec.redacts_output();
     if !dlp && sec.blocklist.is_empty() && sec.regexes.is_empty() {
         return 0;
     }
-    let Some(blocks) = response
-        .anthropic_content
-        .as_mut()
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return 0;
-    };
     let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
     let mut counts = ScanCounts::new(sec);
     let mut hits = 0;
-    for block in &mut *blocks {
-        if !block.as_object().is_some_and(is_signed_thinking_block) {
-            continue;
+    let mut visit = |text: &mut String| {
+        counts.visit(text);
+        if dlp {
+            hits += redaction_hits(text, pii, secrets);
         }
-        walk_signed_prose(block, &mut |text, _| {
-            counts.visit(text);
-            if dlp {
-                hits += redaction_hits(text, pii, secrets);
-            }
-            0
-        });
+        0
+    };
+    let mut native = response
+        .anthropic_content
+        .as_mut()
+        .and_then(serde_json::Value::as_array_mut);
+    for block in native.iter_mut().flat_map(|blocks| blocks.iter_mut()) {
+        if block.as_object().is_some_and(is_signed_thinking_block) {
+            walk_signed_prose(block, &mut |text, _| visit(text));
+        }
+    }
+    let signed_reasoning = has_signed_unit(response.reasoning_details.as_deref())
+        || chunks
+            .iter()
+            .any(|chunk| has_signed_unit(chunk.reasoning_details.as_deref()));
+    if signed_reasoning {
+        visit(&mut response.reasoning);
     }
     let rules = counts.outcome();
     if rules.block.is_some() {
@@ -925,9 +955,23 @@ pub fn strip_unservable_thinking(sec: &SecurityConf, response: &mut GatewayRespo
             .sum::<usize>();
     }
     if hits > 0 {
-        blocks.retain(|block| !block.as_object().is_some_and(is_signed_thinking_block));
+        if let Some(blocks) = native {
+            blocks.retain(|block| !block.as_object().is_some_and(is_signed_thinking_block));
+        }
+        if signed_reasoning {
+            response.reasoning.clear();
+            response.reasoning_details = None;
+        }
     }
     hits
+}
+
+fn has_signed_unit(units: Option<&[serde_json::Value]>) -> bool {
+    units.is_some_and(|units| {
+        units
+            .iter()
+            .any(|unit| unit.as_object().is_some_and(is_signed_thinking_block))
+    })
 }
 
 /// Cheap byte scan gating the full scanner: an email needs an '@', a phone
@@ -1320,7 +1364,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(strip_unservable_thinking(&s, &mut response), 2);
+        assert_eq!(strip_unservable_thinking(&s, &mut response, &[]), 2);
         assert_eq!(
             response.anthropic_content,
             Some(serde_json::json!([{"type":"text","text":"clean answer"}])),
@@ -1340,7 +1384,7 @@ mod tests {
             ])),
             ..Default::default()
         };
-        assert_eq!(strip_unservable_thinking(&sec(), &mut response), 1);
+        assert_eq!(strip_unservable_thinking(&sec(), &mut response, &[]), 1);
         assert_eq!(
             response.anthropic_content,
             Some(serde_json::json!([{"type":"text","text":"clean answer"}]))
@@ -1352,7 +1396,7 @@ mod tests {
             ])),
             ..Default::default()
         };
-        assert_eq!(strip_unservable_thinking(&sec(), &mut clean), 0);
+        assert_eq!(strip_unservable_thinking(&sec(), &mut clean, &[]), 0);
         assert!(clean.anthropic_content.unwrap().as_array().unwrap().len() == 1);
     }
 
@@ -1364,7 +1408,7 @@ mod tests {
             ..Default::default()
         };
         let event = |value| gw_models::StreamChunk {
-            anthropic_event: Some(value),
+            native_event: Some(value),
             ..Default::default()
         };
         let mut chunks = vec![
@@ -1377,13 +1421,13 @@ mod tests {
                 "delta":{"type":"input_json_delta","partial_json":"klmnopqrstuvwxyz012345"}
             })),
         ];
-        assert!(anthropic_event_dlp_hits(&security, &mut chunks) >= 1);
+        assert!(native_event_dlp_hits(&security, &mut chunks) >= 1);
 
         let mut opaque = vec![event(serde_json::json!({
             "type":"content_block_delta","index":0,
             "delta":{"type":"signature_delta","signature":"sk-abcdefghijklmnopqrstuvwxyz012345"}
         }))];
-        assert_eq!(anthropic_event_dlp_hits(&security, &mut opaque), 0);
+        assert_eq!(native_event_dlp_hits(&security, &mut opaque), 0);
 
         let mut opaque_with_extra = vec![event(serde_json::json!({
             "type":"content_block_delta","index":0,
@@ -1394,9 +1438,31 @@ mod tests {
             }
         }))];
         assert_eq!(
-            anthropic_event_dlp_hits(&security, &mut opaque_with_extra),
+            native_event_dlp_hits(&security, &mut opaque_with_extra),
             1,
             "only the signature field itself is opaque"
+        );
+
+        let mut responses = vec![
+            event(serde_json::json!({
+                "type":"response.reasoning_summary_text.delta","output_index":0,
+                "delta":"token sk-abcdefghij"
+            })),
+            event(serde_json::json!({
+                "type":"response.reasoning_summary_text.delta","output_index":0,
+                "delta":"klmnopqrstuvwxyz012345 leaked"
+            })),
+        ];
+        assert!(native_event_dlp_hits(&security, &mut responses) >= 1);
+        let mut encrypted = vec![event(serde_json::json!({
+            "type":"response.output_item.done","output_index":0,
+            "item":{"type":"reasoning","encrypted_content":"sk-abcdefghijklmnopqrstuvwxyz012345",
+                    "summary":[{"type":"summary_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"}]}
+        }))];
+        assert_eq!(
+            native_event_dlp_hits(&security, &mut encrypted),
+            1,
+            "encrypted reasoning is opaque; its summary prose is scanned"
         );
     }
 
@@ -1607,6 +1673,78 @@ mod tests {
         assert!(dlp_redact_request(&sec(), &mut request) >= 1);
         let parts = request.message[0].parts.as_ref().unwrap();
         assert!(!parts.to_string().contains("jane@corp.com"));
+    }
+
+    #[test]
+    fn chat_surface_signed_reasoning_gets_the_native_treatment() {
+        let details = serde_json::json!([
+            {"type":"reasoning.text","text":"forbiddenword jane@corp.com","signature":"sig","format":"anthropic-claude-v1","index":0},
+            {"type":"reasoning.encrypted","data":"ops@corp.com","format":"anthropic-claude-v1","index":1},
+            {"type":"reasoning.text","text":"unsigned jane@corp.com","index":2}
+        ]);
+        let mut message = ChatMsg::text("assistant", String::new());
+        message.reasoning_content = Some("prose jane@corp.com".to_owned());
+        message.reasoning_details = Some(details.clone());
+        let mut request = GatewayRequest {
+            message: vec![message],
+            ..Default::default()
+        };
+        assert!(security_check(&sec(), &mut request).block.is_some());
+        assert_eq!(
+            protected_thinking_dlp_hits(&sec(), &mut request),
+            2,
+            "signed prose + opaque data; the unsigned unit is redactable"
+        );
+        assert!(dlp_redact_request(&sec(), &mut request) >= 2);
+        let message = &request.message[0];
+        assert!(
+            !message
+                .reasoning_content
+                .as_deref()
+                .unwrap()
+                .contains("jane")
+        );
+        let replayed = message.reasoning_details.as_ref().unwrap();
+        assert_eq!(&replayed[0], &details[0]);
+        assert_eq!(&replayed[1], &details[1]);
+        assert!(
+            replayed[2]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_EMAIL]")
+        );
+
+        let mut response = GatewayResponse {
+            message: "clean".to_owned(),
+            reasoning: "prose jane@corp.com".to_owned(),
+            reasoning_details: Some(vec![
+                serde_json::json!({"type":"reasoning.text","text":"prose jane@corp.com","signature":"sig"}),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(strip_unservable_thinking(&sec(), &mut response, &[]), 1);
+        assert!(response.reasoning.is_empty() && response.reasoning_details.is_none());
+
+        let mut streamed = GatewayResponse {
+            reasoning: "prose jane@corp.com".to_owned(),
+            ..Default::default()
+        };
+        let chunks = [gw_models::StreamChunk {
+            reasoning_details: Some(vec![
+                serde_json::json!({"type":"reasoning.text","text":"prose jane@corp.com","signature":"sig"}),
+            ]),
+            ..Default::default()
+        }];
+        assert_eq!(strip_unservable_thinking(&sec(), &mut streamed, &chunks), 1);
+        assert!(streamed.reasoning.is_empty());
+
+        let mut unsigned = GatewayResponse {
+            reasoning: "prose jane@corp.com".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(strip_unservable_thinking(&sec(), &mut unsigned, &[]), 0);
+        assert_eq!(dlp_redact_response(&sec(), &mut unsigned), 1);
+        assert_eq!(unsigned.reasoning, "prose [REDACTED_EMAIL]");
     }
 
     #[test]

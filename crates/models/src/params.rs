@@ -58,6 +58,45 @@ pub struct ChatParams {
     /// system prompt (anthropic passes it directly; openai carries it via messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// The client's reasoning request; absent — and free — on the hot path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Box<ReasoningParam>>,
+}
+
+/// A reasoning request in the dialect the client spoke: OpenAI's
+/// `reasoning_effort` / OpenRouter's `reasoning{effort,max_tokens}` on the chat
+/// surface, Anthropic's `thinking` + `output_config` on the native surface.
+/// Each engine forwards its own dialect verbatim and maps the other one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReasoningParam {
+    /// OpenAI vocabulary: none | minimal | low | medium | high | xhigh | max.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// OpenRouter `reasoning.max_tokens`: a thinking budget in tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<i64>,
+    /// Anthropic `thinking` (`{type: enabled, budget_tokens}` / `adaptive` /
+    /// `disabled`), verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Value>,
+    /// Anthropic `output_config` (`{effort, ...}`), verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<Value>,
+}
+
+impl ReasoningParam {
+    /// Whether the request turns reasoning on: an effort other than `none`,
+    /// a budget, or a `thinking` type other than `disabled`.
+    pub fn engaged(&self) -> bool {
+        self.effort
+            .as_deref()
+            .is_some_and(|effort| effort != "none")
+            || self.budget_tokens.is_some_and(|budget| budget > 0)
+            || matches!(
+                self.thinking.as_ref().and_then(|t| t["type"].as_str()),
+                Some("enabled" | "adaptive")
+            )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

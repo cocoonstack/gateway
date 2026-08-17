@@ -43,7 +43,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/chat/completions` | streaming + non-streaming |
 | POST | `/v1/completions` | legacy text completion (`prompt`) |
-| POST | `/v1/responses` | Responses API, streaming + non-streaming |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim |
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
@@ -74,6 +74,36 @@ then `data: [DONE]`. Multimodal `content` arrays, `tools`/`tool_choice`, and
 `anthropic-messages` model the reply's `tool_use` blocks render as
 `tool_calls` (streamed with `index`) and `stop_reason` maps to `finish_reason`.
 
+### Reasoning
+
+Ask for reasoning the OpenAI way (`reasoning_effort`: `none` | `minimal` |
+`low` | `medium` | `high` | `xhigh` | `max`) or the OpenRouter way
+(`reasoning: {effort, max_tokens, enabled}`); a vendor's own knob in the body
+(`thinking`, `enable_thinking`, …) passes through untouched and wins. The
+mapping per model family:
+
+| Family | Request | Response |
+|--------|---------|----------|
+| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
+| Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024 … `max` 65536), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
+| Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on) | same |
+
+Sampling knobs the client sent along a gateway-mapped effort (`temperature`,
+`top_p`, `top_k`) are dropped for Anthropic, which rejects them with thinking on.
+
+The reply carries the reasoning prose as `message.reasoning_content` and its
+units as `message.reasoning_details` — `reasoning.text` (with `signature`
+when Anthropic signed it), `reasoning.encrypted` (redacted thinking), each
+tagged `format: "anthropic-claude-v1"`, plus a compatible vendor's own units
+verbatim. Streams carry the same two fields in `delta` (prose as it arrives,
+each unit once complete). Replay the assistant message as received: signed
+units become Anthropic thinking blocks ahead of the turn (unsigned prose is
+dropped — the vendor rejects it), and go to OpenAI-compatible vendors as
+`reasoning_content` / `reasoning_details`. Requests that engage reasoning or
+replay signed units are pinned to their requested model (see [Extended
+thinking](#extended-thinking)); `usage.completion_tokens_details.reasoning_tokens`
+reports the reasoning share when the vendor does.
+
 ## Anthropic-compatible
 
 | Method | Path | Notes |
@@ -83,7 +113,11 @@ then `data: [DONE]`. Multimodal `content` arrays, `tools`/`tool_choice`, and
 `/v1/messages` works on both Anthropic-protocol models and OpenAI-protocol
 models — the gateway converts between the two, including the streaming event
 sequence (`message_start` → `content_block_*` → `message_delta` →
-`message_stop`) and `stop_reason`/`finish_reason` mapping.
+`message_stop`) and `stop_reason`/`finish_reason` mapping. On an OpenAI-protocol
+model, `thinking` (a budget, or `output_config.effort`) becomes
+`reasoning_effort` and the model's reasoning prose comes back as an unsigned
+`thinking` block ahead of the answer (streamed as `thinking_delta`); replaying
+it sends the prose on as `reasoning_content`.
 
 ### Extended thinking
 
@@ -92,11 +126,11 @@ On an `anthropic-messages` model, `/v1/messages` preserves signed
 streaming event sequence (`thinking_delta`/`signature_delta`) pass through
 unmodified, including from compatible upstreams that ignore `stream: true`.
 
-Requests that engage thinking (`thinking: {"type": "enabled" | "adaptive"}`,
-or a continuation carrying signed blocks) are pinned to their requested model:
-variant splits, over-quota fallback, and moderation degrade will not move them,
-because a signature only replays against the model that produced it. Pinned
-thinking on a model that does not resolve to `anthropic-messages` is a 400.
+Requests that engage reasoning on any surface (`thinking: {"type": "enabled"
+| "adaptive"}`, a `reasoning_effort`, or a continuation carrying signed
+blocks or `reasoning_details`) are pinned to their requested model: variant
+splits, over-quota fallback, and moderation degrade will not move them,
+because a signature only replays against the model that produced it.
 
 Tool-loop continuations are audited against what the gateway served for the
 same key, model, and tool id within the last ten minutes: a modified protected

@@ -4,6 +4,7 @@
 //! `raw_usage` for the CommonUsage DAG node.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_protocol::reasoning::is_thinking_block;
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -17,33 +18,48 @@ impl OpenAiEngine {
     /// multimodal parts win over flat text; assistant tool_calls and tool
     /// results pass through losslessly.
     fn wire_messages(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.base.request.message)
-            .into_iter()
-            .map(|m| {
-                let mut msg = Map::new();
-                msg.insert("role".into(), m.role.into());
-                // OpenAI: assistant tool-call turns carry content: null
-                let content = match (m.parts, m.content) {
-                    (Some(parts), _) => parts,
-                    (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
-                    (None, c) => c.into(),
-                };
-                msg.insert("content".into(), content);
-                if let Some(tc) = m.tool_calls {
-                    msg.insert("tool_calls".into(), tc);
+        let mut out = Vec::new();
+        for m in std::mem::take(&mut self.base.request.message) {
+            match m.parts {
+                // a Messages-surface turn: thinking, tool_use and tool_result
+                // blocks have OpenAI counterparts of their own
+                Some(Value::Array(parts)) if parts.iter().any(is_native_block) => {
+                    native_turn(&m.role, parts, m.reasoning_content, &mut out);
                 }
-                if let Some(id) = m.tool_call_id {
-                    msg.insert("tool_call_id".into(), id.into());
+                parts => {
+                    let mut msg = Map::new();
+                    msg.insert("role".into(), m.role.into());
+                    // OpenAI: assistant tool-call turns carry content: null
+                    let content = match (parts, m.content) {
+                        (Some(parts), _) => parts,
+                        (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
+                        (None, c) => c.into(),
+                    };
+                    msg.insert("content".into(), content);
+                    if let Some(tc) = m.tool_calls {
+                        msg.insert("tool_calls".into(), tc);
+                    }
+                    if let Some(id) = m.tool_call_id {
+                        msg.insert("tool_call_id".into(), id.into());
+                    }
+                    if let Some(reasoning) = m.reasoning_content {
+                        msg.insert("reasoning_content".into(), reasoning.into());
+                    }
+                    if let Some(details) = m.reasoning_details {
+                        msg.insert("reasoning_details".into(), details);
+                    }
+                    out.push(Value::Object(msg));
                 }
-                Value::Object(msg)
-            })
-            .collect()
+            }
+        }
+        out
     }
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let messages = Value::Array(self.wire_messages());
         let param = self.base.param()?;
         let protocol = param.protocol;
+        let reasoning_model = openai_reasoning_model(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), messages);
@@ -64,7 +80,18 @@ impl OpenAiEngine {
             }
             put!("temperature", p.temperature);
             put!("top_p", p.top_p);
-            put!("max_tokens", p.max_tokens);
+            // OpenAI's reasoning families take max_completion_tokens (max_tokens
+            // is a 400); compatible vendors know max_tokens
+            if reasoning_model {
+                put!("max_completion_tokens", p.max_tokens);
+            } else {
+                put!("max_tokens", p.max_tokens);
+            }
+            put!(
+                "reasoning_effort",
+                p.reasoning
+                    .and_then(|reasoning| reasoning_effort(*reasoning))
+            );
             put!("presence_penalty", p.presence_penalty);
             put!("frequency_penalty", p.frequency_penalty);
             put!("logprobs", p.logprobs);
@@ -116,22 +143,40 @@ impl OpenAiEngine {
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
+        // one walk to the first choice; JSON-pointer lookups allocate per call
+        let mut choice = v
+            .get_mut("choices")
+            .and_then(|choices| choices.get_mut(0))
+            .map(Value::take)
+            .unwrap_or_default();
+        let mut message = match choice.get_mut("message").map(Value::take) {
+            Some(Value::Object(message)) => message,
+            _ => Map::new(),
+        };
         let mut resp = GatewayResponse {
-            message: crate::engine::take_string(&mut v, "/choices/0/message/content")
+            message: take_str(&mut message, "content").unwrap_or_default(),
+            reasoning: take_str(&mut message, "reasoning_content")
+                .or_else(|| take_str(&mut message, "reasoning"))
                 .unwrap_or_default(),
-            tool_calls: v
-                .pointer_mut("/choices/0/message/tool_calls")
-                .map(Value::take)
-                .filter(|t| !t.is_null()),
-            model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
-            finish_reason: crate::engine::take_string(&mut v, "/choices/0/finish_reason")
-                .unwrap_or_default(),
+            reasoning_details: match message.remove("reasoning_details") {
+                Some(Value::Array(details)) => Some(details),
+                _ => None,
+            },
+            tool_calls: message.remove("tool_calls").filter(|t| !t.is_null()),
+            model: match v.get_mut("model").map(Value::take) {
+                Some(Value::String(model)) => model,
+                _ => String::new(),
+            },
+            finish_reason: match choice.get_mut("finish_reason").map(Value::take) {
+                Some(Value::String(finish)) => finish,
+                _ => String::new(),
+            },
             ..Default::default()
         };
         if let Some(calls) = &mut resp.tool_calls {
             crate::engine::normalize_tool_arguments(calls);
         }
-        let usage = v.pointer_mut("/usage").map(Value::take).unwrap_or_default();
+        let usage = v.get_mut("usage").map(Value::take).unwrap_or_default();
         apply_openai_usage(&mut resp, usage);
         Ok(EngineOutcome::with_status(resp, status))
     }
@@ -184,8 +229,9 @@ fn apply_sse_event(
         .get_mut("choices")
         .and_then(|choices| choices.get_mut(0))
         .and_then(|choice| choice.get_mut("delta"))
+        .and_then(Value::as_object_mut)
     {
-        if let Some(Value::String(text)) = delta.get_mut("content").map(Value::take)
+        if let Some(text) = take_str(delta, "content")
             && !text.is_empty()
         {
             full.push_str(&text);
@@ -195,10 +241,22 @@ fn apply_sse_event(
                 ..Default::default()
             });
         }
-        tool_calls = delta
-            .get_mut("tool_calls")
-            .map(Value::take)
-            .filter(|t| !t.is_null());
+        let reasoning = take_str(delta, "reasoning_content")
+            .or_else(|| take_str(delta, "reasoning"))
+            .unwrap_or_default();
+        let reasoning_details = match delta.remove("reasoning_details") {
+            Some(Value::Array(details)) => Some(details),
+            _ => None,
+        };
+        if !reasoning.is_empty() || reasoning_details.is_some() {
+            resp.reasoning.push_str(&reasoning);
+            chunks.push(StreamChunk {
+                reasoning,
+                reasoning_details,
+                ..Default::default()
+            });
+        }
+        tool_calls = delta.remove("tool_calls").filter(|t| !t.is_null());
     }
     if let Some(mut tool_calls) = tool_calls {
         withhold_block_open_arguments(&mut tool_calls);
@@ -219,7 +277,7 @@ fn apply_sse_event(
             ..Default::default()
         });
     }
-    if let Some(usage) = v.pointer_mut("/usage") {
+    if let Some(usage) = v.get_mut("usage") {
         apply_openai_usage(resp, usage.take());
     }
     Ok(chunks)
@@ -341,6 +399,107 @@ fn normalize_tools_openai(tools: Value) -> Value {
             })
             .collect(),
     )
+}
+
+/// The request's `reasoning_effort`: the client's own, else derived from an
+/// Anthropic-dialect request — `output_config.effort` (same vocabulary), a
+/// `thinking` budget, or an OpenRouter budget. `adaptive` without an effort
+/// and `disabled` leave the vendor default (`none` is not accepted by every
+/// reasoning model).
+fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
+    if let Some(effort) = reasoning.effort {
+        return Some(effort);
+    }
+    if let Some(Value::String(effort)) = reasoning
+        .output_config
+        .and_then(|mut config| config.get_mut("effort").map(Value::take))
+    {
+        return Some(effort);
+    }
+    let budget = reasoning.budget_tokens.or_else(|| {
+        reasoning
+            .thinking
+            .filter(|thinking| thinking["type"] == "enabled")
+            .and_then(|thinking| thinking["budget_tokens"].as_i64())
+    })?;
+    Some(gw_protocol::reasoning::budget_effort(budget).to_owned())
+}
+
+/// OpenAI's own reasoning families — o-series and GPT-5 onward.
+fn openai_reasoning_model(model: &str) -> bool {
+    match model.as_bytes() {
+        [b'o', minor, ..] => minor.is_ascii_digit(),
+        [b'g', b'p', b't', b'-', major, ..] => (b'5'..=b'9').contains(major),
+        _ => false,
+    }
+}
+
+fn is_native_block(block: &Value) -> bool {
+    is_thinking_block(block) || matches!(block["type"].as_str(), Some("tool_use" | "tool_result"))
+}
+
+/// A Messages-surface turn on the OpenAI wire: an assistant turn's thinking
+/// blocks fold into `reasoning_content` (unless the client sent one) and its
+/// `tool_use` blocks become `tool_calls`; a user turn's `tool_result` blocks
+/// become `role: tool` messages ahead of whatever else it carried.
+fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &mut Vec<Value>) {
+    let mut msg = Map::new();
+    msg.insert("role".into(), role.into());
+    let mut content = Vec::new();
+    if role == gw_consts::role::AI {
+        let mut prose = String::new();
+        let mut tool_use = Vec::new();
+        for part in parts {
+            match part["type"].as_str() {
+                Some("thinking") => prose.push_str(part["thinking"].as_str().unwrap_or_default()),
+                Some("redacted_thinking") => {}
+                Some("tool_use") => tool_use.push(part),
+                _ => content.push(part),
+            }
+        }
+        if !tool_use.is_empty() {
+            let calls = gw_protocol::anthropic::tool_use_to_tool_calls(tool_use, &mut 0);
+            msg.insert("tool_calls".into(), Value::Array(calls));
+        }
+        if let Some(reasoning) = reasoning.or((!prose.is_empty()).then_some(prose)) {
+            msg.insert("reasoning_content".into(), reasoning.into());
+        }
+    } else {
+        for mut part in parts {
+            if part["type"] != "tool_result" {
+                content.push(part);
+                continue;
+            }
+            let text = match part["content"].take() {
+                Value::String(text) => text,
+                Value::Array(blocks) => gw_protocol::anthropic::blocks_text(&blocks),
+                _ => String::new(),
+            };
+            out.push(json!({
+                "role": "tool",
+                "tool_call_id": part["tool_use_id"].take(),
+                "content": text,
+            }));
+        }
+    }
+    // OpenAI: content is null only on a tool-call turn; a turn left with
+    // neither is dropped
+    if content.is_empty() {
+        if !msg.contains_key("tool_calls") {
+            return;
+        }
+        msg.insert("content".into(), Value::Null);
+    } else {
+        msg.insert("content".into(), Value::Array(content));
+    }
+    out.push(Value::Object(msg));
+}
+
+fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {
+    match object.remove(key) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
 }
 
 /// Copy token fields + keep the raw usage subtree bytes for the DAG node.
@@ -601,5 +760,70 @@ mod tests {
         let mut e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said:"));
+    }
+
+    #[derive(Debug)]
+    struct Reply(&'static str, bool);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for Reply {
+        async fn send(
+            &self,
+            _req: crate::transport::UpstreamRequest,
+        ) -> gw_models::GResult<crate::transport::UpstreamResponse> {
+            let bytes = self.0.as_bytes().to_vec();
+            Ok(crate::transport::UpstreamResponse {
+                status: 200,
+                body: if self.1 {
+                    UpstreamBody::Sse(bytes)
+                } else {
+                    UpstreamBody::Json(bytes.into())
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn non_stream_captures_reasoning_prose_and_details() {
+        let body = r#"{"model":"deepseek","choices":[{"message":{"content":"391","reasoning_content":"17*23","reasoning_details":[{"type":"reasoning.text","text":"17*23"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let out = OpenAiEngine::new(req(false), Arc::new(Reply(body, false)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.message, "391");
+        assert_eq!(out.response.reasoning, "17*23");
+        assert_eq!(out.response.reasoning_details.unwrap()[0]["text"], "17*23");
+
+        let alias = r#"{"model":"grok","choices":[{"message":{"content":"391","reasoning":"via reasoning"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let out = OpenAiEngine::new(req(false), Arc::new(Reply(alias, false)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.reasoning, "via reasoning");
+        assert!(out.response.reasoning_details.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_forwards_reasoning_deltas_and_details() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"17*\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"23\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"23\",\"index\":0}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"391\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = OpenAiEngine::new(req(true), Arc::new(Reply(sse, true)))
+            .run()
+            .await
+            .unwrap();
+        let reasoning: Vec<&str> = out.chunks.iter().map(|c| c.reasoning.as_str()).collect();
+        assert_eq!(reasoning, ["17*", "23", "", ""]);
+        assert_eq!(
+            out.chunks[1].reasoning_details.as_ref().unwrap()[0]["text"],
+            "23"
+        );
+        assert_eq!(out.chunks[2].delta, "391");
+        assert_eq!(out.response.reasoning, "17*23");
+        assert_eq!(out.response.message, "391");
     }
 }

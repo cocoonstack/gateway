@@ -48,40 +48,67 @@ impl GatewayRequest {
         self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")
     }
 
-    /// Whether any message carries a top-level Anthropic protected-thinking
-    /// block. These blocks are valid only on the native `/v1/messages`
-    /// surface routed to an Anthropic-messages engine.
-    pub fn has_anthropic_thinking_blocks(&self) -> bool {
-        self.message.iter().any(|message| {
-            message
-                .parts
-                .as_ref()
+    /// Whether the request explicitly engages reasoning: the typed reasoning
+    /// request; a Responses body's `reasoning` (or a replayed reasoning item);
+    /// or an Anthropic `thinking` riding the chat surface's passthrough bag
+    /// with a type other than `disabled` — a routine SDK serialization.
+    pub fn reasoning_engaged(&self) -> bool {
+        let Some(param) = self.model_param_v2.as_ref() else {
+            return false;
+        };
+        if let Some(crate::params::TypedParams::Chat(chat)) = param.typed.as_ref()
+            && chat.reasoning.as_ref().is_some_and(|r| r.engaged())
+        {
+            return true;
+        }
+        if param.protocol == gw_consts::Protocol::Responses {
+            let reasoning = param
+                .raw
+                .get("reasoning")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|reasoning| {
+                    reasoning
+                        .get("effort")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|effort| effort != "none")
+                        || reasoning
+                            .get("max_tokens")
+                            .and_then(serde_json::Value::as_i64)
+                            .is_some_and(|budget| budget > 0)
+                        || reasoning
+                            .get("enabled")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                });
+            let replay = param
+                .raw
+                .get("input")
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
-        })
-    }
-
-    /// Whether the request explicitly enables thinking. A `thinking` key with
-    /// `{"type":"disabled"}` is a routine SDK serialization and must not
-    /// trigger thinking handling.
-    pub fn anthropic_thinking_enabled(&self) -> bool {
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"));
+            return reasoning || replay;
+        }
         matches!(
-            self.model_param_v2
-                .as_ref()
-                .and_then(|param| param.raw.pointer("/thinking/type"))
+            param
+                .raw
+                .get("thinking")
+                .and_then(|thinking| thinking.get("type"))
                 .and_then(serde_json::Value::as_str),
             Some("enabled" | "adaptive")
         )
     }
 
-    /// Whether this native Messages request must stay on its requested model.
-    /// The initial extended-thinking request enables the `thinking` option;
-    /// tool continuations carry protected thinking blocks. Pinning both sides
-    /// prevents variants or fallback policy from moving a signed continuation
-    /// to a different model.
-    pub fn pins_anthropic_thinking_route(&self) -> bool {
-        self.preserve_anthropic_wire
-            && (self.has_anthropic_thinking_blocks() || self.anthropic_thinking_enabled())
+    /// Whether this request must stay on its requested model: reasoning output
+    /// replays only against the model that produced it, so the request that
+    /// engages reasoning and the continuation carrying its output both pin.
+    pub fn pins_reasoning_route(&self) -> bool {
+        self.reasoning_engaged()
+            || self.message.iter().any(|m| {
+                m.reasoning_details.is_some()
+                    || m.parts
+                        .as_ref()
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
+            })
     }
 }
 
@@ -171,6 +198,13 @@ pub mod domain {
         /// the call id a role:"tool" result message refers back to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tool_call_id: Option<String>,
+        /// assistant reasoning prose replayed by the client (`reasoning_content`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_content: Option<String>,
+        /// assistant reasoning units replayed by the client (`reasoning_details`
+        /// array: signed thinking, encrypted reasoning) in emission order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_details: Option<Value>,
     }
 
     impl ChatMsg {
@@ -260,6 +294,80 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(req.protocol(), Some(Protocol::AnthropicMessages));
+    }
+
+    #[test]
+    fn reasoning_engaged_reads_every_surface() {
+        let with_raw = |protocol: Protocol, raw: serde_json::Value| {
+            let mut param = ModelParamV2::new(protocol);
+            param.raw = raw;
+            GatewayRequest {
+                model_param_v2: Some(param),
+                ..Default::default()
+            }
+        };
+        assert!(
+            with_raw(
+                Protocol::Responses,
+                serde_json::json!({"reasoning":{"effort":"low"}})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            with_raw(
+                Protocol::Responses,
+                serde_json::json!({"reasoning":{"max_tokens":2000}})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            with_raw(
+                Protocol::Responses,
+                serde_json::json!({"reasoning":{"enabled":true}})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            !with_raw(
+                Protocol::Responses,
+                serde_json::json!({"reasoning":{"effort":"none"}})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            !with_raw(Protocol::Responses, serde_json::json!({"input":"plain"}))
+                .reasoning_engaged()
+        );
+        assert!(with_raw(Protocol::Responses, serde_json::json!({"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"x"}]})).reasoning_engaged());
+        assert!(
+            !with_raw(
+                Protocol::Responses,
+                serde_json::json!({"input":[{"type":"message","role":"user","content":"hi"}]})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            with_raw(
+                Protocol::OpenaiChat,
+                serde_json::json!({"thinking":{"type":"enabled","budget_tokens":1024}})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            !with_raw(
+                Protocol::OpenaiChat,
+                serde_json::json!({"thinking":{"type":"disabled"}})
+            )
+            .reasoning_engaged()
+        );
+        assert!(
+            !with_raw(
+                Protocol::OpenaiChat,
+                serde_json::json!({"reasoning":{"effort":"low"}})
+            )
+            .reasoning_engaged(),
+            "chat reasoning is typed, not raw"
+        );
     }
 
     #[test]

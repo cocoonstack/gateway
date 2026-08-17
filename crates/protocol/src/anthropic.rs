@@ -26,6 +26,10 @@ pub struct MessagesRequest {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub stop_sequences: Option<Vec<String>>,
+    #[serde(default)]
+    pub thinking: Option<Value>,
+    #[serde(default)]
+    pub output_config: Option<Value>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }

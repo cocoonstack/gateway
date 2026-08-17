@@ -39,12 +39,14 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
         let output = get(v, &["output_tokens"]).max(0);
         let read_cache = get(v, &["cache_read_input_tokens"]).max(0);
         let write_cache = get(v, &["cache_creation_input_tokens"]).max(0);
+        // thinking tokens are already inside output_tokens
+        let reason = get(v, &["output_tokens_details", "thinking_tokens"]).clamp(0, output);
         CommonUsage {
             platform_input: input,
             read_cache,
             write_cache,
-            completion: output,
-            reason: 0,
+            completion: output - reason,
+            reason,
         }
     } else {
         CommonUsage::from_openai_parts(

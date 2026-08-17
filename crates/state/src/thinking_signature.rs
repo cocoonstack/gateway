@@ -181,7 +181,7 @@ impl ThinkingSignatureAudit {
         // thinking blocks from the replayed turn; nothing signed remains to
         // audit, so the upstream arbitrates. With thinking enabled a known
         // anchor whose protected blocks were removed is still a Mismatch.
-        if sequence.blocks.is_empty() && !request.anthropic_thinking_enabled() {
+        if sequence.blocks.is_empty() && !request.reasoning_engaged() {
             return (Some(context), ReviewVerdict::Miss);
         }
 

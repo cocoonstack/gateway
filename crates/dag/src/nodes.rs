@@ -60,13 +60,13 @@ impl DagNode for ModelQuotaGate {
         if under {
             return Ok(());
         }
-        // Extended-thinking responses and their signed continuations must use
-        // one model. The model quota is a soft routing trigger, so preserve the
-        // requested route just as we do when no fallback is configured.
-        if ctx.request.pins_anthropic_thinking_route() {
+        // Reasoning output and its continuations must use one model. The model
+        // quota is a soft routing trigger, so preserve the requested route
+        // just as we do when no fallback is configured.
+        if ctx.request.pins_reasoning_route() {
             ctx.decide(
                 "model_quota",
-                format!("{requested} over {limit}, thinking route pinned"),
+                format!("{requested} over {limit}, reasoning route pinned"),
             );
             return Ok(());
         }
@@ -105,7 +105,6 @@ impl DagNode for ResolveModel {
         &["model_quota"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let thinking_route = ctx.request.pins_anthropic_thinking_route();
         let param = ctx
             .request
             .model_param_v2
@@ -125,11 +124,6 @@ impl DagNode for ResolveModel {
                 format!("unknown model: {name}"),
             ));
         };
-        if thinking_route && mt != Protocol::AnthropicMessages {
-            return Err(GatewayError::bad_request(
-                "native Anthropic thinking requires an anthropic-messages model",
-            ));
-        }
         let decision = format!("{name} -> {mt}");
         param.protocol = mt;
         ctx.decide("resolve_model", decision);
@@ -186,9 +180,6 @@ impl DagNode for VariantSelect {
         &["tenant_entitlement"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.request.pins_anthropic_thinking_route() {
-            return Ok(());
-        }
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
@@ -198,7 +189,7 @@ impl DagNode for VariantSelect {
         let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
             return Ok(());
         };
-        if conf.variants.is_empty() {
+        if conf.variants.is_empty() || ctx.request.pins_reasoning_route() {
             return Ok(());
         }
         let key = match ctx.effective_user_id() {
