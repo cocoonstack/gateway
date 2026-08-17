@@ -93,11 +93,63 @@ pub fn tool_calls_to_tool_use(calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Inverse of [`tool_calls_to_tool_use`]: `input` becomes the JSON-encoded
+/// `arguments`, each converted call takes the next `index` (streamed deltas
+/// accumulate by it); other entries pass through so a misfit fails at the caller.
+pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Value> {
+    blocks
+        .into_iter()
+        .map(|mut b| {
+            if b["type"] != "tool_use" {
+                return b;
+            }
+            let arguments = match &b["input"] {
+                Value::Null => "{}".to_owned(),
+                input => input.to_string(),
+            };
+            let call = serde_json::json!({
+                "index": *index, "id": b["id"].take(), "type": "function",
+                "function": {"name": b["name"].take(), "arguments": arguments}
+            });
+            *index += 1;
+            call
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn tool_use_blocks_convert_to_tool_calls() {
+        let blocks = vec![
+            json!({"type":"tool_use","id":"toolu_1","name":"shell","input":{"command":"ls -la"}}),
+            json!({"type":"text","text":"kept as is"}),
+            json!({"id":"call_9","type":"function","function":{"name":"kept","arguments":"{}"}}),
+            json!({"type":"tool_use","id":"toolu_2","name":"noop"}),
+        ];
+        let mut index = 0;
+        let calls = tool_use_to_tool_calls(blocks, &mut index);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["id"], "toolu_1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "shell");
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            "{\"command\":\"ls -la\"}"
+        );
+        assert_eq!(calls[1]["type"], "text");
+        assert_eq!(calls[2]["id"], "call_9");
+        assert_eq!(calls[3]["index"], 1);
+        assert_eq!(calls[3]["function"]["arguments"], "{}");
+        assert_eq!(index, 2);
+        let back = tool_calls_to_tool_use(&calls);
+        assert_eq!(back[0]["input"], json!({"command":"ls -la"}));
+    }
 
     #[test]
     fn tool_calls_convert_to_tool_use_blocks() {
