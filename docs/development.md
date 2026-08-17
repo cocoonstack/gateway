@@ -68,3 +68,6 @@ is unset. A release micro-benchmark lives in `crates/server/tests/bench.rs`:
 ```bash
 cargo test --release -p gw-server --test bench -- --ignored --nocapture
 ```
+
+It gates every merge on parity with `main`; measured HTTP-level numbers and
+the load-test recipe are in [Performance](performance.md).

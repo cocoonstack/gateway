@@ -17,6 +17,7 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 - **Per-user billing & enterprise audit** — every ledger row attributes to an effective end user (the key's `owner`, else the request's `x-gw-user` / `user` hint) with a `request_id`, so cost rolls up per user (`/admin/usage/users`) and a soft per-user daily budget applies on every surface. Per-tenant content policy adds blocklist action tiers (block / flag / shadow), regex recognizers, secret masking, and an external-moderation seam; every hit is recorded without prompt text. An admin-operation trail (key CRUD / config / reload, with source IP) and optional at-rest content retention complete the audit surfaces (`/admin/audit/*`)
 - **Fleet-ready** — run N instances behind a load balancer: Postgres shares config (versioned + a change feed), the access-key table, the ledger/files/batches store, and a distributed batch queue any instance drains; Redis shares rate/quota/TPM counters, account health, and optionally the response cache. Single-node stays zero-dependency
 - **Providers behind traits** — engines talk to upstreams through a `Transport` seam; accounts with a real endpoint go over HTTP (reqwest + rustls), accounts without one are served by a deterministic in-process mock; AWS SigV4 signing included
+- **Fast** — the whole pipeline (auth, admission, DLP, engine, billing) costs ~24 µs per request in-process; over HTTP one node serves ~99k requests/s at p99 5.8 ms on small bodies and ~40k/s at 256 concurrency on 52 KB / 13k-token prompts, mock upstream ([numbers and method](docs/performance.md))
 - **Observability built in** — Prometheus `/metrics` (per-route request/status counters, per-pipeline-stage latency, token counters), structured access logs
 - **One binary, one YAML** — no external services required to start; in-process state by default, SQLite for one-node durability, Postgres + Redis for a shared fleet; graceful shutdown
 - **Web control plane** — a role-aware browser console ([`control-plane/`](control-plane/)): members see their own usage and charges, tenant admins manage keys and security events under gateway-enforced tenant scope, system admins get fleet economics, instance health, config publish/rollback and audit. Go BFF + React UI, its own identity store, everything proxied through the gateway admin API
@@ -44,7 +45,7 @@ GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
 ```
 
-Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
+Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Performance](docs/performance.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
 
 ## Docker
 

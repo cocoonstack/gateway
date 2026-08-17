@@ -41,6 +41,25 @@ providers:
     api_key_env: MYVENDOR_KEY
 ```
 
+### Rerank
+
+`/v1/rerank` speaks the Cohere/Jina shape (`{model, query, documents, top_n?}`),
+so Cohere and Jina need no preset — a raw account on the `rerank` protocol
+with the vendor's base URL, and models pinned by `provider`:
+
+```yaml
+accounts:
+  - {name: cohere, provider: cohere, endpoint: "https://api.cohere.com", api_key_env: COHERE_API_KEY, protocols: ["rerank"]}
+  - {name: jina,   provider: jina,   endpoint: "https://api.jina.ai",   api_key_env: JINA_API_KEY,   protocols: ["rerank"]}
+models:
+  - {name: rerank-v3.5, protocol: rerank, provider: cohere}
+  - {name: jina-reranker-v3, protocol: rerank, provider: jina}
+```
+
+Jina reports `usage.total_tokens`, which bills as prompt tokens; Cohere bills
+by search units and reports no tokens, so its ledger rows carry zero tokens
+(as with per-second speech pricing). Both verified live.
+
 ## Native (non-OpenAI) wire engines
 
 Some vendors are addressed in their own wire dialect rather than an
@@ -53,7 +72,7 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `gemini` | Google Gemini | `https://generativelanguage.googleapis.com` | `x-goog-api-key`; streams via `streamGenerateContent`; thinking tokens billed as reasoning |
 | `dashscope` | Alibaba Qwen (native) | `https://dashscope-intl.aliyuncs.com` | `Bearer`; streams via `X-DashScope-SSE` + `incremental_output` |
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
-| `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | `access_token` query param (non-streaming) |
+| `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
 | `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id (`cohere.command-r-v1:0`); signing and path verified against AWS, model bodies not yet exercised on an allowlisted account |
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id (`meta.llama3-1-8b-instruct-v1:0`); same verification status |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
@@ -88,6 +107,14 @@ over the preset.
 2. Configure the provider/account with a real `endpoint` and `api_key_env`.
 3. Start the gateway. Requests egress to the real vendor and the ledger records
    real usage.
+
+Exercised against the real vendors, end to end through the gateway: OpenAI
+(every surface above including realtime, files/batches, prompt caching on
+Anthropic, tool loops and reasoning on both), Anthropic, Gemini, DeepSeek,
+MiniMax (OpenAI- and Anthropic-compatible endpoints), Qwen/DashScope
+(both compatible endpoints), Baidu Qianfan v2 and the native Ernie wire,
+Cohere and Jina rerank, and OpenAI/Anthropic relays. AWS Bedrock is verified
+up to an accepted SigV4 signature (see the table above).
 
 `GW_TRANSPORT` overrides transport routing: unset (or any value other than
 `mock`/`http`) routes `mock://` sentinel URLs in-process and real URLs over
