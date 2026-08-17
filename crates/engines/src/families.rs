@@ -760,6 +760,16 @@ impl ResponsesEngine {
         )
     }
 
+    /// The client's requested name when a variant/fallback served the call;
+    /// native events must not leak the served model.
+    fn model_override(&self) -> Option<&str> {
+        self.base
+            .request
+            .model_param_v2
+            .as_ref()
+            .and_then(|param| param.fallback_from.as_deref())
+    }
+
     /// Streaming Responses pumped live: delta frames forwarded through
     /// `stream_tx` as they arrive; `response.completed` carries final usage.
     async fn run_stream(&mut self) -> GResult<EngineOutcome> {
@@ -776,11 +786,12 @@ impl ResponsesEngine {
         };
         crate::pump::reject_json_error("responses", status, &reply.body)?;
         let mut full = String::new();
+        let model_override = self.model_override();
         let r = crate::pump::pump_sse(
             "responses",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| responses_apply_frame(&v, status, &mut resp, &mut full),
+            |v| responses_apply_frame(v, status, model_override, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;
@@ -830,10 +841,17 @@ impl ResponsesEngine {
         };
         let mut full = String::new();
         let mut chunks = Vec::new();
+        let model_override = self.model_override();
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
-            chunks.extend(responses_apply_frame(&v, status, &mut resp, &mut full)?);
+            chunks.extend(responses_apply_frame(
+                v,
+                status,
+                model_override,
+                &mut resp,
+                &mut full,
+            )?);
         }
         resp.message = full;
         Ok(EngineOutcome {
@@ -911,27 +929,32 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame to the accumulating response; returns the
-/// chunks it yields. Text rides in `response.output_text.delta`; the final
-/// usage/status arrive in `response.completed`.
+/// Apply one Responses SSE frame to the accumulating response. Every frame
+/// moves out as a native event for the Responses view to forward verbatim
+/// (reasoning items, function calls and all); text is accumulated from
+/// `response.output_text.delta` and the final usage/status read from
+/// `response.completed`.
 fn responses_apply_frame(
-    v: &Value,
+    mut v: Value,
     status: u16,
+    model_override: Option<&str>,
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
-    if let Some(err) = crate::engine::vendor_error(status, v) {
+    if let Some(err) = crate::engine::vendor_error(status, &v) {
         return Err(err);
     }
-    let mut chunks = Vec::new();
+    if let Some(model) = model_override
+        && let Some(response) = v.get_mut("response").and_then(Value::as_object_mut)
+        && response.contains_key("model")
+    {
+        response.insert("model".to_owned(), model.into());
+    }
+    let mut chunk = StreamChunk::default();
     match v["type"].as_str().unwrap_or_default() {
         "response.output_text.delta" => {
             if let Some(d) = v["delta"].as_str() {
                 full.push_str(d);
-                chunks.push(StreamChunk {
-                    delta: d.to_owned(),
-                    ..Default::default()
-                });
             }
         }
         "response.completed" => {
@@ -947,14 +970,12 @@ fn responses_apply_frame(
             resp.completion_tokens = output;
             crate::engine::fill_total_if_zero(resp);
             resp.common_usage = common;
-            chunks.push(StreamChunk {
-                finish_reason: Some(resp.finish_reason.clone()),
-                ..Default::default()
-            });
+            chunk.finish_reason = Some(resp.finish_reason.clone());
         }
         _ => {}
     }
-    Ok(chunks)
+    chunk.native_event = Some(v);
+    Ok(vec![chunk])
 }
 
 #[cfg(test)]
@@ -968,7 +989,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::transport::MockTransport;
+    use crate::transport::{MockTransport, UpstreamRequest, UpstreamResponse};
 
     fn req(mt: Protocol, name: &str, typed: Option<TypedParams>) -> GatewayRequest {
         let mut p = ModelParamV2::with_name(mt, name);
@@ -1250,5 +1271,58 @@ mod tests {
             out.response.message
         );
         assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
+        assert!(out.chunks.iter().all(|c| c.native_event.is_some()));
+    }
+
+    #[derive(Debug)]
+    struct SseReply(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for SseReply {
+        async fn send(&self, _req: UpstreamRequest) -> GResult<UpstreamResponse> {
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Sse(self.0.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_forwards_reasoning_and_function_call_events_verbatim() {
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-served\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"summary_index\":0,\"delta\":\"thinking about it\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thinking about it\"}],\"encrypted_content\":\"opaque\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"now\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"now\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":2,\"delta\":\"done\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-served\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":9,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
+        );
+        let mut r = req(Protocol::Responses, "gpt-5-served", None);
+        r.stream = true;
+        let param = r.model_param_v2.as_mut().unwrap();
+        param.raw = serde_json::json!({"input": "go"});
+        param.fallback_from = Some("gpt-5-public".to_owned());
+        let out = ResponsesEngine::new(r, Arc::new(SseReply(sse)))
+            .run()
+            .await
+            .unwrap();
+        let events: Vec<&Value> = out
+            .chunks
+            .iter()
+            .filter_map(|c| c.native_event.as_ref())
+            .collect();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events[1]["item"]["encrypted_content"], "opaque");
+        assert_eq!(events[2]["delta"], "thinking about it");
+        assert_eq!(events[6]["item"]["arguments"], "{}");
+        assert_eq!(events[0]["response"]["model"], "gpt-5-public");
+        assert_eq!(events[8]["response"]["model"], "gpt-5-public");
+        assert!(out.chunks.iter().all(|c| c.delta.is_empty()));
+        assert_eq!(out.response.message, "done");
+        assert_eq!(out.response.finish_reason, "completed");
+        assert_eq!(out.response.common_usage.unwrap().reason, 4);
     }
 }

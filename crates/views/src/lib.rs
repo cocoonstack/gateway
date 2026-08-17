@@ -2989,7 +2989,11 @@ fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
     if let Some(tool_calls) = &chunk.tool_calls {
         tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
     }
-    if let Some(event) = &chunk.anthropic_event {
+    if let Some(event) = &chunk.native_event {
+        // Anthropic deltas are objects keyed by kind; Responses deltas are strings
+        if let Some(value) = event["delta"].as_str() {
+            tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
+        }
         for field in ["text", "thinking", "partial_json"] {
             if let Some(value) = event["delta"][field].as_str() {
                 tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
@@ -3277,7 +3281,7 @@ fn messages_stream_response(
                     true
                 }
                 Some(mut c) => {
-                    if let Some(mut event) = c.anthropic_event.take() {
+                    if let Some(mut event) = c.native_event.take() {
                         if let Some(capture) = self.thinking_capture.as_mut() {
                             capture.observe(&event);
                         }
@@ -3550,8 +3554,11 @@ async fn responses(
     terminal_response(&ctx, response).await
 }
 
-/// Streaming /v1/responses as the Responses SSE dialect; live for real vendors,
-/// buffered-then-redacted when outbound DLP is on.
+/// Streaming /v1/responses: the vendor's own event sequence forwarded verbatim
+/// (reasoning items, function calls, encrypted content); a synthesized
+/// created/delta/completed sequence only for engines that returned a buffered
+/// non-native reply. Live for real vendors, buffered-then-redacted when
+/// outbound DLP is on.
 fn responses_stream_response(
     s: AppState,
     request: GatewayRequest,
@@ -3565,6 +3572,7 @@ fn responses_stream_response(
         queue: VecDeque<Event>,
         model: String,
         created: bool,
+        native: bool,
         status: String,
         seq: u64,
     }
@@ -3595,7 +3603,7 @@ fn responses_stream_response(
                     // the official Responses error event is flat: no nested
                     // `error` object, sequence_number continues the stream
                     self.queue.push_back(
-                        Event::default().data(
+                        Event::default().event("error").data(
                             json!({
                                 "type": "error",
                                 "code": err.class.code(),
@@ -3609,7 +3617,23 @@ fn responses_stream_response(
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
-                Some(c) => {
+                Some(mut c) => {
+                    if let Some(event) = c.native_event.take() {
+                        // Upstream-controlled name: a missing or CR/LF-bearing
+                        // type cannot become an SSE event name (axum asserts)
+                        // — drop the frame, keep the stream alive.
+                        let Some(kind) = event["type"]
+                            .as_str()
+                            .filter(|kind| !kind.is_empty() && !kind.contains(['\r', '\n']))
+                        else {
+                            return false;
+                        };
+                        self.created = true;
+                        self.native = true;
+                        self.queue
+                            .push_back(Event::default().event(kind).data(event.to_string()));
+                        return false;
+                    }
                     self.ensure_created();
                     if !c.delta.is_empty() {
                         self.seq += 1;
@@ -3626,16 +3650,18 @@ fn responses_stream_response(
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
                     };
-                    self.seq += 1;
-                    self.queue.push_back(
-                        Event::default().data(
-                            json!({"type":"response.completed","response":{
-                                "model": self.model, "status": self.status,
-                                "usage": responses_usage(pt, ct, tt, c.common_usage),
-                            }})
-                            .to_string(),
-                        ),
-                    );
+                    if !self.native {
+                        self.seq += 1;
+                        self.queue.push_back(
+                            Event::default().data(
+                                json!({"type":"response.completed","response":{
+                                    "model": self.model, "status": self.status,
+                                    "usage": responses_usage(pt, ct, tt, c.common_usage),
+                                }})
+                                .to_string(),
+                            ),
+                        );
+                    }
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
@@ -3653,6 +3679,7 @@ fn responses_stream_response(
             queue: VecDeque::new(),
             model,
             created: false,
+            native: false,
             seq: 0,
             status: "completed".to_owned(),
         },
@@ -5578,7 +5605,7 @@ mod tests {
             ..Default::default()
         };
         let native = gw_engines::StreamChunk {
-            anthropic_event: Some(json!({
+            native_event: Some(json!({
                 "type":"content_block_delta",
                 "delta":{"type":"text_delta","text":"answer"}
             })),

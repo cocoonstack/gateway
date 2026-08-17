@@ -674,14 +674,12 @@ fn redact_secrets(text: &str) -> Option<(String, usize)> {
     (count > 0).then(|| (out.into_owned(), count))
 }
 
-/// DLP probe of native Anthropic SSE events before buffered replay. Signature
-/// deltas and encrypted redacted-thinking data are opaque; text, tool JSON,
-/// citations, and forward-compatible delta payloads remain covered. `&mut`
-/// only to share the walk family; nothing is rewritten.
-pub fn anthropic_event_dlp_hits(
-    sec: &SecurityConf,
-    chunks: &mut [gw_models::StreamChunk],
-) -> usize {
+/// DLP probe of native SSE events (Anthropic Messages, OpenAI Responses)
+/// before buffered replay. Signature deltas and encrypted reasoning data are
+/// opaque; text, tool JSON, citations, reasoning summaries and
+/// forward-compatible delta payloads remain covered. `&mut` only to share the
+/// walk family; nothing is rewritten.
+pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::StreamChunk]) -> usize {
     if !sec.redacts_output() {
         return 0;
     }
@@ -690,8 +688,8 @@ pub fn anthropic_event_dlp_hits(
     let mut scan = |text: &mut String| redaction_hits(text, pii, secrets);
     let mut hits: usize = chunks
         .iter_mut()
-        .filter_map(|chunk| chunk.anthropic_event.as_mut())
-        .map(|event| walk_anthropic_event(event, &mut fragments, &mut scan))
+        .filter_map(|chunk| chunk.native_event.as_mut())
+        .map(|event| walk_native_event(event, &mut fragments, &mut scan))
         .sum();
     if fragments.overflowed {
         return hits.max(1);
@@ -733,7 +731,7 @@ impl EventFragments {
     }
 }
 
-fn walk_anthropic_event(
+fn walk_native_event(
     event: &mut serde_json::Value,
     fragments: &mut EventFragments,
     f: &mut impl FnMut(&mut String) -> usize,
@@ -779,6 +777,14 @@ fn walk_anthropic_event(
             }
         }
         return hits;
+    }
+    // Responses text/summary deltas: joined per output item so a pattern split
+    // across frames still matches
+    if let Some(index) = event["output_index"].as_u64()
+        && let Some(text) = event["delta"].as_str()
+    {
+        fragments.append(index, event["type"].as_str().unwrap_or_default(), text);
+        return walk_object_excluding(event, &["delta"], f);
     }
     walk_part_value(event, f)
 }
@@ -1364,7 +1370,7 @@ mod tests {
             ..Default::default()
         };
         let event = |value| gw_models::StreamChunk {
-            anthropic_event: Some(value),
+            native_event: Some(value),
             ..Default::default()
         };
         let mut chunks = vec![
@@ -1377,13 +1383,13 @@ mod tests {
                 "delta":{"type":"input_json_delta","partial_json":"klmnopqrstuvwxyz012345"}
             })),
         ];
-        assert!(anthropic_event_dlp_hits(&security, &mut chunks) >= 1);
+        assert!(native_event_dlp_hits(&security, &mut chunks) >= 1);
 
         let mut opaque = vec![event(serde_json::json!({
             "type":"content_block_delta","index":0,
             "delta":{"type":"signature_delta","signature":"sk-abcdefghijklmnopqrstuvwxyz012345"}
         }))];
-        assert_eq!(anthropic_event_dlp_hits(&security, &mut opaque), 0);
+        assert_eq!(native_event_dlp_hits(&security, &mut opaque), 0);
 
         let mut opaque_with_extra = vec![event(serde_json::json!({
             "type":"content_block_delta","index":0,
@@ -1394,7 +1400,7 @@ mod tests {
             }
         }))];
         assert_eq!(
-            anthropic_event_dlp_hits(&security, &mut opaque_with_extra),
+            native_event_dlp_hits(&security, &mut opaque_with_extra),
             1,
             "only the signature field itself is opaque"
         );

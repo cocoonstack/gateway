@@ -305,7 +305,7 @@ pub fn anthropic_native_chunks(
     events
         .into_iter()
         .map(|event| StreamChunk {
-            anthropic_event: Some(event),
+            native_event: Some(event),
             ..Default::default()
         })
         .collect()
@@ -439,7 +439,7 @@ impl SseState {
     }
 
     fn push_visible(chunks: &mut Vec<StreamChunk>, chunk: StreamChunk) {
-        if chunk.anthropic_event.is_some()
+        if chunk.native_event.is_some()
             || !chunk.delta.is_empty()
             || chunk.tool_calls.is_some()
             || chunk.finish_reason.is_some()
@@ -553,7 +553,7 @@ impl SseState {
             {
                 message.insert("model".to_owned(), model.clone().into());
             }
-            native_chunk.anthropic_event = Some(event);
+            native_chunk.native_event = Some(event);
         }
         Self::push_visible(&mut chunks, native_chunk);
         Ok(chunks)
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_decodes_anthropic_event_sequence() {
+    async fn stream_decodes_native_event_sequence() {
         let mut r = base_req();
         r.stream = true;
         let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
@@ -703,14 +703,14 @@ mod tests {
             .unwrap();
 
         assert!(outcome.chunks.iter().any(|chunk| {
-            chunk.anthropic_event.as_ref().is_some_and(|event| {
+            chunk.native_event.as_ref().is_some_and(|event| {
                 event.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
                     && event.pointer("/delta/signature").and_then(Value::as_str)
                         == Some("opaque-signature")
             })
         }));
         assert!(outcome.chunks.iter().any(|chunk| {
-            chunk.anthropic_event.as_ref().is_some_and(|event| {
+            chunk.native_event.as_ref().is_some_and(|event| {
                 event.get("type").and_then(Value::as_str) == Some("message_stop")
             })
         }));
@@ -749,7 +749,7 @@ mod tests {
             .iter()
             .filter_map(|chunk| {
                 chunk
-                    .anthropic_event
+                    .native_event
                     .as_ref()
                     .and_then(|event| event["type"].as_str())
             })
@@ -810,7 +810,7 @@ mod tests {
         let chunks = anthropic_native_chunks(&response, None);
         let events: Vec<_> = chunks
             .iter()
-            .filter_map(|chunk| chunk.anthropic_event.as_ref())
+            .filter_map(|chunk| chunk.native_event.as_ref())
             .collect();
 
         assert_eq!(

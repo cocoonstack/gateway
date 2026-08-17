@@ -2626,6 +2626,82 @@ async fn responses_api_streaming_full_pipeline() {
 }
 
 #[tokio::test]
+async fn responses_stream_forwards_native_events_with_names_and_bills() {
+    #[derive(Debug)]
+    struct ReasoningFixture;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ReasoningFixture {
+        async fn send(
+            &self,
+            _request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let sse = concat!(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-responses\",\"status\":\"in_progress\"}}\n\n",
+                "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque\"}}\n\n",
+                "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"summary_index\":0,\"delta\":\"weighing options\"}\n\n",
+                "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"now\",\"arguments\":\"{}\"}}\n\n",
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":2,\"delta\":\"done\"}\n\n",
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-responses\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":9,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
+            );
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            })
+        }
+    }
+
+    let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(ReasoningFixture)));
+
+    let body =
+        r#"{"model":"gpt-5-responses","stream":true,"input":"think","reasoning":{"effort":"low"}}"#;
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/responses", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let names: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("event: "))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "response.created",
+            "response.output_item.added",
+            "response.reasoning_summary_text.delta",
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.completed",
+        ]
+    );
+    let frames: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|f| *f != "[DONE]")
+        .map(|f| serde_json::from_str(f).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 6, "one data frame per upstream event");
+    assert_eq!(frames[1]["item"]["encrypted_content"], "opaque");
+    assert_eq!(frames[3]["item"]["arguments"], "{}");
+    assert_eq!(
+        frames[5]["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+        4
+    );
+    assert!(text.trim_end().ends_with("data: [DONE]"));
+
+    let led = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
+    let led = body_json(led).await;
+    assert_eq!(led["count"], 1);
+    assert_eq!(led["records"][0]["completion_tokens"], 9);
+}
+
+#[tokio::test]
 async fn responses_stream_is_incremental_with_dlp_off() {
     let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
     let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());

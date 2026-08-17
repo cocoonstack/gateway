@@ -110,9 +110,10 @@ pub struct StreamChunk {
     pub usage_totals: Option<(i64, i64, i64)>,
     /// cache/reasoning detail riding with `usage_totals` when the vendor sent it.
     pub common_usage: Option<CommonUsage>,
-    /// Original Anthropic SSE event. Anthropic views forward it without
-    /// rebuilding signed thinking blocks; other protocol views ignore it.
-    pub anthropic_event: Option<Value>,
+    /// The vendor's own SSE event (Anthropic Messages, OpenAI Responses). The
+    /// matching native view forwards it verbatim — signed thinking, reasoning
+    /// items and all; other protocol views ignore it.
+    pub native_event: Option<Value>,
     /// set when the pipeline failed mid-stream; views emit it as an error frame.
     pub error: Option<Box<StreamError>>,
 }
