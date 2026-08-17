@@ -899,6 +899,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "futures",
  "gw-consts",

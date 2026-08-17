@@ -4007,7 +4007,14 @@ async fn audio_transcribe(
     log_access(surface, &ctx, started);
     let response = match ctx.outcome.take() {
         Some(o) if o.block.block => error_response(400, o.response.message),
-        Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
+        // the vendor body verbatim (text plus usage/segments/language when sent)
+        Some(o) => {
+            let body = o
+                .response
+                .response_v2
+                .unwrap_or_else(|| json!({ "text": o.response.message }));
+            (StatusCode::OK, Json(body)).into_response()
+        }
         None => error_response(500, "stt engine returned no outcome"),
     };
     terminal_response(&ctx, response).await

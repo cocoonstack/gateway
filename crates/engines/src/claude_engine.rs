@@ -20,7 +20,17 @@ impl ClaudeEngine {
             if m.role == gw_consts::role::SYSTEM {
                 continue;
             }
-            let content = m.parts.unwrap_or(Value::String(m.content));
+            let content = match m.parts {
+                // the chat surface's image parts wear the OpenAI shape
+                Some(Value::Array(parts)) => Value::Array(
+                    parts
+                        .into_iter()
+                        .map(gw_protocol::anthropic::image_url_to_image)
+                        .collect(),
+                ),
+                Some(parts) => parts,
+                None => Value::String(m.content),
+            };
             if m.role == gw_consts::role::TOOL {
                 let block = tool_result_block(m.tool_call_id, content);
                 push_turn(&mut messages, "user", Value::Array(vec![block]));

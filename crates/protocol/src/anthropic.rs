@@ -78,6 +78,50 @@ pub struct AnthUsage {
     pub cache_creation_input_tokens: i64,
 }
 
+/// An OpenAI `image_url` content part as an Anthropic `image` block: a data
+/// URI becomes a base64 source, anything else a URL source. Other parts pass
+/// through untouched.
+pub fn image_url_to_image(mut part: Value) -> Value {
+    if part["type"] != "image_url" {
+        return part;
+    }
+    let url = match part["image_url"].get_mut("url").map(Value::take) {
+        Some(Value::String(url)) => url,
+        _ => return part,
+    };
+    let source = match url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+    {
+        Some((media_type, data)) => {
+            serde_json::json!({"type": "base64", "media_type": media_type, "data": data})
+        }
+        None => serde_json::json!({"type": "url", "url": url}),
+    };
+    serde_json::json!({"type": "image", "source": source})
+}
+
+/// Inverse of [`image_url_to_image`]: an Anthropic `image` block as an OpenAI
+/// `image_url` part (base64 sources become data URIs).
+pub fn image_to_image_url(mut block: Value) -> Value {
+    if block["type"] != "image" {
+        return block;
+    }
+    let source = block["source"].take();
+    let url = match source["type"].as_str() {
+        Some("base64") => format!(
+            "data:{};base64,{}",
+            source["media_type"].as_str().unwrap_or("image/png"),
+            source["data"].as_str().unwrap_or_default()
+        ),
+        _ => match source.get("url").and_then(Value::as_str) {
+            Some(url) => url.to_owned(),
+            None => return block,
+        },
+    };
+    serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+}
+
 /// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
 /// Anthropic `tool_use` content blocks. `arguments` is a JSON string on the
 /// OpenAI wire; it parses into the block's structured `input` (kept verbatim
@@ -130,6 +174,29 @@ pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Valu
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn image_parts_convert_both_ways() {
+        let part = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}});
+        let block = image_url_to_image(part.clone());
+        assert_eq!(
+            block,
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}})
+        );
+        assert_eq!(image_to_image_url(block), part);
+        let remote = json!({"type":"image_url","image_url":{"url":"https://x/y.png"}});
+        assert_eq!(
+            image_url_to_image(remote.clone()),
+            json!({"type":"image","source":{"type":"url","url":"https://x/y.png"}})
+        );
+        assert_eq!(
+            image_to_image_url(image_url_to_image(remote.clone())),
+            remote
+        );
+        let text = json!({"type":"text","text":"hi"});
+        assert_eq!(image_url_to_image(text.clone()), text);
+        assert_eq!(image_to_image_url(text.clone()), text);
+    }
 
     use super::*;
 

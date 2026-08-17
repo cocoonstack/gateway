@@ -493,10 +493,27 @@ impl MockTransport {
     }
 
     fn image_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "image")?;
-        let n = body["n"].as_i64().unwrap_or(1).clamp(1, 4);
+        // edits arrive as multipart; the `n` text part is the only field read
+        let n = if req.body.starts_with(b"--") {
+            Self::form_field(&req.body, "n")
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(1)
+        } else {
+            Self::parse(&req.body, "image")?["n"].as_i64().unwrap_or(1)
+        }
+        .clamp(1, 4);
         let data: Vec<Value> = (0..n).map(|_| json!({"b64_json": MOCK_B64})).collect();
         Self::ok_json(json!({"created": MOCK_CREATED, "data": data}))
+    }
+
+    /// A text field of a multipart body: the bytes between the part header's
+    /// blank line and the next CRLF.
+    fn form_field<'a>(body: &'a [u8], name: &str) -> Option<&'a str> {
+        let text = std::str::from_utf8(body).ok()?;
+        let marker = format!("name=\"{name}\"\r\n\r\n");
+        let start = text.find(&marker)? + marker.len();
+        let end = text[start..].find("\r\n")? + start;
+        Some(&text[start..end])
     }
 
     fn moderations_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
@@ -547,14 +564,17 @@ impl MockTransport {
     }
 
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "audio")?;
+        // transcription uploads are multipart with a `file` part
         if req.url.ends_with("/audio/transcriptions") {
-            Self::ok_json(
-                json!({"text": "[mock-stt] transcribed audio", "language": body["language"]}),
-            )
+            let language = Self::form_field(&req.body, "language");
+            return Self::ok_json(
+                json!({"text": "[mock-stt] transcribed audio", "language": language}),
+            );
         } else if req.url.ends_with("/audio/translations") {
-            Self::ok_json(json!({"text": "[mock-stt] translated audio"}))
-        } else if req.url.ends_with("/audio/speech") {
+            return Self::ok_json(json!({"text": "[mock-stt] translated audio"}));
+        }
+        let body = Self::parse(&req.body, "audio")?;
+        if req.url.ends_with("/audio/speech") {
             let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
             Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
         } else {

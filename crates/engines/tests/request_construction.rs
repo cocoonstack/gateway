@@ -41,6 +41,20 @@ impl RecordingTransport {
     fn url(&self) -> String {
         self.seen.lock().unwrap().as_ref().unwrap().url.clone()
     }
+    fn body_form(&self) -> (String, String) {
+        let g = self.seen.lock().unwrap();
+        let req = g.as_ref().expect("engine sent a request");
+        let content_type = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        (
+            content_type,
+            String::from_utf8_lossy(&req.body).into_owned(),
+        )
+    }
     fn header(&self, name: &str) -> Option<String> {
         let g = self.seen.lock().unwrap();
         g.as_ref()
@@ -697,10 +711,15 @@ async fn image_edit_routes_to_edits_endpoint() {
         }),
     );
     let _ = ImageEngine::new(req, t.clone()).run().await.unwrap();
-    let b = t.body_json();
-    assert_eq!(b["prompt"], "add a hat");
-    assert_eq!(b["image"], "c3JjaW1n");
-    assert_eq!(b["mask"], "bWFzaw==");
+    let (content_type, body) = t.body_form();
+    assert!(content_type.starts_with("multipart/form-data; boundary=gw-"));
+    assert!(body.contains("name=\"prompt\"\r\n\r\nadd a hat\r\n"));
+    assert!(body.contains(
+        "name=\"image\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\nsrcimg\r\n"
+    ));
+    assert!(body.contains(
+        "name=\"mask\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\nmask\r\n"
+    ));
     assert!(t.url().ends_with("/images/edits"), "url: {}", t.url());
 }
 
@@ -744,9 +763,13 @@ async fn stt_request_shape() {
         .run()
         .await
         .unwrap();
-    let b = t.body_json();
-    assert_eq!(b["model"], "whisper-1");
-    assert_eq!(b["audio_b64"], "TU9DSw==");
+    let (content_type, body) = t.body_form();
+    assert!(content_type.starts_with("multipart/form-data; boundary=gw-"));
+    assert!(body.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"));
+    assert!(body.contains("name=\"language\"\r\n\r\nen\r\n"));
+    assert!(body.contains(
+        "name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\nMOCK\r\n"
+    ));
     assert!(
         t.url().ends_with("/audio/transcriptions"),
         "url: {}",
@@ -1253,4 +1276,37 @@ async fn openai_history_replays_reasoning_and_folds_native_thinking_blocks() {
     assert_eq!(messages[7]["role"], "user");
     assert_eq!(messages[7]["content"][0]["text"], "thanks, and in Paris?");
     assert_eq!(messages.len(), 8);
+}
+
+#[tokio::test]
+async fn image_parts_cross_the_wires() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-fable-5");
+    let mut msg = ChatMsg::text("user", "what is this?");
+    msg.parts = Some(serde_json::json!([
+        {"type":"text","text":"what is this?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+    ]));
+    req.message = vec![msg];
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["messages"][0]["content"][1],
+        serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}})
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4o-mini");
+    let mut msg = ChatMsg::text("user", "what is this?");
+    msg.parts = Some(serde_json::json!([
+        {"type":"text","text":"what is this?"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+    ]));
+    req.message = vec![msg];
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["messages"][0]["content"][1],
+        serde_json::json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}})
+    );
 }

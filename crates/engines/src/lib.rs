@@ -12,6 +12,7 @@ pub mod engine;
 pub mod factory;
 pub mod families;
 pub mod http_transport;
+pub mod multipart;
 pub mod openai_engine;
 pub mod pump;
 pub mod realtime;

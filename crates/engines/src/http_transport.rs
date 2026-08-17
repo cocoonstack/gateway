@@ -196,12 +196,15 @@ impl Transport for HttpTransport {
             }
         };
         let status = resp.status().as_u16();
-        let is_sse = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.starts_with("text/event-stream"))
-            .unwrap_or(false);
+        // an error status is a body to parse, never a stream — Google answers a
+        // failed streamGenerateContent with text/event-stream and a bare JSON
+        // error, which would decode as an empty, successful stream
+        let is_sse = status < 400
+            && resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream"));
         if is_sse {
             use futures::TryStreamExt;
             let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {

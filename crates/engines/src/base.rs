@@ -285,7 +285,7 @@ fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
 /// Decode a buffered JSON reply, surfacing vendor error envelopes instead of
 /// parsing them as broken success (bespoke engines add their own vendor-
 /// specific checks, e.g. minimax base_resp, on top of this).
-fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)> {
+pub(crate) fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)> {
     let bytes = match &reply.body {
         UpstreamBody::Json(b) => b,
         UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {

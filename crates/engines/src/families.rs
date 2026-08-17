@@ -3,11 +3,13 @@
 //! that boundary. The mock protocol flags byte-level vendor differences as
 //! deferred to a later fidelity pass.
 
+use base64::Engine as _;
 use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams};
 use serde_json::{Value, json};
 
 use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
+use crate::multipart::{Form, audio_kind, image_kind};
 use crate::sse::SseDecoder;
 use crate::transport::{SharedTransport, UpstreamBody};
 
@@ -358,32 +360,71 @@ impl ModelEngine for ImageEngine {
             ),
         };
         require_non_empty(&prompt, "image prompt")?;
-        let mut body = json!({"model": model, "n": n});
-        body["prompt"] = prompt.into();
-        if let Some(s) = size {
-            body["size"] = s.into();
-        }
-        // base64 image/mask payloads move — json! would re-copy megabytes
-        let (path, is_edit) = if let Some(img) = image {
-            body["image"] = img.into();
-            if let Some(m) = mask {
-                body["mask"] = m.into();
+        let base = self.base.base_url("mock://api.openai.com");
+        let (status, v, is_edit) = if let Some(image) = image {
+            // edits upload the source (and mask) as files
+            let image = decode_b64(&image, "image")?;
+            let mut form = Form::new(&image);
+            form.text("model", &model);
+            form.text("prompt", &prompt);
+            form.text("n", &n.to_string());
+            if let Some(size) = &size {
+                form.text("size", size);
             }
-            ("/v1/images/edits", true)
+            let (ext, content_type) = image_kind(&image);
+            form.file("image", &format!("image.{ext}"), content_type, &image);
+            if let Some(mask) = mask {
+                let mask = decode_b64(&mask, "mask")?;
+                let (ext, content_type) = image_kind(&mask);
+                form.file("mask", &format!("mask.{ext}"), content_type, &mask);
+            }
+            let (content_type, body) = form.finish();
+            let headers = vec![
+                ("content-type".into(), content_type),
+                (
+                    "authorization".into(),
+                    format!("Bearer {}", self.base.api_key()),
+                ),
+            ];
+            let reply = self
+                .base
+                .send_bytes(&format!("{base}/v1/images/edits"), headers, body, false)
+                .await?;
+            let (status, v) = crate::base::parse_json_reply(reply)?;
+            (status, v, true)
         } else {
-            ("/v1/images/generations", false)
+            let mut body = json!({"model": model, "n": n});
+            body["prompt"] = prompt.into();
+            if let Some(s) = size {
+                body["size"] = s.into();
+            }
+            let (status, v) = self
+                .base
+                .round_trip(&format!("{base}/v1/images/generations"), body)
+                .await?;
+            (status, v, false)
         };
-        let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
-        let (status, v) = self.base.round_trip(&url, body).await?;
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
-        Ok(family_outcome(
-            format!("{count} image(s) {verb}"),
-            &model,
-            v,
-            status,
-        ))
+        // gpt-image usage: input/output tokens (image + text details)
+        let (input, output) = (
+            crate::engine::tok(&v["usage"]["input_tokens"]),
+            crate::engine::tok(&v["usage"]["output_tokens"]),
+        );
+        let mut outcome = family_outcome(format!("{count} image(s) {verb}"), &model, v, status);
+        outcome.response.prompt_tokens = input;
+        outcome.response.completion_tokens = output;
+        crate::engine::fill_total_if_zero(&mut outcome.response);
+        Ok(outcome)
     }
+}
+
+/// Decode a client-supplied base64 payload; a bad payload is the client's 400,
+/// not an upstream failure.
+fn decode_b64(payload: &str, what: &str) -> GResult<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| GatewayError::bad_request(format!("{what} is not valid base64: {e}")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,7 +453,8 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let (path, body) = match self.kind {
+        let base = self.base.base_url("mock://api.openai.com");
+        let (status, v) = match self.kind {
             AudioKind::Tts => {
                 let (input, voice, format) = match &self.base.param()?.typed {
                     Some(TypedParams::AudioTts(p)) => (
@@ -430,7 +472,28 @@ impl ModelEngine for AudioEngine {
                 if let Some(f) = format {
                     b["response_format"] = json!(f);
                 }
-                ("/v1/audio/speech", b)
+                let reply = self
+                    .base
+                    .send_upstream(
+                        &format!("{base}/v1/audio/speech"),
+                        self.base.bearer_headers(),
+                        b,
+                        false,
+                    )
+                    .await?;
+                // the vendor answers with the audio bytes themselves; a JSON
+                // body is an error envelope (or a compatible upstream's b64)
+                let status = reply.status;
+                match reply.body {
+                    UpstreamBody::Json(bytes) if status < 400 && !looks_like_json(&bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        (status, json!({"audio_b64": b64}))
+                    }
+                    body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
+                        status,
+                        body,
+                    })?,
+                }
             }
             AudioKind::Stt => {
                 let (audio, language, translate) = match self.base.take_typed() {
@@ -438,25 +501,41 @@ impl ModelEngine for AudioEngine {
                     _ => (String::new(), None, false),
                 };
                 require_non_empty(&audio, "stt audio_b64")?;
+                let audio = decode_b64(&audio, "audio_b64")?;
                 let path = if translate {
                     "/v1/audio/translations"
                 } else {
                     "/v1/audio/transcriptions"
                 };
-                // the base64 payload moves — json! would re-copy megabytes
-                // (measured ~75us/MB per request)
-                let mut b = json!({"model": model, "language": language});
-                b["audio_b64"] = audio.into();
-                (path, b)
+                let mut form = Form::new(&audio);
+                form.text("model", &model);
+                if let Some(language) = &language {
+                    form.text("language", language);
+                }
+                let (ext, content_type) = audio_kind(&audio);
+                form.file("file", &format!("audio.{ext}"), content_type, &audio);
+                let (content_type, body) = form.finish();
+                let headers = vec![
+                    ("content-type".into(), content_type),
+                    (
+                        "authorization".into(),
+                        format!("Bearer {}", self.base.api_key()),
+                    ),
+                ];
+                let reply = self
+                    .base
+                    .send_bytes(&format!("{base}{path}"), headers, body, false)
+                    .await?;
+                crate::base::parse_json_reply(reply)?
             }
             AudioKind::Other => {
                 let mut b = json!({"model": model});
                 b["raw"] = self.base.take_raw();
-                ("/v1/audio/other", b)
+                self.base
+                    .round_trip(&format!("{base}/v1/audio/other"), b)
+                    .await?
             }
         };
-        let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
-        let (status, v) = self.base.round_trip(&url, body).await?;
         let message = match self.kind {
             AudioKind::Stt => v["text"].as_str().unwrap_or_default().to_owned(),
             _ => format!(
@@ -464,8 +543,24 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        Ok(family_outcome(message, &model, v, status))
+        // token-priced transcription models report input/output tokens
+        let (input, output) = (
+            crate::engine::tok(&v["usage"]["input_tokens"]),
+            crate::engine::tok(&v["usage"]["output_tokens"]),
+        );
+        let mut outcome = family_outcome(message, &model, v, status);
+        outcome.response.prompt_tokens = input;
+        outcome.response.completion_tokens = output;
+        crate::engine::fill_total_if_zero(&mut outcome.response);
+        Ok(outcome)
     }
+}
+
+fn looks_like_json(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.iter().find(|b| !b.is_ascii_whitespace()),
+        Some(b'{' | b'[')
+    )
 }
 
 base_engine!(VideoEngine);

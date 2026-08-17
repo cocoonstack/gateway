@@ -435,13 +435,18 @@ fn openai_reasoning_model(model: &str) -> bool {
 }
 
 fn is_native_block(block: &Value) -> bool {
-    is_thinking_block(block) || matches!(block["type"].as_str(), Some("tool_use" | "tool_result"))
+    is_thinking_block(block)
+        || matches!(
+            block["type"].as_str(),
+            Some("tool_use" | "tool_result" | "image")
+        )
 }
 
 /// A Messages-surface turn on the OpenAI wire: an assistant turn's thinking
 /// blocks fold into `reasoning_content` (unless the client sent one) and its
 /// `tool_use` blocks become `tool_calls`; a user turn's `tool_result` blocks
-/// become `role: tool` messages ahead of whatever else it carried.
+/// become `role: tool` messages ahead of whatever else it carried; `image`
+/// blocks become `image_url` parts.
 fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &mut Vec<Value>) {
     let mut msg = Map::new();
     msg.insert("role".into(), role.into());
@@ -454,7 +459,7 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
                 Some("thinking") => prose.push_str(part["thinking"].as_str().unwrap_or_default()),
                 Some("redacted_thinking") => {}
                 Some("tool_use") => tool_use.push(part),
-                _ => content.push(part),
+                _ => content.push(gw_protocol::anthropic::image_to_image_url(part)),
             }
         }
         if !tool_use.is_empty() {
@@ -467,7 +472,7 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
     } else {
         for mut part in parts {
             if part["type"] != "tool_result" {
-                content.push(part);
+                content.push(gw_protocol::anthropic::image_to_image_url(part));
                 continue;
             }
             let text = match part["content"].take() {

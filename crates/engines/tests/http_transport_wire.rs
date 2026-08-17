@@ -588,3 +588,44 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
     assert_eq!(err.message, "overloaded");
     assert_eq!(err.original_status, None);
 }
+
+#[tokio::test]
+async fn an_error_status_under_an_sse_content_type_is_a_body_not_a_stream() {
+    let app = Router::new().route(
+        "/v1beta/models/nope:streamGenerateContent",
+        post(|| async {
+            axum::response::Response::builder()
+                .status(404)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(
+                    r#"{"error":{"code":404,"message":"models/nope is not found","status":"NOT_FOUND"}}"#,
+                ))
+                .unwrap()
+        }),
+    );
+    let addr = serve_router(app).await;
+    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let resp = transport
+        .send(UpstreamRequest {
+            protocol: Protocol::Gemini,
+            method: "POST".into(),
+            url: format!("http://{addr}/v1beta/models/nope:streamGenerateContent"),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b"{}".to_vec(),
+            stream: true,
+            account: "gemini".into(),
+            replay_account: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, 404);
+    let UpstreamBody::Json(body) = resp.body else {
+        panic!(
+            "an error reply must not become an (empty) stream: {:?}",
+            resp.body
+        )
+    };
+    assert!(
+        gw_engines::engine::vendor_error(404, &serde_json::from_slice(&body).unwrap()).is_some()
+    );
+}
