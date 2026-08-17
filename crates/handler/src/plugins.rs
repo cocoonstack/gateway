@@ -409,6 +409,7 @@ fn is_media_block(ty: &str) -> bool {
             | "input_file"
             | "file"
             | "document"
+            | "reasoning"
     )
 }
 
@@ -430,7 +431,8 @@ fn is_signed_thinking_block(block: &serde_json::Map<String, serde_json::Value>) 
 
 /// A media block's payload keys: base64/URL leaves a rewrite would corrupt or
 /// noise could false-match, the nested media containers (`image_url`,
-/// `input_audio`, Chat's `file`), and file-handle references (`file_id`).
+/// `input_audio`, Chat's `file`), file-handle references (`file_id`), and a
+/// Responses reasoning item's `encrypted_content`.
 /// Skipped only inside a [`is_media_block`] object; the same name in a tool
 /// argument, a JSON Schema, or a metadata bag is prose and stays scanned.
 fn is_media_payload_key(k: &str) -> bool {
@@ -445,6 +447,7 @@ fn is_media_payload_key(k: &str) -> bool {
             | "file_id"
             | "file_data"
             | "file_url"
+            | "encrypted_content"
     )
 }
 
@@ -1403,6 +1406,28 @@ mod tests {
             native_event_dlp_hits(&security, &mut opaque_with_extra),
             1,
             "only the signature field itself is opaque"
+        );
+
+        let mut responses = vec![
+            event(serde_json::json!({
+                "type":"response.reasoning_summary_text.delta","output_index":0,
+                "delta":"token sk-abcdefghij"
+            })),
+            event(serde_json::json!({
+                "type":"response.reasoning_summary_text.delta","output_index":0,
+                "delta":"klmnopqrstuvwxyz012345 leaked"
+            })),
+        ];
+        assert!(native_event_dlp_hits(&security, &mut responses) >= 1);
+        let mut encrypted = vec![event(serde_json::json!({
+            "type":"response.output_item.done","output_index":0,
+            "item":{"type":"reasoning","encrypted_content":"sk-abcdefghijklmnopqrstuvwxyz012345",
+                    "summary":[{"type":"summary_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"}]}
+        }))];
+        assert_eq!(
+            native_event_dlp_hits(&security, &mut encrypted),
+            1,
+            "encrypted reasoning is opaque; its summary prose is scanned"
         );
     }
 
