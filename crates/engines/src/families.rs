@@ -846,16 +846,13 @@ impl ResponsesEngine {
         self.base.model_name().unwrap_or_default().to_owned()
     }
 
-    /// Native passthrough: the client's Responses-shaped body moves through
-    /// verbatim, with `model` ensured.
+    /// Native passthrough with the DAG-selected model applied.
     fn build_body(&mut self) -> GResult<Value> {
         let mut body = match self.base.take_raw() {
             raw @ Value::Object(_) => raw,
             _ => json!({}),
         };
-        if let Some(map) = body.as_object_mut()
-            && !map.contains_key("model")
-        {
+        if let Some(map) = body.as_object_mut() {
             map.insert("model".to_owned(), self.base.model_name()?.into());
         }
         Ok(body)
@@ -1460,6 +1457,18 @@ mod tests {
             (out.response.prompt_tokens, out.response.completion_tokens),
             (32, 12)
         );
+    }
+
+    #[tokio::test]
+    fn responses_body_uses_the_routed_model() {
+        let mut request = req(Protocol::Responses, "gpt-5-served", None);
+        let param = request.model_param_v2.as_mut().unwrap();
+        param.raw = json!({"model": "gpt-5-public", "input": "go"});
+        param.fallback_from = Some("gpt-5-public".to_owned());
+
+        let mut engine = ResponsesEngine::new(request, Arc::new(MockTransport));
+
+        assert_eq!(engine.build_body().unwrap()["model"], "gpt-5-served");
     }
 
     #[tokio::test]
