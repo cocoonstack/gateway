@@ -118,14 +118,14 @@ ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
 is the weighted platform total. `prompt_cache` (anthropic-messages models)
 marks the system prompt and the latest user turn as Anthropic prompt-cache
 breakpoints, so each turn of a conversation re-reads its prefix at the
-cache-read rate; a prompt below the vendor's minimum cacheable length is
-simply not cached, and a long one-shot prompt pays the cache-write premium
-once, which is why the knob is per model and off by default. `variants` splits a public name across other
-declared same-protocol models (one level): entitlement and the per-(AK, model)
-daily counter judge the public name, billing prices the served variant, and
-the response echoes the requested name. Selection hashes the effective user,
-so a user sticks to one backend across the fleet; a realtime session picks
-its variant once at the handshake and pins it for the whole session.
+cache-read rate; it is per model and off by default because a long one-shot
+prompt would pay the cache-write premium for nothing. `variants` splits a
+public name across other declared same-protocol models (one level):
+entitlement and the per-(AK, model) daily counter judge the public name,
+billing prices the served variant, and the response echoes the requested
+name. Selection hashes the effective user, so a user sticks to one backend
+across the fleet; a realtime session picks its variant once at the handshake
+and pins it for the whole session.
 
 ### `providers` — first-class provider presets
 

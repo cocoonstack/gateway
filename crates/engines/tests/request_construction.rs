@@ -901,9 +901,8 @@ async fn anthropic_chat_history_drops_empty_turns_and_alternates() {
 
 #[tokio::test]
 async fn anthropic_prompt_cache_marks_system_and_latest_user_turn() {
-    let t = RecordingTransport::new(
-        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
-    );
+    let reply = r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+    let t = RecordingTransport::new(reply);
     let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
     req.message.push(ChatMsg::text("assistant", "hi"));
     req.message.push(ChatMsg::text("user", "and now?"));
@@ -922,9 +921,22 @@ async fn anthropic_prompt_cache_marks_system_and_latest_user_turn() {
     assert_eq!(last[0]["text"], "and now?");
     assert_eq!(last[0]["cache_control"]["type"], "ephemeral");
 
-    let plain = RecordingTransport::new(
-        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    let own = RecordingTransport::new(reply);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+    let mut last = ChatMsg::text("user", "");
+    last.parts = Some(serde_json::json!([
+        {"type": "text", "text": "long-lived", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]));
+    req.message.push(last);
+    req.prompt_cache = true;
+    let _ = ClaudeEngine::new(req, own.clone()).run().await.unwrap();
+    let b = own.body_json();
+    assert_eq!(
+        b["messages"][0]["content"][1]["cache_control"]["ttl"], "1h",
+        "a client-placed breakpoint is kept: {b}"
     );
+
+    let plain = RecordingTransport::new(reply);
     let _ = ClaudeEngine::new(
         chat_req(Protocol::AnthropicMessages, "claude-sonnet"),
         plain.clone(),
