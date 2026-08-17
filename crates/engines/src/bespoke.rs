@@ -73,7 +73,8 @@ base_engine!(ErnieEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for ErnieEngine {
-    /// Baidu Ernie (Wenxin): /wenxinworkshop/chat/{model}?access_token=…
+    /// Baidu Ernie (Wenxin): /wenxinworkshop/chat/{model}, a v2 API key
+    /// (`bce-v3/…`) as Bearer or a legacy OAuth token as `?access_token=`.
     /// Request {messages,[temperature]}; response {result, usage{...}, is_truncated}.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
@@ -100,13 +101,19 @@ impl ModelEngine for ErnieEngine {
         {
             body["temperature"] = json!(t);
         }
-        // Baidu auth is an access_token query param; real token from the env var at go-live
-        let url = format!(
-            "{}/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{model}?access_token={}",
+        let key = self.base.api_key();
+        let mut url = format!(
+            "{}/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{model}",
             self.base.base_url("mock://aip.baidubce.com"),
-            self.base.api_key(),
         );
-        let (status, mut v) = self.base.post_json(&url, vec![], body).await?;
+        let mut headers = Vec::new();
+        if key.starts_with("bce-v3/") {
+            headers.push(("authorization".to_owned(), format!("Bearer {key}")));
+        } else {
+            url.push_str("?access_token=");
+            url.push_str(&key);
+        }
+        let (status, mut v) = self.base.post_json(&url, headers, body).await?;
         let message = crate::engine::take_string(&mut v, "/result").unwrap_or_default();
         let usage = &v["usage"];
         let prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);

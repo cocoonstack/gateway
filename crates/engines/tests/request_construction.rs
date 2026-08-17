@@ -468,10 +468,31 @@ async fn ernie_request_shape() {
     assert_eq!(b["messages"][0]["role"], "user");
     assert_eq!(b["messages"][0]["content"], "hello");
     assert!(t.url().contains("wenxinworkshop"), "url: {}", t.url());
+    assert!(t.url().contains("?access_token=mock"), "url: {}", t.url());
     assert_eq!(
         t.header("content-type").as_deref(),
         Some("application/json")
     );
+
+    // a Qianfan v2 API key travels as Bearer, never in the query
+    let var = "GW_TEST_QIANFAN_V2_KEY";
+    // SAFETY: the var name is unique to this test and nothing reads it concurrently.
+    unsafe { std::env::set_var(var, "bce-v3/ALTAK-x/secret") };
+    let t = RecordingTransport::new(r#"{"result":"ok","usage":{}}"#);
+    let mut req = chat_req(Protocol::Ernie, "completions_pro");
+    req.account = Some(Arc::new(gw_models::Account {
+        endpoint: "https://aip.baidubce.com".into(),
+        api_key_env: var.into(),
+        ..Default::default()
+    }));
+    let _ = ErnieEngine::new(req, t.clone()).run().await.unwrap();
+    assert!(!t.url().contains("access_token"), "url: {}", t.url());
+    assert_eq!(
+        t.header("authorization").as_deref(),
+        Some("Bearer bce-v3/ALTAK-x/secret")
+    );
+    // SAFETY: same unique var; no concurrent reader.
+    unsafe { std::env::remove_var(var) };
 }
 
 #[tokio::test]
