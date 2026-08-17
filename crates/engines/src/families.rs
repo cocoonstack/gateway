@@ -1370,6 +1370,88 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BytesReply(&'static [u8]);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for BytesReply {
+        async fn send(&self, _req: UpstreamRequest) -> GResult<UpstreamResponse> {
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Json(self.0.to_vec().into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tts_audio_bytes_become_the_b64_payload() {
+        let mut r = req(Protocol::Tts, "gpt-4o-mini-tts", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::AudioTts(TtsParams {
+            input: "hi".into(),
+            voice: None,
+            response_format: Some("mp3".into()),
+        }));
+        let out = AudioEngine::new(r, Arc::new(BytesReply(b"\xff\xfbaudio")), AudioKind::Tts)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.response.response_v2.unwrap()["audio_b64"],
+            base64::engine::general_purpose::STANDARD.encode(b"\xff\xfbaudio")
+        );
+    }
+
+    #[tokio::test]
+    async fn image_and_transcription_usage_reach_the_response() {
+        let mut r = req(Protocol::Image, "gpt-image-1", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Image(ImageParams {
+            prompt: "a circle".into(),
+            n: 1,
+            size: None,
+            image: None,
+            mask: None,
+        }));
+        let out = ImageEngine::new(
+            r,
+            Arc::new(BytesReply(
+                br#"{"data":[{"b64_json":"AA=="}],"usage":{"input_tokens":15,"output_tokens":1056}}"#,
+            )),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                out.response.prompt_tokens,
+                out.response.completion_tokens,
+                out.response.total_tokens
+            ),
+            (15, 1056, 1071)
+        );
+
+        let mut r = req(Protocol::Stt, "gpt-4o-mini-transcribe", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::AudioStt(SttParams {
+            audio_b64: "TU9DSw==".into(),
+            language: None,
+            translate: false,
+        }));
+        let out = AudioEngine::new(
+            r,
+            Arc::new(BytesReply(
+                br#"{"text":"mock","usage":{"type":"tokens","input_tokens":32,"output_tokens":12}}"#,
+            )),
+            AudioKind::Stt,
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(out.response.message, "mock");
+        assert_eq!(
+            (out.response.prompt_tokens, out.response.completion_tokens),
+            (32, 12)
+        );
+    }
+
     #[tokio::test]
     async fn responses_stream_forwards_reasoning_and_function_call_events_verbatim() {
         let sse = concat!(
