@@ -241,17 +241,20 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
     let units = clamp_tokens(b.units);
     let unit_cost = units.saturating_mul(cfg.unit_price_for_tenant(b.tenant, b.served_model));
-    let vendor = cfg
+    let (vendor, vendor_unit) = cfg
         .accounts
         .iter()
         .find(|a| a.name == b.account)
         .map(|a| {
             (
-                a.cost_input_price_per_1k_micros,
-                a.cost_output_price_per_1k_micros,
+                (
+                    a.cost_input_price_per_1k_micros,
+                    a.cost_output_price_per_1k_micros,
+                ),
+                a.cost_unit_price_micros,
             )
         })
-        .unwrap_or((0, 0));
+        .unwrap_or(((0, 0), 0));
     BillingRecord {
         ak: b.ak.to_owned(),
         product: b.product.to_owned(),
@@ -268,7 +271,8 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         total_tokens: total,
         cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged)
             .saturating_add(unit_cost),
-        vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor),
+        vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor)
+            .saturating_add(units.saturating_mul(vendor_unit)),
         billed_units: units,
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
@@ -286,6 +290,7 @@ pub struct UsageRow {
     pub total_tokens: i64,
     pub cost_micros: i64,
     pub vendor_cost_micros: i64,
+    pub billed_units: i64,
 }
 
 /// One row of the per-(user, model) usage rollup over a billing period.
@@ -299,6 +304,7 @@ pub struct UserUsageRow {
     pub total_tokens: i64,
     pub cost_micros: i64,
     pub vendor_cost_micros: i64,
+    pub billed_units: i64,
 }
 
 impl UserUsageRow {
@@ -312,6 +318,7 @@ impl UserUsageRow {
             total_tokens: 0,
             cost_micros: 0,
             vendor_cost_micros: 0,
+            billed_units: 0,
         }
     }
 
@@ -323,6 +330,7 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.saturating_add(o.total_tokens);
         self.cost_micros = self.cost_micros.saturating_add(o.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(o.vendor_cost_micros);
+        self.billed_units = self.billed_units.saturating_add(o.billed_units);
     }
 
     /// Fold one raw ledger row's counters into self (saturating).
@@ -333,6 +341,7 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.saturating_add(r.total_tokens);
         self.cost_micros = self.cost_micros.saturating_add(r.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
+        self.billed_units = self.billed_units.saturating_add(r.billed_units);
     }
 
     /// Keep the larger of each counter. A bucket's source rows are append-only
@@ -346,6 +355,7 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.max(o.total_tokens);
         self.cost_micros = self.cost_micros.max(o.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.max(o.vendor_cost_micros);
+        self.billed_units = self.billed_units.max(o.billed_units);
     }
 }
 
@@ -360,6 +370,7 @@ fn usage_of(r: &BillingRecord) -> UserUsageRow {
         total_tokens: r.total_tokens,
         cost_micros: r.cost_micros,
         vendor_cost_micros: r.vendor_cost_micros,
+        billed_units: r.billed_units,
     }
 }
 
@@ -401,6 +412,7 @@ where
             total_tokens: row.get(4),
             cost_micros: row.get(5),
             vendor_cost_micros: row.get(6),
+            billed_units: row.get(7),
         },
     )
 }
@@ -818,6 +830,7 @@ impl Store for MemoryStore {
                     total_tokens: 0,
                     cost_micros: 0,
                     vendor_cost_micros: 0,
+                    billed_units: 0,
                 });
             // saturating: a hostile upstream can drive a single record's counts
             // to i64::MAX (usage is floored, not capped), so the rollup sum must
@@ -828,6 +841,7 @@ impl Store for MemoryStore {
             e.total_tokens = e.total_tokens.saturating_add(r.total_tokens);
             e.cost_micros = e.cost_micros.saturating_add(r.cost_micros);
             e.vendor_cost_micros = e.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
+            e.billed_units = e.billed_units.saturating_add(r.billed_units);
         }
         Ok(rollup.into_values().collect())
     }
@@ -1178,12 +1192,12 @@ row_mapper!(row_to_billing -> BillingRecord {
 
 row_mapper!(usage_row -> UsageRow {
     tenant, model, requests, prompt_tokens, completion_tokens, total_tokens,
-    cost_micros, vendor_cost_micros,
+    cost_micros, vendor_cost_micros, billed_units,
 });
 
 row_mapper!(user_usage_row -> UserUsageRow {
     user_id, model, requests, prompt_tokens, completion_tokens, total_tokens,
-    cost_micros, vendor_cost_micros,
+    cost_micros, vendor_cost_micros, billed_units,
 });
 
 row_mapper!(security_event_row -> SecurityEvent {
@@ -1269,6 +1283,7 @@ impl SqliteStore {
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
                 vendor_cost_micros INTEGER NOT NULL,
+                billed_units INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (minute_epoch, tenant, user_id, model))",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
@@ -1320,6 +1335,7 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN created_at_epoch_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN billed_units INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_rollup ADD COLUMN billed_units INTEGER NOT NULL DEFAULT 0",
             // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
@@ -1652,7 +1668,7 @@ sql_store_impl!(SqliteStore, sqlite, {
             match tenant {
                 Some(t) => sqlx::query(
                     "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
                      FROM billing WHERE tenant = ?
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -1661,7 +1677,7 @@ sql_store_impl!(SqliteStore, sqlite, {
                 .await,
                 None => sqlx::query(
                     "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
                      FROM billing
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -1686,7 +1702,7 @@ sql_store_impl!(SqliteStore, sqlite, {
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let rolled = sqlx::query(
             "SELECT user_id, model, SUM(requests), SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM usage_rollup
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND minute_epoch BETWEEN ?3 AND ?4
@@ -1701,7 +1717,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
         let raw = sqlx::query(
             "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM billing
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
@@ -1737,7 +1753,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         let rolled = sqlx::query(
             "SELECT minute_epoch - (minute_epoch % ?5), SUM(requests),
              SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM usage_rollup
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND minute_epoch BETWEEN ?3 AND ?4
@@ -1754,7 +1770,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         let raw = sqlx::query(
             "SELECT created_at_epoch_secs - (created_at_epoch_secs % ?6), COUNT(*),
              SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-             SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM billing
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
@@ -1783,10 +1799,10 @@ sql_store_impl!(SqliteStore, sqlite, {
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
-              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
+              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units)
              SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
               SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-              SUM(cost_micros), SUM(vendor_cost_micros)
+              SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2
              GROUP BY 1, 2, 3, 4
              ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
@@ -1795,7 +1811,8 @@ sql_store_impl!(SqliteStore, sqlite, {
               completion_tokens = MAX(usage_rollup.completion_tokens, excluded.completion_tokens),
               total_tokens = MAX(usage_rollup.total_tokens, excluded.total_tokens),
               cost_micros = MAX(usage_rollup.cost_micros, excluded.cost_micros),
-              vendor_cost_micros = MAX(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros)",
+              vendor_cost_micros = MAX(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros),
+              billed_units = MAX(usage_rollup.billed_units, excluded.billed_units)",
         )
         .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
         .bind(hi)
@@ -2080,6 +2097,7 @@ impl PostgresStore {
                 prompt_tokens BIGINT NOT NULL, completion_tokens BIGINT NOT NULL,
                 total_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL,
                 vendor_cost_micros BIGINT NOT NULL,
+                billed_units BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (minute_epoch, tenant, user_id, model))",
             "CREATE TABLE IF NOT EXISTS security_events (
                 n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
@@ -2144,6 +2162,7 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS billed_units BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_rollup ADD COLUMN IF NOT EXISTS billed_units BIGINT NOT NULL DEFAULT 0",
         ];
         crate::setup_schema(&pool, "postgres", &ddls).await?;
         Ok(Self {
@@ -2163,7 +2182,7 @@ sql_store_impl!(PostgresStore, postgres, {
                     "SELECT tenant, model, COUNT(*),
                      SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
                      SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-                     SUM(vendor_cost_micros)::BIGINT
+                     SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
                      FROM billing WHERE tenant = $1
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -2176,7 +2195,7 @@ sql_store_impl!(PostgresStore, postgres, {
                     "SELECT tenant, model, COUNT(*),
                      SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
                      SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-                     SUM(vendor_cost_micros)::BIGINT
+                     SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
                      FROM billing
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -2203,7 +2222,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let rolled = sqlx::query(
             "SELECT user_id, model, SUM(requests)::BIGINT,
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM usage_rollup
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND minute_epoch BETWEEN $3 AND $4
@@ -2219,7 +2238,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let raw = sqlx::query(
             "SELECT user_id, model, COUNT(*),
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM billing
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
@@ -2255,7 +2274,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let rolled = sqlx::query(
             "SELECT minute_epoch - (minute_epoch % $5), SUM(requests)::BIGINT,
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM usage_rollup
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND minute_epoch BETWEEN $3 AND $4
@@ -2272,7 +2291,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let raw = sqlx::query(
             "SELECT created_at_epoch_secs - (created_at_epoch_secs % $6), COUNT(*),
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT, SUM(total_tokens)::BIGINT,
-             SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM billing
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
@@ -2314,11 +2333,11 @@ sql_store_impl!(PostgresStore, postgres, {
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
-              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
+              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units)
              SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
               SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
               SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-              SUM(vendor_cost_micros)::BIGINT
+              SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM billing WHERE created_at_epoch_secs >= $1 AND created_at_epoch_secs < $2
              GROUP BY 1, 2, 3, 4
              ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
@@ -2329,7 +2348,8 @@ sql_store_impl!(PostgresStore, postgres, {
               total_tokens = GREATEST(usage_rollup.total_tokens, excluded.total_tokens),
               cost_micros = GREATEST(usage_rollup.cost_micros, excluded.cost_micros),
               vendor_cost_micros =
-               GREATEST(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros)",
+               GREATEST(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros),
+              billed_units = GREATEST(usage_rollup.billed_units, excluded.billed_units)",
         )
         .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
         .bind(hi)
@@ -2824,7 +2844,7 @@ mod tests {
 
     #[test]
     fn billing_record_prices_units_at_the_model_or_tenant_unit_price() {
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: tts, protocol: tts, unit_price_micros: 15}]\ntenants: [{name: acme, model_prices: {tts: {unit_price_micros: 20}}}]";
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: tts, protocol: tts, unit_price_micros: 15}]\ntenants: [{name: acme, model_prices: {tts: {unit_price_micros: 20}}}]\naccounts: [{name: acc, provider: openai, protocols: [tts], cost_unit_price_micros: 4}]";
         let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
         let input = |tenant: &'static str| BillingInput {
             ak: "k",
@@ -2850,6 +2870,7 @@ mod tests {
             (rec.billed_units, rec.cost_micros, rec.total_tokens),
             (40, 600, 0)
         );
+        assert_eq!(rec.vendor_cost_micros, 160);
         assert_eq!(billing_record(&cfg, &input("acme")).cost_micros, 800);
     }
 
@@ -3887,6 +3908,7 @@ mod tests {
         assert_eq!(usage.len(), 2);
         assert_eq!(usage[0].requests, 1);
         assert_eq!(usage[0].vendor_cost_micros, 7);
+        assert_eq!(usage[0].billed_units, 3);
         assert!(store.ledger_usage(Some("ghost")).await.unwrap().is_empty());
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
         assert_eq!(job.status, BatchStatus::Completed);

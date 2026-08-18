@@ -119,9 +119,12 @@ models:
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
 is the weighted platform total. `unit_price_micros` prices what the surfaces
 without token usage meter — a `tts` model's input characters, an `stt`
-model's audio seconds (the vendor's `usage.seconds` / `duration`, fractions
-rounded up), a `rerank` model's `search_units` — and adds to `cost_micros`
-next to any token cost; the count lands in the ledger's `billed_units`. `prompt_cache` (anthropic-messages models)
+model's audio seconds (the vendor's `usage.seconds` / `duration`, else the
+uploaded WAV/MP3's own play length; fractions rounded up), a `rerank`
+model's `search_units` — and adds to `cost_micros` next to any token cost;
+the count lands in the ledger's `billed_units` and the `/admin/usage`
+aggregates. An account's `cost_unit_price_micros` is the vendor side of the
+same unit, for margin. `prompt_cache` (anthropic-messages models)
 marks the system prompt and the latest user turn as Anthropic prompt-cache
 breakpoints, so each turn of a conversation re-reads its prefix at the
 cache-read rate; it is per model and off by default because a long one-shot
@@ -182,6 +185,7 @@ accounts:
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
     cost_input_price_per_1k_micros: 100   # optional: what this vendor charges us (margin accounting)
+    cost_unit_price_micros: 0             #   and per non-token unit (see the model's unit_price_micros)
     cost_output_price_per_1k_micros: 400
 ```
 

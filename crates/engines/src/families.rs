@@ -463,8 +463,11 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // speech bills per input character; the reply carries no usage
+        // speech bills per input character; the reply carries no usage.
+        // Transcription bills per second: the vendor's count, else the
+        // upload's own play length.
         let mut units = 0;
+        let mut local_seconds = None;
         let (status, v) = match self.kind {
             AudioKind::Tts => {
                 let (input, voice, format) = match &self.base.param()?.typed {
@@ -517,6 +520,7 @@ impl ModelEngine for AudioEngine {
                 };
                 require_non_empty(&audio, "stt audio_b64")?;
                 let audio = decode_b64(&audio, "audio_b64")?;
+                local_seconds = crate::multipart::audio_seconds(&audio);
                 let path = if translate {
                     "audio/translations"
                 } else {
@@ -575,6 +579,7 @@ impl ModelEngine for AudioEngine {
         if self.kind == AudioKind::Stt {
             units = whole_seconds(&v["usage"]["seconds"])
                 .or_else(|| whole_seconds(&v["duration"]))
+                .or_else(|| local_seconds.map(|s| s.ceil() as i64))
                 .unwrap_or(0);
         }
         let mut outcome = family_outcome(message, &model, v, status);

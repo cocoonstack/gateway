@@ -245,6 +245,10 @@ pub struct AccountConf {
     pub cost_input_price_per_1k_micros: i64,
     #[serde(default)]
     pub cost_output_price_per_1k_micros: i64,
+    /// What the vendor charges us per non-token unit (see the model's
+    /// `unit_price_micros`); zero = untracked.
+    #[serde(default)]
+    pub cost_unit_price_micros: i64,
     pub protocols: Vec<String>,
 }
 
@@ -755,6 +759,7 @@ impl GatewayConfig {
                     tier: String::new(),
                     cost_input_price_per_1k_micros: 0,
                     cost_output_price_per_1k_micros: 0,
+                    cost_unit_price_micros: 0,
                     timeout_seconds: None,
                     connect_retries: None,
                     retry_status: None,
@@ -858,7 +863,8 @@ impl GatewayConfig {
             if neg(
                 a.cost_input_price_per_1k_micros,
                 a.cost_output_price_per_1k_micros,
-            ) {
+            ) || a.cost_unit_price_micros < 0
+            {
                 return Err(ConfigError::NegativePrice {
                     owner: format!("account {}", a.name),
                 });

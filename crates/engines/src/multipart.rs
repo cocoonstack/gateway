@@ -76,6 +76,87 @@ pub fn audio_kind(bytes: &[u8]) -> (&'static str, &'static str) {
     }
 }
 
+/// The play length of an uploaded WAV or MP3 payload, for duration billing
+/// when the vendor reports none. Other containers answer `None`.
+pub fn audio_seconds(bytes: &[u8]) -> Option<f64> {
+    match bytes {
+        [b'R', b'I', b'F', b'F', ..] => wav_seconds(bytes),
+        [b'f', b'L', b'a', b'C', ..]
+        | [b'O', b'g', b'g', b'S', ..]
+        | [0x1A, 0x45, 0xDF, 0xA3, ..]
+        | [_, _, _, _, b'f', b't', b'y', b'p', ..] => None,
+        _ => mp3_seconds(bytes),
+    }
+}
+
+fn wav_seconds(bytes: &[u8]) -> Option<f64> {
+    let le32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let mut at = 12;
+    let mut byte_rate = 0;
+    while let Some(size) = le32(at + 4) {
+        let id = bytes.get(at..at + 4)?;
+        match id {
+            b"fmt " => byte_rate = le32(at + 16)?,
+            b"data" if byte_rate > 0 => {
+                let data = size.min(bytes.len().saturating_sub(at + 8));
+                return Some(data as f64 / byte_rate as f64);
+            }
+            _ => {}
+        }
+        at += 8 + size + (size & 1);
+    }
+    None
+}
+
+/// Layer III frames only (the `mp3` container); frame headers are walked, not
+/// decoded, so a VBR file sums exactly.
+fn mp3_seconds(bytes: &[u8]) -> Option<f64> {
+    const V1_KBPS: [u32; 16] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+    ];
+    const V2_KBPS: [u32; 16] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+    ];
+    let mut at = 0;
+    if let [b'I', b'D', b'3', _, _, flags, s0, s1, s2, s3, ..] = bytes {
+        let size = [s0, s1, s2, s3]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 7) | (*b & 0x7F) as usize);
+        at = 10 + size + if flags & 0x10 != 0 { 10 } else { 0 };
+    }
+    let mut seconds = 0.0;
+    let mut frames = 0u32;
+    while let Some(h) = bytes.get(at..at + 4) {
+        if h[0] != 0xFF || h[1] & 0xE0 != 0xE0 || h[1] & 0x06 != 0x02 {
+            break;
+        }
+        let (kbps, samples, sample_rates): (&[u32; 16], f64, [u32; 3]) = match (h[1] >> 3) & 0x03 {
+            0b11 => (&V1_KBPS, 1152.0, [44_100, 48_000, 32_000]),
+            0b10 => (&V2_KBPS, 576.0, [22_050, 24_000, 16_000]),
+            0b00 => (&V2_KBPS, 576.0, [11_025, 12_000, 8_000]),
+            _ => break,
+        };
+        let bitrate = kbps[(h[2] >> 4) as usize] * 1000;
+        let sample_rate = match sample_rates.get(((h[2] >> 2) & 0x03) as usize) {
+            Some(&sr) => sr,
+            None => break,
+        };
+        if bitrate == 0 {
+            break;
+        }
+        let padding = ((h[2] >> 1) & 1) as usize;
+        let frame_len = (samples as usize / 8) * bitrate as usize / sample_rate as usize + padding;
+        seconds += samples / sample_rate as f64;
+        frames += 1;
+        at += frame_len;
+    }
+    (frames > 0).then_some(seconds)
+}
+
 /// The image container of an uploaded payload; `png` when unrecognized.
 pub fn image_kind(bytes: &[u8]) -> (&'static str, &'static str) {
     match bytes {
@@ -135,5 +216,36 @@ mod tests {
         );
         assert_eq!(image_kind(b"\x89PNG"), ("png", "image/png"));
         assert_eq!(image_kind(b"\xFF\xD8\xFF\xE0"), ("jpg", "image/jpeg"));
+    }
+
+    #[test]
+    fn wav_and_mp3_play_lengths_are_read_from_the_container() {
+        // 16-bit mono 8 kHz WAV: byte rate 16000, 32000 data bytes = 2 s
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + 32_000).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.resize(wav.len() + 32_000, 0);
+        assert_eq!(audio_seconds(&wav), Some(2.0));
+
+        // MPEG-1 Layer III, 128 kbps, 44.1 kHz, no padding: 417-byte frames of
+        // 1152 samples; an ID3v2 tag of 10+5 bytes in front
+        let mut mp3 = vec![b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0];
+        for _ in 0..100 {
+            mp3.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            mp3.resize(mp3.len() + 417 - 4, 0);
+        }
+        let secs = audio_seconds(&mp3).unwrap();
+        assert!((secs - 100.0 * 1152.0 / 44_100.0).abs() < 1e-9, "{secs}");
+        assert_eq!(audio_seconds(b"OggS...."), None);
     }
 }
