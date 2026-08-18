@@ -26,6 +26,7 @@ export interface UsageRow {
   total_tokens: number;
   cost_micros: number;
   vendor_cost_micros: number;
+  billed_units: number;
 }
 
 export interface SeriesPoint {
@@ -37,6 +38,7 @@ export interface SeriesPoint {
   total_tokens: number;
   cost_micros: number;
   vendor_cost_micros: number;
+  billed_units: number;
 }
 
 export interface UsageSeries {
@@ -58,6 +60,7 @@ export interface Overview {
   totals: {
     requests: number;
     total_tokens: number;
+    billed_units: number;
     cost_micros: number;
     vendor_cost_micros?: number;
   };

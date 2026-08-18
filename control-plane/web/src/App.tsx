@@ -59,7 +59,7 @@ export default function App() {
 
   useEffect(() => {
     setUnauthorizedHandler(() => applySession(null));
-    api<Session>("/api/v1/session")
+    void api<Session>("/api/v1/session")
       .then(applySession)
       .catch((error: unknown) => {
         if (!(error instanceof APIError) || error.status !== 401) {

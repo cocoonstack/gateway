@@ -3,18 +3,18 @@
 //! that boundary. The mock protocol flags byte-level vendor differences as
 //! deferred to a later fidelity pass.
 
+use base64::Engine as _;
 use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams};
 use serde_json::{Value, json};
 
 use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
+use crate::multipart::{Form, audio_kind, image_kind};
 use crate::sse::SseDecoder;
-use crate::transport::{SharedTransport, UpstreamBody};
+use crate::transport::{Headers, SharedTransport, UpstreamBody};
 
-/// Build Gemini `parts` from a unified message: text → `{"text":…}`, data-URI
-/// images → `{"inlineData":…}`. Non-data image URLs can't be inlined offline
-/// (no fetch), so they're skipped rather than forwarded as an unusable OpenAI
-/// block; without this, multimodal requests silently drop every image.
+/// Gemini `parts` from a unified message: text and data-URI images (`inlineData`);
+/// remote image URLs cannot be inlined without a fetch and are skipped.
 fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
     if let Some(Value::Array(parts)) = &m.parts {
         let mut out = Vec::new();
@@ -57,17 +57,15 @@ base_engine!(VertexEngine);
 impl VertexEngine {
     /// Gemini API auth: the x-goog-api-key header — an API key is not an OAuth
     /// Bearer token and Google rejects it as one.
-    fn gemini_headers(&self) -> Vec<(String, String)> {
+    fn gemini_headers(&self) -> Headers {
         vec![
-            ("content-type".into(), "application/json".into()),
-            ("x-goog-api-key".into(), self.base.api_key()),
+            ("content-type", "application/json".into()),
+            ("x-goog-api-key", self.base.api_key()),
         ]
     }
 
     fn build_body(&self) -> Value {
-        // system turns go to systemInstruction, never the contents: Gemini has
-        // no system content role, and a `user`-role downgrade both loses the
-        // directive's authority and breaks turn alternation
+        // Gemini has no system role: system turns go to systemInstruction, never contents
         let contents: Vec<Value> = self
             .base
             .request
@@ -181,9 +179,8 @@ impl ModelEngine for VertexEngine {
     }
 }
 
-/// Gemini finishReason → the shared vocabulary: safety-family values become
-/// `content_filter` so clients detect moderation blocks; the rest lowercase
-/// (`finish_openai` already maps `max_tokens` → `length`).
+/// Gemini finishReason in the shared vocabulary: safety-family values become
+/// `content_filter`, the rest lowercase.
 fn vertex_finish_reason(fr: &str) -> String {
     match fr {
         "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" => {
@@ -227,10 +224,9 @@ fn vertex_apply_frame(
     Ok(chunks)
 }
 
-/// Fold a cumulative `usageMetadata` object into the response (last frame wins).
-/// Thinking models report `thoughtsTokenCount` outside `candidatesTokenCount`;
-/// OpenAI semantics fold reasoning into completion, so map thoughts → reasoning
-/// ⊆ completion or billing loses them.
+/// Fold a cumulative `usageMetadata` into the response (last frame wins);
+/// `thoughtsTokenCount` sits outside `candidatesTokenCount`, so thoughts fold
+/// into completion or billing loses them.
 fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if um.is_null() {
         return;
@@ -263,16 +259,21 @@ base_engine!(EmbeddingsEngine);
 impl ModelEngine for EmbeddingsEngine {
     /// Merges the openai/ali/vertex embedding engines to the openai shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let input = match &param.typed {
-            Some(TypedParams::Embeddings(p)) => json!(p.input),
-            _ => Value::Array(
-                self.base
-                    .request
-                    .message
-                    .iter()
-                    .map(|m| json!(m.content))
-                    .collect(),
+        let model = self.base.model_name()?.to_owned();
+        // the batch moves: json! would re-copy every input string
+        let (input, dimensions) = match self.base.take_typed() {
+            Some(TypedParams::Embeddings(p)) => (
+                Value::Array(p.input.into_iter().map(Value::String).collect()),
+                p.dimensions,
+            ),
+            _ => (
+                Value::Array(
+                    std::mem::take(&mut self.base.request.message)
+                        .into_iter()
+                        .map(|m| Value::String(m.content))
+                        .collect(),
+                ),
+                None,
             ),
         };
         if input.as_array().is_none_or(|a| a.is_empty()) {
@@ -280,26 +281,21 @@ impl ModelEngine for EmbeddingsEngine {
                 "embeddings input must not be empty",
             ));
         }
-        let mut body = json!({"model": param.model_name});
+        let mut body = json!({"model": model});
         body["input"] = input;
-        if let Some(TypedParams::Embeddings(p)) = &param.typed
-            && let Some(d) = p.dimensions
-        {
+        if let Some(d) = dimensions {
             body["dimensions"] = json!(d);
         }
         let (status, v) = self
             .base
             .round_trip(
-                &format!(
-                    "{}/v1/embeddings",
-                    self.base.base_url("mock://api.openai.com")
-                ),
+                &self.base.openai_url("mock://api.openai.com", "embeddings"),
                 body,
             )
             .await?;
         let pt = crate::engine::tok(&v["usage"]["prompt_tokens"]);
         let resp = GatewayResponse {
-            model: param.model_name.clone(),
+            model,
             prompt_tokens: pt,
             total_tokens: pt,
             raw_usage: (!v["usage"].is_null()).then(|| v["usage"].clone()),
@@ -358,32 +354,79 @@ impl ModelEngine for ImageEngine {
             ),
         };
         require_non_empty(&prompt, "image prompt")?;
-        let mut body = json!({"model": model, "n": n});
-        body["prompt"] = prompt.into();
-        if let Some(s) = size {
-            body["size"] = s.into();
-        }
-        // base64 image/mask payloads move — json! would re-copy megabytes
-        let (path, is_edit) = if let Some(img) = image {
-            body["image"] = img.into();
-            if let Some(m) = mask {
-                body["mask"] = m.into();
+        let (status, v, is_edit) = if let Some(image) = image {
+            let image = decode_b64(&image, "image")?;
+            let mut form = Form::new(&image);
+            form.text("model", &model);
+            form.text("prompt", &prompt);
+            form.text("n", &n.to_string());
+            if let Some(size) = &size {
+                form.text("size", size);
             }
-            ("/v1/images/edits", true)
+            let (ext, content_type) = image_kind(&image);
+            form.file("image", &format!("image.{ext}"), content_type, &image);
+            if let Some(mask) = mask {
+                let mask = decode_b64(&mask, "mask")?;
+                let (ext, content_type) = image_kind(&mask);
+                form.file("mask", &format!("mask.{ext}"), content_type, &mask);
+            }
+            let (content_type, body) = form.finish();
+            let headers = vec![
+                ("content-type", content_type),
+                ("authorization", format!("Bearer {}", self.base.api_key())),
+            ];
+            let reply = self
+                .base
+                .send_bytes(
+                    &self
+                        .base
+                        .openai_url("mock://api.openai.com", "images/edits"),
+                    headers,
+                    body,
+                    false,
+                )
+                .await?;
+            let (status, v) = crate::base::parse_json_reply(reply)?;
+            (status, v, true)
         } else {
-            ("/v1/images/generations", false)
+            let mut body = json!({"model": model, "n": n});
+            body["prompt"] = prompt.into();
+            if let Some(s) = size {
+                body["size"] = s.into();
+            }
+            let (status, v) = self
+                .base
+                .round_trip(
+                    &self
+                        .base
+                        .openai_url("mock://api.openai.com", "images/generations"),
+                    body,
+                )
+                .await?;
+            (status, v, false)
         };
-        let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
-        let (status, v) = self.base.round_trip(&url, body).await?;
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
-        Ok(family_outcome(
-            format!("{count} image(s) {verb}"),
-            &model,
-            v,
-            status,
-        ))
+        // gpt-image reports tokens; every model bills per image when it carries a unit price
+        let (input, output) = (
+            crate::engine::tok(&v["usage"]["input_tokens"]),
+            crate::engine::tok(&v["usage"]["output_tokens"]),
+        );
+        let mut outcome = family_outcome(format!("{count} image(s) {verb}"), &model, v, status);
+        outcome.response.prompt_tokens = input;
+        outcome.response.completion_tokens = output;
+        outcome.response.billed_units = count as i64;
+        crate::engine::fill_total_if_zero(&mut outcome.response);
+        Ok(outcome)
     }
+}
+
+/// Decode a client-supplied base64 payload; a bad payload is the client's 400,
+/// not an upstream failure.
+fn decode_b64(payload: &str, what: &str) -> GResult<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| GatewayError::bad_request(format!("{what} is not valid base64: {e}")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,7 +455,10 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let (path, body) = match self.kind {
+        // speech bills per input char, transcription per second (vendor count, else play length)
+        let mut units = 0;
+        let mut local_seconds = None;
+        let (status, v) = match self.kind {
             AudioKind::Tts => {
                 let (input, voice, format) = match &self.base.param()?.typed {
                     Some(TypedParams::AudioTts(p)) => (
@@ -423,6 +469,7 @@ impl ModelEngine for AudioEngine {
                     _ => (self.base.last_message_text(), None, None),
                 };
                 require_non_empty(input, "tts input")?;
+                units = input.chars().count() as i64;
                 let mut b = json!({"model": model, "input": input});
                 if let Some(v) = voice {
                     b["voice"] = json!(v);
@@ -430,7 +477,30 @@ impl ModelEngine for AudioEngine {
                 if let Some(f) = format {
                     b["response_format"] = json!(f);
                 }
-                ("/v1/audio/speech", b)
+                let reply = self
+                    .base
+                    .send_upstream(
+                        &self
+                            .base
+                            .openai_url("mock://api.openai.com", "audio/speech"),
+                        self.base.bearer_headers(),
+                        b,
+                        false,
+                    )
+                    .await?;
+                // a JSON body is an error envelope (or a compatible upstream's b64), not audio
+                let status = reply.status;
+                match reply.body {
+                    UpstreamBody::Json(bytes) if status < 400 && !looks_like_json(&bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        (status, json!({"audio_b64": b64}))
+                    }
+                    body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
+                        status,
+                        body,
+                        headers: reply.headers,
+                    })?,
+                }
             }
             AudioKind::Stt => {
                 let (audio, language, translate) = match self.base.take_typed() {
@@ -438,25 +508,47 @@ impl ModelEngine for AudioEngine {
                     _ => (String::new(), None, false),
                 };
                 require_non_empty(&audio, "stt audio_b64")?;
+                let audio = decode_b64(&audio, "audio_b64")?;
+                local_seconds = crate::multipart::audio_seconds(&audio);
                 let path = if translate {
-                    "/v1/audio/translations"
+                    "audio/translations"
                 } else {
-                    "/v1/audio/transcriptions"
+                    "audio/transcriptions"
                 };
-                // the base64 payload moves — json! would re-copy megabytes
-                // (measured ~75us/MB per request)
-                let mut b = json!({"model": model, "language": language});
-                b["audio_b64"] = audio.into();
-                (path, b)
+                let mut form = Form::new(&audio);
+                form.text("model", &model);
+                if let Some(language) = &language {
+                    form.text("language", language);
+                }
+                let (ext, content_type) = audio_kind(&audio);
+                form.file("file", &format!("audio.{ext}"), content_type, &audio);
+                let (content_type, body) = form.finish();
+                let headers = vec![
+                    ("content-type", content_type),
+                    ("authorization", format!("Bearer {}", self.base.api_key())),
+                ];
+                let reply = self
+                    .base
+                    .send_bytes(
+                        &self.base.openai_url("mock://api.openai.com", path),
+                        headers,
+                        body,
+                        false,
+                    )
+                    .await?;
+                crate::base::parse_json_reply(reply)?
             }
             AudioKind::Other => {
                 let mut b = json!({"model": model});
                 b["raw"] = self.base.take_raw();
-                ("/v1/audio/other", b)
+                self.base
+                    .round_trip(
+                        &self.base.openai_url("mock://api.openai.com", "audio/other"),
+                        b,
+                    )
+                    .await?
             }
         };
-        let url = format!("{}{path}", self.base.base_url("mock://api.openai.com"));
-        let (status, v) = self.base.round_trip(&url, body).await?;
         let message = match self.kind {
             AudioKind::Stt => v["text"].as_str().unwrap_or_default().to_owned(),
             _ => format!(
@@ -464,8 +556,38 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        Ok(family_outcome(message, &model, v, status))
+        // duration-priced transcription reports `usage.seconds` (or `duration`)
+        let (input, output) = (
+            crate::engine::tok(&v["usage"]["input_tokens"]),
+            crate::engine::tok(&v["usage"]["output_tokens"]),
+        );
+        if self.kind == AudioKind::Stt {
+            units = whole_seconds(&v["usage"]["seconds"])
+                .or_else(|| whole_seconds(&v["duration"]))
+                .or_else(|| local_seconds.map(|s| s.ceil() as i64))
+                .unwrap_or(0);
+        }
+        let mut outcome = family_outcome(message, &model, v, status);
+        outcome.response.prompt_tokens = input;
+        outcome.response.completion_tokens = output;
+        outcome.response.billed_units = units;
+        crate::engine::fill_total_if_zero(&mut outcome.response);
+        Ok(outcome)
     }
+}
+
+/// A vendor duration as whole billed seconds (fractions round up).
+fn whole_seconds(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f.ceil() as i64))
+        .filter(|s| *s > 0)
+}
+
+fn looks_like_json(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.iter().find(|b| !b.is_ascii_whitespace()),
+        Some(b'{' | b'[')
+    )
 }
 
 base_engine!(VideoEngine);
@@ -492,13 +614,7 @@ impl ModelEngine for VideoEngine {
         }
         let (status, v) = self
             .base
-            .round_trip(
-                &format!(
-                    "{}/v1/videos/generations",
-                    self.base.base_url("mock://api.vendor.com")
-                ),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("videos/generations"), body)
             .await?;
         let message = v["video_url"].as_str().unwrap_or_default().to_owned();
         let step = v["status"].as_str().unwrap_or_default().to_owned();
@@ -523,10 +639,7 @@ impl ModelEngine for SearchEngine {
         let body = json!({"query": query, "count": count});
         let (status, v) = self
             .base
-            .round_trip(
-                &format!("{}/v1/search", self.base.base_url("mock://api.vendor.com")),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("search"), body)
             .await?;
         let titles: Vec<String> = v["results"]
             .as_array()
@@ -564,10 +677,7 @@ impl ModelEngine for ModerationsEngine {
         let (status, v) = self
             .base
             .round_trip(
-                &format!(
-                    "{}/v1/moderations",
-                    self.base.base_url("mock://api.openai.com")
-                ),
+                &self.base.openai_url("mock://api.openai.com", "moderations"),
                 body,
             )
             .await?;
@@ -614,16 +724,15 @@ impl ModelEngine for RerankEngine {
         }
         let (status, v) = self
             .base
-            .round_trip(
-                &format!("{}/v1/rerank", self.base.base_url("mock://api.vendor.com")),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("rerank"), body)
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
+        let units = crate::engine::tok(&v["meta"]["billed_units"]["search_units"]);
         let mut out = family_outcome(format!("{n} results"), &model, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
+        out.response.billed_units = units;
         Ok(out)
     }
 }
@@ -652,13 +761,7 @@ impl ModelEngine for PassthroughEngine {
         body["payload"] = self.base.take_raw();
         let (status, v) = self
             .base
-            .round_trip(
-                &format!(
-                    "{}/v1/passthrough",
-                    self.base.base_url("mock://api.vendor.com")
-                ),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("passthrough"), body)
             .await?;
         let message = if v["ok"].as_bool().unwrap_or(false) {
             "ok"
@@ -697,10 +800,7 @@ impl ModelEngine for CompletionsEngine {
         let (status, mut v) = self
             .base
             .round_trip(
-                &format!(
-                    "{}/v1/completions",
-                    self.base.base_url("mock://api.openai.com")
-                ),
+                &self.base.openai_url("mock://api.openai.com", "completions"),
                 body,
             )
             .await?;
@@ -738,26 +838,110 @@ impl ResponsesEngine {
         self.base.model_name().unwrap_or_default().to_owned()
     }
 
-    /// Native passthrough: the client's Responses-shaped body moves through
-    /// verbatim, with `model` ensured.
+    /// The native body as sent, or one built from the normalized turns off the native surface.
     fn build_body(&mut self) -> GResult<Value> {
-        let model_name = self.base.param()?.model_name.clone();
         let mut body = match self.base.take_raw() {
-            raw @ Value::Object(_) => raw,
-            _ => json!({}),
+            Value::Object(raw) => raw,
+            _ => serde_json::Map::new(),
         };
-        if let Some(map) = body.as_object_mut() {
-            map.entry("model".to_owned())
-                .or_insert_with(|| json!(model_name));
+        if !self.base.request.preserve_responses_wire {
+            self.cross_protocol_body(&mut body);
         }
-        Ok(body)
+        body.insert("model".to_owned(), self.base.model_name()?.into());
+        Ok(Value::Object(body))
+    }
+
+    /// A Responses body from the chat/messages turns and the typed params.
+    fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) {
+        let system = self.base.system_text();
+        if !system.is_empty() {
+            body.entry("instructions").or_insert(system.into());
+        }
+        let messages = std::mem::take(&mut self.base.request.message);
+        let mut input = Vec::with_capacity(messages.len());
+        for m in messages {
+            if m.role == gw_consts::role::SYSTEM {
+                continue;
+            }
+            if m.role == gw_consts::role::TOOL {
+                input.push(function_call_output(
+                    m.tool_call_id.unwrap_or_default().into(),
+                    m.content,
+                ));
+                continue;
+            }
+            let role = if m.role == gw_consts::role::AI {
+                "assistant"
+            } else {
+                "user"
+            };
+            let mut calls = Vec::new();
+            if let Some(Value::Array(blocks)) = m.parts {
+                for mut block in blocks {
+                    match block["type"].as_str() {
+                        Some("tool_use") => calls.push(function_call(
+                            block["id"].take(),
+                            block["name"].take(),
+                            block["input"].take().to_string().into(),
+                        )),
+                        Some("tool_result") => input.push(function_call_output(
+                            block["tool_use_id"].take(),
+                            match block["content"].take() {
+                                Value::String(s) => s,
+                                Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts),
+                                _ => String::new(),
+                            },
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(Value::Array(tool_calls)) = m.tool_calls {
+                calls.extend(tool_calls.into_iter().map(|mut c| {
+                    function_call(
+                        c["id"].take(),
+                        c["function"]["name"].take(),
+                        c["function"]["arguments"].take(),
+                    )
+                }));
+            }
+            if !m.content.is_empty() {
+                input.push(object([
+                    ("role", role.into()),
+                    ("content", m.content.into()),
+                ]));
+            }
+            input.extend(calls);
+        }
+        body.insert("input".to_owned(), Value::Array(input));
+        body.insert("stream".to_owned(), self.base.request.stream.into());
+        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
+            if let Some(v) = p.max_tokens {
+                body.insert("max_output_tokens".to_owned(), v.into());
+            }
+            if let Some(v) = p.temperature {
+                body.insert("temperature".to_owned(), json!(v));
+            }
+            if let Some(v) = p.top_p {
+                body.insert("top_p".to_owned(), json!(v));
+            }
+            if let Some(Value::Array(tools)) = p.tools {
+                body.insert(
+                    "tools".to_owned(),
+                    Value::Array(tools.into_iter().map(responses_tool).collect()),
+                );
+            }
+            if let Some(v) = p.tool_choice {
+                body.insert("tool_choice".to_owned(), v);
+            }
+            if let Some(effort) = p.reasoning.and_then(|r| r.effort) {
+                body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
+            }
+        }
     }
 
     fn url(&self) -> String {
-        format!(
-            "{}/v1/responses",
-            self.base.base_url("mock://api.openai.com")
-        )
+        self.base.openai_url("mock://api.openai.com", "responses")
     }
 
     /// Streaming Responses pumped live: delta frames forwarded through
@@ -777,11 +961,12 @@ impl ResponsesEngine {
         crate::pump::reject_json_error("responses", status, &reply.body)?;
         let mut full = String::new();
         let model_override = self.base.model_override();
+        let native = self.base.request.preserve_responses_wire;
         let r = crate::pump::pump_sse(
             "responses",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| responses_apply_frame(v, status, model_override, &mut resp, &mut full),
+            |v| responses_apply_frame(v, status, model_override, native, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;
@@ -790,12 +975,31 @@ impl ResponsesEngine {
 
     /// Non-streaming Responses reply: full `output` array + `usage`.
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let v: Value = serde_json::from_slice(bytes)
+        let mut v: Value = serde_json::from_slice(bytes)
             .map_err(|e| GatewayError::internal("parse responses reply").with_source(e))?;
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
-        let (text, tool_calls) = responses_output(&v);
+        // the verbatim body must not leak the served variant either
+        if let Some(requested) = self.base.model_override()
+            && let Some(body) = v.as_object_mut()
+            && body.contains_key("model")
+        {
+            body.insert("model".to_owned(), requested.into());
+        }
+        let native = self.base.request.preserve_responses_wire;
+        let (text, mut tool_calls) = responses_output(&v);
+        let finish_reason = if native {
+            v["status"].as_str().unwrap_or("completed").to_owned()
+        } else {
+            responses_finish(&v, !tool_calls.is_empty())
+        };
+        if !native {
+            tool_calls = tool_calls
+                .into_iter()
+                .map(function_call_to_tool_call)
+                .collect();
+        }
         let (input, output, common_usage) = responses_usage(&v["usage"]);
         let resp = GatewayResponse {
             message: text,
@@ -808,7 +1012,7 @@ impl ResponsesEngine {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| self.model_name()),
-            finish_reason: v["status"].as_str().unwrap_or("completed").to_owned(),
+            finish_reason,
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
@@ -832,6 +1036,7 @@ impl ResponsesEngine {
         let mut full = String::new();
         let mut chunks = Vec::new();
         let model_override = self.base.model_override();
+        let native = self.base.request.preserve_responses_wire;
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
@@ -839,6 +1044,7 @@ impl ResponsesEngine {
                 v,
                 status,
                 model_override,
+                native,
                 &mut resp,
                 &mut full,
             )?);
@@ -903,6 +1109,70 @@ fn responses_output(v: &Value) -> (String, Vec<Value>) {
     (text, tool_calls)
 }
 
+/// A Chat- or Anthropic-shaped tool definition flattened into the Responses shape.
+fn responses_tool(mut tool: Value) -> Value {
+    if let Some(Value::Object(mut f)) = tool.get_mut("function").map(Value::take) {
+        f.insert("type".to_owned(), "function".into());
+        return Value::Object(f);
+    }
+    if let Value::Object(fields) = &mut tool
+        && let Some(schema) = fields.remove("input_schema")
+    {
+        fields.insert("type".to_owned(), "function".into());
+        fields.insert("parameters".to_owned(), schema);
+    }
+    tool
+}
+
+/// A JSON object from moved values (`json!` would deep-copy each one).
+fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
+    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+}
+
+fn function_call(call_id: Value, name: Value, arguments: Value) -> Value {
+    object([
+        ("type", "function_call".into()),
+        ("call_id", call_id),
+        ("name", name),
+        ("arguments", arguments),
+    ])
+}
+
+fn function_call_output(call_id: Value, output: String) -> Value {
+    object([
+        ("type", "function_call_output".into()),
+        ("call_id", call_id),
+        ("output", output.into()),
+    ])
+}
+
+/// A Responses `status`/`incomplete_details.reason` in the shared finish vocabulary.
+fn responses_finish(response: &Value, tool_calls: bool) -> String {
+    let status = response["status"].as_str().unwrap_or("completed");
+    match (status, response["incomplete_details"]["reason"].as_str()) {
+        _ if tool_calls => "tool_calls",
+        ("completed", _) => "stop",
+        ("incomplete", Some("content_filter")) => "content_filter",
+        ("incomplete", _) => "length",
+        (other, _) => other,
+    }
+    .to_owned()
+}
+
+fn function_call_to_tool_call(mut item: Value) -> Value {
+    object([
+        ("id", item["call_id"].take()),
+        ("type", "function".into()),
+        (
+            "function",
+            object([
+                ("name", item["name"].take()),
+                ("arguments", item["arguments"].take()),
+            ]),
+        ),
+    ])
+}
+
 /// Normalize a Responses `usage` object; returns (input, output, common usage).
 fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) {
     if usage.is_null() {
@@ -919,13 +1189,12 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame: every frame moves out as a native event for
-/// the view to forward verbatim; text accumulates from `output_text.delta`,
-/// usage/status come from `response.completed`.
+/// Apply one Responses SSE frame: a native event natively, plain chunk fields elsewhere.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,
     model_override: Option<&str>,
+    native: bool,
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
@@ -940,18 +1209,40 @@ fn responses_apply_frame(
     }
     let mut chunk = StreamChunk::default();
     match v["type"].as_str().unwrap_or_default() {
+        "response.output_text.delta" if native => {
+            full.push_str(v["delta"].as_str().unwrap_or_default());
+        }
         "response.output_text.delta" => {
-            if let Some(d) = v["delta"].as_str() {
-                full.push_str(d);
+            if let Some(Value::String(d)) = v.get_mut("delta").map(Value::take) {
+                full.push_str(&d);
+                chunk.delta = d;
             }
         }
-        "response.completed" => {
+        "response.output_item.done" if !native => {
+            let item = v["item"].take();
+            if item["type"] == "function_call" {
+                let mut call = function_call_to_tool_call(item);
+                if let Value::Array(calls) = resp
+                    .tool_calls
+                    .get_or_insert_with(|| Value::Array(Vec::new()))
+                {
+                    call["index"] = calls.len().into();
+                    calls.push(call.clone());
+                }
+                chunk.tool_calls = Some(Value::Array(vec![call]));
+            }
+        }
+        "response.completed" | "response.incomplete" => {
             let r = &v["response"];
             if let Some(m) = r["model"].as_str() {
                 resp.model = m.to_owned();
             }
             if let Some(st) = r["status"].as_str() {
-                resp.finish_reason = st.to_owned();
+                resp.finish_reason = if native {
+                    st.to_owned()
+                } else {
+                    responses_finish(r, resp.tool_calls.is_some())
+                };
             }
             let (input, output, common) = responses_usage(&r["usage"]);
             resp.prompt_tokens = input;
@@ -962,7 +1253,12 @@ fn responses_apply_frame(
         }
         _ => {}
     }
-    chunk.native_event = Some(v);
+    if native {
+        chunk.native_event = Some(v);
+    } else if chunk.delta.is_empty() && chunk.finish_reason.is_none() && chunk.tool_calls.is_none()
+    {
+        return Ok(Vec::new());
+    }
     Ok(vec![chunk])
 }
 
@@ -1116,6 +1412,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn billed_units_come_from_search_units_seconds_and_input_characters() {
+        let params = Some(TypedParams::Rerank(gw_models::RerankParams {
+            query: "q".into(),
+            documents: vec!["a".into(), "b".into()],
+            top_n: None,
+        }));
+        let out = RerankEngine::new(
+            req(Protocol::Rerank, "rerank-v3.5", params),
+            Arc::new(BytesReply(
+                br#"{"results":[{"index":0,"relevance_score":0.9}],"meta":{"billed_units":{"search_units":1}}}"#,
+            )),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            (out.response.billed_units, out.response.total_tokens),
+            (1, 0)
+        );
+
+        let mut stt = AudioEngine::new(
+            req(
+                Protocol::Stt,
+                "whisper-1",
+                Some(TypedParams::AudioStt(SttParams {
+                    audio_b64: "TU9DSw==".into(),
+                    language: None,
+                    translate: false,
+                })),
+            ),
+            Arc::new(BytesReply(
+                br#"{"text":"hi","usage":{"type":"duration","seconds":4}}"#,
+            )),
+            AudioKind::Stt,
+        );
+        assert_eq!(stt.run().await.unwrap().response.billed_units, 4);
+        assert_eq!(whole_seconds(&json!(4.1)), Some(5));
+        assert_eq!(whole_seconds(&json!(0)), None);
+
+        let mut tts = AudioEngine::new(
+            req(
+                Protocol::Tts,
+                "tts-1",
+                Some(TypedParams::AudioTts(TtsParams {
+                    input: "héllo wörld".into(),
+                    voice: None,
+                    response_format: None,
+                })),
+            ),
+            t(),
+            AudioKind::Tts,
+        );
+        assert_eq!(tts.run().await.unwrap().response.billed_units, 11);
+    }
+
     #[test]
     fn rerank_tokens_reads_both_dialects() {
         assert_eq!(rerank_tokens(&json!({"usage": {"total_tokens": 7}})), 7);
@@ -1223,8 +1575,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_cross_protocol_body_comes_from_the_turns() {
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.stream = true;
+        r.message = vec![
+            ChatMsg::text("system", "be terse"),
+            ChatMsg::text("user", "what time"),
+            ChatMsg {
+                tool_calls: Some(serde_json::json!([{"id": "call_1", "type": "function",
+                    "function": {"name": "now", "arguments": "{}"}}])),
+                ..ChatMsg::text("assistant", "")
+            },
+            ChatMsg {
+                tool_call_id: Some("call_1".into()),
+                ..ChatMsg::text("tool", "noon")
+            },
+        ];
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(gw_models::ChatParams {
+            max_tokens: Some(64),
+            tools: Some(serde_json::json!([
+                {"type": "function", "function": {
+                    "name": "now", "parameters": {"type": "object"}}},
+                {"name": "later", "description": "schedule it",
+                    "input_schema": {"type": "object"}},
+            ])),
+            reasoning: Some(Box::new(gw_models::ReasoningParam {
+                effort: Some("low".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }));
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_output_tokens"], 64);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "now");
+        assert_eq!(
+            body["tools"][1],
+            serde_json::json!({"type": "function", "name": "later",
+                "description": "schedule it", "parameters": {"type": "object"}})
+        );
+        assert_eq!(
+            body["input"],
+            serde_json::json!([
+                {"role": "user", "content": "what time"},
+                {"type": "function_call", "call_id": "call_1", "name": "now", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "noon"},
+            ])
+        );
+        assert_eq!(
+            function_call_to_tool_call(serde_json::json!({"type": "function_call",
+                "call_id": "c", "name": "now", "arguments": "{}"})),
+            serde_json::json!({"id": "c", "type": "function", "function": {"name": "now", "arguments": "{}"}})
+        );
+    }
+
+    #[tokio::test]
     async fn responses_api_round_trip() {
         let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.preserve_responses_wire = true;
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({
             "input": "summarize this",
             "instructions": "be terse",
@@ -1249,6 +1660,7 @@ mod tests {
     async fn responses_api_streaming() {
         let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.stream = true;
+        r.preserve_responses_wire = true;
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"input": "stream this"});
         let out = ResponsesEngine::new(r, t()).run().await.unwrap();
         assert!(out.chunks.len() >= 2, "chunks: {:?}", out.chunks);
@@ -1271,8 +1683,118 @@ mod tests {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(self.0.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct BytesReply(&'static [u8]);
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for BytesReply {
+        async fn send(&self, _req: UpstreamRequest) -> GResult<UpstreamResponse> {
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Json(self.0.to_vec().into()),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tts_audio_bytes_become_the_b64_payload() {
+        let mut r = req(Protocol::Tts, "gpt-4o-mini-tts", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::AudioTts(TtsParams {
+            input: "hi".into(),
+            voice: None,
+            response_format: Some("mp3".into()),
+        }));
+        let out = AudioEngine::new(r, Arc::new(BytesReply(b"\xff\xfbaudio")), AudioKind::Tts)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.response.response_v2.unwrap()["audio_b64"],
+            base64::engine::general_purpose::STANDARD.encode(b"\xff\xfbaudio")
+        );
+    }
+
+    #[tokio::test]
+    async fn image_and_transcription_usage_reach_the_response() {
+        let mut r = req(Protocol::Image, "gpt-image-1", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Image(ImageParams {
+            prompt: "a circle".into(),
+            n: 1,
+            size: None,
+            image: None,
+            mask: None,
+        }));
+        let out = ImageEngine::new(
+            r,
+            Arc::new(BytesReply(
+                br#"{"data":[{"b64_json":"AA=="}],"usage":{"input_tokens":15,"output_tokens":1056}}"#,
+            )),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                out.response.prompt_tokens,
+                out.response.completion_tokens,
+                out.response.total_tokens
+            ),
+            (15, 1056, 1071)
+        );
+
+        let mut r = req(Protocol::Stt, "gpt-4o-mini-transcribe", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::AudioStt(SttParams {
+            audio_b64: "TU9DSw==".into(),
+            language: None,
+            translate: false,
+        }));
+        let out = AudioEngine::new(
+            r,
+            Arc::new(BytesReply(
+                br#"{"text":"mock","usage":{"type":"tokens","input_tokens":32,"output_tokens":12}}"#,
+            )),
+            AudioKind::Stt,
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(out.response.message, "mock");
+        assert_eq!(
+            (out.response.prompt_tokens, out.response.completion_tokens),
+            (32, 12)
+        );
+    }
+
+    #[test]
+    fn responses_body_uses_the_routed_model() {
+        let mut request = req(Protocol::Responses, "gpt-5-served", None);
+        let param = request.model_param_v2.as_mut().unwrap();
+        param.raw = json!({"model": "gpt-5-public", "input": "go"});
+        param.fallback_from = Some("gpt-5-public".to_owned());
+        let mut engine = ResponsesEngine::new(request, Arc::new(MockTransport));
+        assert_eq!(engine.build_body().unwrap()["model"], "gpt-5-served");
+    }
+
+    #[test]
+    fn responses_reply_names_the_requested_model() {
+        let mut request = req(Protocol::Responses, "gpt-5-served", None);
+        let param = request.model_param_v2.as_mut().unwrap();
+        param.raw = json!({"input": "go"});
+        param.fallback_from = Some("gpt-5-public".to_owned());
+        let engine = ResponsesEngine::new(request, Arc::new(MockTransport));
+        let out = engine
+            .parse_json(
+                200,
+                br#"{"id":"r","object":"response","model":"gpt-5-served-2026","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            )
+            .unwrap();
+        assert_eq!(out.response.response_v2.unwrap()["model"], "gpt-5-public");
     }
 
     #[tokio::test]
@@ -1290,6 +1812,7 @@ mod tests {
         );
         let mut r = req(Protocol::Responses, "gpt-5-served", None);
         r.stream = true;
+        r.preserve_responses_wire = true;
         let param = r.model_param_v2.as_mut().unwrap();
         param.raw = serde_json::json!({"input": "go"});
         param.fallback_from = Some("gpt-5-public".to_owned());
@@ -1312,5 +1835,55 @@ mod tests {
         assert_eq!(out.response.message, "done");
         assert_eq!(out.response.finish_reason, "completed");
         assert_eq!(out.response.common_usage.unwrap().reason, 4);
+    }
+
+    #[test]
+    fn responses_cross_protocol_stream_finishes_with_indexed_tool_calls() {
+        let mut resp = GatewayResponse::default();
+        let mut full = String::new();
+        let chunks = responses_apply_frame(
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_1", "name": "now", "arguments": "{}"}}),
+            200,
+            None,
+            false,
+            &mut resp,
+            &mut full,
+        )
+        .unwrap();
+        assert_eq!(chunks[0].tool_calls.as_ref().unwrap()[0]["index"], 0);
+
+        let chunks = responses_apply_frame(
+            json!({"type": "response.completed", "response": {
+                "status": "completed", "usage": {"input_tokens": 5, "output_tokens": 2}}}),
+            200,
+            None,
+            false,
+            &mut resp,
+            &mut full,
+        )
+        .unwrap();
+        assert_eq!(chunks[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(resp.finish_reason, "tool_calls");
+
+        for (reason, want) in [
+            ("max_output_tokens", "length"),
+            ("content_filter", "content_filter"),
+        ] {
+            let mut resp = GatewayResponse::default();
+            let chunks = responses_apply_frame(
+                json!({"type": "response.incomplete", "response": {
+                    "status": "incomplete", "incomplete_details": {"reason": reason},
+                    "usage": {"input_tokens": 5, "output_tokens": 7}}}),
+                200,
+                None,
+                false,
+                &mut resp,
+                &mut String::new(),
+            )
+            .unwrap();
+            assert_eq!(chunks[0].finish_reason.as_deref(), Some(want), "{reason}");
+            assert_eq!((resp.prompt_tokens, resp.completion_tokens), (5, 7));
+        }
     }
 }

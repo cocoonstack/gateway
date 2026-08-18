@@ -41,6 +41,10 @@ pub struct GatewayResponse {
 
     /// PTU spilled over to pay-go account.
     pub ptu_spillover: bool,
+    /// Non-token units the vendor metered (TTS input characters, transcription
+    /// seconds, rerank search units); priced by the model's `unit_price_micros`.
+    #[serde(default)]
+    pub billed_units: i64,
     /// sora2 async step marker.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub step: String,
@@ -73,9 +77,8 @@ impl GatewayResponse {
     }
 }
 
-/// A mid-stream failure as rendered to the client: the contract
-/// classification, a human-readable message (no internal numeric codes), and
-/// the upstream's original status when an upstream HTTP response was received.
+/// A mid-stream failure as rendered to the client: the contract classification,
+/// a human-readable message and the upstream's original status when one was received.
 #[derive(Debug, Clone)]
 pub struct StreamError {
     pub class: gw_consts::ErrClass,

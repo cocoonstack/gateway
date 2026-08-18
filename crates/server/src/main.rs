@@ -214,11 +214,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Choose the upstream transport from `GW_TRANSPORT`: `mock` forces zero egress,
-/// `http` forces real HTTP (accounts without an endpoint fail loudly), anything
-/// else routes `mock://` sentinels in-process and real URLs over HTTP. Built
-/// with default policies — the handler pushes the config-derived ones at
-/// construction and on every reload.
+/// The upstream transport from `GW_TRANSPORT`: `mock` forces zero egress, `http`
+/// forces real HTTP, anything else routes `mock://` in-process and real URLs over HTTP.
 fn select_transport() -> anyhow::Result<gw_engines::SharedTransport> {
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {

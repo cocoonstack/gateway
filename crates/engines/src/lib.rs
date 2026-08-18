@@ -6,12 +6,16 @@
 //! the SSE decoder, usage normalization, the dispatch factory, and the engine
 //! implementations.
 
+pub mod bedrock;
 pub mod bespoke;
 pub mod claude_engine;
+pub mod converse;
 pub mod engine;
+pub mod eventstream;
 pub mod factory;
 pub mod families;
 pub mod http_transport;
+pub mod multipart;
 pub mod openai_engine;
 pub mod pump;
 pub mod realtime;

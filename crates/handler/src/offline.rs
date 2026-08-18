@@ -29,8 +29,7 @@ impl OfflineHandler {
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
         if store.distributed_batches() {
-            // persist the EFFECTIVE user (owner overrides the hint): execution,
-            // billing, and erasure must all key on the same identity
+            // persist the EFFECTIVE user: execution, billing and erasure key on one identity
             let items: Vec<BatchItem> = items
                 .into_iter()
                 .map(|mut i| {
@@ -50,9 +49,7 @@ impl OfflineHandler {
                 .await?;
             let this = self.clone();
             let id = job.id.clone();
-            // items are captured HERE: an erasure landing after this instant
-            // must stop them, so the marker comparison point is submission,
-            // not the spawned executor's first poll
+            // an erasure landing after this instant must stop the captured items
             let captured_at = gw_state::epoch_millis();
             // claim 0: non-distributed store — no fence, the heartbeat is a no-op
             tokio::spawn(
@@ -76,16 +73,13 @@ impl OfflineHandler {
         captured_at: i64,
     ) {
         let store = self.online.state().store.clone();
-        // the distributed claim already set status=running with the fence bump;
-        // only the in-process path needs this write — unfenced on the distributed
-        // path it could resurrect a batch a stale worker no longer owns
+        // unfenced, this write could resurrect a batch a stale worker no longer owns
         if claim == 0
             && let Err(e) = store.batch_set_status(id, BatchStatus::Running).await
         {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
-        // skip items a prior executor already recorded (a reclaim re-runs at most
-        // the in-flight one); a read failure fails the job — re-running re-bills
+        // skip items a prior executor recorded; a read failure fails the job (re-running re-bills)
         let prior = match store.batch_get(id).await {
             Ok(Some(job)) => job.results,
             Ok(None) => return, // the batch row vanished; nothing to run
@@ -101,9 +95,7 @@ impl OfflineHandler {
         let done_indices: std::collections::HashSet<usize> =
             prior.iter().map(|r| r.index).collect();
         use std::sync::atomic::Ordering::Relaxed;
-        // background heartbeat: refreshes claimed_at so a slow item isn't judged
-        // stale, and flips `lost` when the fence stops matching; the per-item
-        // synchronous touch below is what bounds a double-run
+        // heartbeat: keeps a slow item from being judged stale, flips `lost` when the fence moves
         let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb = {
             let store = store.clone();
@@ -128,32 +120,21 @@ impl OfflineHandler {
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
             }
-            // synchronous fence before each item: if reclaimed while stalled, stop
-            // before billing the next item — at most the in-flight one double-runs
-            // (the resume/dedup path tolerates that). Fail CLOSED: a touch that
-            // can't confirm ownership stops us. claim 0 = in-process, unfenced.
+            // fence per item, fail CLOSED: at most the in-flight item double-runs (claim 0: none)
             if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
                 break;
             }
-            // re-read the stored copy just before dispatch: an erasure that
-            // landed while this batch sat queued blanks the persisted item.
-            // Fail CLOSED — a read error or vanished row can't prove the item
-            // wasn't erased, so the stale pre-load copy never dispatches
+            // re-read before dispatch (fail CLOSED): an erasure while queued blanks the stored item
             if store.distributed_batches() {
                 match store.batch_item_snapshot(id, index).await {
                     Ok(Some(fresh)) => item = fresh,
                     Ok(None) | Err(_) => {
-                        let result = BatchItemResult {
+                        let result = failed_item(
                             index,
-                            ok: false,
-                            message: "item unavailable at dispatch".into(),
-                            total_tokens: 0,
-                            user: match ak.owner_override() {
-                                Some(owner) => owner.to_owned(),
-                                None => item.user,
-                            },
-                        };
+                            "item unavailable at dispatch".into(),
+                            ak.attributed_user(&item.user).to_owned(),
+                        );
                         if let Err(e) = store.batch_push_result(id, result).await {
                             tracing::error!(error = %e, batch = %id, "batch result write failed");
                         }
@@ -162,23 +143,14 @@ impl OfflineHandler {
                 }
             }
             let user = ak.attributed_user(&item.user).to_owned();
-            // local backends don't persist items, so a mid-batch erasure can't
-            // blank them — the erasure marker stops the user's remaining items
-            // (fail closed on a marker read error). An erased item must not
-            // run: fail it instead of sending an erased prompt upstream
+            // local backends keep no item rows: the erasure marker stops the rest (fail closed)
             let erased_mid_batch = !store.distributed_batches()
                 && store
                     .user_erased_since(&ak.tenant, &user, captured_at)
                     .await
                     .unwrap_or(true);
             if erased_mid_batch || item.messages.is_empty() {
-                let result = BatchItemResult {
-                    index,
-                    ok: false,
-                    message: "item content erased".into(),
-                    total_tokens: 0,
-                    user,
-                };
+                let result = failed_item(index, "item content erased".into(), user);
                 if let Err(e) = store.batch_push_result(id, result).await {
                     tracing::error!(error = %e, batch = %id, "batch result write failed");
                 }
@@ -194,18 +166,10 @@ impl OfflineHandler {
                 )),
                 ..Default::default()
             };
-            // each item on its own task so a pipeline panic fails that item
-            // instead of wedging the batch in Running forever
+            // each item on its own task so a pipeline panic fails the item, not the batch
             let online = self.online.clone();
             let item_ak = ak.clone();
             let ran = tokio::spawn(async move { online.run(request, item_ak).await }).await;
-            let fail = |message: String| BatchItemResult {
-                index,
-                ok: false,
-                message,
-                total_tokens: 0,
-                user: String::new(),
-            };
             let result = match ran {
                 Ok(Ok(ctx)) => match ctx.outcome {
                     Some(out) => BatchItemResult {
@@ -213,14 +177,13 @@ impl OfflineHandler {
                         ok: true,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
-                        user: String::new(),
+                        user,
                     },
-                    None => fail("pipeline produced no outcome".into()),
+                    None => failed_item(index, "pipeline produced no outcome".into(), user),
                 },
-                Ok(Err(e)) => fail(e.to_string()),
-                Err(join_err) => fail(format!("item task failed: {join_err}")),
+                Ok(Err(e)) => failed_item(index, e.to_string(), user),
+                Err(join_err) => failed_item(index, format!("item task failed: {join_err}"), user),
             };
-            let result = BatchItemResult { user, ..result };
             // if we lost the claim mid-run, don't persist — the new owner is authoritative
             if lost.load(Relaxed) {
                 break;
@@ -239,9 +202,8 @@ impl OfflineHandler {
         }
     }
 
-    /// Fleet drain loop (distributed stores only): claim pending batches and
-    /// execute them, requeuing on the way any batch whose executor went stale.
-    /// Runs forever; poll interval applies only when the queue is empty.
+    /// Fleet drain loop (distributed stores only): claim and execute pending batches,
+    /// requeuing those whose executor went stale; polls only when the queue is empty.
     pub async fn drain_forever(&self, stale_secs: i64, poll: std::time::Duration) {
         let store = self.online.state().store.clone();
         loop {
@@ -292,5 +254,15 @@ impl OfflineHandler {
                 }
             }
         }
+    }
+}
+
+fn failed_item(index: usize, message: String, user: String) -> BatchItemResult {
+    BatchItemResult {
+        index,
+        ok: false,
+        message,
+        total_tokens: 0,
+        user,
     }
 }

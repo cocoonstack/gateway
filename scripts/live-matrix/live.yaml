@@ -1,0 +1,83 @@
+# Live vendor matrix config for scripts/live-matrix/live_matrix.py: every account reads its key from the
+# named env var; prices/weights here are the billing oracle's inputs, not real list prices.
+listen:
+  host: 127.0.0.1
+  port: 18080
+
+admin:
+  token_env: GW_ADMIN_TOKEN
+
+access_keys:
+  - ak: ak-live
+    product: live
+    qps: 100
+    daily_token_quota: 100000000
+
+providers:
+  - {name: anthropic, kind: anthropic, api_key_env: ANTHROPIC_API_KEY, timeout_seconds: 120}
+  - {name: openai, kind: openai, api_key_env: OPENAI_API_KEY, timeout_seconds: 120}
+  - {name: gemini, kind: gemini, api_key_env: GEMINI_API_KEY, timeout_seconds: 120}
+  - {name: deepseek, kind: deepseek, api_key_env: DEEPSEEK_API_KEY, timeout_seconds: 120}
+  - {name: minimax-anth, kind: anthropic, endpoint: https://api.minimax.io/anthropic, api_key_env: MINIMAX_CP_KEY, timeout_seconds: 120}
+  - {name: minimax-oai, kind: openai, endpoint: https://api.minimax.io, api_key_env: MINIMAX_CP_KEY, timeout_seconds: 120}
+  - {name: qwen-oai, kind: openai, endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode, api_key_env: DASHSCOPE_API_KEY, timeout_seconds: 120}
+  - {name: qwen-anth, kind: anthropic, endpoint: https://dashscope-intl.aliyuncs.com/apps/anthropic, api_key_env: DASHSCOPE_API_KEY, timeout_seconds: 120}
+  - {name: qianfan, kind: openai, endpoint: https://qianfan.baidubce.com/v2, api_key_env: QIANFAN_API_KEY, timeout_seconds: 120}
+  - {name: moonshot, kind: moonshot, api_key_env: MOONSHOT_API_KEY, timeout_seconds: 120}
+  - {name: siliconflow, kind: siliconflow, api_key_env: SILICONFLOW_API_KEY, timeout_seconds: 120}
+  - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_API_KEY, timeout_seconds: 120}
+
+models:
+  # anthropic: cache-priced, prompt_cache breakpoints, thinking
+  - {name: claude-haiku-4-5-20251001, provider: anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25, write_cache_1h: 2.0}, prompt_cache: true}
+  - {name: claude-sonnet-4-5-20250929, provider: anthropic, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25, write_cache_1h: 2.0}, prompt_cache: true}
+  - {name: claude-sonnet-4-6, provider: anthropic, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
+  # openai
+  - {name: gpt-4o-mini, provider: openai, input_price_per_1k_micros: 150, output_price_per_1k_micros: 600, token_rate: {read_cache: 0.5}, cache_ttl_seconds: 120}
+  - {name: gpt-4.1-mini, provider: openai, input_price_per_1k_micros: 400, output_price_per_1k_micros: 1600, token_rate: {read_cache: 0.25}}
+  - {name: gpt-5-mini, provider: openai, input_price_per_1k_micros: 250, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1, reasoning: 1.0}}
+  - {name: o4-mini, provider: openai, input_price_per_1k_micros: 1100, output_price_per_1k_micros: 4400, token_rate: {read_cache: 0.25}}
+  - {name: text-embedding-3-small, provider: openai, protocol: embeddings, input_price_per_1k_micros: 20}
+  - {name: gpt-5.4-mini, provider: openai, input_price_per_1k_micros: 250, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}
+  - {name: gpt-4.1-nano, provider: openai, protocol: responses, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # gemini
+  - {name: gemini-3.6-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
+  - {name: gemini-3.7-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
+  # deepseek
+  - {name: deepseek-chat, provider: deepseek, input_price_per_1k_micros: 270, output_price_per_1k_micros: 1100, token_rate: {read_cache: 0.1}}
+  - {name: deepseek-reasoner, provider: deepseek, input_price_per_1k_micros: 550, output_price_per_1k_micros: 2190, token_rate: {read_cache: 0.25}}
+  # minimax
+  - {name: MiniMax-M2.5, provider: minimax-anth, input_price_per_1k_micros: 300, output_price_per_1k_micros: 1200}
+  - {name: MiniMax-M2.7, provider: minimax-oai, input_price_per_1k_micros: 300, output_price_per_1k_micros: 1200}
+  # qwen
+  - {name: qwen-plus, provider: qwen-oai, input_price_per_1k_micros: 400, output_price_per_1k_micros: 1200, token_rate: {read_cache: 0.4}}
+  - {name: qwen3-max, provider: qwen-oai, input_price_per_1k_micros: 1200, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.2}}
+  - {name: qwen3-235b-a22b, provider: qwen-anth, input_price_per_1k_micros: 700, output_price_per_1k_micros: 2800}
+  # qianfan
+  - {name: ernie-x1.1, provider: qianfan, input_price_per_1k_micros: 300, output_price_per_1k_micros: 1200}
+  - {name: ernie-4.5-turbo-128k, provider: qianfan, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # moonshot
+  - {name: kimi-k2.6, provider: moonshot, input_price_per_1k_micros: 600, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.15}}
+  # siliconflow
+  - {name: Qwen/Qwen3-8B, provider: siliconflow, input_price_per_1k_micros: 50, output_price_per_1k_micros: 50}
+  - {name: BAAI/bge-m3, provider: siliconflow, protocol: embeddings, input_price_per_1k_micros: 10}
+  - {name: BAAI/bge-reranker-v2-m3, provider: siliconflow, protocol: rerank, input_price_per_1k_micros: 10}
+  # openrouter
+  - {name: openai/gpt-oss-20b:free, provider: openrouter, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # rerank vendors
+  - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
+  - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
+  # bedrock (long-term bearer key, us-east-1)
+  - {name: "us.anthropic.claude-haiku-4-5-20251001-v1:0", protocol: aws-anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
+  - {name: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", protocol: aws-converse, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}, prompt_cache: true}
+  - {name: "us.amazon.nova-lite-v1:0", protocol: aws-converse, input_price_per_1k_micros: 60, output_price_per_1k_micros: 240}
+  - {name: "us.deepseek.r1-v1:0", protocol: aws-converse, input_price_per_1k_micros: 1350, output_price_per_1k_micros: 5400}
+  - {name: "us.meta.llama3-1-8b-instruct-v1:0", protocol: aws-llama, input_price_per_1k_micros: 220, output_price_per_1k_micros: 220}
+
+accounts:
+  - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
+  - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
+  - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama"], timeout_seconds: 120}
+
+security:
+  dlp_redact: false

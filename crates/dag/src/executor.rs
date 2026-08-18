@@ -83,9 +83,8 @@ fn topo_order(layer: &Layer) -> GResult<Vec<usize>> {
     Ok(order)
 }
 
-/// Run a precomputed plan; a node error aborts the whole run (fail-fast for
-/// online requests). A cache hit short-circuits every node after the one that
-/// set it — the cached response must not re-run limits, the engine, or billing.
+/// Run a precomputed plan; a node error aborts the run and a cache hit
+/// short-circuits every node after the one that set it.
 pub async fn run(plan: &Plan, ctx: &mut DagContext) -> GResult<()> {
     for (layer, order) in plan.layers.iter().zip(&plan.orders) {
         for &i in order {

@@ -5,8 +5,10 @@ import App from "./App";
 import type { Role, Session } from "./types";
 
 const overview = {
-  totals: { requests: 12, total_tokens: 4200, cost_micros: 20000, vendor_cost_micros: 12000 },
-  usage: [],
+  totals: { requests: 12, total_tokens: 4200, billed_units: 63, cost_micros: 20000, vendor_cost_micros: 12000 },
+  usage: [
+    { user_id: "", model: "tts-1", requests: 1, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_micros: 945, vendor_cost_micros: 252, billed_units: 63 },
+  ],
   series: { bucket: "day", since: 1, until: 2, series: [] },
   models: [{ model: "gpt-test", state: "available", requests: 12, errors: 0, window_minutes: 15 }],
 };
@@ -35,6 +37,8 @@ describe("role navigation", () => {
     expect(screen.getByRole("link", { name: /users & roles/i })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /configuration/i })).toBeInTheDocument();
     expect(await screen.findByText("Revenue")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Units" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "63" })).toBeInTheDocument();
   });
 });
 

@@ -16,9 +16,8 @@ const AUTH_CACHE_TTL: Duration = Duration::from_secs(2);
 /// Bounded so unknown-key probing can't grow the negative cache unboundedly.
 const AUTH_CACHE_MAX: u64 = 100_000;
 
-/// The live key table. Mirrors [`crate::AkAuth`]'s semantics: config keys are
-/// re-applied on reload, admin keys survive it, and config ownership is sticky
-/// against admin overwrites.
+/// The live key table with [`crate::AkAuth`]'s semantics: config keys re-apply
+/// on reload, admin keys survive it, config ownership is sticky.
 #[async_trait]
 pub trait KeyStore: Send + Sync + std::fmt::Debug {
     /// Resolve a presented key; `None` = unknown, revoked, or (for a networked
@@ -40,9 +39,8 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()>;
 }
 
-/// Fleet-shared key table in Postgres. Reads go through a short-TTL cache
-/// (positive and negative entries); writes invalidate the local cache
-/// immediately and reach other instances within [`AUTH_CACHE_TTL`].
+/// Fleet-shared key table in Postgres: short-TTL cached reads (positive and
+/// negative), writes reach other instances within [`AUTH_CACHE_TTL`].
 #[derive(Debug)]
 pub struct PostgresKeyStore {
     pool: sqlx::PgPool,
@@ -240,10 +238,8 @@ impl KeyStore for PostgresKeyStore {
     }
 }
 
-/// The one INSERT..ON CONFLICT for the key table. The sticky-source CASE is a
-/// no-op when `source` is Config, so the reload path shares it unchanged.
-/// `suspended_until_epoch_secs` is deliberately absent: an upsert never clears
-/// a runtime suspension — only a patch touches it.
+/// The one INSERT..ON CONFLICT for the key table; `suspended_until_epoch_secs`
+/// is deliberately absent — an upsert never clears a runtime suspension.
 async fn upsert(
     exec: impl sqlx::PgExecutor<'_>,
     info: &AkInfo,

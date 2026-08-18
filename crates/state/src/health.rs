@@ -1,20 +1,19 @@
 //! Account health (cooldown/recovery) behind a trait: in-process for a single
 //! node, Redis so a bad upstream account cools down across the whole fleet.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::AccountHealth;
 
-/// How long a local view of another instance's cooldown may lag. Account
-/// selection scans every candidate per request, so reads must stay local;
-/// cooldowns are seconds-granular, so a 1s lag is invisible.
+/// How long a local view of another instance's cooldown may lag; selection
+/// scans every candidate per request, so reads stay local.
 const AVAILABLE_CACHE_TTL: Duration = Duration::from_millis(1000);
 const AVAILABLE_CACHE_MAX: u64 = 10_000;
-/// Failure streaks self-expire after an hour idle, so a stale streak restarts
-/// instead of instantly re-tripping (the in-process backend mirrors this via
-/// its `FAILS_DECAY`); a success deletes them outright.
+/// Failure streaks self-expire after an hour idle (the in-process `FAILS_DECAY`
+/// mirrors it); a success deletes them outright.
 const FAILS_TTL_MS: i64 = 3_600_000;
 
 /// Consecutive-failure cooldown with auto-recovery, shared or per-node.
@@ -48,10 +47,8 @@ impl HealthStore for AccountHealth {
     }
 }
 
-/// Fleet-wide health in Redis: the failure streak and the cooldown flag live
-/// under `gw:health:*`, so an account tripped by one instance is skipped by
-/// all. Reads come from a short-TTL local cache; a Redis outage fails open
-/// (accounts stay selectable), matching the governance posture.
+/// Fleet-wide health in Redis (`gw:health:*`): an account tripped by one
+/// instance is skipped by all; short-TTL local reads, a Redis outage fails open.
 pub struct RedisHealth {
     conn: redis::aio::ConnectionManager,
     cache: moka::sync::Cache<String, bool>,
@@ -79,18 +76,19 @@ impl RedisHealth {
 impl HealthStore for RedisHealth {
     async fn record_failure(&self, name: &str, threshold: usize, cooldown: Duration) -> bool {
         let mut conn = self.conn.clone();
-        // Atomic trip; an expired flag no longer EXISTS, so a still-failing
-        // account re-arms.
-        let script = redis::Script::new(
-            "local f = redis.call('INCR', KEYS[1])
-             redis.call('PEXPIRE', KEYS[1], ARGV[3])
-             if f >= tonumber(ARGV[1]) and redis.call('EXISTS', KEYS[2]) == 0 then
-               redis.call('SET', KEYS[2], '1', 'PX', ARGV[2])
-               return 1
-             end
-             return 0",
-        );
-        let tripped: i64 = match script
+        // atomic trip; an expired flag no longer EXISTS, so a still-failing account re-arms
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local f = redis.call('INCR', KEYS[1])
+                 redis.call('PEXPIRE', KEYS[1], ARGV[3])
+                 if f >= tonumber(ARGV[1]) and redis.call('EXISTS', KEYS[2]) == 0 then
+                   redis.call('SET', KEYS[2], '1', 'PX', ARGV[2])
+                   return 1
+                 end
+                 return 0",
+            )
+        });
+        let tripped: i64 = match SCRIPT
             .key(fails_key(name))
             .key(cd_key(name))
             .arg(threshold as i64)

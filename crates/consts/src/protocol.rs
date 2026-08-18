@@ -41,6 +41,10 @@ pub enum Protocol {
     Ernie,
     /// MiniMax v1 chat (sender_type/reply/base_resp shape)
     MinimaxV1,
+    /// Anthropic Claude on AWS Bedrock (SigV4, Messages body, InvokeModel wire)
+    AwsAnthropic,
+    /// Any Bedrock model through the Converse API (Messages engine, transcoded)
+    AwsConverse,
     /// Cohere Command on AWS Bedrock (SigV4)
     AwsCohere,
     /// Llama on AWS Bedrock (SigV4)
@@ -71,6 +75,8 @@ impl Protocol {
         Protocol::Passthrough,
         Protocol::Ernie,
         Protocol::MinimaxV1,
+        Protocol::AwsAnthropic,
+        Protocol::AwsConverse,
         Protocol::AwsCohere,
         Protocol::AwsLlama,
         Protocol::Dashscope,
@@ -96,6 +102,8 @@ impl Protocol {
             Protocol::Passthrough => "passthrough",
             Protocol::Ernie => "ernie",
             Protocol::MinimaxV1 => "minimax-v1",
+            Protocol::AwsAnthropic => "aws-anthropic",
+            Protocol::AwsConverse => "aws-converse",
             Protocol::AwsCohere => "aws-cohere",
             Protocol::AwsLlama => "aws-llama",
             Protocol::Dashscope => "dashscope",
@@ -124,7 +132,7 @@ mod tests {
         for &p in Protocol::ALL {
             assert_eq!(Protocol::from_wire(p.as_str()), Some(p));
         }
-        assert_eq!(Protocol::ALL.len(), 21);
+        assert_eq!(Protocol::ALL.len(), 23);
         assert!(Protocol::from_wire("nope").is_none());
     }
 }

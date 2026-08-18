@@ -58,9 +58,8 @@ impl EngineOutcome {
     }
 }
 
-/// One engine per upstream model method. An engine's job is strictly
-/// request → upstream → parse; cross-cutting work (usage normalization,
-/// error mapping, quota, billing, retries) belongs to DAG nodes.
+/// One engine per upstream model method: strictly request → upstream → parse;
+/// cross-cutting work belongs to DAG nodes.
 #[async_trait::async_trait]
 pub trait ModelEngine: Send + Sync {
     /// Perform the upstream call. `&mut self`: the engine owns its request
@@ -69,17 +68,14 @@ pub trait ModelEngine: Send + Sync {
     async fn run(&mut self) -> GResult<EngineOutcome>;
 }
 
-/// One upstream usage count, floored at 0 — a vendor must never drive a negative
-/// into billing/quota. The overflow ceiling is applied later at the metering
-/// sinks (see `gw_state::clamp_tokens`).
+/// One upstream usage count floored at 0 (a vendor must never drive a negative
+/// into billing); the ceiling is `gw_state::clamp_tokens` at the sinks.
 pub fn tok(v: &Value) -> i64 {
     v.as_i64().unwrap_or(0).max(0)
 }
 
-/// Move the string at `ptr` (a static, unescaped JSON Pointer) out of `v`;
-/// `None` when absent or not a string. Walks the segments itself:
-/// `pointer_mut` allocates per segment on every call, and indexing a hostile
-/// non-object reply would panic.
+/// Move the string at `ptr` (a static, unescaped JSON Pointer) out of `v`; walks
+/// the segments itself since `pointer_mut` allocates per segment.
 pub fn take_string(v: &mut Value, ptr: &str) -> Option<String> {
     let mut cur = v;
     for segment in ptr.split('/').skip(1) {
@@ -95,19 +91,15 @@ pub fn take_string(v: &mut Value, ptr: &str) -> Option<String> {
     }
 }
 
-/// Detect a vendor error and turn it into a `GatewayError`. Covers the
-/// enveloped shapes (OpenAI `{"error":{…}}`, MiniMax `{"type":"error",…}`) at
-/// any status, plus — because some vendors (Bedrock, DashScope native) answer
-/// 4xx/5xx with a FLAT body — any JSON reply on an error status, so an
-/// upstream failure can never parse as an empty success. The HTTP status is
-/// the real upstream status if already an error, else the envelope's
-/// `http_code`/`code` if it looks like one, else 502.
+/// A vendor error as a `GatewayError`: enveloped shapes at any status plus any
+/// JSON body on an error status (Bedrock/DashScope answer 4xx flat), so a
+/// failure never parses as an empty success; status = upstream's, else the
+/// envelope's `http_code`/`code`, else 502.
 pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     let err = v.get("error").filter(|e| e.is_object());
     let message = match (err, http_status >= 400) {
         (Some(e), _) => e["message"].as_str().unwrap_or("upstream error"),
-        // `Message`: the AWS auth layer capitalizes where modeled Bedrock
-        // errors use lowercase `message`.
+        // the AWS auth layer capitalizes `Message`
         (None, true) => v["message"]
             .as_str()
             .or_else(|| v["msg"].as_str())
@@ -123,7 +115,7 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
             e["http_code"]
                 .as_str()
                 .and_then(|s| s.parse::<u16>().ok())
-                .or_else(|| e["code"].as_u64().map(|c| c as u16))
+                .or_else(|| e["code"].as_u64().and_then(|c| u16::try_from(c).ok()))
                 .or_else(|| e["code"].as_str().and_then(|s| s.parse::<u16>().ok()))
         })
         .filter(|c| *c >= 400)
@@ -139,17 +131,18 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     })
 }
 
-/// Drop the empty object some OpenAI-compatible vendors emit ahead of a tool
-/// call's accumulated arguments (`{}{"command":"…"}`), and complete the empty
-/// string others leave on a no-argument call to `{}`. A strip is committed only
-/// when an object remains, so an unparseable string is passed through, not
-/// guessed at.
+/// Drop the empty object some vendors emit ahead of accumulated arguments
+/// (`{}{"command":…}`) and complete an empty no-argument string to `{}`; an
+/// unparseable string passes through untouched.
 pub fn normalize_tool_arguments(calls: &mut Value) {
     let Some(calls) = calls.as_array_mut() else {
         return;
     };
     for call in calls {
-        let Some(Value::String(args)) = call.pointer_mut("/function/arguments") else {
+        let Some(Value::String(args)) = call
+            .get_mut("function")
+            .and_then(|function| function.get_mut("arguments"))
+        else {
             continue;
         };
         let trimmed = args.trim_start();

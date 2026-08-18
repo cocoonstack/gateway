@@ -63,10 +63,9 @@ pub struct ChatParams {
     pub reasoning: Option<Box<ReasoningParam>>,
 }
 
-/// A reasoning request in the dialect the client spoke: OpenAI's
-/// `reasoning_effort` / OpenRouter's `reasoning{effort,max_tokens}` on the chat
-/// surface, Anthropic's `thinking` + `output_config` on the native surface.
-/// Each engine forwards its own dialect verbatim and maps the other one.
+/// A reasoning request in the client's dialect (OpenAI/OpenRouter on the chat
+/// surface, Anthropic's `thinking` + `output_config` natively); each engine
+/// forwards its own dialect verbatim and maps the other.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReasoningParam {
     /// OpenAI vocabulary: none | minimal | low | medium | high | xhigh | max.

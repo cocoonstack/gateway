@@ -21,9 +21,8 @@ type Digest = [u8; 32];
 
 pub const THINKING_SIGNATURE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_ENTRIES: usize = 250_000;
-/// Compatible upstreams may reuse tool ids ("call_1") across conversations
-/// under one access key; an anchor keeps the last few fingerprints so a
-/// collision cannot invalidate another live conversation's continuation.
+/// Compatible upstreams reuse tool ids ("call_1") across conversations; an
+/// anchor keeps the last few fingerprints so a collision cannot invalidate another one.
 const MAX_ANCHOR_FINGERPRINTS: usize = 4;
 const MAX_STREAM_BLOCKS: usize = 1024;
 const MAX_STREAM_CAPTURE: usize = 4 * 1024 * 1024;
@@ -141,9 +140,8 @@ impl ThinkingSignatureAudit {
         };
         let messages = &request.message;
 
-        // Anthropic validates the latest logical assistant turn when the
-        // trailing logical user turn returns tool results. Older thinking may
-        // legally be omitted. Consecutive same-role messages form one turn.
+        // Anthropic validates only the latest logical assistant turn (older thinking may be
+        // omitted); consecutive same-role messages form one turn
         let mut trailing_user_start = messages.len();
         while trailing_user_start > 0
             && messages[trailing_user_start - 1].role == gw_consts::role::USER
@@ -177,10 +175,8 @@ impl ThinkingSignatureAudit {
             }
         }
 
-        // With thinking disabled the API requires the client to strip the
-        // thinking blocks from the replayed turn; nothing signed remains to
-        // audit, so the upstream arbitrates. With thinking enabled a known
-        // anchor whose protected blocks were removed is still a Mismatch.
+        // thinking disabled: the client must strip the replayed blocks and the upstream
+        // arbitrates; enabled: a known anchor missing its blocks is still a Mismatch
         if sequence.blocks.is_empty() && !request.reasoning_engaged() {
             return (Some(context), ReviewVerdict::Miss);
         }
@@ -348,8 +344,7 @@ impl ThinkingSignatureAudit {
         });
         SequenceFingerprint {
             opaque: self.sequence_digest(context, blocks, false),
-            // With display:"omitted", Anthropic ignores text a client places
-            // in an empty thinking field. A visible summary is strict.
+            // with display:"omitted" Anthropic ignores client text in an empty thinking field
             strict: has_visible_summary.then(|| self.sequence_digest(context, blocks, true)),
         }
     }
@@ -531,7 +526,7 @@ fn invalid_bounded_string(value: Option<&Value>) -> bool {
     }
 }
 
-fn tool_result_ids(message: &ChatMsg) -> HashSet<&str> {
+fn tool_result_ids(message: &ChatMsg) -> impl Iterator<Item = &str> {
     message
         .parts
         .as_ref()
@@ -540,7 +535,6 @@ fn tool_result_ids(message: &ChatMsg) -> HashSet<&str> {
         .flatten()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
         .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
-        .collect()
 }
 
 #[derive(Debug)]

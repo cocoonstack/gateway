@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"maps"
 	"net"
 	"net/http"
 	"sync"
@@ -31,11 +32,7 @@ func (t *loginThrottle) allow(key string, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(t.windows) > throttleSweepAt {
-		for k, w := range t.windows {
-			if now.Sub(w.start) >= loginWindow {
-				delete(t.windows, k)
-			}
-		}
+		maps.DeleteFunc(t.windows, func(_ string, w window) bool { return now.Sub(w.start) >= loginWindow })
 	}
 	w := t.windows[key]
 	if now.Sub(w.start) >= loginWindow {

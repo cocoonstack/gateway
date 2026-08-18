@@ -109,12 +109,23 @@ pub struct ModelConf {
     pub input_price_per_1k_micros: i64,
     #[serde(default)]
     pub output_price_per_1k_micros: i64,
+    /// Price per billed unit on the surfaces that don't meter tokens: a TTS
+    /// input character, a transcription second, a rerank search unit.
+    #[serde(default)]
+    pub unit_price_micros: i64,
     /// Model-level requests-per-minute limit; None = unlimited.
     #[serde(default)]
     pub qpm: Option<i64>,
     /// Request-level cache TTL; None = this model isn't cached.
     #[serde(default)]
     pub cache_ttl_seconds: Option<u64>,
+    /// Long-context tier; None = one price regardless of prompt size.
+    #[serde(default)]
+    pub long_context: Option<LongContextConf>,
+    /// Multiplier on the charged and vendor cost of batch (`/v1/batches`)
+    /// items, e.g. 0.5; None = full price.
+    #[serde(default)]
+    pub batch_discount: Option<f64>,
     /// Billing weights per token component; None = every component at 1.0.
     #[serde(default)]
     pub token_rate: Option<TokenRateConf>,
@@ -145,20 +156,19 @@ pub struct VariantConf {
     pub weight: u32,
 }
 
-/// Cumulative-weight pick over a model's variants, keyed by a stable hash so
-/// every instance (REST DAG and realtime handshake alike) maps the same key
-/// to the same bucket with no shared state.
-pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> &'a VariantConf {
+/// Cumulative-weight pick over a model's variants by a stable hash, so every
+/// instance maps the same key to the same bucket with no shared state.
+pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
     let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
     let mut roll = fnv1a(key) % total.max(1);
     for v in variants {
         if roll < u64::from(v.weight) {
-            return v;
+            return Some(v);
         }
         roll -= u64::from(v.weight);
     }
-    // unreachable (weights validated >= 1); quiets the type checker
-    &variants[0]
+    // weights are validated >= 1, so only an empty list falls through
+    variants.first()
 }
 
 /// FNV-1a 64: deterministic across processes and releases (std's hasher is
@@ -183,19 +193,47 @@ pub struct TokenRateConf {
     pub completion: f64,
     #[serde(default = "weight_one")]
     pub reasoning: f64,
+    /// Audio-token weights (realtime, audio chat); unset = the text weight.
+    #[serde(default)]
+    pub audio_prompt: Option<f64>,
+    #[serde(default)]
+    pub audio_completion: Option<f64>,
+    /// 1-hour cache-write weight; unset = `write_cache`.
+    #[serde(default)]
+    pub write_cache_1h: Option<f64>,
 }
 
 impl TokenRateConf {
     /// `(field name, value)` pairs for validation.
-    fn fields(&self) -> [(&'static str, f64); 5] {
+    fn fields(&self) -> [(&'static str, f64); 8] {
         [
             ("prompt", self.prompt),
             ("read_cache", self.read_cache),
             ("write_cache", self.write_cache),
             ("completion", self.completion),
             ("reasoning", self.reasoning),
+            ("audio_prompt", self.audio_prompt.unwrap_or(self.prompt)),
+            (
+                "audio_completion",
+                self.audio_completion.unwrap_or(self.completion),
+            ),
+            (
+                "write_cache_1h",
+                self.write_cache_1h.unwrap_or(self.write_cache),
+            ),
         ]
     }
+}
+
+/// A long-context price tier: past `threshold_tokens` prompt tokens the whole
+/// call bills at these multipliers of the model's price.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct LongContextConf {
+    pub threshold_tokens: i64,
+    #[serde(default = "weight_one")]
+    pub prompt_weight: f64,
+    #[serde(default = "weight_one")]
+    pub completion_weight: f64,
 }
 
 fn weight_one() -> f64 {
@@ -241,6 +279,10 @@ pub struct AccountConf {
     pub cost_input_price_per_1k_micros: i64,
     #[serde(default)]
     pub cost_output_price_per_1k_micros: i64,
+    /// What the vendor charges us per non-token unit (see the model's
+    /// `unit_price_micros`); zero = untracked.
+    #[serde(default)]
+    pub cost_unit_price_micros: i64,
     pub protocols: Vec<String>,
 }
 
@@ -248,9 +290,8 @@ fn default_priority() -> i32 {
     1
 }
 
-/// What a fired content rule does. `block` denies the request; `flag` lets it
-/// through but records the hit; `shadow` is `flag` for a rule under evaluation —
-/// same recording, and the caller can tell trial rules apart when auditing.
+/// What a fired content rule does: `block` denies, `flag` records, `shadow`
+/// is `flag` for a rule under evaluation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -280,9 +321,8 @@ pub struct RegexRule {
     pub action: Action,
 }
 
-/// Local security policy (rule-based; no cloud security service). Lives globally
-/// (`security:`) and per-tenant ([`TenantConf::security`]); the tenant's wins
-/// whole when present.
+/// Local rule-based security policy, global (`security:`) and per-tenant
+/// ([`TenantConf::security`], which wins whole when present).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConf {
     /// Blocklist terms; normalized to lower-case (empties dropped) at load.
@@ -393,10 +433,8 @@ pub struct AbuseTier {
     pub suspend_hours: u64,
 }
 
-/// Automatic abuse suspension; empty tiers = disabled (no counting at all).
-/// Tiers must ascend in both fields (validated) — the highest reject
-/// threshold met wins. Counts REST admission rejections only: the realtime
-/// gate denies per turn without feeding this counter.
+/// Automatic abuse suspension (empty tiers = disabled); tiers ascend in both
+/// fields, the highest reject threshold met wins; REST admission rejections only.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AbuseConf {
     #[serde(default)]
@@ -481,13 +519,15 @@ pub struct ProductConfEntry {
     pub qpm: Option<i64>,
 }
 
-/// A per-1k-token price pair (micro-dollars).
+/// A per-1k-token price pair plus the per-unit price (micro-dollars).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub struct PriceConf {
     #[serde(default)]
     pub input_price_per_1k_micros: i64,
     #[serde(default)]
     pub output_price_per_1k_micros: i64,
+    #[serde(default)]
+    pub unit_price_micros: i64,
 }
 
 /// Tenant-level pooled governance and model entitlement. All of a tenant's
@@ -629,7 +669,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "siliconflow" => ProviderPreset {
             endpoint: "https://api.siliconflow.cn",
-            wires: &["openai-chat", "embeddings", "rerank"],
+            wires: &["openai-chat", "embeddings", "rerank", "tts", "stt", "image"],
             default_model_wire: "openai-chat",
         },
         _ => return None,
@@ -690,8 +730,7 @@ impl GatewayConfig {
         cfg.normalize()?;
         cfg.validate()?;
         cfg.build_indices();
-        // a hash of the document, not a per-process counter: every replica must
-        // agree on it, and a restarted node must not hit stale cache entries
+        // a document hash, not a counter: replicas must agree across restarts
         cfg.generation = stable_hash(yaml);
         Ok(cfg)
     }
@@ -749,6 +788,7 @@ impl GatewayConfig {
                     tier: String::new(),
                     cost_input_price_per_1k_micros: 0,
                     cost_output_price_per_1k_micros: 0,
+                    cost_unit_price_micros: 0,
                     timeout_seconds: None,
                     connect_retries: None,
                     retry_status: None,
@@ -758,8 +798,7 @@ impl GatewayConfig {
                     protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
                 });
             }
-            // an empty endpoint here would answer from the mock transport beside
-            // the provider's real one — fabricated replies that read as successes
+            // an empty endpoint would answer from the mock transport with fabricated successes
             for a in self.accounts.iter_mut().filter(|a| a.provider == p.name) {
                 if a.endpoint.is_empty() {
                     a.endpoint = if p.endpoint.is_empty() {
@@ -800,12 +839,13 @@ impl GatewayConfig {
         if self.storage.shared_cache && self.storage.redis_url.is_empty() {
             return Err(ConfigError::SharedCacheNeedsRedis);
         }
-        // negative prices would make cost accounting non-monotonic (the usage
-        // rollup's max-upsert relies on per-column monotone sums)
+        // negative prices would break the usage rollup's monotone max-upsert
         let neg = |i: i64, o: i64| i < 0 || o < 0;
         let neg_or_nan = |v: f64| !v.is_finite() || v < 0.0;
         for m in &self.models {
-            if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros) {
+            if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros)
+                || m.unit_price_micros < 0
+            {
                 return Err(ConfigError::NegativePrice {
                     owner: format!("model {}", m.name),
                 });
@@ -820,6 +860,24 @@ impl GatewayConfig {
                         });
                     }
                 }
+            }
+            if let Some(lc) = &m.long_context
+                && (lc.threshold_tokens < 0
+                    || neg_or_nan(lc.prompt_weight)
+                    || neg_or_nan(lc.completion_weight))
+            {
+                return Err(ConfigError::BadTokenRate {
+                    model: m.name.clone(),
+                    field: "long_context",
+                });
+            }
+            if let Some(d) = m.batch_discount
+                && !(d.is_finite() && d > 0.0 && d <= 1.0)
+            {
+                return Err(ConfigError::BadTokenRate {
+                    model: m.name.clone(),
+                    field: "batch_discount",
+                });
             }
             for (i, v) in m.variants.iter().enumerate() {
                 let bad = |reason| ConfigError::BadVariant {
@@ -850,7 +908,8 @@ impl GatewayConfig {
             if neg(
                 a.cost_input_price_per_1k_micros,
                 a.cost_output_price_per_1k_micros,
-            ) {
+            ) || a.cost_unit_price_micros < 0
+            {
                 return Err(ConfigError::NegativePrice {
                     owner: format!("account {}", a.name),
                 });
@@ -870,15 +929,16 @@ impl GatewayConfig {
         }
         for t in &self.tenants {
             for (model, p) in &t.model_prices {
-                if neg(p.input_price_per_1k_micros, p.output_price_per_1k_micros) {
+                if neg(p.input_price_per_1k_micros, p.output_price_per_1k_micros)
+                    || p.unit_price_micros < 0
+                {
                     return Err(ConfigError::NegativePrice {
                         owner: format!("tenant {} price for {model}", t.name),
                     });
                 }
             }
         }
-        // a negative quota/qps is a typo that would silently deny (or never
-        // limit); a NaN qps would bypass the rate bucket — reject both at load
+        // a negative quota/qps would silently deny (or never limit), a NaN qps bypasses the bucket
         let neg_limit = |owner: String| ConfigError::NegativeLimit { owner };
         for k in &self.access_keys {
             if neg_or_nan(k.qps)
@@ -917,8 +977,7 @@ impl GatewayConfig {
         }
         let st = &self.stability;
         let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
-        // upper bound mirrors the store's one-hour retention — a longer window
-        // would silently judge over already-evicted buckets
+        // the store retains one hour; a longer window would judge over evicted buckets
         if !(1..=60).contains(&st.availability_window_minutes) {
             return Err(ConfigError::BadStability {
                 field: "availability_window_minutes (1..=60)",
@@ -968,8 +1027,7 @@ impl GatewayConfig {
                 });
             }
         }
-        // a colon in an ak would collide with the prefixed governance keyspaces
-        // (`abuse:{ak}` above all — a key named `abuse:X` could force-suspend X)
+        // a colon in an ak would collide with the prefixed governance keyspaces (`abuse:{ak}`)
         for k in &self.access_keys {
             if k.ak.contains(':') {
                 return Err(ConfigError::DuplicateName {
@@ -1108,11 +1166,22 @@ impl GatewayConfig {
         }
         self.prices_for(model)
     }
+
+    /// Charged per-unit price for `tenant` on `model` (same override rule).
+    pub fn unit_price_for_tenant(&self, tenant: &str, model: &str) -> i64 {
+        self.find_tenant(tenant)
+            .and_then(|t| t.model_prices.get(model))
+            .map(|p| p.unit_price_micros)
+            .unwrap_or_else(|| {
+                self.find_model(model)
+                    .map(|m| m.unit_price_micros)
+                    .unwrap_or(0)
+            })
+    }
 }
 
-/// Normalize a security policy at load: lower-case the blocklist (so scans
-/// don't rebuild it per request) and compile the regex rules (dropping any that
-/// fail to compile, loudly).
+/// Normalize a security policy at load: lower-case the blocklist and compile
+/// the regex rules (dropping any that fail, loudly).
 fn compile_security(sec: &mut SecurityConf) {
     sec.blocklist = sec
         .blocklist
@@ -1146,10 +1215,8 @@ fn token_from_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|t| !t.is_empty())
 }
 
-/// Deterministic hash of the config document. sha256, NOT `DefaultHasher`:
-/// the generation feeds fleet-shared cache keys, and std's hasher is not
-/// guaranteed stable across Rust releases — mixed-build replicas would
-/// disagree on the identical document and collapse the shared-cache hit rate.
+/// Deterministic hash of the config document — sha256, not `DefaultHasher`,
+/// which is not stable across Rust releases while this feeds fleet-shared cache keys.
 fn stable_hash(yaml: &str) -> u64 {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(yaml.as_bytes());
@@ -1241,7 +1308,11 @@ models:
         let kimi = cfg.accounts.iter().find(|a| a.name == "kimi").unwrap();
         assert_eq!(kimi.endpoint, "https://api.moonshot.cn");
         let sf = cfg.accounts.iter().find(|a| a.name == "sf").unwrap();
-        assert!(sf.protocols.iter().any(|w| w == "rerank"));
+        assert!(
+            ["rerank", "tts", "stt", "image"]
+                .iter()
+                .all(|w| sf.protocols.iter().any(|p| p == w))
+        );
         let orr = cfg
             .accounts
             .iter()
@@ -1483,14 +1554,45 @@ tenants: [{name: t1}, {name: t1}]
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
         ));
 
-        let neg_price = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: -1}]";
-        assert!(
-            matches!(
-                GatewayConfig::from_yaml(neg_price),
-                Err(ConfigError::NegativePrice { .. })
-            ),
-            "negative prices are rejected at load"
+        for bad in [
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, batch_discount: 1.5}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, batch_discount: 0}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, long_context: {threshold_tokens: -1}}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, token_rate: {audio_prompt: -2}}]",
+        ] {
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(bad),
+                    Err(ConfigError::BadTokenRate { .. })
+                ),
+                "rejected at load: {bad}"
+            );
+        }
+        let cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, batch_discount: 0.5, long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}, token_rate: {prompt: 3.0, audio_prompt: 12.0}}]",
+        )
+        .unwrap();
+        let m = cfg.find_model("m1").unwrap();
+        assert_eq!(m.batch_discount, Some(0.5));
+        assert_eq!(m.long_context.unwrap().threshold_tokens, 200_000);
+        let rate = m.token_rate.unwrap();
+        assert_eq!(rate.audio_prompt, Some(12.0));
+        assert_eq!(
+            rate.audio_completion, None,
+            "unset audio weight inherits the text weight"
         );
+        for neg_price in [
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: -1}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: tts, unit_price_micros: -1}]",
+        ] {
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(neg_price),
+                    Err(ConfigError::NegativePrice { .. })
+                ),
+                "negative prices are rejected at load"
+            );
+        }
 
         for bad in [200, 302, 99, 600] {
             let replay_ok = format!(
@@ -1583,12 +1685,16 @@ tenants: [{name: t1}, {name: t1}]
                 weight: 1,
             },
         ];
-        let first = pick_variant(&variants, "user-1").model.clone();
+        let first = pick_variant(&variants, "user-1").unwrap().model.clone();
         for _ in 0..10 {
-            assert_eq!(pick_variant(&variants, "user-1").model, first, "sticky");
+            assert_eq!(
+                pick_variant(&variants, "user-1").unwrap().model,
+                first,
+                "sticky"
+            );
         }
         let hits = (0..1000)
-            .filter(|i| pick_variant(&variants, &format!("user-{i}")).model == "b")
+            .filter(|i| pick_variant(&variants, &format!("user-{i}")).unwrap().model == "b")
             .count();
         assert!(
             (40..250).contains(&hits),

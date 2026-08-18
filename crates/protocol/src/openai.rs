@@ -7,9 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// `content` accepts a plain string or the multimodal parts array
-/// (`[{type:"text",...},{type:"image_url",...}]`). Parts stay untyped `Value`s
-/// so unknown modalities pass through untouched.
+/// `content` as a plain string or the multimodal parts array; parts stay
+/// untyped so unknown modalities pass through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -32,14 +31,6 @@ impl Default for MessageContent {
     fn default() -> Self {
         MessageContent::Text(String::new())
     }
-}
-
-fn parts_text(parts: &[Value]) -> String {
-    parts
-        .iter()
-        .filter(|p| p["type"] == "text")
-        .filter_map(|p| p["text"].as_str())
-        .collect()
 }
 
 /// One function call requested by the model.
@@ -118,6 +109,10 @@ pub struct ChatCompletionRequest {
     /// OpenRouter-style `{effort, max_tokens, enabled}`.
     #[serde(default)]
     pub reasoning: Option<Value>,
+    /// Consumed here: the gateway always streams usage, and non-OpenAI wires
+    /// reject the field.
+    #[serde(default)]
+    pub stream_options: Option<Value>,
     /// unrecognized fields ride along untouched and are passed through to vendors.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -138,6 +133,10 @@ pub struct Usage {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: i64,
+    /// Anthropic cache writes ride inside `prompt_tokens`; surfaced so a client
+    /// can reconcile the write premium it was billed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -347,16 +346,32 @@ impl<'a> ChatCompletionChunk<'a> {
     }
 }
 
+fn parts_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|p| p["type"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .collect()
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn request_roundtrip_keeps_extra_fields() {
-        let j = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"seed":7}"#;
+        let j = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"seed":7,"stream_options":{"include_usage":true}}"#;
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
         assert_eq!(req.model, "gpt-4o");
         assert!(!req.stream);
+        assert!(
+            req.extra.get("stream_options").is_none(),
+            "an OpenAI-surface knob must not reach a foreign wire"
+        );
         let (text, parts) = req.messages[0]
             .content
             .clone()

@@ -2,6 +2,7 @@
 //! in-process counters) and [`RedisGovernance`] (multi-replica, same semantics
 //! via atomic server-side ops — INCR + EXPIRE windows, token-bucket Lua).
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -145,17 +146,19 @@ impl RedisGovernance {
     /// corrects), rolling the increment back on denial. A failed round-trip
     /// admits — limits fail open on a Redis blip.
     async fn reserve_capped(&self, key: String, amount: i64, limit: i64, ttl_ms: i64) -> bool {
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+                 if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+                 if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
+                   redis.call('DECRBY', KEYS[1], ARGV[1])
+                   return 0
+                 end
+                 return 1",
+            )
+        });
         let mut conn = self.conn.clone();
-        let script = redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
-             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
-               redis.call('DECRBY', KEYS[1], ARGV[1])
-               return 0
-             end
-             return 1",
-        );
-        match script
+        match SCRIPT
             .key(&key)
             .arg(amount)
             .arg(limit)
@@ -176,13 +179,15 @@ impl RedisGovernance {
     /// count. A failed round-trip returns 0 so limits fail open rather than
     /// wedging the gateway on a Redis blip.
     async fn incr_window(&self, key: &str, by: i64, window: Duration) -> i64 {
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+                 if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+                 return v",
+            )
+        });
         let mut conn = self.conn.clone();
-        let script = redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-             return v",
-        );
-        match script
+        match SCRIPT
             .key(key)
             .arg(by)
             .arg(window.as_millis() as i64)
@@ -191,7 +196,8 @@ impl RedisGovernance {
         {
             Ok(v) => v,
             Err(e) => {
-                // fail open, but loudly — a persistent outage would otherwise silently disable limits
+                // fail open, but loudly — a persistent outage would otherwise silently disable
+                // limits
                 let key_id = crate::access_key_fingerprint(key);
                 tracing::warn!(error = %e, key_id, "redis governance unavailable; limit skipped");
                 0
@@ -206,8 +212,7 @@ impl Governance for RedisGovernance {
         if qps <= 0.0 {
             return false;
         }
-        // qps >= 1: round(qps) permits per 1s (the in-memory bucket's rounding,
-        // so fleet and single-node enforce alike); qps < 1: 1 permit per 1/qps s
+        // qps >= 1: round(qps) per 1s (the in-memory bucket's rounding); qps < 1: 1 per 1/qps s
         let (limit, window) = if qps < 1.0 {
             (1, Duration::from_secs_f64(1.0 / qps))
         } else {
@@ -241,8 +246,7 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        // floor at 0 atomically on the SAME day bucket the reserve used, so a
-        // request straddling midnight doesn't hit the next day's counter
+        // floor at 0 on the SAME day bucket the reserve used (a request may straddle midnight)
         settle_floored(
             &self.conn,
             &quota_key_at(key, at),
@@ -260,8 +264,8 @@ impl Governance for RedisGovernance {
         .await;
     }
     async fn quota_reset_all(&self) {
-        // no-op: quota keys are date-stamped by UTC day, so rollover is automatic;
-        // a per-instance sweep would wipe the shared keyspace repeatedly
+        // no-op: quota keys are stamped by UTC day, a per-instance sweep would wipe the shared
+        // keyspace
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
@@ -288,8 +292,7 @@ impl Governance for RedisGovernance {
 }
 
 /// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
-/// rollover is implicit and identical across replicas. Callers pass the
-/// admission time so a reserve and its settle hit the same day.
+/// callers pass the admission time so a reserve and its settle hit the same day.
 fn tpm_key(key: &str) -> String {
     format!("gw:tpm:{key}")
 }
@@ -303,26 +306,26 @@ fn quota_key(key: &str) -> String {
     quota_key_at(key, crate::epoch_secs())
 }
 
-/// Apply a settle delta and floor at 0 in one atomic step, so a reset or window
-/// rollover between reserve and settle can't plant a negative value that
-/// over-admits. Preserves an existing TTL (KEEPTTL across the floor), arming
-/// `window` when none is set.
+/// Apply a settle delta and floor at 0 atomically (a rollover between reserve
+/// and settle must not plant a negative); keeps an existing TTL, arms `window` otherwise.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,
     delta: i64,
     window: Duration,
 ) {
+    static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+        redis::Script::new(
+            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+             if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
+             if redis.call('PTTL', KEYS[1]) < 0 then
+               redis.call('PEXPIRE', KEYS[1], ARGV[2])
+             end
+             return v",
+        )
+    });
     let mut conn = conn.clone();
-    let script = redis::Script::new(
-        "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-         if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
-         if redis.call('PTTL', KEYS[1]) < 0 then
-           redis.call('PEXPIRE', KEYS[1], ARGV[2])
-         end
-         return v",
-    );
-    if let Err(e) = script
+    if let Err(e) = SCRIPT
         .key(key)
         .arg(delta)
         .arg(window.as_millis() as i64)

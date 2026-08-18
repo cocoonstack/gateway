@@ -111,11 +111,17 @@ models:
     provider: openai
     input_price_per_1k_micros: 150
     output_price_per_1k_micros: 600
+    batch_discount: 0.5 # /v1/batches items at half price (OpenAI batch pricing)
   - name: claude-sonnet
     protocol: anthropic-messages
     input_price_per_1k_micros: 3000
     output_price_per_1k_micros: 15000
-    token_rate: {read_cache: 0.1, write_cache: 1.25} # Anthropic cache pricing
+    token_rate: {read_cache: 0.1, write_cache: 1.25, write_cache_1h: 2.0} # Anthropic cache pricing
+  - name: claude-longctx # e2e: long-context tier — past 8 prompt tokens the call bills 2x/1.5x
+    protocol: anthropic-messages
+    input_price_per_1k_micros: 3000
+    output_price_per_1k_micros: 15000
+    long_context: {threshold_tokens: 8, prompt_weight: 2.0, completion_weight: 1.5}
   - name: gemini-pro
     protocol: gemini
     input_price_per_1k_micros: 1250
@@ -126,10 +132,13 @@ models:
     output_price_per_1k_micros: 0
   - name: dall-e-3 # image family
     protocol: image
+    unit_price_micros: 40000 # per image
   - name: tts-1 # audio tts family
     protocol: tts
+    unit_price_micros: 15 # per input character
   - name: whisper-1 # audio stt family
     protocol: stt
+    unit_price_micros: 100 # per audio second
   - name: kling-video # video family
     protocol: video
   - name: brave-search # search family

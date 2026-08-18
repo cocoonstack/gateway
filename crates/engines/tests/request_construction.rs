@@ -41,13 +41,27 @@ impl RecordingTransport {
     fn url(&self) -> String {
         self.seen.lock().unwrap().as_ref().unwrap().url.clone()
     }
+    fn body_form(&self) -> (String, String) {
+        let g = self.seen.lock().unwrap();
+        let req = g.as_ref().expect("engine sent a request");
+        let content_type = req
+            .headers
+            .iter()
+            .find(|(k, _)| *k == "content-type")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        (
+            content_type,
+            String::from_utf8_lossy(&req.body).into_owned(),
+        )
+    }
     fn header(&self, name: &str) -> Option<String> {
         let g = self.seen.lock().unwrap();
         g.as_ref()
             .unwrap()
             .headers
             .iter()
-            .find(|(k, _)| k == name)
+            .find(|(k, _)| *k == name)
             .map(|(_, v)| v.clone())
     }
 }
@@ -59,6 +73,7 @@ impl Transport for RecordingTransport {
         Ok(UpstreamResponse {
             status: 200,
             body: UpstreamBody::Json(bytes::Bytes::from(self.reply.clone())),
+            headers: Default::default(),
         })
     }
 }
@@ -151,6 +166,23 @@ async fn anthropic_request_shape() {
         Some("application/json")
     );
     assert_eq!(t.header("anthropic-version").as_deref(), Some("2023-06-01"));
+
+    let t = RecordingTransport::new(
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            stop: Some(serde_json::json!("5")),
+            ..Default::default()
+        }));
+    }
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["stop_sequences"],
+        serde_json::json!(["5"]),
+        "OpenAI's string stop becomes Anthropic's array"
+    );
 }
 
 #[tokio::test]
@@ -328,8 +360,13 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         .header("authorization")
         .expect("sigv4 authorization header");
     assert!(
-        auth.contains("Credential=AKIAREALEXAMPLE123/"),
-        "SigV4 must sign with the real access key, got: {auth}"
+        auth.contains("Credential=AKIAREALEXAMPLE123/") && auth.contains("/eu-west-1/bedrock/"),
+        "SigV4 must sign with the real access key in the endpoint's region, got: {auth}"
+    );
+    assert!(
+        t.url().ends_with("/model/cohere.command-r/invoke"),
+        "url: {}",
+        t.url()
     );
     assert!(
         !auth.contains("AKIDMOCK"),
@@ -399,6 +436,7 @@ async fn responses_api_forwards_native_body() {
         r#"{"id":"resp_1","object":"response","model":"gpt-5","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#,
     );
     let mut req = GatewayRequest {
+        preserve_responses_wire: true,
         model_param_v2: Some(ModelParamV2::with_name(Protocol::Responses, "gpt-5")),
         ..Default::default()
     };
@@ -454,10 +492,31 @@ async fn ernie_request_shape() {
     assert_eq!(b["messages"][0]["role"], "user");
     assert_eq!(b["messages"][0]["content"], "hello");
     assert!(t.url().contains("wenxinworkshop"), "url: {}", t.url());
+    assert!(t.url().contains("?access_token=mock"), "url: {}", t.url());
     assert_eq!(
         t.header("content-type").as_deref(),
         Some("application/json")
     );
+
+    // a Qianfan v2 API key travels as Bearer, never in the query
+    let var = "GW_TEST_QIANFAN_V2_KEY";
+    // SAFETY: the var name is unique to this test and nothing reads it concurrently.
+    unsafe { std::env::set_var(var, "bce-v3/ALTAK-x/secret") };
+    let t = RecordingTransport::new(r#"{"result":"ok","usage":{}}"#);
+    let mut req = chat_req(Protocol::Ernie, "completions_pro");
+    req.account = Some(Arc::new(gw_models::Account {
+        endpoint: "https://aip.baidubce.com".into(),
+        api_key_env: var.into(),
+        ..Default::default()
+    }));
+    let _ = ErnieEngine::new(req, t.clone()).run().await.unwrap();
+    assert!(!t.url().contains("access_token"), "url: {}", t.url());
+    assert_eq!(
+        t.header("authorization").as_deref(),
+        Some("Bearer bce-v3/ALTAK-x/secret")
+    );
+    // SAFETY: same unique var; no concurrent reader.
+    unsafe { std::env::remove_var(var) };
 }
 
 #[tokio::test]
@@ -490,10 +549,13 @@ async fn system_prompt_reaches_every_bespoke_wire() {
     let cohere = RecordingTransport::new(
         r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
-    CohereEngine::new(chat_req(Protocol::AwsCohere, "command-r"), cohere.clone())
-        .run()
-        .await
-        .unwrap();
+    CohereEngine::new(
+        chat_req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
+        cohere.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
     let cb = cohere.body_json();
     assert_eq!(cb["preamble"], "be brief", "cohere system slot");
     assert!(
@@ -570,10 +632,13 @@ async fn cohere_request_shape_with_sigv4() {
     let t = RecordingTransport::new(
         r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
-    let _ = CohereEngine::new(chat_req(Protocol::AwsCohere, "command-r"), t.clone())
-        .run()
-        .await
-        .unwrap();
+    let _ = CohereEngine::new(
+        chat_req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
     let b = t.body_json();
     assert_eq!(b["message"], "hello");
     assert!(b["chat_history"].is_array());
@@ -591,20 +656,40 @@ async fn llama_request_shape_with_sigv4() {
     let t = RecordingTransport::new(
         r#"{"generation":"ok","prompt_token_count":1,"generation_token_count":1,"stop_reason":"stop"}"#,
     );
-    let _ = LlamaEngine::new(chat_req(Protocol::AwsLlama, "llama3-70b"), t.clone())
-        .run()
-        .await
-        .unwrap();
+    let _ = LlamaEngine::new(
+        chat_req(Protocol::AwsLlama, "meta.llama3-70b-instruct-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
     let b = t.body_json();
-    assert!(
-        b["prompt"].as_str().unwrap().contains("hello"),
-        "prompt: {}",
-        b["prompt"]
+    assert_eq!(
+        b["prompt"],
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nbe brief<|eot_id|>\
+         <|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n\n",
+        "the Llama 3 chat template is rendered into the raw prompt"
     );
     assert!(
         t.header("authorization")
             .unwrap()
             .starts_with("AWS4-HMAC-SHA256")
+    );
+
+    let t = RecordingTransport::new(r#"{"generation":"ok","stop_reason":"stop"}"#);
+    let _ = LlamaEngine::new(
+        chat_req(Protocol::AwsLlama, "us.meta.llama4-scout-17b-instruct-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
+    assert!(
+        t.body_json()["prompt"].as_str().unwrap().starts_with(
+            "<|begin_of_text|><|header_start|>system<|header_end|>\n\nbe brief<|eot|>"
+        ),
+        "Llama 4 renames the header tokens"
     );
 }
 
@@ -697,10 +782,15 @@ async fn image_edit_routes_to_edits_endpoint() {
         }),
     );
     let _ = ImageEngine::new(req, t.clone()).run().await.unwrap();
-    let b = t.body_json();
-    assert_eq!(b["prompt"], "add a hat");
-    assert_eq!(b["image"], "c3JjaW1n");
-    assert_eq!(b["mask"], "bWFzaw==");
+    let (content_type, body) = t.body_form();
+    assert!(content_type.starts_with("multipart/form-data; boundary=gw-"));
+    assert!(body.contains("name=\"prompt\"\r\n\r\nadd a hat\r\n"));
+    assert!(body.contains(
+        "name=\"image\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\nsrcimg\r\n"
+    ));
+    assert!(body.contains(
+        "name=\"mask\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\nmask\r\n"
+    ));
     assert!(t.url().ends_with("/images/edits"), "url: {}", t.url());
 }
 
@@ -744,9 +834,13 @@ async fn stt_request_shape() {
         .run()
         .await
         .unwrap();
-    let b = t.body_json();
-    assert_eq!(b["model"], "whisper-1");
-    assert_eq!(b["audio_b64"], "TU9DSw==");
+    let (content_type, body) = t.body_form();
+    assert!(content_type.starts_with("multipart/form-data; boundary=gw-"));
+    assert!(body.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"));
+    assert!(body.contains("name=\"language\"\r\n\r\nen\r\n"));
+    assert!(body.contains(
+        "name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\nMOCK\r\n"
+    ));
     assert!(
         t.url().ends_with("/audio/transcriptions"),
         "url: {}",
@@ -1158,6 +1252,25 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         assert_eq!(b["reasoning_effort"], want);
         assert!(b.get("thinking").is_none() && b.get("output_config").is_none());
     }
+    for (budget, want) in [
+        (1024, "low"),
+        (4096, "medium"),
+        (16384, "high"),
+        (24576, "xhigh"),
+        (32768, "max"),
+    ] {
+        let t = RecordingTransport::new(OPENAI_OK);
+        let req = reasoning_req(
+            Protocol::OpenaiChat,
+            "gpt-5",
+            gw_models::ReasoningParam {
+                thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":budget})),
+                ..Default::default()
+            },
+        );
+        let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        assert_eq!(t.body_json()["reasoning_effort"], want, "budget {budget}");
+    }
 
     let t = RecordingTransport::new(OPENAI_OK);
     let mut req = reasoning_req(
@@ -1253,4 +1366,140 @@ async fn openai_history_replays_reasoning_and_folds_native_thinking_blocks() {
     assert_eq!(messages[7]["role"], "user");
     assert_eq!(messages[7]["content"][0]["text"], "thanks, and in Paris?");
     assert_eq!(messages.len(), 8);
+}
+
+#[tokio::test]
+async fn image_parts_cross_the_wires() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-fable-5");
+    let mut msg = ChatMsg::text("user", "what is this?");
+    msg.parts = Some(serde_json::json!([
+        {"type":"text","text":"what is this?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+    ]));
+    req.message = vec![msg];
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["messages"][0]["content"][1],
+        serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}})
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4o-mini");
+    let mut msg = ChatMsg::text("user", "what is this?");
+    msg.parts = Some(serde_json::json!([
+        {"type":"text","text":"what is this?"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+    ]));
+    req.message = vec![msg];
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["messages"][0]["content"][1],
+        serde_json::json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}})
+    );
+}
+
+#[tokio::test]
+async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
+    let t = RecordingTransport::new(
+        r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#,
+    );
+    let mut req = chat_req(
+        Protocol::AwsAnthropic,
+        "anthropic.claude-3-haiku-20240307-v1:0",
+    );
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            max_tokens: Some(64),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"model": "smuggled", "stream": true, "top_k": 3});
+    }
+    let out = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(out.response.message, "ok");
+    assert_eq!(out.response.prompt_tokens, 3);
+    let b = t.body_json();
+    assert_eq!(b["anthropic_version"], "bedrock-2023-05-31");
+    assert!(b.get("model").is_none() && b.get("stream").is_none(), "{b}");
+    assert_eq!(b["top_k"], 3);
+    assert_eq!(b["system"], "be brief");
+    assert_eq!(b["max_tokens"], 64);
+    assert!(
+        t.url()
+            .ends_with("/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
+        "url: {}",
+        t.url()
+    );
+    let auth = t.header("authorization").expect("sigv4");
+    assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential="), "{auth}");
+    assert_eq!(
+        t.header("content-type").as_deref(),
+        Some("application/json")
+    );
+
+    let t = RecordingTransport::new("{}");
+    let mut req = chat_req(Protocol::AwsAnthropic, "anthropic.claude-sonnet-5-v1:0");
+    req.stream = true;
+    let _ = ClaudeEngine::new(req, t.clone()).run().await;
+    assert!(
+        t.url()
+            .ends_with("/model/anthropic.claude-sonnet-5-v1:0/invoke-with-response-stream"),
+        "url: {}",
+        t.url()
+    );
+    assert!(t.body_json().get("stream").is_none());
+}
+
+#[tokio::test]
+async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
+    let t = RecordingTransport::new(
+        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AwsConverse, "us.meta.llama3-3-70b-instruct-v1:0");
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            max_tokens: Some(64),
+            temperature: Some(0.1),
+            ..Default::default()
+        }));
+    }
+    let out = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(out.response.message, "ok");
+    assert_eq!(out.response.prompt_tokens, 3);
+    let b = t.body_json();
+    assert_eq!(b["system"], serde_json::json!([{"text": "be brief"}]));
+    assert_eq!(b["messages"][0]["content"][0]["text"], "hello");
+    assert_eq!(
+        b["inferenceConfig"],
+        serde_json::json!({"maxTokens": 64, "temperature": 0.1})
+    );
+    assert!(b.get("anthropic_version").is_none() && b.get("model").is_none());
+    assert!(
+        t.url()
+            .ends_with("/model/us.meta.llama3-3-70b-instruct-v1:0/converse"),
+        "url: {}",
+        t.url()
+    );
+}
+
+#[tokio::test]
+async fn native_system_blocks_keep_the_clients_cache_control() {
+    let t = RecordingTransport::new(
+        r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.prompt_cache = true;
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.raw = serde_json::json!({"system": [
+            {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+        ]});
+    }
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["system"],
+        serde_json::json!([{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
+        "the client's breakpoint and ttl survive; prompt_cache adds none on top"
+    );
 }

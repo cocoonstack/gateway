@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gw_models::{GResult, GatewayError};
 use serde_json::Value;
 
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use crate::transport::{Headers, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
@@ -42,12 +42,34 @@ impl Base {
 
     /// The go-live seam: the account's configured endpoint when set, else the
     /// `mock_sentinel` (offline — MockTransport routes by the path in it).
-    pub fn base_url(&self, mock_sentinel: &str) -> String {
+    pub fn base_url<'a>(&'a self, mock_sentinel: &'a str) -> &'a str {
         self.request
             .account
             .as_ref()
-            .map(|a| a.base_url(mock_sentinel).to_owned())
-            .unwrap_or_else(|| mock_sentinel.to_owned())
+            .map_or(mock_sentinel, |a| a.base_url(mock_sentinel))
+    }
+
+    /// An OpenAI-family endpoint URL: `{base}/v1/{path}`, or `{base}/{path}`
+    /// when the configured base already names its API version (Qianfan's
+    /// `/v2`, a relay's `/compatible-mode/v1`).
+    pub fn openai_url(&self, mock_sentinel: &str, path: &str) -> String {
+        let base = self.base_url(mock_sentinel);
+        let versioned = base.rsplit('/').next().is_some_and(|segment| {
+            segment.len() > 1
+                && segment.starts_with('v')
+                && segment[1..].bytes().all(|b| b.is_ascii_digit())
+        });
+        if versioned {
+            format!("{base}/{path}")
+        } else {
+            format!("{base}/v1/{path}")
+        }
+    }
+
+    /// `{base}/v1/{path}` for the generic vendor families (search, rerank,
+    /// video, passthrough) — the mock sentinel is theirs to share.
+    pub fn vendor_url(&self, path: &str) -> String {
+        self.openai_url("mock://api.vendor.com", path)
     }
 
     /// The account's API key (read from its env var at call time when live),
@@ -66,6 +88,16 @@ impl Base {
             .account
             .as_ref()
             .and_then(|a| a.aws_credentials())
+    }
+
+    /// A Bedrock API key (bearer auth): an AWS account configured with
+    /// `api_key_env` alone, no secret key.
+    pub fn bedrock_bearer(&self) -> Option<String> {
+        self.request
+            .account
+            .as_ref()
+            .filter(|a| a.secret_key_env.is_empty())
+            .and_then(|a| a.api_key())
     }
 
     /// Move the raw passthrough bag out (single-use — the run(&mut self) contract).
@@ -131,10 +163,10 @@ impl Base {
 
     /// Bearer auth headers (the OpenAI-shaped families); real key when the
     /// account is live, inert "mock" otherwise.
-    pub fn bearer_headers(&self) -> Vec<(String, String)> {
+    pub fn bearer_headers(&self) -> Headers {
         vec![
-            ("content-type".into(), "application/json".into()),
-            ("authorization".into(), format!("Bearer {}", self.api_key())),
+            ("content-type", "application/json".into()),
+            ("authorization", format!("Bearer {}", self.api_key())),
         ]
     }
 
@@ -143,7 +175,7 @@ impl Base {
     pub async fn send_upstream(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -158,7 +190,7 @@ impl Base {
     pub async fn send_upstream_raw(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -171,14 +203,14 @@ impl Base {
     pub async fn send_bytes(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Vec<u8>,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
         let param = self.param()?;
         let up = UpstreamRequest {
             protocol: param.protocol,
-            method: "POST".to_owned(),
+            method: "POST",
             url: url.to_owned(),
             headers,
             body,
@@ -198,7 +230,7 @@ impl Base {
     pub async fn round_trip_with(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
     ) -> GResult<(u16, Value)> {
         let reply = self.send_upstream(url, headers, body, false).await?;
@@ -211,7 +243,7 @@ impl Base {
     pub async fn post_raw(
         &mut self,
         url: &str,
-        mut headers: Vec<(String, String)>,
+        mut headers: Headers,
         mut body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -227,29 +259,11 @@ impl Base {
     pub async fn post_json(
         &mut self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
     ) -> GResult<(u16, Value)> {
         let reply = self
             .post_raw(url, headers, body, false)
-            .await?
-            .buffered()
-            .await?;
-        parse_json_reply(reply)
-    }
-
-    /// [`Self::send_bytes`] + buffer + parse for a pre-serialized body (no raw
-    /// merge — the caller already folded extras in before signing/sending).
-    /// The ensured content-type is an unsigned header on the AWS engines.
-    pub async fn post_json_bytes(
-        &self,
-        url: &str,
-        mut headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    ) -> GResult<(u16, Value)> {
-        ensure_json_content_type(&mut headers);
-        let reply = self
-            .send_bytes(url, headers, body, false)
             .await?
             .buffered()
             .await?;
@@ -273,19 +287,18 @@ pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, 
     }
 }
 
-fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
+fn ensure_json_content_type(headers: &mut Headers) {
     if !headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
     {
-        headers.insert(0, ("content-type".into(), "application/json".into()));
+        headers.insert(0, ("content-type", "application/json".into()));
     }
 }
 
 /// Decode a buffered JSON reply, surfacing vendor error envelopes instead of
-/// parsing them as broken success (bespoke engines add their own vendor-
-/// specific checks, e.g. minimax base_resp, on top of this).
-fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)> {
+/// parsing them as broken success.
+pub(crate) fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)> {
     let bytes = match &reply.body {
         UpstreamBody::Json(b) => b,
         UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
@@ -322,3 +335,57 @@ macro_rules! base_engine {
     };
 }
 pub(crate) use base_engine;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gw_consts::Protocol;
+    use gw_models::{Account, GatewayRequest, ModelParamV2};
+
+    use super::*;
+
+    fn base_with_endpoint(endpoint: &str) -> Base {
+        Base::new(
+            GatewayRequest {
+                account: Some(Arc::new(Account {
+                    endpoint: endpoint.to_owned(),
+                    ..Default::default()
+                })),
+                model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "m")),
+                ..Default::default()
+            },
+            Arc::new(crate::transport::MockTransport),
+        )
+    }
+
+    #[test]
+    fn openai_url_respects_a_versioned_base() {
+        for (endpoint, want) in [
+            ("", "mock://api.openai.com/v1/chat/completions"),
+            (
+                "https://api.deepseek.com/",
+                "https://api.deepseek.com/v1/chat/completions",
+            ),
+            (
+                "https://qianfan.baidubce.com/v2",
+                "https://qianfan.baidubce.com/v2/chat/completions",
+            ),
+            (
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                "https://relay.example/vendor",
+                "https://relay.example/vendor/v1/chat/completions",
+            ),
+        ] {
+            assert_eq!(
+                base_with_endpoint(endpoint)
+                    .openai_url("mock://api.openai.com", "chat/completions"),
+                want,
+                "{endpoint}"
+            );
+        }
+    }
+}

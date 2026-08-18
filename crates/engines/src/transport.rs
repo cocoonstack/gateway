@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use gw_consts::Protocol;
 use gw_models::{GResult, GatewayError, StreamError};
+pub use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 
 /// Fixed "created" timestamp for deterministic mock payloads.
@@ -16,13 +17,16 @@ pub const MOCK_CREATED: i64 = 1_720_000_000;
 pub const MOCK_B64: &str = "TU9DS0JZVEVT"; // "MOCKBYTES"
 pub(crate) const DEFAULT_CONNECT_RETRIES: u32 = 1;
 
+/// Wire headers an engine attaches; names are always literals.
+pub type Headers = Vec<(&'static str, String)>;
+
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
     pub protocol: Protocol,
-    pub method: String,
+    pub method: &'static str,
     pub url: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Headers,
     pub body: Vec<u8>,
     pub stream: bool,
     /// upstream account slot handling this call (used by failover/downtime simulation).
@@ -96,6 +100,8 @@ impl std::fmt::Debug for UpstreamBody {
 pub struct UpstreamResponse {
     pub status: u16,
     pub body: UpstreamBody,
+    /// Response headers, moved out of the HTTP reply (empty on the mock).
+    pub headers: HeaderMap,
 }
 
 impl UpstreamResponse {
@@ -140,10 +146,8 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 
 pub type SharedTransport = Arc<dyn Transport>;
 
-/// Deterministic fake vendor: parses the engine-built request body (so request
-/// construction is exercised too) and answers in the vendor's wire shape,
-/// routed by URL path segment. An account whose name contains "down" gets a
-/// 503 — the DAG failover trigger.
+/// Deterministic fake vendor: parses the engine-built body and answers in the
+/// vendor's wire shape; an account named "…down…" gets a 503 (the failover trigger).
 #[derive(Debug, Default)]
 pub struct MockTransport;
 
@@ -151,6 +155,14 @@ impl MockTransport {
     /// Deterministic pseudo token count: ~1 token per 4 chars, min 1.
     fn tokens(s: &str) -> i64 {
         ((s.chars().count() as i64) / 4).max(1)
+    }
+
+    fn sys_note(sys: &str) -> String {
+        if sys.is_empty() {
+            String::new()
+        } else {
+            format!("[sys:{sys}] ")
+        }
     }
 
     fn last_user_text(messages: &[Value]) -> String {
@@ -181,6 +193,7 @@ impl MockTransport {
         Ok(UpstreamResponse {
             status: 200,
             body: UpstreamBody::Json(bytes::Bytes::from(v.to_string())),
+            headers: HeaderMap::new(),
         })
     }
 
@@ -224,6 +237,7 @@ impl MockTransport {
                 return Ok(UpstreamResponse {
                     status: 200,
                     body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
+                    headers: HeaderMap::new(),
                 });
             }
             return Self::ok_json(json!({
@@ -251,6 +265,7 @@ impl MockTransport {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
+                headers: HeaderMap::new(),
             })
         } else {
             Self::ok_json(json!({
@@ -289,12 +304,7 @@ impl MockTransport {
         let body = Self::parse(&req.body, "anthropic")?;
         let model = body["model"].as_str().unwrap_or("mock-claude");
         let user = Self::last_user_text(body["messages"].as_array().unwrap_or(&vec![]));
-        let sys = body["system"].as_str().unwrap_or_default();
-        let sys_note = if sys.is_empty() {
-            String::new()
-        } else {
-            format!("[sys:{sys}] ")
-        };
+        let sys_note = Self::sys_note(body["system"].as_str().unwrap_or_default());
         let reply = format!("[mock-anthropic:{model}] {sys_note}you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
 
@@ -328,6 +338,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
+                headers: HeaderMap::new(),
             });
         }
 
@@ -345,9 +356,7 @@ impl MockTransport {
         let reply = format!("[mock-dashscope] you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         if req.stream {
-            // real wire: LF framing, `data:` without a space, id:/event:/comment
-            // lines, finish_reason the literal string "null" until the final
-            // frame, usage cumulative per frame
+            // real wire: LF framing, `data:` sans space, id:/event: lines, "null" finish_reason
             let (a, b) = Self::split_half(&reply);
             let frame = |i: usize, content: &str, fr: &str, out: i64| {
                 format!(
@@ -367,6 +376,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(sse.into_bytes()),
+                headers: HeaderMap::new(),
             });
         }
         Self::ok_json(json!({
@@ -404,6 +414,151 @@ impl MockTransport {
             "usage": {"total_tokens": Self::tokens(user) + Self::tokens(&reply) + 3},
             "base_resp": {"status_code": 0, "status_msg": ""}
         }))
+    }
+
+    /// Bedrock InvokeModel by request protocol; a stream request answers in
+    /// the EventStream wire (`chunk` events carrying the family's frames).
+    fn bedrock_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        if req.protocol == Protocol::AwsConverse {
+            return self.converse_reply(req);
+        }
+        let reply = match req.protocol {
+            Protocol::AwsAnthropic => self.anthropic_reply(req)?,
+            Protocol::AwsCohere => self.cohere_reply(req)?,
+            Protocol::AwsLlama => self.llama_reply(req)?,
+            _ => return Err(GatewayError::internal("mock bedrock protocol")),
+        };
+        if !req.stream {
+            return Ok(reply);
+        }
+        let frames: Vec<Vec<u8>> = match reply.body {
+            UpstreamBody::Sse(bytes) => crate::sse::SseDecoder::decode_all(&bytes)
+                .map_err(GatewayError::internal)?
+                .0
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            UpstreamBody::Json(bytes) => {
+                let mut v: Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| GatewayError::internal("mock bedrock reply").with_source(e))?;
+                if v.get("generation").is_some() {
+                    let text = v["generation"].as_str().unwrap_or_default().to_owned();
+                    let (a, b) = Self::split_half(&text);
+                    vec![
+                        json!({"generation": a, "prompt_token_count": v["prompt_token_count"],
+                               "generation_token_count": null, "stop_reason": null}),
+                        json!({"generation": b, "prompt_token_count": null,
+                               "generation_token_count": v["generation_token_count"],
+                               "stop_reason": "stop"}),
+                    ]
+                } else if v.get("text").is_some() {
+                    let text = v["text"].as_str().unwrap_or_default().to_owned();
+                    let (a, b) = Self::split_half(&text);
+                    vec![
+                        json!({"is_finished": false, "event_type": "text-generation", "text": a}),
+                        json!({"is_finished": false, "event_type": "text-generation", "text": b}),
+                        json!({"is_finished": true, "event_type": "stream-end",
+                               "finish_reason": "COMPLETE",
+                               "amazon-bedrock-invocationMetrics": {
+                                   "inputTokenCount": v["meta"]["tokens"]["input_tokens"].take(),
+                                   "outputTokenCount": v["meta"]["tokens"]["output_tokens"].take()}}),
+                    ]
+                } else {
+                    // a JSON answer to a stream request (the tool-use reply) stays JSON
+                    return Ok(UpstreamResponse {
+                        status: reply.status,
+                        body: UpstreamBody::Json(bytes),
+                        headers: reply.headers,
+                    });
+                }
+                .into_iter()
+                .map(|f| f.to_string().into_bytes())
+                .collect()
+            }
+            UpstreamBody::SseStream(_) => Vec::new(),
+        };
+        let mut wire = Vec::new();
+        for frame in frames {
+            wire.extend(crate::eventstream::encode_event(
+                "chunk",
+                &crate::eventstream::chunk_payload(&frame),
+            ));
+        }
+        Ok(UpstreamResponse {
+            status: 200,
+            body: UpstreamBody::SseStream(Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from(wire))
+            }))),
+            headers: reply.headers,
+        })
+    }
+
+    /// Bedrock Converse: `{system, messages[{role, content[{text}]}], toolConfig}`
+    /// → `{output.message, stopReason, usage}`; a stream is the typed
+    /// EventStream sequence (messageStart … metadata).
+    fn converse_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let body = Self::parse(&req.body, "converse")?;
+        let model = req
+            .url
+            .rsplit("/model/")
+            .next()
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("mock");
+        let user = body["messages"]
+            .as_array()
+            .and_then(|ms| ms.iter().rev().find(|m| m["role"] == "user"))
+            .and_then(|m| m["content"][0]["text"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let sys_note = Self::sys_note(body["system"][0]["text"].as_str().unwrap_or_default());
+        let reply = format!("[mock-converse:{model}] {sys_note}you said: {user}");
+        let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
+        if let Some(tool) = body["toolConfig"]["tools"][0]["toolSpec"]["name"].as_str() {
+            return Self::ok_json(json!({
+                "output": {"message": {"role": "assistant", "content": [
+                    {"toolUse": {"toolUseId": "tu-mock-1", "name": tool, "input": {"echo": user}}}]}},
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": it, "outputTokens": ot, "totalTokens": it + ot}
+            }));
+        }
+        if !req.stream {
+            return Self::ok_json(json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": reply}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": it, "outputTokens": ot, "totalTokens": it + ot}
+            }));
+        }
+        let (a, b) = Self::split_half(&reply);
+        let mut wire = Vec::new();
+        for (event_type, payload) in [
+            ("messageStart", json!({"role": "assistant"})),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0, "delta": {"text": a}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0, "delta": {"text": b}}),
+            ),
+            ("contentBlockStop", json!({"contentBlockIndex": 0})),
+            ("messageStop", json!({"stopReason": "end_turn"})),
+            (
+                "metadata",
+                json!({"usage": {"inputTokens": it, "outputTokens": ot, "totalTokens": it + ot}}),
+            ),
+        ] {
+            wire.extend(crate::eventstream::encode_event(
+                event_type,
+                payload.to_string().as_bytes(),
+            ));
+        }
+        Ok(UpstreamResponse {
+            status: 200,
+            body: UpstreamBody::SseStream(Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from(wire))
+            }))),
+            headers: HeaderMap::new(),
+        })
     }
 
     fn cohere_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
@@ -456,6 +611,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
+                headers: HeaderMap::new(),
             });
         }
         Self::ok_json(json!({
@@ -473,7 +629,6 @@ impl MockTransport {
             Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
             _ => vec![],
         };
-        // deterministic 8-dim vector from byte sums
         let data: Vec<Value> = inputs
             .iter()
             .enumerate()
@@ -493,10 +648,27 @@ impl MockTransport {
     }
 
     fn image_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "image")?;
-        let n = body["n"].as_i64().unwrap_or(1).clamp(1, 4);
+        // edits arrive as multipart; the `n` text part is the only field read
+        let n = if req.body.starts_with(b"--") {
+            Self::form_field(&req.body, "n")
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(1)
+        } else {
+            Self::parse(&req.body, "image")?["n"].as_i64().unwrap_or(1)
+        }
+        .clamp(1, 4);
         let data: Vec<Value> = (0..n).map(|_| json!({"b64_json": MOCK_B64})).collect();
         Self::ok_json(json!({"created": MOCK_CREATED, "data": data}))
+    }
+
+    /// A text field of a multipart body: the bytes between the part header's
+    /// blank line and the next CRLF.
+    fn form_field<'a>(body: &'a [u8], name: &str) -> Option<&'a str> {
+        let text = std::str::from_utf8(body).ok()?;
+        let marker = format!("name=\"{name}\"\r\n\r\n");
+        let start = text.find(&marker)? + marker.len();
+        let end = text[start..].find("\r\n")? + start;
+        Some(&text[start..end])
     }
 
     fn moderations_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
@@ -506,7 +678,6 @@ impl MockTransport {
             .map(|arr| {
                 arr.iter()
                     .map(|i| {
-                        // deterministic: the literal token "unsafe" flags
                         let flagged = i.as_str().is_some_and(|s| s.contains("unsafe"));
                         json!({"flagged": flagged, "categories": {"unsafe": flagged}})
                     })
@@ -525,7 +696,6 @@ impl MockTransport {
                 arr.iter()
                     .enumerate()
                     .map(|(i, d)| {
-                        // deterministic relevance: shared-word count with the query
                         let doc = d.as_str().unwrap_or_default().to_lowercase();
                         let hits = query.split_whitespace().filter(|w| doc.contains(w)).count();
                         (i, hits as f64)
@@ -547,14 +717,17 @@ impl MockTransport {
     }
 
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "audio")?;
         if req.url.ends_with("/audio/transcriptions") {
-            Self::ok_json(
-                json!({"text": "[mock-stt] transcribed audio", "language": body["language"]}),
-            )
+            let language = Self::form_field(&req.body, "language");
+            return Self::ok_json(json!({
+                "text": "[mock-stt] transcribed audio", "language": language,
+                "usage": {"type": "duration", "seconds": 5}
+            }));
         } else if req.url.ends_with("/audio/translations") {
-            Self::ok_json(json!({"text": "[mock-stt] translated audio"}))
-        } else if req.url.ends_with("/audio/speech") {
+            return Self::ok_json(json!({"text": "[mock-stt] translated audio"}));
+        }
+        let body = Self::parse(&req.body, "audio")?;
+        if req.url.ends_with("/audio/speech") {
             let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
             Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
         } else {
@@ -611,7 +784,6 @@ impl MockTransport {
     /// output_text content; usage uses the Responses input/output dialect.
     fn responses_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "responses")?;
-        // `input` may be a plain string or an array of input items.
         let input: std::borrow::Cow<str> = match &body["input"] {
             Value::String(s) => s.as_str().into(),
             Value::Array(items) => items
@@ -649,6 +821,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
+                headers: HeaderMap::new(),
             });
         }
         Self::ok_json(json!({
@@ -669,7 +842,7 @@ impl MockTransport {
 #[async_trait::async_trait]
 impl Transport for MockTransport {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
-        // downtime simulation: account name containing "down" → upstream 503 (triggers DAG failover)
+        // an account named …down… answers 503 (the DAG failover trigger)
         if req.account.contains("down") {
             return Err(GatewayError::new(
                 gw_consts::ErrCode::FED_RESP_RPC_FAILED,
@@ -685,7 +858,9 @@ impl Transport for MockTransport {
             }));
         }
         let u = req.url.as_str();
-        if u.contains("dashscope") {
+        if u.contains("/model/") {
+            self.bedrock_reply(&req)
+        } else if u.contains("dashscope") {
             self.dashscope_reply(&req)
         } else if u.contains("wenxinworkshop") {
             self.ernie_reply(&req)

@@ -35,16 +35,11 @@ pub struct MessagesRequest {
 }
 
 impl MessagesRequest {
-    /// Flatten the system prompt (string or text blocks) to plain text.
-    pub fn system_text(&self) -> Option<String> {
-        let sys = self.system.as_ref()?;
-        let text = match sys {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|b| b["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(""),
+    /// Take the system prompt (string or text blocks) as plain text.
+    pub fn system_text(&mut self) -> Option<String> {
+        let text = match self.system.take()? {
+            Value::String(s) => s,
+            Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect(),
             _ => return None,
         };
         (!text.is_empty()).then_some(text)
@@ -78,10 +73,54 @@ pub struct AnthUsage {
     pub cache_creation_input_tokens: i64,
 }
 
-/// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
-/// Anthropic `tool_use` content blocks. `arguments` is a JSON string on the
-/// OpenAI wire; it parses into the block's structured `input` (kept verbatim
-/// when unparseable). Entries without a `function` object are skipped.
+/// An OpenAI `image_url` part as an Anthropic `image` block (data URI → base64
+/// source, else URL source); other parts pass through.
+pub fn image_url_to_image(mut part: Value) -> Value {
+    if part["type"] != "image_url" {
+        return part;
+    }
+    let url = match part["image_url"].get_mut("url").map(Value::take) {
+        Some(Value::String(url)) => url,
+        _ => return part,
+    };
+    let source = match url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+    {
+        Some((media_type, data)) => {
+            serde_json::json!({"type": "base64", "media_type": media_type, "data": data})
+        }
+        None => serde_json::json!({"type": "url", "url": url}),
+    };
+    serde_json::json!({"type": "image", "source": source})
+}
+
+/// Inverse of [`image_url_to_image`]: an Anthropic `image` block as an OpenAI
+/// `image_url` part (base64 sources become data URIs).
+pub fn image_to_image_url(mut block: Value) -> Value {
+    if block["type"] != "image" {
+        return block;
+    }
+    let source = block["source"].take();
+    let url = match source["type"].as_str() {
+        Some("base64") => format!(
+            "data:{};base64,{}",
+            source["media_type"].as_str().unwrap_or("image/png"),
+            source["data"].as_str().unwrap_or_default()
+        ),
+        _ => match source.get("url").and_then(Value::as_str) {
+            Some(url) => url.to_owned(),
+            None => {
+                block["source"] = source;
+                return block;
+            }
+        },
+    };
+    serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+}
+
+/// OpenAI-shaped tool calls as Anthropic `tool_use` blocks; the `arguments`
+/// string parses into `input` (kept verbatim when unparseable).
 pub fn tool_calls_to_tool_use(calls: Vec<Value>) -> Vec<Value> {
     calls
         .into_iter()
@@ -104,8 +143,7 @@ pub fn tool_calls_to_tool_use(calls: Vec<Value>) -> Vec<Value> {
 }
 
 /// Inverse of [`tool_calls_to_tool_use`]: `input` becomes the JSON-encoded
-/// `arguments`, each converted call takes the next `index` (streamed deltas
-/// accumulate by it); other entries pass through so a misfit fails at the caller.
+/// `arguments`, each call takes the next `index`; other entries pass through.
 pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Value> {
     blocks
         .into_iter()
@@ -130,6 +168,31 @@ pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Valu
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn image_parts_convert_both_ways() {
+        let part = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}});
+        let block = image_url_to_image(part.clone());
+        assert_eq!(
+            block,
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}})
+        );
+        assert_eq!(image_to_image_url(block), part);
+        let remote = json!({"type":"image_url","image_url":{"url":"https://x/y.png"}});
+        assert_eq!(
+            image_url_to_image(remote.clone()),
+            json!({"type":"image","source":{"type":"url","url":"https://x/y.png"}})
+        );
+        assert_eq!(
+            image_to_image_url(image_url_to_image(remote.clone())),
+            remote
+        );
+        let text = json!({"type":"text","text":"hi"});
+        assert_eq!(image_url_to_image(text.clone()), text);
+        assert_eq!(image_to_image_url(text.clone()), text);
+        let file = json!({"type":"image","source":{"type":"file","file_id":"file_1"}});
+        assert_eq!(image_to_image_url(file.clone()), file);
+    }
 
     use super::*;
 
@@ -195,10 +258,10 @@ mod tests {
 
     #[test]
     fn system_flattening() {
-        let r: MessagesRequest =
+        let mut r: MessagesRequest =
             serde_json::from_str(r#"{"model":"m","system":"be brief","messages":[]}"#).unwrap();
         assert_eq!(r.system_text().unwrap(), "be brief");
-        let r: MessagesRequest = serde_json::from_str(
+        let mut r: MessagesRequest = serde_json::from_str(
             r#"{"model":"m","system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"messages":[]}"#,
         )
         .unwrap();

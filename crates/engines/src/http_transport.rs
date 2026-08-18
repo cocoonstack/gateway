@@ -17,8 +17,7 @@ use crate::transport::{
 };
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
-// A hung connect (black-holed SYN) must surface as a connect error — which the
-// retry predicate covers — instead of burning the whole request timeout.
+// a hung connect must surface as a (retryable) connect error, not burn the request timeout
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Live per-account request timeout and connect-phase retry budget.
@@ -34,24 +33,6 @@ impl Default for UpstreamPolicy {
             timeout: Duration::from_secs(60),
             connect_retries: DEFAULT_CONNECT_RETRIES,
         }
-    }
-}
-
-/// The vendor's `Retry-After` seconds, capped; unparseable waits at least a
-/// second, absent falls back to the connect path's linear backoff.
-fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
-    const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
-    const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
-    match headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(v) => v
-            .trim()
-            .parse::<u64>()
-            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
-            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT)),
-        None => RETRY_BACKOFF * attempt,
     }
 }
 
@@ -130,16 +111,14 @@ impl Transport for HttpTransport {
             });
         let body = bytes::Bytes::from(req.body);
         let mut attempt = 0u32;
-        let resp = loop {
+        let mut resp = loop {
             let mut builder = self.client.request(method.clone(), &req.url);
-            // reqwest's request timeout is a TOTAL deadline including the body,
-            // which would kill a streaming generation longer than the policy —
-            // streams get a header-phase deadline here and an idle gap cap below
+            // reqwest's timeout is a total deadline: streams get a header deadline + idle cap
             if !req.stream {
                 builder = builder.timeout(timeout);
             }
             for (k, v) in &req.headers {
-                builder = builder.header(k, v);
+                builder = builder.header(*k, v);
             }
             let sent = builder.body(body.clone()).send();
             let result = if req.stream {
@@ -196,12 +175,17 @@ impl Transport for HttpTransport {
             }
         };
         let status = resp.status().as_u16();
-        let is_sse = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.starts_with("text/event-stream"))
-            .unwrap_or(false);
+        // an error status is a body, never a stream (Google sends failures as text/event-stream)
+        let is_sse = status < 400
+            && resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| {
+                    ct.starts_with("text/event-stream")
+                        || ct.starts_with("application/vnd.amazon.eventstream")
+                });
+        let headers = std::mem::take(resp.headers_mut());
         if is_sse {
             use futures::TryStreamExt;
             let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
@@ -211,6 +195,7 @@ impl Transport for HttpTransport {
             return Ok(UpstreamResponse {
                 status,
                 body: idle_capped(stream, timeout),
+                headers,
             });
         }
         let read = resp.bytes();
@@ -226,8 +211,7 @@ impl Transport for HttpTransport {
             read.await
         };
         let bytes = bytes.map_err(|e| {
-            // both stay 502 (failover-eligible); the code split preserves the
-            // external 408-vs-424 classification
+            // both stay 502 (failover-eligible); the code split keeps the external 408-vs-424 class
             let what = if e.is_timeout() {
                 "read upstream body timed out"
             } else {
@@ -238,35 +222,9 @@ impl Transport for HttpTransport {
         Ok(UpstreamResponse {
             status,
             body: UpstreamBody::Json(bytes),
+            headers,
         })
     }
-}
-
-/// Wrap a live SSE byte stream so a vendor that stops sending for `gap` yields
-/// one terminal error item — no gap between chunks may exceed the policy
-/// timeout, but an actively flowing stream lives as long as the generation.
-fn idle_capped(
-    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
-    gap: Duration,
-) -> UpstreamBody {
-    use futures::StreamExt;
-    UpstreamBody::SseStream(Box::pin(futures::stream::unfold(
-        Some(stream),
-        move |state| async move {
-            let mut s = state?;
-            match tokio::time::timeout(gap, s.next()).await {
-                Ok(Some(item)) => Some((item, Some(s))),
-                Ok(None) => None,
-                Err(_) => Some((
-                    Err(StreamFault {
-                        timeout: true,
-                        message: format!("stream idle for {gap:?}"),
-                    }),
-                    None,
-                )),
-            }
-        },
-    )))
 }
 
 /// Default transport: `mock://` sentinel URLs (accounts with no configured
@@ -313,6 +271,50 @@ impl Transport for DispatchTransport {
             self.http.send(req).await
         }
     }
+}
+
+/// The vendor's `Retry-After` seconds, capped; unparseable waits at least a
+/// second, absent falls back to the connect path's linear backoff.
+fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+    const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
+    match headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT)),
+        None => RETRY_BACKOFF * attempt,
+    }
+}
+
+/// A live SSE byte stream that yields one terminal error when no chunk arrives
+/// within `gap`; an actively flowing stream lives as long as the generation.
+fn idle_capped(
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
+    gap: Duration,
+) -> UpstreamBody {
+    use futures::StreamExt;
+    UpstreamBody::SseStream(Box::pin(futures::stream::unfold(
+        Some(stream),
+        move |state| async move {
+            let mut s = state?;
+            match tokio::time::timeout(gap, s.next()).await {
+                Ok(Some(item)) => Some((item, Some(s))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(StreamFault {
+                        timeout: true,
+                        message: format!("stream idle for {gap:?}"),
+                    }),
+                    None,
+                )),
+            }
+        },
+    )))
 }
 
 #[cfg(test)]
@@ -367,7 +369,7 @@ mod tests {
     fn request(url: String) -> UpstreamRequest {
         UpstreamRequest {
             protocol: gw_consts::Protocol::OpenaiChat,
-            method: "POST".into(),
+            method: "POST",
             url,
             headers: Vec::new(),
             body: b"{}".to_vec(),

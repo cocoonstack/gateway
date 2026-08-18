@@ -355,6 +355,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
                         .unwrap()
                         .into(),
                     ),
+                    headers: Default::default(),
                 });
             }
             let is_seed = request["messages"]
@@ -374,6 +375,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
                 return Ok(gw_engines::transport::UpstreamResponse {
                     status: 200,
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                    headers: Default::default(),
                 });
             }
             let response = if is_seed {
@@ -408,6 +410,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
                 body: gw_engines::transport::UpstreamBody::Json(
                     serde_json::to_vec(&response).unwrap().into(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -1332,6 +1335,147 @@ async fn embeddings_images_audio_families() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert!(j["text"].as_str().unwrap().contains("transcribed"));
+}
+
+#[tokio::test]
+async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
+    let app = app();
+    // batch items at the model's batch_discount
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/batches",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o-mini","items":[{"messages":[{"role":"user","content":"discounted item"}]}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    for _ in 0..100 {
+        let j = body_json(
+            app.clone()
+                .oneshot(get_authed(&format!("/v1/batches/{id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if j["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // the same prompt online, at list price
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"discounted item"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // long-context tier: a prompt past the threshold bills 2x / 1.5x
+    for content in ["hi", "this prompt is long enough to cross the tier"] {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/v1/messages",
+                Some("ak-demo-123"),
+                &format!(
+                    r#"{{"model":"claude-longctx","max_tokens":32,"messages":[{{"role":"user","content":"{content}"}}]}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // images bill per image
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/images/generations",
+            Some("ak-demo-123"),
+            r#"{"model":"dall-e-3","prompt":"two pandas","n":2}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
+    let j = body_json(resp).await;
+    let rows: Vec<&Value> = j["records"].as_array().unwrap().iter().collect();
+    let mini: Vec<&&Value> = rows
+        .iter()
+        .filter(|r| r["model"] == "gpt-4o-mini")
+        .collect();
+    let (batch, online) = (mini[0], mini[1]);
+    assert_eq!(batch["prompt_tokens"], online["prompt_tokens"]);
+    let half = |v: &Value| (v["cost_micros"].as_f64().unwrap() * 0.5).round() as i64;
+    assert_eq!(
+        batch["cost_micros"],
+        half(online),
+        "batch item at half price: {batch} vs {online}"
+    );
+    assert_eq!(
+        batch["vendor_cost_micros"],
+        (online["vendor_cost_micros"].as_f64().unwrap() * 0.5).round() as i64
+    );
+    let long: Vec<&&Value> = rows
+        .iter()
+        .filter(|r| r["model"] == "claude-longctx")
+        .collect();
+    let (short, tiered) = (long[0], long[1]);
+    assert_eq!(
+        short["total_tokens"],
+        short["prompt_tokens"].as_i64().unwrap() + short["completion_tokens"].as_i64().unwrap(),
+        "under the threshold the weighted total is the plain sum"
+    );
+    let (p, c) = (
+        tiered["prompt_tokens"].as_i64().unwrap(),
+        tiered["completion_tokens"].as_i64().unwrap(),
+    );
+    assert!(p > 8, "prompt {p} must cross the tier");
+    assert_eq!(
+        tiered["total_tokens"].as_i64().unwrap(),
+        p * 2 + (c as f64 * 1.5).round() as i64,
+        "past the threshold both sides scale: {tiered}"
+    );
+    let image = rows.iter().find(|r| r["model"] == "dall-e-3").unwrap();
+    assert_eq!(image["billed_units"], 2);
+    assert_eq!(image["cost_micros"], 80_000);
+}
+
+#[tokio::test]
+async fn unit_priced_surfaces_bill_characters_and_seconds() {
+    let app = app();
+    for body in [
+        r#"{"model":"tts-1","input":"read this aloud","voice":"alloy"}"#,
+        r#"{"model":"whisper-1","audio_b64":"TU9DSw=="}"#,
+    ] {
+        let path = if body.contains("tts-1") {
+            "/v1/audio/speech"
+        } else {
+            "/v1/audio/transcriptions"
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(path, Some("ak-demo-123"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
+    let j = body_json(resp).await;
+    let rows = j["records"].as_array().unwrap();
+    let row = |model: &str| rows.iter().find(|r| r["model"] == model).unwrap();
+    // "read this aloud" = 15 characters × 15 micros; the mock transcribes 5 s × 100 micros
+    assert_eq!(row("tts-1")["billed_units"], 15);
+    assert_eq!(row("tts-1")["cost_micros"], 225);
+    assert_eq!(row("whisper-1")["billed_units"], 5);
+    assert_eq!(row("whisper-1")["cost_micros"], 500);
+    assert_eq!(row("whisper-1")["total_tokens"], 0);
 }
 
 #[tokio::test]
@@ -2357,6 +2501,7 @@ async fn dlp_redacts_streaming_output_from_the_vendor() {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2471,6 +2616,7 @@ async fn outbound_dlp_redacts_the_responses_body() {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Json(body.to_string().into()),
+                headers: Default::default(),
             })
         }
     }
@@ -2689,6 +2835,7 @@ async fn chat_surface_reasoning_round_trips_through_claude() {
                 return Ok(gw_engines::transport::UpstreamResponse {
                     status: 200,
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                    headers: Default::default(),
                 });
             }
             Ok(gw_engines::transport::UpstreamResponse {
@@ -2707,6 +2854,7 @@ async fn chat_surface_reasoning_round_trips_through_claude() {
                     .unwrap()
                     .into(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2855,6 +3003,7 @@ async fn responses_stream_forwards_native_events_with_names_and_bills() {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -2907,6 +3056,69 @@ async fn responses_stream_forwards_native_events_with_names_and_bills() {
     let led = body_json(led).await;
     assert_eq!(led["count"], 1);
     assert_eq!(led["records"][0]["completion_tokens"], 9);
+}
+
+#[tokio::test]
+async fn responses_model_streams_as_chat_and_messages_on_the_other_surfaces() {
+    let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+
+    let body =
+        r#"{"model":"gpt-5-responses","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let frames: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|f| *f != "[DONE]")
+        .map(|f| serde_json::from_str(f).unwrap())
+        .collect();
+    let content: String = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(
+        content, "[mock-responses:gpt-5-responses] you said: hi",
+        "the chat turns became Responses input and the reply rides chat deltas"
+    );
+    assert!(
+        !text.contains("event: response."),
+        "no Responses events on the chat wire"
+    );
+    let last = frames.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert!(last["usage"]["completion_tokens"].as_i64().unwrap() > 0);
+
+    let body = r#"{"model":"gpt-5-responses","stream":true,"max_tokens":50,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app
+        .oneshot(post("/v1/messages", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        !text.contains("event: response."),
+        "no Responses events on the messages wire"
+    );
+    let deltas: String = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter_map(|f| f["delta"]["text"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(deltas, "[mock-responses:gpt-5-responses] you said: hi");
+    assert!(text.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]
@@ -4245,6 +4457,7 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                 return Ok(gw_engines::transport::UpstreamResponse {
                     status: 200,
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                    headers: Default::default(),
                 });
             }
             let mut tool_use =
@@ -4263,6 +4476,7 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                 body: gw_engines::transport::UpstreamBody::Json(
                     serde_json::to_vec(&response).unwrap().into(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -4409,6 +4623,7 @@ async fn model_prompt_cache_knob_reaches_the_anthropic_wire() {
                 body: gw_engines::transport::UpstreamBody::Json(
                     serde_json::to_vec(&response).unwrap().into(),
                 ),
+                headers: Default::default(),
             })
         }
     }

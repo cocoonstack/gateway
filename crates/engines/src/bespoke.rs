@@ -4,94 +4,26 @@
 //! real SigV4 Authorization header.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::base::{Base, base_engine};
+use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
-use crate::sigv4::{SigV4Params, sign};
-
-/// Deterministic SigV4 date for the mock round; live calls would stamp now().
-const MOCK_AMZ_DATE: &str = "20250101T000000Z";
-
-/// SigV4 headers for a bedrock-style call. `creds` = real `(access_key, secret_key)`
-/// at go-live (from the account's env-var pair), else the inert mock credentials.
-fn aws_headers(
-    host: &str,
-    uri: &str,
-    payload: &[u8],
-    creds: Option<(&str, &str)>,
-) -> Vec<(String, String)> {
-    let amz_date = MOCK_AMZ_DATE;
-    let (access_key, secret_key) = creds.unwrap_or(("AKIDMOCK", "mock-secret"));
-    let (_, authorization) = sign(&SigV4Params {
-        access_key,
-        secret_key,
-        region: "us-east-1",
-        service: "bedrock",
-        amz_date,
-        method: "POST",
-        canonical_uri: uri,
-        canonical_query: "",
-        headers: &[("host", host), ("x-amz-date", amz_date)],
-        payload,
-    });
-    vec![
-        ("host".into(), host.into()),
-        ("x-amz-date".into(), amz_date.into()),
-        ("authorization".into(), authorization),
-        // Bedrock InvokeModel requires accept; content-type is added by post_json.
-        ("accept".into(), "application/json".into()),
-    ]
-}
-
-/// One Bedrock invoke: host + scheme from the account endpoint at go-live
-/// (else the mock sentinel); SigV4 signs this same host so URL and signature
-/// agree. Raw extras merge before signing so the signature covers the exact
-/// bytes sent — and the body serializes once, not per layer.
-async fn bedrock_invoke(base: &mut Base, uri: &str, mut body: Value) -> GResult<(u16, Value)> {
-    let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
-    let host = root.split_once("://").map(|(_, h)| h).unwrap_or(&root);
-    if let Some(obj) = body.as_object_mut() {
-        let raw = base.take_raw();
-        crate::base::merge_raw_extras_owned(obj, raw);
-    }
-    let payload = crate::base::body_bytes(&body)?;
-    let creds = base.aws_credentials();
-    let headers = aws_headers(
-        host,
-        uri,
-        &payload,
-        creds
-            .as_ref()
-            .map(|(a, s): &(String, String)| (a.as_str(), s.as_str())),
-    );
-    base.post_json_bytes(&format!("{root}{uri}"), headers, payload)
-        .await
-}
+use crate::transport::Headers;
 
 base_engine!(ErnieEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for ErnieEngine {
-    /// Baidu Ernie (Wenxin): /wenxinworkshop/chat/{model}?access_token=…
-    /// Request {messages,[temperature]}; response {result, usage{...}, is_truncated}.
+    /// Baidu Ernie: `/wenxinworkshop/chat/{model}`, a `bce-v3/…` key as Bearer
+    /// or a legacy token as `?access_token=`; reply `{result, usage}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let messages: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
-            .filter(|m| m.role != gw_consts::role::SYSTEM)
-            .map(|m| {
-                json!({"role": if m.role == gw_consts::role::AI {"assistant"} else {"user"},
-                             "content": m.content})
-            })
-            .collect();
-        let mut body = json!({});
-        body["messages"] = Value::Array(messages);
         // ernie's system is a top-level field (system turns are filtered above)
         let system = self.base.system_text();
+        let messages = simple_turns(&mut self.base, ("assistant", "user"), ("role", "content"));
+        let mut body = json!({});
+        body["messages"] = Value::Array(messages);
         if !system.is_empty() {
             body["system"] = system.into();
         }
@@ -100,13 +32,19 @@ impl ModelEngine for ErnieEngine {
         {
             body["temperature"] = json!(t);
         }
-        // Baidu auth is an access_token query param; real token from the env var at go-live
-        let url = format!(
-            "{}/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{model}?access_token={}",
+        let key = self.base.api_key();
+        let mut url = format!(
+            "{}/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{model}",
             self.base.base_url("mock://aip.baidubce.com"),
-            self.base.api_key(),
         );
-        let (status, mut v) = self.base.post_json(&url, vec![], body).await?;
+        let mut headers = Vec::new();
+        if key.starts_with("bce-v3/") {
+            headers.push(("authorization", format!("Bearer {key}")));
+        } else {
+            url.push_str("?access_token=");
+            url.push_str(&key);
+        }
+        let (status, mut v) = self.base.post_json(&url, headers, body).await?;
         let message = crate::engine::take_string(&mut v, "/result").unwrap_or_default();
         let usage = &v["usage"];
         let prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);
@@ -138,21 +76,11 @@ impl ModelEngine for MinimaxV1Engine {
     /// response {reply, usage{total_tokens}, base_resp{status_code,status_msg}}.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let messages: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
-            .filter(|m| m.role != gw_consts::role::SYSTEM)
-            .map(|m| {
-                json!({"sender_type": if m.role == gw_consts::role::AI {"BOT"} else {"USER"},
-                       "text": m.content})
-            })
-            .collect();
-        let mut body = json!({"model": model});
-        body["messages"] = Value::Array(messages);
         // v1 carries the system instruction as top-level `prompt` + role_meta
         let system = self.base.system_text();
+        let messages = simple_turns(&mut self.base, ("BOT", "USER"), ("sender_type", "text"));
+        let mut body = json!({"model": model});
+        body["messages"] = Value::Array(messages);
         if !system.is_empty() {
             body["prompt"] = system.into();
             body["role_meta"] = json!({"user_name": "USER", "bot_name": "BOT"});
@@ -189,27 +117,11 @@ impl ModelEngine for MinimaxV1Engine {
 
 base_engine!(CohereEngine);
 
-#[async_trait::async_trait]
-impl ModelEngine for CohereEngine {
-    /// AWS Bedrock Cohere Command: {message, chat_history[{role USER/CHATBOT, message}]};
-    /// response {text, finish_reason, meta{tokens{input_tokens,output_tokens}}}.
-    async fn run(&mut self) -> GResult<EngineOutcome> {
-        let model = self.base.model_name()?.to_owned();
-        let mut history: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
-            .filter(|m| m.role != gw_consts::role::SYSTEM)
-            .map(|m| {
-                let role = if m.role == gw_consts::role::AI {
-                    "CHATBOT"
-                } else {
-                    "USER"
-                };
-                json!({"role": role, "message": m.content})
-            })
-            .collect();
+impl CohereEngine {
+    fn build_body(&mut self) -> Value {
+        // cohere's system slot is `preamble` (system turns are filtered above)
+        let system = self.base.system_text();
+        let mut history = simple_turns(&mut self.base, ("CHATBOT", "USER"), ("role", "message"));
         let message = history
             .pop()
             .map(|mut last| last["message"].take())
@@ -217,8 +129,6 @@ impl ModelEngine for CohereEngine {
         let mut body = json!({});
         body["message"] = message;
         body["chat_history"] = Value::Array(history);
-        // cohere's system slot is `preamble` (system turns are filtered above)
-        let system = self.base.system_text();
         if !system.is_empty() {
             body["preamble"] = system.into();
         }
@@ -227,18 +137,76 @@ impl ModelEngine for CohereEngine {
         {
             body["max_tokens"] = json!(mt);
         }
-        let (status, mut v) =
-            bedrock_invoke(&mut self.base, "/model/cohere.command-r/invoke", body).await?;
-        let message = crate::engine::take_string(&mut v, "/text").unwrap_or_default();
-        let tokens = &v["meta"]["tokens"];
-        let (input, output) = (
-            crate::engine::tok(&tokens["input_tokens"]),
-            crate::engine::tok(&tokens["output_tokens"]),
+        body
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelEngine for CohereEngine {
+    /// Bedrock Cohere Command: `{message, chat_history}` → `{text, finish_reason}`
+    /// (legacy `generations[0]`), billed counts in the Bedrock headers.
+    async fn run(&mut self) -> GResult<EngineOutcome> {
+        let model = self.base.model_name()?.to_owned();
+        let body = self.build_body();
+        if self.base.request.stream {
+            let mut resp = GatewayResponse {
+                model,
+                is_messages_protocol: true,
+                ..Default::default()
+            };
+            let mut full = String::new();
+            let (status, r) = bedrock_stream(&mut self.base, body, |v| {
+                let mut chunks = Vec::new();
+                if let Some(t) = v["text"].as_str()
+                    && !t.is_empty()
+                    && v["event_type"] != "stream-end"
+                {
+                    full.push_str(t);
+                    chunks.push(StreamChunk {
+                        delta: t.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                if let Some(fr) = v["finish_reason"].as_str() {
+                    resp.finish_reason = cohere_finish_reason(Some(fr));
+                    chunks.push(StreamChunk {
+                        finish_reason: Some(resp.finish_reason.clone()),
+                        ..Default::default()
+                    });
+                }
+                invocation_metrics(&v, &mut resp);
+                Ok(chunks)
+            })
+            .await?;
+            resp.message = full;
+            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
+            resp.raw_usage = Some(
+                json!({"input_tokens": resp.prompt_tokens, "output_tokens": resp.completion_tokens}),
+            );
+            return Ok(EngineOutcome::from_pump(resp, status, r));
+        }
+        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
+        let message = crate::engine::take_string(&mut v, "/text")
+            .or_else(|| crate::engine::take_string(&mut v, "/generations/0/text"))
+            .unwrap_or_default();
+        let finish_reason = cohere_finish_reason(
+            v["finish_reason"]
+                .as_str()
+                .or_else(|| v["generations"][0]["finish_reason"].as_str()),
+        );
+        let meta = &v["meta"];
+        let body_count = |key: &str| match crate::engine::tok(&meta["billed_units"][key]) {
+            0 => crate::engine::tok(&meta["tokens"][key]),
+            n => n,
+        };
+        let (input, output) = bedrock_header_usage(
+            &headers,
+            (body_count("input_tokens"), body_count("output_tokens")),
         );
         let resp = GatewayResponse {
             message,
             model,
-            finish_reason: v["finish_reason"].as_str().unwrap_or("stop").to_lowercase(),
+            finish_reason,
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
@@ -250,23 +218,76 @@ impl ModelEngine for CohereEngine {
     }
 }
 
+/// The non-system turns as `{role_key: ai|user, content_key: text}` objects,
+/// moved out of the request (the vendors' flat two-role wires).
+fn simple_turns(
+    base: &mut Base,
+    (ai, user): (&str, &str),
+    (role_key, content_key): (&str, &str),
+) -> Vec<Value> {
+    std::mem::take(&mut base.request.message)
+        .into_iter()
+        .filter(|m| m.role != gw_consts::role::SYSTEM)
+        .map(|m| {
+            let mut turn = Map::with_capacity(2);
+            let role = if m.role == gw_consts::role::AI {
+                ai
+            } else {
+                user
+            };
+            turn.insert(role_key.to_owned(), role.into());
+            turn.insert(content_key.to_owned(), Value::String(m.content));
+            Value::Object(turn)
+        })
+        .collect()
+}
+
+/// The Llama 3/4 chat template for Bedrock's raw prompt; a bare `role: text`
+/// prompt makes the model invent turns until max_gen_len.
+fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
+    let (start, end, eot) = if model.contains("llama4") {
+        ("<|header_start|>", "<|header_end|>", "<|eot|>")
+    } else {
+        ("<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>")
+    };
+    let mut prompt = String::from("<|begin_of_text|>");
+    for m in messages {
+        let role = match m.role.as_str() {
+            gw_consts::role::SYSTEM => "system",
+            gw_consts::role::AI => "assistant",
+            _ => "user",
+        };
+        prompt.push_str(start);
+        prompt.push_str(role);
+        prompt.push_str(end);
+        prompt.push_str("\n\n");
+        prompt.push_str(&m.content);
+        prompt.push_str(eot);
+    }
+    prompt.push_str(start);
+    prompt.push_str("assistant");
+    prompt.push_str(end);
+    prompt.push_str("\n\n");
+    prompt
+}
+
+fn cohere_finish_reason(vendor: Option<&str>) -> String {
+    match vendor {
+        None | Some("COMPLETE") => "stop".to_owned(),
+        Some("MAX_TOKENS") => "length".to_owned(),
+        Some(other) => other.to_lowercase(),
+    }
+}
+
 base_engine!(LlamaEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for LlamaEngine {
-    /// AWS Bedrock Llama: {prompt, max_gen_len, temperature};
-    /// response {generation, prompt_token_count, generation_token_count, stop_reason}.
+    /// Bedrock Llama: `{prompt, max_gen_len, temperature}` → `{generation,
+    /// prompt_token_count, generation_token_count, stop_reason}`, streamed per delta.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // llama is completion-style: collapse the conversation into a prompt
-        let prompt: String = self
-            .base
-            .request
-            .message
-            .iter()
-            .map(|m| format!("{}: {}\n", m.role, m.content))
-            .collect::<String>()
-            + "assistant: ";
+        let prompt = llama_prompt(&model, &self.base.request.message);
         let mut body = json!({});
         body["prompt"] = prompt.into();
         if let Some(p) = self.base.chat_params() {
@@ -277,15 +298,56 @@ impl ModelEngine for LlamaEngine {
                 body["temperature"] = json!(t);
             }
         }
-        let (status, mut v) = bedrock_invoke(
-            &mut self.base,
-            "/model/meta.llama3-70b-instruct-v1/invoke",
-            body,
-        )
-        .await?;
-        let (pt, ct) = (
-            crate::engine::tok(&v["prompt_token_count"]),
-            crate::engine::tok(&v["generation_token_count"]),
+        if self.base.request.stream {
+            let mut resp = GatewayResponse {
+                model,
+                ..Default::default()
+            };
+            let mut full = String::new();
+            let (status, r) = bedrock_stream(&mut self.base, body, |v| {
+                let mut chunks = Vec::new();
+                if let Some(t) = v["generation"].as_str()
+                    && !t.is_empty()
+                {
+                    full.push_str(t);
+                    chunks.push(StreamChunk {
+                        delta: t.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                if let Some(n) = v["prompt_token_count"].as_i64() {
+                    resp.prompt_tokens = n;
+                }
+                if let Some(n) = v["generation_token_count"].as_i64() {
+                    resp.completion_tokens = n;
+                }
+                if let Some(sr) = v["stop_reason"].as_str() {
+                    resp.finish_reason = sr.to_owned();
+                    chunks.push(StreamChunk {
+                        finish_reason: Some(sr.to_owned()),
+                        ..Default::default()
+                    });
+                }
+                invocation_metrics(&v, &mut resp);
+                Ok(chunks)
+            })
+            .await?;
+            resp.message = full;
+            let total = resp.prompt_tokens.saturating_add(resp.completion_tokens);
+            resp.total_tokens = total;
+            resp.raw_usage = Some(json!({
+                "prompt_tokens": resp.prompt_tokens, "completion_tokens": resp.completion_tokens,
+                "total_tokens": total
+            }));
+            return Ok(EngineOutcome::from_pump(resp, status, r));
+        }
+        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
+        let (pt, ct) = bedrock_header_usage(
+            &headers,
+            (
+                crate::engine::tok(&v["prompt_token_count"]),
+                crate::engine::tok(&v["generation_token_count"]),
+            ),
         );
         let total = pt.saturating_add(ct);
         let resp = GatewayResponse {
@@ -351,11 +413,11 @@ impl DashScopeEngine {
         )
     }
 
-    fn headers(&self, stream: bool) -> Vec<(String, String)> {
+    fn headers(&self, stream: bool) -> Headers {
         let mut h = self.base.bearer_headers();
         if stream {
             // DashScope streams only when this header is present
-            h.push(("X-DashScope-SSE".into(), "enable".into()));
+            h.push(("X-DashScope-SSE", "enable".into()));
         }
         h
     }
@@ -391,10 +453,8 @@ impl DashScopeEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for DashScopeEngine {
-    /// Ali DashScope native wire (not the openai-compatible mode):
-    /// {model, input:{messages}, parameters:{result_format:"message",…}};
-    /// response {output:{choices:[{message,finish_reason}]}, usage{input/output/total_tokens}}.
-    /// Streaming: `X-DashScope-SSE: enable` + `incremental_output`.
+    /// DashScope native wire: `{model, input:{messages}, parameters}` →
+    /// `{output:{choices}, usage}`; streams via `X-DashScope-SSE` + `incremental_output`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         if self.base.request.stream {
             return self.run_stream().await;
@@ -419,9 +479,8 @@ impl ModelEngine for DashScopeEngine {
     }
 }
 
-/// Apply one DashScope SSE frame; returns the chunks it yields. Running
-/// frames carry the literal string "null" as finish_reason; usage is
-/// cumulative — the last frame's counts win.
+/// Apply one DashScope SSE frame: running frames carry the literal "null"
+/// finish_reason and cumulative usage (last frame wins).
 fn dashscope_apply_frame(
     v: &Value,
     status: u16,
@@ -491,7 +550,33 @@ mod tests {
     use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 
     use super::*;
-    use crate::transport::{MockTransport, SharedTransport};
+    use crate::transport::{
+        HeaderMap, MockTransport, SharedTransport, Transport, UpstreamBody, UpstreamRequest,
+        UpstreamResponse,
+    };
+
+    #[derive(Debug)]
+    struct BedrockReply(&'static str, i64, i64);
+
+    #[async_trait::async_trait]
+    impl Transport for BedrockReply {
+        async fn send(&self, _req: UpstreamRequest) -> GResult<UpstreamResponse> {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-amzn-bedrock-input-token-count",
+                self.1.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "x-amzn-bedrock-output-token-count",
+                self.2.to_string().parse().unwrap(),
+            );
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Json(self.0.as_bytes().to_vec().into()),
+                headers,
+            })
+        }
+    }
 
     fn req(mt: Protocol, name: &str) -> GatewayRequest {
         GatewayRequest {
@@ -532,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn cohere_wire_shape() {
-        let mut e = CohereEngine::new(req(Protocol::AwsCohere, "command-r"), t());
+        let mut e = CohereEngine::new(req(Protocol::AwsCohere, "cohere.command-r-v1:0"), t());
         let out = e.run().await.unwrap();
         assert!(
             out.response
@@ -543,8 +628,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bedrock_headers_bill_command_r_and_the_legacy_command_shape_parses() {
+        let mut e = CohereEngine::new(
+            req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
+            Arc::new(BedrockReply(
+                r#"{"response_id":"r","text":"hi there","finish_reason":"COMPLETE"}"#,
+                57,
+                9,
+            )),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(out.response.message, "hi there");
+        assert_eq!(out.response.finish_reason, "stop");
+        assert_eq!(
+            (out.response.prompt_tokens, out.response.completion_tokens),
+            (57, 9)
+        );
+
+        let mut e = CohereEngine::new(
+            req(Protocol::AwsCohere, "cohere.command-text-v14"),
+            Arc::new(BedrockReply(
+                r#"{"generations":[{"id":"g","text":"legacy hi","finish_reason":"MAX_TOKENS"}],"prompt":""}"#,
+                12,
+                4,
+            )),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(out.response.message, "legacy hi");
+        assert_eq!(out.response.finish_reason, "length");
+        assert_eq!(out.response.total_tokens, 16);
+
+        let mut e = LlamaEngine::new(
+            req(Protocol::AwsLlama, "meta.llama3-1-8b-instruct-v1:0"),
+            Arc::new(BedrockReply(
+                r#"{"generation":"yo","prompt_token_count":1,"generation_token_count":1,"stop_reason":"stop"}"#,
+                30,
+                20,
+            )),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(
+            (out.response.prompt_tokens, out.response.completion_tokens),
+            (30, 20)
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_streams_reassemble_text_and_take_the_invocation_metrics() {
+        let mut r = req(Protocol::AwsLlama, "meta.llama3-1-8b-instruct-v1:0");
+        r.stream = true;
+        let out = LlamaEngine::new(r, t()).run().await.unwrap();
+        assert!(
+            out.response.message.contains("[mock-llama]"),
+            "{:?}",
+            out.response
+        );
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.chunks.iter().any(|c| c.finish_reason.is_some()));
+        assert!(out.response.total_tokens > 0);
+
+        let mut r = req(Protocol::AwsCohere, "cohere.command-r-v1:0");
+        r.stream = true;
+        let out = CohereEngine::new(r, t()).run().await.unwrap();
+        assert!(
+            out.response
+                .message
+                .contains("[mock-cohere] you said: hello bespoke"),
+            "{:?}",
+            out.response
+        );
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
+    }
+
+    #[tokio::test]
     async fn llama_wire_shape() {
-        let mut e = LlamaEngine::new(req(Protocol::AwsLlama, "llama3-70b"), t());
+        let mut e = LlamaEngine::new(
+            req(Protocol::AwsLlama, "meta.llama3-70b-instruct-v1:0"),
+            t(),
+        );
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("[mock-llama]"));
         assert!(out.response.total_tokens > 0);

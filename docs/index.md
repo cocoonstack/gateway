@@ -22,6 +22,7 @@ client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
 - [Running a fleet](multi-instance.md) — nginx LB, shared state, affinity
 - [Configuration](configuration.md) — the full `gateway.yaml` reference
 - [Architecture](architecture.md) — crate layout, pipeline, trait seams
+- [Performance](performance.md) — measured per-node throughput and latency, how to reproduce
 - [Development](development.md) — build, test, workspace map, contributing
 
 ## Repository

@@ -19,36 +19,29 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
      FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
      RETURNING id";
 
-/// Per-call token ceiling: usage is floored at 0 upstream but not capped, so
-/// clamping keeps a hostile count from overflowing downstream accumulators.
-/// Far above any real response, so real traffic is never clamped.
+/// Per-call token ceiling so a hostile count cannot overflow downstream
+/// accumulators; far above any real response.
 const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
-/// Prune the SQL ledger every Nth insert instead of per write (the cap becomes
-/// approximate by at most this many rows, saving a round-trip per billing).
-/// Pruning spares rows the rollup hasn't folded yet (created at or past the
-/// watermark), so a burst can exceed `ledger_max_rows` briefly rather than
-/// lose usage — billing integrity outranks a strict cap.
+/// Prune the SQL ledger every Nth insert (the cap is approximate by that many
+/// rows); rows the rollup has not folded yet are spared, so a burst may exceed
+/// `ledger_max_rows` briefly rather than lose usage.
 const LEDGER_PRUNE_EVERY: usize = 64;
 
 /// Usage-rollup bucket width.
 const ROLLUP_BUCKET_SECS: i64 = 60;
 
 /// Each rollup advance recomputes at least this trailing window (more when the
-/// watermark trails it — first run rolls the whole ledger, a stalled task
-/// catches up whole), so late rows and missed ticks self-heal.
+/// watermark trails it), so late rows and missed ticks self-heal.
 const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 
-/// A minute is rolled only once it has been closed for at least this long, so
-/// an in-flight billing write (or a replica whose clock trails by less than a
-/// minute) can never land a row in an already-rolled minute — which is what
-/// makes the max-upsert sound: a rolled minute's source set can only shrink
-/// (pruning), never grow.
+/// A minute is rolled only once closed for this long, so no in-flight write or
+/// trailing replica lands a row in a rolled minute — a rolled minute's source
+/// set can only shrink, which keeps the max-upsert sound.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 
 /// Postgres advisory-lock key serializing the fleet's rollup: one replica
-/// advances per tick, the rest skip (the upsert is idempotent either way —
-/// the lock only avoids N replicas repeating the same scan).
+/// advances per tick (the upsert is idempotent; the lock only avoids repeated scans).
 const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 
 /// One minute past the newest rolled bucket — where the raw ledger tail
@@ -86,6 +79,10 @@ pub struct BillingRecord {
     /// What the serving account's vendor charged us (zero = untracked).
     #[serde(default)]
     pub vendor_cost_micros: i64,
+    /// Non-token units billed (TTS characters, transcription seconds, rerank
+    /// search units); their price is folded into `cost_micros`.
+    #[serde(default)]
+    pub billed_units: i64,
     /// PTU spilled over to a paygo account (a failover occurred).
     #[serde(default)]
     pub ptu_spillover: bool,
@@ -190,6 +187,10 @@ pub struct BillingInput<'a> {
     pub billable_prompt: i64,
     pub billable_completion: i64,
     pub total: i64,
+    /// Non-token units the vendor metered, priced at the model's unit price.
+    pub units: i64,
+    /// Multiplier on charged and vendor cost (batch items); 1.0 = list price.
+    pub discount: f64,
     pub ptu_spillover: bool,
     /// Counts are estimated (aborted stream), not vendor-reported.
     pub estimated: bool,
@@ -207,21 +208,22 @@ pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_model
         Some(r) => gw_models::TokenRate {
             prompt_includes_cache: false,
             prompt_weight: r.prompt,
+            audio_prompt_weight: r.audio_prompt.unwrap_or(r.prompt),
             read_cache_weight: r.read_cache,
             write_cache_weight: r.write_cache,
+            write_cache_1h_weight: r.write_cache_1h.unwrap_or(r.write_cache),
             completion_weight: r.completion,
+            audio_completion_weight: r.audio_completion.unwrap_or(r.completion),
             reasoning_weight: r.reasoning,
         },
         None => gw_models::TokenRate::default(),
     }
 }
 
-/// Price one call into a [`BillingRecord`]: the tenant's price for the served
-/// model, vendor cost from the serving account. Shared by the request pipeline
-/// and the realtime surface so the two can't drift; token counts are clamped.
-/// Cost multiplies the weighted billable sides; the prompt/completion columns
-/// keep the vendor-reported counts, while `total_tokens` is the weighted
-/// platform total that quota metering consumed.
+/// Price one call into a [`BillingRecord`] (tenant price for the served model,
+/// vendor cost from the account), shared by the pipeline and the realtime
+/// surface; prompt/completion keep the vendor counts, `total_tokens` is the
+/// weighted platform total quota metering consumed.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
@@ -233,17 +235,29 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
-    let vendor = cfg
+    let units = clamp_tokens(b.units);
+    let unit_cost = units.saturating_mul(cfg.unit_price_for_tenant(b.tenant, b.served_model));
+    let discounted = |cost: i64| {
+        if b.discount == 1.0 {
+            cost
+        } else {
+            (cost as f64 * b.discount).round() as i64
+        }
+    };
+    let (vendor, vendor_unit) = cfg
         .accounts
         .iter()
         .find(|a| a.name == b.account)
         .map(|a| {
             (
-                a.cost_input_price_per_1k_micros,
-                a.cost_output_price_per_1k_micros,
+                (
+                    a.cost_input_price_per_1k_micros,
+                    a.cost_output_price_per_1k_micros,
+                ),
+                a.cost_unit_price_micros,
             )
         })
-        .unwrap_or((0, 0));
+        .unwrap_or(((0, 0), 0));
     BillingRecord {
         ak: b.ak.to_owned(),
         product: b.product.to_owned(),
@@ -258,8 +272,15 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged),
-        vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor),
+        cost_micros: discounted(
+            gw_models::cost_micros(billable_prompt, billable_completion, charged)
+                .saturating_add(unit_cost),
+        ),
+        vendor_cost_micros: discounted(
+            gw_models::cost_micros(billable_prompt, billable_completion, vendor)
+                .saturating_add(units.saturating_mul(vendor_unit)),
+        ),
+        billed_units: units,
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
     }
@@ -276,6 +297,7 @@ pub struct UsageRow {
     pub total_tokens: i64,
     pub cost_micros: i64,
     pub vendor_cost_micros: i64,
+    pub billed_units: i64,
 }
 
 /// One row of the per-(user, model) usage rollup over a billing period.
@@ -289,6 +311,7 @@ pub struct UserUsageRow {
     pub total_tokens: i64,
     pub cost_micros: i64,
     pub vendor_cost_micros: i64,
+    pub billed_units: i64,
 }
 
 impl UserUsageRow {
@@ -302,6 +325,7 @@ impl UserUsageRow {
             total_tokens: 0,
             cost_micros: 0,
             vendor_cost_micros: 0,
+            billed_units: 0,
         }
     }
 
@@ -313,6 +337,7 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.saturating_add(o.total_tokens);
         self.cost_micros = self.cost_micros.saturating_add(o.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(o.vendor_cost_micros);
+        self.billed_units = self.billed_units.saturating_add(o.billed_units);
     }
 
     /// Fold one raw ledger row's counters into self (saturating).
@@ -323,6 +348,7 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.saturating_add(r.total_tokens);
         self.cost_micros = self.cost_micros.saturating_add(r.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
+        self.billed_units = self.billed_units.saturating_add(r.billed_units);
     }
 
     /// Keep the larger of each counter. A bucket's source rows are append-only
@@ -336,6 +362,7 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.max(o.total_tokens);
         self.cost_micros = self.cost_micros.max(o.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.max(o.vendor_cost_micros);
+        self.billed_units = self.billed_units.max(o.billed_units);
     }
 }
 
@@ -350,6 +377,7 @@ fn usage_of(r: &BillingRecord) -> UserUsageRow {
         total_tokens: r.total_tokens,
         cost_micros: r.cost_micros,
         vendor_cost_micros: r.vendor_cost_micros,
+        billed_units: r.billed_units,
     }
 }
 
@@ -391,6 +419,7 @@ where
             total_tokens: row.get(4),
             cost_micros: row.get(5),
             vendor_cost_micros: row.get(6),
+            billed_units: row.get(7),
         },
     )
 }
@@ -399,8 +428,7 @@ fn bucket_floor(ts: i64) -> i64 {
     ts - ts.rem_euclid(ROLLUP_BUCKET_SECS)
 }
 
-/// Minute-align a query window: identical semantics whether a minute is served
-/// from its bucket or still raw, so a repeated query can't drift as the
+/// Minute-align a query window so a repeated query cannot drift as the
 /// watermark advances past its bounds.
 fn align_bounds(since: i64, until: i64) -> (i64, i64) {
     (
@@ -409,9 +437,8 @@ fn align_bounds(since: i64, until: i64) -> (i64, i64) {
     )
 }
 
-/// A content-safety outcome, recorded WITHOUT the offending text — only which
-/// key/user/rule fired and what the gateway did, so hits are queryable per
-/// ak/tenant without retaining prompt content.
+/// A content-safety outcome recorded WITHOUT the offending text: which
+/// key/user/rule fired and what the gateway did.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SecurityEvent {
     pub created_at_epoch_secs: i64,
@@ -652,13 +679,38 @@ struct MemoryLedger {
     request_ids: HashSet<String>,
 }
 
-/// First epoch second NOT yet folded into the rollup: rows at or above it are
-/// still the ledger's to report.
-fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
-    rollup
-        .keys()
-        .next_back()
-        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+#[derive(Debug, Default)]
+struct MemoryContent {
+    rows: Vec<crate::ContentRecord>,
+    terminal_keys: HashSet<(String, String, String)>,
+}
+
+impl MemoryContent {
+    fn push_terminal(&mut self, record: &crate::ContentRecord) {
+        if self.terminal_keys.insert(Self::terminal_key(record)) {
+            self.rows.push(record.clone());
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
+        let before = self.rows.len();
+        self.rows.retain(|record| {
+            let retained = keep(record);
+            if !retained && record.kind == "terminal" {
+                self.terminal_keys.remove(&Self::terminal_key(record));
+            }
+            retained
+        });
+        (before - self.rows.len()) as u64
+    }
+
+    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
+        (
+            record.tenant.clone(),
+            record.user_id.clone(),
+            record.request_id.clone(),
+        )
+    }
 }
 
 /// In-process store: append-only ledger, DashMap-backed files and batches.
@@ -697,45 +749,6 @@ impl MemoryStore {
     }
 }
 
-#[derive(Debug, Default)]
-struct MemoryContent {
-    rows: Vec<crate::ContentRecord>,
-    terminal_keys: HashSet<(String, String, String)>,
-}
-
-impl MemoryContent {
-    fn push_terminal(&mut self, record: &crate::ContentRecord) {
-        if self.terminal_keys.insert(Self::terminal_key(record)) {
-            self.rows.push(record.clone());
-        }
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
-        let before = self.rows.len();
-        self.rows.retain(|record| {
-            let retained = keep(record);
-            if !retained && record.kind == "terminal" {
-                self.terminal_keys.remove(&Self::terminal_key(record));
-            }
-            retained
-        });
-        (before - self.rows.len()) as u64
-    }
-
-    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
-        (
-            record.tenant.clone(),
-            record.user_id.clone(),
-            record.request_id.clone(),
-        )
-    }
-}
-
-/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
@@ -759,10 +772,8 @@ impl Store for MemoryStore {
         }
         ledger.rows.push(r.clone());
         if self.ledger_max_rows > 0 && ledger.rows.len() > self.ledger_max_rows {
-            // spare rows the rollup hasn't folded yet — lost here means lost
-            // from usage forever; the cap yields to billing integrity. A full
-            // scan, not a prefix cut: completion order can wedge a young row
-            // ahead of prunable ones, which must not defeat the cap.
+            // spare unrolled rows (the cap yields to billing integrity); a full scan, since
+            // completion order can wedge a young row ahead of prunable ones
             let mut excess = ledger.rows.len() - self.ledger_max_rows;
             let mut removed = Vec::new();
             ledger.rows.retain(|r| {
@@ -808,16 +819,16 @@ impl Store for MemoryStore {
                     total_tokens: 0,
                     cost_micros: 0,
                     vendor_cost_micros: 0,
+                    billed_units: 0,
                 });
-            // saturating: a hostile upstream can drive a single record's counts
-            // to i64::MAX (usage is floored, not capped), so the rollup sum must
-            // not overflow across records
+            // saturating: a hostile record can carry i64::MAX counts (usage is floored, not capped)
             e.requests += 1;
             e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
             e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
             e.total_tokens = e.total_tokens.saturating_add(r.total_tokens);
             e.cost_micros = e.cost_micros.saturating_add(r.cost_micros);
             e.vendor_cost_micros = e.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
+            e.billed_units = e.billed_units.saturating_add(r.billed_units);
         }
         Ok(rollup.into_values().collect())
     }
@@ -1133,9 +1144,8 @@ impl Store for MemoryStore {
     }
 }
 
-/// Positional row → record mappers shared by the SQL backends: fields decode
-/// in the SELECT's column order. One macro so the sqlx trait-bound boilerplate
-/// lives once.
+/// Positional row → record mappers shared by the SQL backends (fields decode in
+/// the SELECT's column order).
 macro_rules! row_mapper {
     ($name:ident -> $ty:path { $($field:ident),+ $(,)? }) => {
         fn $name<'r, R>(row: &'r R) -> $ty
@@ -1153,6 +1163,20 @@ macro_rules! row_mapper {
     };
 }
 
+/// First epoch second NOT yet folded into the rollup: rows at or above it are
+/// still the ledger's to report.
+fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
+    rollup
+        .keys()
+        .next_back()
+        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+}
+
+/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn next_col(col: &mut usize) -> usize {
     let i = *col;
     *col += 1;
@@ -1163,17 +1187,17 @@ row_mapper!(row_to_billing -> BillingRecord {
     ak, product, tenant, model, served_model, protocol, account,
     prompt_tokens, completion_tokens, total_tokens, cost_micros,
     vendor_cost_micros, ptu_spillover, user_id, request_id,
-    created_at_epoch_secs, estimated,
+    created_at_epoch_secs, estimated, billed_units,
 });
 
 row_mapper!(usage_row -> UsageRow {
     tenant, model, requests, prompt_tokens, completion_tokens, total_tokens,
-    cost_micros, vendor_cost_micros,
+    cost_micros, vendor_cost_micros, billed_units,
 });
 
 row_mapper!(user_usage_row -> UserUsageRow {
     user_id, model, requests, prompt_tokens, completion_tokens, total_tokens,
-    cost_micros, vendor_cost_micros,
+    cost_micros, vendor_cost_micros, billed_units,
 });
 
 row_mapper!(security_event_row -> SecurityEvent {
@@ -1245,7 +1269,8 @@ impl SqliteStore {
                 ptu_spillover INTEGER NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
                 created_at_epoch_secs INTEGER NOT NULL DEFAULT 0,
-                estimated INTEGER NOT NULL DEFAULT 0)",
+                estimated INTEGER NOT NULL DEFAULT 0,
+                billed_units INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
             "CREATE TABLE IF NOT EXISTS erasures (
@@ -1258,6 +1283,7 @@ impl SqliteStore {
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
                 vendor_cost_micros INTEGER NOT NULL,
+                billed_units INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (minute_epoch, tenant, user_id, model))",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
@@ -1308,6 +1334,8 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN created_at_epoch_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE billing ADD COLUMN billed_units INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_rollup ADD COLUMN billed_units INTEGER NOT NULL DEFAULT 0",
             // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
@@ -1319,7 +1347,8 @@ impl SqliteStore {
                 return Err(crate::sqlx_err("migrate billing schema", e));
             }
         }
-        // a dead process's jobs can never progress single-instance — fail them, don't let clients poll forever
+        // a dead process's jobs can never progress single-instance — fail them, don't let clients
+        // poll forever
         sqlx::query("UPDATE batches SET status = 'failed' WHERE status IN ('pending', 'running')")
             .execute(&pool)
             .await
@@ -1361,11 +1390,8 @@ macro_rules! dialect_sql {
     }};
 }
 
-/// One `impl Store` per SQL backend. The methods in the macro body are
-/// dialect-independent (placeholder syntax aside) and expand once per backend
-/// from this single source; `$specific` carries the genuinely dialect-bound
-/// methods (id generation, rollup locking, batch fencing, erasure shape,
-/// NULL-parameter and SUM casts).
+/// One `impl Store` per SQL backend: the dialect-independent methods expand from
+/// this body, `$specific` carries the dialect-bound ones.
 macro_rules! sql_store_impl {
     ($T:ty, $dialect:ident, { $($specific:item)* }) => {
         #[async_trait::async_trait]
@@ -1378,8 +1404,8 @@ macro_rules! sql_store_impl {
                     "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
                      prompt_tokens, completion_tokens, total_tokens, cost_micros,
                      vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-                     estimated)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     estimated, billed_units)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT (request_id) DO NOTHING"
                 ))
                 .bind(&r.ak)
@@ -1399,6 +1425,7 @@ macro_rules! sql_store_impl {
                 .bind(&r.request_id)
                 .bind(r.created_at_epoch_secs)
                 .bind(r.estimated)
+                .bind(r.billed_units)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::sqlx_err("insert billing record", e))?;
@@ -1432,7 +1459,7 @@ macro_rules! sql_store_impl {
                     "SELECT ak, product, tenant, model, served_model, protocol, account,
                      prompt_tokens, completion_tokens, total_tokens, cost_micros,
                      vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-                     estimated
+                     estimated, billed_units
                      FROM billing ORDER BY n DESC LIMIT ?"
                 ))
                 .bind(limit.min(i64::MAX as usize) as i64)
@@ -1639,7 +1666,7 @@ sql_store_impl!(SqliteStore, sqlite, {
             match tenant {
                 Some(t) => sqlx::query(
                     "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
                      FROM billing WHERE tenant = ?
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -1648,7 +1675,7 @@ sql_store_impl!(SqliteStore, sqlite, {
                 .await,
                 None => sqlx::query(
                     "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
                      FROM billing
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -1673,7 +1700,7 @@ sql_store_impl!(SqliteStore, sqlite, {
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let rolled = sqlx::query(
             "SELECT user_id, model, SUM(requests), SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM usage_rollup
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND minute_epoch BETWEEN ?3 AND ?4
@@ -1688,7 +1715,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
         let raw = sqlx::query(
             "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM billing
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
@@ -1724,7 +1751,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         let rolled = sqlx::query(
             "SELECT minute_epoch - (minute_epoch % ?5), SUM(requests),
              SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM usage_rollup
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND minute_epoch BETWEEN ?3 AND ?4
@@ -1741,7 +1768,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         let raw = sqlx::query(
             "SELECT created_at_epoch_secs - (created_at_epoch_secs % ?6), COUNT(*),
              SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-             SUM(cost_micros), SUM(vendor_cost_micros)
+             SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM billing
              WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
                AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
@@ -1770,10 +1797,10 @@ sql_store_impl!(SqliteStore, sqlite, {
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
-              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
+              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units)
              SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
               SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-              SUM(cost_micros), SUM(vendor_cost_micros)
+              SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
              FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2
              GROUP BY 1, 2, 3, 4
              ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
@@ -1782,7 +1809,8 @@ sql_store_impl!(SqliteStore, sqlite, {
               completion_tokens = MAX(usage_rollup.completion_tokens, excluded.completion_tokens),
               total_tokens = MAX(usage_rollup.total_tokens, excluded.total_tokens),
               cost_micros = MAX(usage_rollup.cost_micros, excluded.cost_micros),
-              vendor_cost_micros = MAX(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros)",
+              vendor_cost_micros = MAX(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros),
+              billed_units = MAX(usage_rollup.billed_units, excluded.billed_units)",
         )
         .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
         .bind(hi)
@@ -1900,8 +1928,7 @@ sql_store_impl!(SqliteStore, sqlite, {
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
-        // ids derive from the AUTOINCREMENT sequence (sqlite_sequence), which a
-        // delete never rewinds — MAX(n)+1 would recycle a deleted file's id
+        // ids come from the AUTOINCREMENT sequence: MAX(n)+1 would recycle a deleted file's id
         let id: String = sqlx::query_scalar(
             "INSERT INTO files (id, tenant, purpose, bytes, content)
              VALUES ('file-' || (SELECT COALESCE(
@@ -2003,9 +2030,8 @@ sql_store_impl!(SqliteStore, sqlite, {
     }
 });
 
-/// A terminal batch's input rows have served their purpose — delete them in
-/// the same transaction as the status write, so submitted prompt text cannot
-/// outlive the run even across a crash between statements.
+/// Delete a terminal batch's input rows in the status write's transaction, so
+/// submitted prompt text cannot outlive the run.
 async fn prune_terminal_items(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
@@ -2022,9 +2048,8 @@ async fn prune_terminal_items(
     Ok(())
 }
 
-/// Postgres-backed store shared across a fleet. Unlike [`SqliteStore`] there
-/// is no orphan sweep on open — a starting instance must not fail batches
-/// another live instance is still executing.
+/// Postgres-backed store shared across a fleet; no orphan sweep on open, since
+/// another live instance may still be executing those batches.
 #[derive(Debug)]
 pub struct PostgresStore {
     pool: sqlx::PgPool,
@@ -2057,7 +2082,8 @@ impl PostgresStore {
                 ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE,
                 user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
                 created_at_epoch_secs BIGINT NOT NULL DEFAULT 0,
-                estimated BOOLEAN NOT NULL DEFAULT FALSE)",
+                estimated BOOLEAN NOT NULL DEFAULT FALSE,
+                billed_units BIGINT NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
@@ -2066,6 +2092,7 @@ impl PostgresStore {
                 prompt_tokens BIGINT NOT NULL, completion_tokens BIGINT NOT NULL,
                 total_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL,
                 vendor_cost_micros BIGINT NOT NULL,
+                billed_units BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (minute_epoch, tenant, user_id, model))",
             "CREATE TABLE IF NOT EXISTS security_events (
                 n BIGSERIAL PRIMARY KEY, created_at_epoch_secs BIGINT NOT NULL,
@@ -2107,9 +2134,8 @@ impl PostgresStore {
             // per-item end-user attribution so a fleet drainer still bills/budgets it
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
-            // pre-upgrade results predate the user_id column; their items rows
-            // (pruned only at terminal status from this version on) still carry
-            // the owner — backfill so erasure reaches history. Idempotent.
+            // pre-upgrade results predate user_id; backfill it from the items rows so erasure
+            // reaches history (idempotent)
             "UPDATE batch_results r SET user_id = i.user_id FROM batch_items i
              WHERE r.batch_id = i.batch_id AND r.idx = i.idx
                AND r.user_id = '' AND i.user_id <> ''",
@@ -2129,6 +2155,8 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS billed_units BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_rollup ADD COLUMN IF NOT EXISTS billed_units BIGINT NOT NULL DEFAULT 0",
         ];
         crate::setup_schema(&pool, "postgres", &ddls).await?;
         Ok(Self {
@@ -2148,7 +2176,7 @@ sql_store_impl!(PostgresStore, postgres, {
                     "SELECT tenant, model, COUNT(*),
                      SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
                      SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-                     SUM(vendor_cost_micros)::BIGINT
+                     SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
                      FROM billing WHERE tenant = $1
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -2161,7 +2189,7 @@ sql_store_impl!(PostgresStore, postgres, {
                     "SELECT tenant, model, COUNT(*),
                      SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
                      SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-                     SUM(vendor_cost_micros)::BIGINT
+                     SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
                      FROM billing
                      GROUP BY tenant, model ORDER BY tenant, model",
                 )
@@ -2188,7 +2216,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let rolled = sqlx::query(
             "SELECT user_id, model, SUM(requests)::BIGINT,
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM usage_rollup
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND minute_epoch BETWEEN $3 AND $4
@@ -2204,7 +2232,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let raw = sqlx::query(
             "SELECT user_id, model, COUNT(*),
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM billing
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
@@ -2240,7 +2268,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let rolled = sqlx::query(
             "SELECT minute_epoch - (minute_epoch % $5), SUM(requests)::BIGINT,
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM usage_rollup
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND minute_epoch BETWEEN $3 AND $4
@@ -2257,7 +2285,7 @@ sql_store_impl!(PostgresStore, postgres, {
         let raw = sqlx::query(
             "SELECT created_at_epoch_secs - (created_at_epoch_secs % $6), COUNT(*),
              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT, SUM(total_tokens)::BIGINT,
-             SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM billing
              WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
                AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
@@ -2299,11 +2327,11 @@ sql_store_impl!(PostgresStore, postgres, {
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
-              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros)
+              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units)
              SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
               SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
               SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-              SUM(vendor_cost_micros)::BIGINT
+              SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
              FROM billing WHERE created_at_epoch_secs >= $1 AND created_at_epoch_secs < $2
              GROUP BY 1, 2, 3, 4
              ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
@@ -2314,7 +2342,8 @@ sql_store_impl!(PostgresStore, postgres, {
               total_tokens = GREATEST(usage_rollup.total_tokens, excluded.total_tokens),
               cost_micros = GREATEST(usage_rollup.cost_micros, excluded.cost_micros),
               vendor_cost_micros =
-               GREATEST(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros)",
+               GREATEST(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros),
+              billed_units = GREATEST(usage_rollup.billed_units, excluded.billed_units)",
         )
         .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
         .bind(hi)
@@ -2375,8 +2404,7 @@ sql_store_impl!(PostgresStore, postgres, {
         .execute(&mut *tx)
         .await
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
-        // pending/running batches included: the emptied item fails at execution
-        // instead of running erased content (terminal batches already pruned)
+        // pending/running batches included: an emptied item fails at execution instead of running
         let i = sqlx::query(
             "UPDATE batch_items i SET messages = '[]' FROM batches b
              WHERE i.batch_id = b.id AND i.user_id = $1 AND i.messages <> '[]'
@@ -2535,8 +2563,7 @@ sql_store_impl!(PostgresStore, postgres, {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
-        // DO NOTHING (first-writer-wins) + non-terminal guard; the FOR UPDATE row
-        // lock serializes with batch_finalize so no result lands after finalize.
+        // first-writer-wins + non-terminal guard; FOR UPDATE serializes with batch_finalize
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens, user_id)
              SELECT $1, $2, $3, $4, $5, $6
@@ -2557,9 +2584,8 @@ sql_store_impl!(PostgresStore, postgres, {
     }
 
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
-        // Lock the row, THEN aggregate separately: a single UPDATE reads its
-        // subquery on the statement-start snapshot and would miss a result that
-        // commits while it waits for the lock, wrongly reporting Failed.
+        // lock the row, THEN aggregate: a single UPDATE's subquery reads the statement-start
+        // snapshot and would miss a result committing while it waits for the lock
         let mut tx = self
             .pool
             .begin()
@@ -2796,6 +2822,8 @@ mod tests {
                 billable_prompt: 250,
                 billable_completion: 60,
                 total: 310,
+                units: 0,
+                discount: 1.0,
                 ptu_spillover: false,
                 estimated: false,
             },
@@ -2804,6 +2832,52 @@ mod tests {
         assert_eq!(rec.completion_tokens, 60);
         assert_eq!(rec.total_tokens, 310);
         assert_eq!(rec.cost_micros, 250 + 120);
+    }
+
+    #[test]
+    fn token_rate_audio_and_1h_weights_inherit_their_text_and_5m_weights() {
+        let cfg = gw_config::GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, token_rate: {prompt: 3.0, write_cache: 1.25, audio_completion: 8.0}}]",
+        )
+        .unwrap();
+        let rate = model_token_rate(&cfg, "m");
+        assert_eq!(rate.audio_prompt_weight, 3.0);
+        assert_eq!(rate.write_cache_1h_weight, 1.25);
+        assert_eq!(rate.audio_completion_weight, 8.0);
+        assert_eq!(rate.completion_weight, 1.0);
+    }
+
+    #[test]
+    fn billing_record_prices_units_at_the_model_or_tenant_unit_price() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: tts, protocol: tts, unit_price_micros: 15}]\ntenants: [{name: acme, model_prices: {tts: {unit_price_micros: 20}}}]\naccounts: [{name: acc, provider: openai, protocols: [tts], cost_unit_price_micros: 4}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let input = |tenant: &'static str| BillingInput {
+            ak: "k",
+            product: "demo",
+            tenant,
+            user_id: "",
+            request_id: "req-u",
+            requested_model: "tts",
+            served_model: "tts",
+            protocol: "tts",
+            account: "acc",
+            prompt: 0,
+            completion: 0,
+            billable_prompt: 0,
+            billable_completion: 0,
+            total: 0,
+            units: 40,
+            discount: 1.0,
+            ptu_spillover: false,
+            estimated: false,
+        };
+        let rec = billing_record(&cfg, &input("default"));
+        assert_eq!(
+            (rec.billed_units, rec.cost_micros, rec.total_tokens),
+            (40, 600, 0)
+        );
+        assert_eq!(rec.vendor_cost_micros, 160);
+        assert_eq!(billing_record(&cfg, &input("acme")).cost_micros, 800);
     }
 
     #[test]
@@ -2826,6 +2900,8 @@ mod tests {
                 billable_prompt: i64::MAX,
                 billable_completion: i64::MAX,
                 total: i64::MAX,
+                units: 0,
+                discount: 1.0,
                 ptu_spillover: false,
                 estimated: false,
             },
@@ -2853,6 +2929,7 @@ mod tests {
             total_tokens: 8,
             cost_micros: 42,
             vendor_cost_micros: 7,
+            billed_units: 3,
             ptu_spillover: false,
             estimated: false,
         }
@@ -2865,6 +2942,7 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(snap[0].model, "m1");
         assert_eq!(snap[1].total_tokens, 8);
+        assert_eq!(snap[1].billed_units, 3);
         let (total, page) = store.ledger_snapshot(1).await.unwrap();
         assert_eq!(total, 2);
         assert_eq!(page.len(), 1);
@@ -3837,6 +3915,7 @@ mod tests {
         assert_eq!(usage.len(), 2);
         assert_eq!(usage[0].requests, 1);
         assert_eq!(usage[0].vendor_cost_micros, 7);
+        assert_eq!(usage[0].billed_units, 3);
         assert!(store.ledger_usage(Some("ghost")).await.unwrap().is_empty());
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
         assert_eq!(job.status, BatchStatus::Completed);

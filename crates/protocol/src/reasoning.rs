@@ -22,10 +22,8 @@ pub enum ThinkingDialect {
     AdaptiveSummarized,
 }
 
-/// Reasoning effort → thinking budget in tokens; `None` for `none` and for
-/// unknown vocabulary. Fixed per level, not a share of `max_tokens`: Anthropic
-/// renders the budget into the prompt, so a moving budget thrashes the cache.
-/// `max` stays under the 64K output cap with the answer budget on top.
+/// Reasoning effort → thinking budget, fixed per level (a `max_tokens` share
+/// would thrash the prompt cache); `None` for `none` and unknown vocabulary.
 pub fn effort_budget(effort: &str) -> Option<i64> {
     Some(match effort {
         "minimal" | "low" => 1024,
@@ -38,18 +36,23 @@ pub fn effort_budget(effort: &str) -> Option<i64> {
 }
 
 /// Thinking budget → reasoning effort (the OpenAI and Anthropic `effort`
-/// vocabularies coincide).
+/// vocabularies coincide); buckets split midway between [`effort_budget`]'s
+/// levels so a canonical budget round-trips to its own effort.
 pub fn budget_effort(budget: i64) -> &'static str {
     match budget {
-        ..=4999 => "low",
-        5000..=9999 => "medium",
-        _ => "high",
+        ..=2559 => "low",
+        2560..=10239 => "medium",
+        10240..=20479 => "high",
+        20480..=28671 => "xhigh",
+        _ => "max",
     }
 }
 
 /// The thinking dialect of a model on the Anthropic wire, by name. Vendors
 /// speaking that wire (MiniMax, GLM, Kimi) cloned the budget dialect.
 pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
+    // Bedrock ids carry a vendor (and region) prefix: `us.anthropic.claude-…`
+    let model = model.find("claude").map_or(model, |i| &model[i..]);
     if !model.starts_with("claude") || model.starts_with("claude-3") {
         return ThinkingDialect::Budget;
     }
@@ -76,9 +79,8 @@ pub fn is_thinking_block(block: &Value) -> bool {
     )
 }
 
-/// An Anthropic `thinking` / `redacted_thinking` block as a `reasoning_details`
-/// unit: `reasoning.text` carrying the signature, `reasoning.encrypted`
-/// carrying the opaque data. Other blocks yield `None`.
+/// A `thinking` / `redacted_thinking` block as a `reasoning_details` unit
+/// (`reasoning.text` + signature, or `reasoning.encrypted`); other blocks yield `None`.
 pub fn thinking_block_to_detail(mut block: Value, index: usize) -> Option<Value> {
     let mut detail = Map::new();
     match block["type"].as_str() {
@@ -98,19 +100,8 @@ pub fn thinking_block_to_detail(mut block: Value, index: usize) -> Option<Value>
     Some(Value::Object(detail))
 }
 
-/// `display: omitted` may leave the prose out; a missing string is `""`, not
-/// `null`, on either wire.
-fn take_string_or_empty(block: &mut Value, key: &str) -> Value {
-    match block.get_mut(key).map(Value::take) {
-        Some(value @ Value::String(_)) => value,
-        _ => Value::String(String::new()),
-    }
-}
-
-/// Inverse of [`thinking_block_to_detail`] for a replayed unit: only signed
-/// text and Anthropic-format encrypted data become blocks — the vendor rejects
-/// an unsigned thinking block, so unsigned prose is dropped rather than
-/// forwarded to fail. Anthropic-shaped units pass through as they are.
+/// Inverse of [`thinking_block_to_detail`]: only signed text and Anthropic
+/// encrypted data become blocks (the vendor rejects unsigned thinking).
 pub fn detail_to_thinking_block(mut detail: Value) -> Option<Value> {
     let mut block = Map::new();
     match detail["type"].as_str() {
@@ -133,6 +124,15 @@ pub fn detail_to_thinking_block(mut detail: Value) -> Option<Value> {
     Some(Value::Object(block))
 }
 
+/// `display: omitted` may leave the prose out; a missing string is `""`, not
+/// `null`, on either wire.
+fn take_string_or_empty(block: &mut Value, key: &str) -> Value {
+    match block.get_mut(key).map(Value::take) {
+        Some(value @ Value::String(_)) => value,
+        _ => Value::String(String::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -147,9 +147,11 @@ mod tests {
         assert!(effort_budget("xhigh") < effort_budget("max"));
         assert_eq!(effort_budget("none"), None);
         assert_eq!(effort_budget("bogus"), None);
-        assert_eq!(budget_effort(1024), "low");
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(budget_effort(effort_budget(effort).unwrap()), effort);
+        }
         assert_eq!(budget_effort(8192), "medium");
-        assert_eq!(budget_effort(32768), "high");
+        assert_eq!(budget_effort(65536), "max");
     }
 
     #[test]
@@ -169,6 +171,10 @@ mod tests {
             ("claude-mythos-5", AdaptiveSummarized),
             ("claude-opus-5-1", AdaptiveSummarized),
             ("MiniMax-M3", Budget),
+            ("anthropic.claude-3-5-sonnet-20241022-v2:0", Budget),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", Budget),
+            ("anthropic.claude-opus-4-6-v1:0", Adaptive),
+            ("global.anthropic.claude-sonnet-5-v1:0", AdaptiveSummarized),
         ] {
             assert_eq!(anthropic_thinking_dialect(model), want, "{model}");
         }

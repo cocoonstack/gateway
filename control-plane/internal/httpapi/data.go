@@ -43,12 +43,14 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	var totals struct {
 		Requests         int64 `json:"requests"`
 		TotalTokens      int64 `json:"total_tokens"`
+		BilledUnits      int64 `json:"billed_units"`
 		CostMicros       int64 `json:"cost_micros"`
 		VendorCostMicros int64 `json:"vendor_cost_micros,omitempty"`
 	}
 	for _, row := range usage {
 		totals.Requests += row.Requests
 		totals.TotalTokens += row.TotalTokens
+		totals.BilledUnits += row.BilledUnits
 		totals.CostMicros += row.CostMicros
 		totals.VendorCostMicros += row.VendorCostMicros
 	}

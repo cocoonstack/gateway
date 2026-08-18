@@ -29,7 +29,7 @@ export function useAction(fallback = "Request failed") {
     setError("");
     try {
       await fn();
-    } catch (err) {
+    } catch (err: unknown) {
       setError(errorMessage(err, fallback));
     } finally {
       setBusy(false);

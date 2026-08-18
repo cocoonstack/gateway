@@ -20,6 +20,7 @@ type UsageRow struct {
 	TotalTokens      int64  `json:"total_tokens"`
 	CostMicros       int64  `json:"cost_micros"`
 	VendorCostMicros int64  `json:"vendor_cost_micros"`
+	BilledUnits      int64  `json:"billed_units"`
 }
 
 type SeriesPoint struct {
@@ -31,6 +32,7 @@ type SeriesPoint struct {
 	TotalTokens      int64 `json:"total_tokens"`
 	CostMicros       int64 `json:"cost_micros"`
 	VendorCostMicros int64 `json:"vendor_cost_micros"`
+	BilledUnits      int64 `json:"billed_units"`
 }
 
 type Series struct {
@@ -49,19 +51,21 @@ type ModelStatus struct {
 }
 
 type Key struct {
-	AK                      string           `json:"ak"`
-	Product                 string           `json:"product"`
-	Tenant                  string           `json:"tenant"`
-	Owner                   *string          `json:"owner"`
-	QPS                     float64          `json:"qps"`
-	DailyTokenQuota         int64            `json:"daily_token_quota"`
-	TokensPerMinute         *int64           `json:"tokens_per_minute"`
-	ExpiresAtEpochSecs      *int64           `json:"expires_at_epoch_secs"`
-	Banned                  bool             `json:"banned"`
-	SuspendedUntilEpochSecs *int64           `json:"suspended_until_epoch_secs"`
-	Status                  string           `json:"status"`
-	Available               bool             `json:"available"`
-	ModelQuotas             map[string]int64 `json:"model_quotas,omitempty"`
+	AK      string  `json:"ak"`
+	Product string  `json:"product"`
+	Tenant  string  `json:"tenant"`
+	Owner   *string `json:"owner"`
+
+	QPS                float64          `json:"qps"`
+	DailyTokenQuota    int64            `json:"daily_token_quota"`
+	TokensPerMinute    *int64           `json:"tokens_per_minute"`
+	ExpiresAtEpochSecs *int64           `json:"expires_at_epoch_secs"`
+	ModelQuotas        map[string]int64 `json:"model_quotas,omitempty"`
+
+	Banned                  bool   `json:"banned"`
+	SuspendedUntilEpochSecs *int64 `json:"suspended_until_epoch_secs"`
+	Status                  string `json:"status"`
+	Available               bool   `json:"available"`
 }
 
 type Account struct {
@@ -119,9 +123,8 @@ type Scope struct {
 	User   string
 }
 
-// Client is the control plane's only dependency on the Rust gateway. Key
-// mutations carry the acting tenant ("" = global operator) so the gateway's
-// own AdminScope enforcement — not this process — draws the tenant boundary.
+// Client is the control plane's only dependency on the Rust gateway; key mutations
+// carry the acting tenant ("" = global) so the gateway's own AdminScope draws the boundary.
 type Client interface {
 	Usage(ctx context.Context, scope Scope, since, until int64) ([]UsageRow, error)
 	UsageSeries(ctx context.Context, scope Scope, bucket string, since, until int64) (Series, error)
@@ -142,8 +145,7 @@ type Client interface {
 
 type ridKey struct{}
 
-// WithRequestID tags ctx so every gateway call made under it carries the
-// X-Request-ID header end to end.
+// WithRequestID tags ctx so every gateway call under it carries X-Request-ID end to end.
 func WithRequestID(ctx context.Context, rid string) context.Context {
 	return context.WithValue(ctx, ridKey{}, rid)
 }

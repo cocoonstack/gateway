@@ -74,6 +74,7 @@ tenants:
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
     model_prices:            # optional per-model charged-price override for this tenant
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
+      tts-1: {unit_price_micros: 20}
     user_daily_token_quota: 100000  # optional soft per-end-user daily cap
     security:                # optional; overrides the global `security:` WHOLE for this tenant
       blocklist: ["forbidden"]
@@ -102,11 +103,17 @@ models:
     protocol: openai-chat            # wire protocol (or set `provider:` instead)
     input_price_per_1k_micros: 2500  # billing rates (micros per 1k tokens)
     output_price_per_1k_micros: 10000
+    unit_price_micros: 0             # per non-token unit: TTS character, transcription second, rerank search unit
     qpm: 60                          # optional model-level rate limit
     cache_ttl_seconds: 60            # optional request-level response cache
     token_rate:                      # optional per-component billing weights
       read_cache: 0.1                #   cache reads at 10% of the input price
       write_cache: 1.25              #   (prompt/completion/reasoning default 1.0)
+      write_cache_1h: 2.0            #   1-hour cache writes (default = write_cache)
+      audio_prompt: 16.67            #   audio input tokens (default = prompt weight)
+      audio_completion: 8.33         #   audio output tokens (default = completion weight)
+    long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
+    batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price
     prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
@@ -115,11 +122,28 @@ models:
 
 `token_rate` weights scale cost and quota consumption per token component; the
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
-is the weighted platform total. `prompt_cache` (anthropic-messages models)
+is the weighted platform total. Audio tokens (realtime, audio chat: the
+vendor's `audio_tokens` details), 1-hour cache writes (Anthropic's
+`cache_creation.ephemeral_1h_input_tokens`) are subsets of prompt/completion
+and cache-write with their own weights (audio tokens are attributed to the
+fresh, non-cached prompt side — the flat OpenAI usage shape does not say
+whether a cached token was audio); `long_context` re-scales both billable
+sides once the prompt crosses the threshold (Anthropic's >200k tier);
+`batch_discount` multiplies the charged and vendor cost of items served
+through `/v1/batches`. `unit_price_micros` prices what the surfaces
+without token usage meter — a `tts` model's input characters, an `stt`
+model's audio seconds (the vendor's `usage.seconds` / `duration`, else the
+uploaded WAV/MP3's own play length; fractions rounded up), a `rerank`
+model's `search_units`, an `image` model's images — and adds to `cost_micros` next to any token cost;
+the count lands in the ledger's `billed_units` and the `/admin/usage`
+aggregates. An account's `cost_unit_price_micros` is the vendor side of the
+same unit, for margin. `prompt_cache` (anthropic-messages models)
 marks the system prompt and the latest user turn as Anthropic prompt-cache
 breakpoints, so each turn of a conversation re-reads its prefix at the
 cache-read rate; it is per model and off by default because a long one-shot
-prompt would pay the cache-write premium for nothing. `variants` splits a
+prompt would pay the cache-write premium for nothing. A `/v1/messages` client
+that sends `system` as blocks with its own `cache_control` (including
+`ttl: 1h`) keeps them as sent — the gateway adds no second breakpoint there. `variants` splits a
 public name across other declared same-protocol models (one level):
 entitlement and the per-(AK, model) daily counter judge the public name,
 billing prices the served variant, and the response echoes the requested
@@ -176,6 +200,7 @@ accounts:
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
     cost_input_price_per_1k_micros: 100   # optional: what this vendor charges us (margin accounting)
+    cost_unit_price_micros: 0             #   and per non-token unit (see the model's unit_price_micros)
     cost_output_price_per_1k_micros: 400
 ```
 

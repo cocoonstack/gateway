@@ -25,15 +25,8 @@ pub struct PumpResult {
     pub terminal_error: Option<StreamError>,
 }
 
-/// Drive a vendor SSE reply through `apply` (which owns the engine's
-/// accumulation state): a buffered body decodes in one pass; a live stream is
-/// decoded as bytes arrive and forwarded through `tx` when one is attached.
-///
-/// A JSON body is the vendor refusing to stream — callers dispatch that
-/// themselves before pumping.
 /// A stream request answered with JSON is an error body: surface the vendor's
-/// error envelope. A JSON body with no envelope falls through to
-/// [`pump_sse`]'s generic "expected sse" error.
+/// envelope; one without an envelope falls through to [`pump_sse`]'s "expected sse".
 pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) -> GResult<()> {
     if let UpstreamBody::Json(b) = body {
         let v: Value = serde_json::from_slice(b)
@@ -45,9 +38,8 @@ pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) ->
     Ok(())
 }
 
-/// Deliver the terminal error frame for a committed abort (best effort — the
-/// client may already be gone) and mark the pump result aborted. Committed
-/// implies a live channel: `sent_any` only ever turns true with `tx` attached.
+/// Deliver the terminal error frame for a committed abort (best effort) and mark
+/// the pump result aborted; committed implies `tx` is attached.
 async fn abort_frame(
     tx: &Option<tokio::sync::mpsc::Sender<StreamChunk>>,
     out: &mut PumpResult,
@@ -97,10 +89,7 @@ where
             let mut dec = SseDecoder::default();
             let mut sent_any = false;
             while let Some(item) = s.next().await {
-                // A fault after bytes reached the client is a committed abort,
-                // not a failover signal: emit the terminal error frame and keep
-                // what was delivered. Before commit it is a plain upstream
-                // failure, eligible for failover.
+                // after commit a fault aborts (terminal frame); before commit it may fail over
                 let bytes = match item {
                     Ok(b) => b,
                     Err(fault) if sent_any => {
@@ -126,10 +115,7 @@ where
                     }
                 };
                 for data in events {
-                    // A malformed frame, vendor error frame, or apply failure
-                    // after bytes reached the client is a committed abort, NOT
-                    // a failover signal — replaying would splice a second
-                    // generation onto the same stream.
+                    // a bad frame after commit aborts: a replay would splice a second generation
                     let applied = serde_json::from_str(&data)
                         .map_err(|e| {
                             GatewayError::internal(format!("parse {vendor} sse frame"))
@@ -155,8 +141,7 @@ where
                             Some(sender) => {
                                 if sender.send(chunk).await.is_err() {
                                     if sent_any {
-                                        // client left mid-response: finalize the
-                                        // delivered part for billing
+                                        // client left mid-response: bill the delivered part
                                         out.aborted = true;
                                     } else {
                                         return Err(GatewayError::client_closed(

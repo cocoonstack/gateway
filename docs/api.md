@@ -43,7 +43,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/chat/completions` | streaming + non-streaming |
 | POST | `/v1/completions` | legacy text completion (`prompt`) |
-| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort`) and streams as that surface's own frames |
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
@@ -84,8 +84,8 @@ mapping per model family:
 
 | Family | Request | Response |
 |--------|---------|----------|
-| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
-| Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024 … `max` 65536), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
+| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400) | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
+| Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024, `medium` 4096, `high` 16384, `xhigh` 24576, `max` 32768), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
 | Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on) | same |
 
 Sampling knobs the client sent along a gateway-mapped effort (`temperature`,
@@ -102,7 +102,10 @@ dropped — the vendor rejects it), and go to OpenAI-compatible vendors as
 `reasoning_content` / `reasoning_details`. Requests that engage reasoning or
 replay signed units are pinned to their requested model (see [Extended
 thinking](#extended-thinking)); `usage.completion_tokens_details.reasoning_tokens`
-reports the reasoning share when the vendor does.
+reports the reasoning share when the vendor does, and
+`usage.prompt_tokens_details` carries `cached_tokens` (cache reads) plus, on
+Anthropic-family models, `cache_creation_input_tokens` — cache writes ride
+inside `prompt_tokens` there, so a client can reconcile the write premium.
 
 ## Anthropic-compatible
 
