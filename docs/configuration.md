@@ -74,6 +74,7 @@ tenants:
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
     model_prices:            # optional per-model charged-price override for this tenant
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
+      tts-1: {unit_price_micros: 20}
     user_daily_token_quota: 100000  # optional soft per-end-user daily cap
     security:                # optional; overrides the global `security:` WHOLE for this tenant
       blocklist: ["forbidden"]
@@ -102,6 +103,7 @@ models:
     protocol: openai-chat            # wire protocol (or set `provider:` instead)
     input_price_per_1k_micros: 2500  # billing rates (micros per 1k tokens)
     output_price_per_1k_micros: 10000
+    unit_price_micros: 0             # per non-token unit: TTS character, transcription second, rerank search unit
     qpm: 60                          # optional model-level rate limit
     cache_ttl_seconds: 60            # optional request-level response cache
     token_rate:                      # optional per-component billing weights
@@ -115,7 +117,11 @@ models:
 
 `token_rate` weights scale cost and quota consumption per token component; the
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
-is the weighted platform total. `prompt_cache` (anthropic-messages models)
+is the weighted platform total. `unit_price_micros` prices what the surfaces
+without token usage meter — a `tts` model's input characters, an `stt`
+model's audio seconds (the vendor's `usage.seconds` / `duration`, fractions
+rounded up), a `rerank` model's `search_units` — and adds to `cost_micros`
+next to any token cost; the count lands in the ledger's `billed_units`. `prompt_cache` (anthropic-messages models)
 marks the system prompt and the latest user turn as Anthropic prompt-cache
 breakpoints, so each turn of a conversation re-reads its prefix at the
 cache-read rate; it is per model and off by default because a long one-shot

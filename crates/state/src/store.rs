@@ -86,6 +86,10 @@ pub struct BillingRecord {
     /// What the serving account's vendor charged us (zero = untracked).
     #[serde(default)]
     pub vendor_cost_micros: i64,
+    /// Non-token units billed (TTS characters, transcription seconds, rerank
+    /// search units); their price is folded into `cost_micros`.
+    #[serde(default)]
+    pub billed_units: i64,
     /// PTU spilled over to a paygo account (a failover occurred).
     #[serde(default)]
     pub ptu_spillover: bool,
@@ -190,6 +194,8 @@ pub struct BillingInput<'a> {
     pub billable_prompt: i64,
     pub billable_completion: i64,
     pub total: i64,
+    /// Non-token units the vendor metered, priced at the model's unit price.
+    pub units: i64,
     pub ptu_spillover: bool,
     /// Counts are estimated (aborted stream), not vendor-reported.
     pub estimated: bool,
@@ -233,6 +239,8 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
+    let units = clamp_tokens(b.units);
+    let unit_cost = units.saturating_mul(cfg.unit_price_for_tenant(b.tenant, b.served_model));
     let vendor = cfg
         .accounts
         .iter()
@@ -258,8 +266,10 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged),
+        cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged)
+            .saturating_add(unit_cost),
         vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor),
+        billed_units: units,
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
     }
@@ -1163,7 +1173,7 @@ row_mapper!(row_to_billing -> BillingRecord {
     ak, product, tenant, model, served_model, protocol, account,
     prompt_tokens, completion_tokens, total_tokens, cost_micros,
     vendor_cost_micros, ptu_spillover, user_id, request_id,
-    created_at_epoch_secs, estimated,
+    created_at_epoch_secs, estimated, billed_units,
 });
 
 row_mapper!(usage_row -> UsageRow {
@@ -1245,7 +1255,8 @@ impl SqliteStore {
                 ptu_spillover INTEGER NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
                 created_at_epoch_secs INTEGER NOT NULL DEFAULT 0,
-                estimated INTEGER NOT NULL DEFAULT 0)",
+                estimated INTEGER NOT NULL DEFAULT 0,
+                billed_units INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
             "CREATE TABLE IF NOT EXISTS erasures (
@@ -1308,6 +1319,7 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN created_at_epoch_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE billing ADD COLUMN billed_units INTEGER NOT NULL DEFAULT 0",
             // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
@@ -1378,8 +1390,8 @@ macro_rules! sql_store_impl {
                     "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
                      prompt_tokens, completion_tokens, total_tokens, cost_micros,
                      vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-                     estimated)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     estimated, billed_units)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT (request_id) DO NOTHING"
                 ))
                 .bind(&r.ak)
@@ -1399,6 +1411,7 @@ macro_rules! sql_store_impl {
                 .bind(&r.request_id)
                 .bind(r.created_at_epoch_secs)
                 .bind(r.estimated)
+                .bind(r.billed_units)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::sqlx_err("insert billing record", e))?;
@@ -1432,7 +1445,7 @@ macro_rules! sql_store_impl {
                     "SELECT ak, product, tenant, model, served_model, protocol, account,
                      prompt_tokens, completion_tokens, total_tokens, cost_micros,
                      vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-                     estimated
+                     estimated, billed_units
                      FROM billing ORDER BY n DESC LIMIT ?"
                 ))
                 .bind(limit.min(i64::MAX as usize) as i64)
@@ -2057,7 +2070,8 @@ impl PostgresStore {
                 ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE,
                 user_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
                 created_at_epoch_secs BIGINT NOT NULL DEFAULT 0,
-                estimated BOOLEAN NOT NULL DEFAULT FALSE)",
+                estimated BOOLEAN NOT NULL DEFAULT FALSE,
+                billed_units BIGINT NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
@@ -2129,6 +2143,7 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE billing ADD COLUMN IF NOT EXISTS billed_units BIGINT NOT NULL DEFAULT 0",
         ];
         crate::setup_schema(&pool, "postgres", &ddls).await?;
         Ok(Self {
@@ -2796,6 +2811,7 @@ mod tests {
                 billable_prompt: 250,
                 billable_completion: 60,
                 total: 310,
+                units: 0,
                 ptu_spillover: false,
                 estimated: false,
             },
@@ -2804,6 +2820,37 @@ mod tests {
         assert_eq!(rec.completion_tokens, 60);
         assert_eq!(rec.total_tokens, 310);
         assert_eq!(rec.cost_micros, 250 + 120);
+    }
+
+    #[test]
+    fn billing_record_prices_units_at_the_model_or_tenant_unit_price() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: tts, protocol: tts, unit_price_micros: 15}]\ntenants: [{name: acme, model_prices: {tts: {unit_price_micros: 20}}}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let input = |tenant: &'static str| BillingInput {
+            ak: "k",
+            product: "demo",
+            tenant,
+            user_id: "",
+            request_id: "req-u",
+            requested_model: "tts",
+            served_model: "tts",
+            protocol: "tts",
+            account: "acc",
+            prompt: 0,
+            completion: 0,
+            billable_prompt: 0,
+            billable_completion: 0,
+            total: 0,
+            units: 40,
+            ptu_spillover: false,
+            estimated: false,
+        };
+        let rec = billing_record(&cfg, &input("default"));
+        assert_eq!(
+            (rec.billed_units, rec.cost_micros, rec.total_tokens),
+            (40, 600, 0)
+        );
+        assert_eq!(billing_record(&cfg, &input("acme")).cost_micros, 800);
     }
 
     #[test]
@@ -2826,6 +2873,7 @@ mod tests {
                 billable_prompt: i64::MAX,
                 billable_completion: i64::MAX,
                 total: i64::MAX,
+                units: 0,
                 ptu_spillover: false,
                 estimated: false,
             },
@@ -2853,6 +2901,7 @@ mod tests {
             total_tokens: 8,
             cost_micros: 42,
             vendor_cost_micros: 7,
+            billed_units: 3,
             ptu_spillover: false,
             estimated: false,
         }
@@ -2865,6 +2914,7 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(snap[0].model, "m1");
         assert_eq!(snap[1].total_tokens, 8);
+        assert_eq!(snap[1].billed_units, 3);
         let (total, page) = store.ledger_snapshot(1).await.unwrap();
         assert_eq!(total, 2);
         assert_eq!(page.len(), 1);

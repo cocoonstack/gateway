@@ -41,6 +41,10 @@ pub struct GatewayResponse {
 
     /// PTU spilled over to pay-go account.
     pub ptu_spillover: bool,
+    /// Non-token units the vendor metered (TTS input characters, transcription
+    /// seconds, rerank search units); priced by the model's `unit_price_micros`.
+    #[serde(default)]
+    pub billed_units: i64,
     /// sora2 async step marker.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub step: String,

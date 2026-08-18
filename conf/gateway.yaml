@@ -128,8 +128,10 @@ models:
     protocol: image
   - name: tts-1 # audio tts family
     protocol: tts
+    unit_price_micros: 15 # per input character
   - name: whisper-1 # audio stt family
     protocol: stt
+    unit_price_micros: 100 # per audio second
   - name: kling-video # video family
     protocol: video
   - name: brave-search # search family

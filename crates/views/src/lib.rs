@@ -536,6 +536,7 @@ async fn bill_realtime_turn(
                 billable_prompt: bp,
                 billable_completion: bc,
                 total,
+                units: 0,
                 ptu_spillover: false,
                 estimated,
             },
@@ -4553,6 +4554,7 @@ mod tests {
                     total_tokens: tokens,
                     cost_micros,
                     vendor_cost_micros: cost_micros / 2,
+                    billed_units: 0,
                     ptu_spillover: false,
                     estimated: false,
                 })
@@ -4623,6 +4625,7 @@ mod tests {
                 total_tokens: 10,
                 cost_micros: 40,
                 vendor_cost_micros: 25,
+                billed_units: 0,
                 ptu_spillover: false,
                 estimated: false,
             })

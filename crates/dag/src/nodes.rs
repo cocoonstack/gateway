@@ -681,7 +681,7 @@ impl DagNode for CostCalc {
         let rate =
             gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
         // saturating sums so a malformed usage subtree can't overflow the totals
-        let tokens = match &resp.common_usage {
+        let mut tokens = match &resp.common_usage {
             Some(u) => {
                 let ti = gw_models::TokenInput {
                     prompt: u.platform_input,
@@ -695,6 +695,7 @@ impl DagNode for CostCalc {
                     completion: u.completion_total(),
                     billable_prompt: gw_models::weighted_prompt(&ti, &rate),
                     billable_completion: gw_models::weighted_completion(&ti, &rate),
+                    units: 0,
                 }
             }
             // total-only vendors (MiniMax v1) report no sides; meter the
@@ -704,6 +705,7 @@ impl DagNode for CostCalc {
             }
             None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
         };
+        tokens.units = resp.billed_units;
         bill(ctx, tokens, false).await
     }
 }
@@ -723,6 +725,8 @@ struct BillTokens {
     completion: i64,
     billable_prompt: i64,
     billable_completion: i64,
+    /// Non-token units (characters / seconds / search units), priced separately.
+    units: i64,
 }
 
 impl BillTokens {
@@ -737,6 +741,7 @@ impl BillTokens {
             completion,
             billable_prompt,
             billable_completion,
+            units: 0,
         }
     }
 
@@ -872,6 +877,7 @@ async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GRes
                 billable_prompt: tokens.billable_prompt,
                 billable_completion: tokens.billable_completion,
                 total: tokens.total(),
+                units: tokens.units,
                 ptu_spillover,
                 estimated,
             },

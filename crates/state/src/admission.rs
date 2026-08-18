@@ -348,6 +348,7 @@ mod tests {
             total_tokens: 2,
             cost_micros: 0,
             vendor_cost_micros: 0,
+            billed_units: 0,
             ptu_spillover: false,
             estimated: false,
         }

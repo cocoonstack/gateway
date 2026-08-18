@@ -57,8 +57,8 @@ models:
 ```
 
 Jina reports `usage.total_tokens`, which bills as prompt tokens; Cohere bills
-by search units and reports no tokens, so its ledger rows carry zero tokens
-(as with per-second speech pricing). Both verified live.
+by search units (`meta.billed_units.search_units`), priced by the model's
+`unit_price_micros`. Both verified live.
 
 ## Native (non-OpenAI) wire engines
 

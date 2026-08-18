@@ -109,6 +109,10 @@ pub struct ModelConf {
     pub input_price_per_1k_micros: i64,
     #[serde(default)]
     pub output_price_per_1k_micros: i64,
+    /// Price per billed unit on the surfaces that don't meter tokens: a TTS
+    /// input character, a transcription second, a rerank search unit.
+    #[serde(default)]
+    pub unit_price_micros: i64,
     /// Model-level requests-per-minute limit; None = unlimited.
     #[serde(default)]
     pub qpm: Option<i64>,
@@ -481,13 +485,15 @@ pub struct ProductConfEntry {
     pub qpm: Option<i64>,
 }
 
-/// A per-1k-token price pair (micro-dollars).
+/// A per-1k-token price pair plus the per-unit price (micro-dollars).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub struct PriceConf {
     #[serde(default)]
     pub input_price_per_1k_micros: i64,
     #[serde(default)]
     pub output_price_per_1k_micros: i64,
+    #[serde(default)]
+    pub unit_price_micros: i64,
 }
 
 /// Tenant-level pooled governance and model entitlement. All of a tenant's
@@ -805,7 +811,9 @@ impl GatewayConfig {
         let neg = |i: i64, o: i64| i < 0 || o < 0;
         let neg_or_nan = |v: f64| !v.is_finite() || v < 0.0;
         for m in &self.models {
-            if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros) {
+            if neg(m.input_price_per_1k_micros, m.output_price_per_1k_micros)
+                || m.unit_price_micros < 0
+            {
                 return Err(ConfigError::NegativePrice {
                     owner: format!("model {}", m.name),
                 });
@@ -870,7 +878,9 @@ impl GatewayConfig {
         }
         for t in &self.tenants {
             for (model, p) in &t.model_prices {
-                if neg(p.input_price_per_1k_micros, p.output_price_per_1k_micros) {
+                if neg(p.input_price_per_1k_micros, p.output_price_per_1k_micros)
+                    || p.unit_price_micros < 0
+                {
                     return Err(ConfigError::NegativePrice {
                         owner: format!("tenant {} price for {model}", t.name),
                     });
@@ -1107,6 +1117,18 @@ impl GatewayConfig {
             return (p.input_price_per_1k_micros, p.output_price_per_1k_micros);
         }
         self.prices_for(model)
+    }
+
+    /// Charged per-unit price for `tenant` on `model` (same override rule).
+    pub fn unit_price_for_tenant(&self, tenant: &str, model: &str) -> i64 {
+        self.find_tenant(tenant)
+            .and_then(|t| t.model_prices.get(model))
+            .map(|p| p.unit_price_micros)
+            .unwrap_or_else(|| {
+                self.find_model(model)
+                    .map(|m| m.unit_price_micros)
+                    .unwrap_or(0)
+            })
     }
 }
 
@@ -1487,14 +1509,18 @@ tenants: [{name: t1}, {name: t1}]
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
         ));
 
-        let neg_price = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: -1}]";
-        assert!(
-            matches!(
-                GatewayConfig::from_yaml(neg_price),
-                Err(ConfigError::NegativePrice { .. })
-            ),
-            "negative prices are rejected at load"
-        );
+        for neg_price in [
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: -1}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: tts, unit_price_micros: -1}]",
+        ] {
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(neg_price),
+                    Err(ConfigError::NegativePrice { .. })
+                ),
+                "negative prices are rejected at load"
+            );
+        }
 
         for bad in [200, 302, 99, 600] {
             let replay_ok = format!(

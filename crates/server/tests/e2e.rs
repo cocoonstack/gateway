@@ -1338,6 +1338,37 @@ async fn embeddings_images_audio_families() {
 }
 
 #[tokio::test]
+async fn unit_priced_surfaces_bill_characters_and_seconds() {
+    let app = app();
+    for body in [
+        r#"{"model":"tts-1","input":"read this aloud","voice":"alloy"}"#,
+        r#"{"model":"whisper-1","audio_b64":"TU9DSw=="}"#,
+    ] {
+        let path = if body.contains("tts-1") {
+            "/v1/audio/speech"
+        } else {
+            "/v1/audio/transcriptions"
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(path, Some("ak-demo-123"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
+    let j = body_json(resp).await;
+    let rows = j["records"].as_array().unwrap();
+    let row = |model: &str| rows.iter().find(|r| r["model"] == model).unwrap();
+    // "read this aloud" = 15 characters × 15 micros; the mock transcribes 5 s × 100 micros
+    assert_eq!(row("tts-1")["billed_units"], 15);
+    assert_eq!(row("tts-1")["cost_micros"], 225);
+    assert_eq!(row("whisper-1")["billed_units"], 5);
+    assert_eq!(row("whisper-1")["cost_micros"], 500);
+    assert_eq!(row("whisper-1")["total_tokens"], 0);
+}
+
+#[tokio::test]
 async fn vertex_chat_family() {
     let app = app();
     let resp = app

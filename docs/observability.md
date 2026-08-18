@@ -45,7 +45,8 @@ and can be capped with `storage.ledger_max_rows`. Each record carries
 `request_id`, the
 access key, product, `tenant`, `user_id` (effective end user), the requested
 `model` and the `served_model` (differs after a quota fallback), protocol,
-account, token counts, charged `cost_micros` and `vendor_cost_micros`,
+account, token counts, `billed_units` (characters / seconds / search units on
+the unit-priced surfaces), charged `cost_micros` and `vendor_cost_micros`,
 `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag (set
 when counts came from an aborted stream rather than a vendor usage payload).
 Writes are idempotent by `request_id`; a transient store failure is held in a

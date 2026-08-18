@@ -463,6 +463,8 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
+        // speech bills per input character; the reply carries no usage
+        let mut units = 0;
         let (status, v) = match self.kind {
             AudioKind::Tts => {
                 let (input, voice, format) = match &self.base.param()?.typed {
@@ -474,6 +476,7 @@ impl ModelEngine for AudioEngine {
                     _ => (self.base.last_message_text(), None, None),
                 };
                 require_non_empty(input, "tts input")?;
+                units = input.chars().count() as i64;
                 let mut b = json!({"model": model, "input": input});
                 if let Some(v) = voice {
                     b["voice"] = json!(v);
@@ -563,17 +566,31 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        // token-priced transcription models report input/output tokens
+        // token-priced transcription models report input/output tokens;
+        // duration-priced ones report `usage.seconds` (or `duration`)
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
         );
+        if self.kind == AudioKind::Stt {
+            units = whole_seconds(&v["usage"]["seconds"])
+                .or_else(|| whole_seconds(&v["duration"]))
+                .unwrap_or(0);
+        }
         let mut outcome = family_outcome(message, &model, v, status);
         outcome.response.prompt_tokens = input;
         outcome.response.completion_tokens = output;
+        outcome.response.billed_units = units;
         crate::engine::fill_total_if_zero(&mut outcome.response);
         Ok(outcome)
     }
+}
+
+/// A vendor duration as whole billed seconds (fractions round up).
+fn whole_seconds(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f.ceil() as i64))
+        .filter(|s| *s > 0)
 }
 
 fn looks_like_json(bytes: &[u8]) -> bool {
@@ -733,9 +750,11 @@ impl ModelEngine for RerankEngine {
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
+        let units = crate::engine::tok(&v["meta"]["billed_units"]["search_units"]);
         let mut out = family_outcome(format!("{n} results"), &model, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
+        out.response.billed_units = units;
         Ok(out)
     }
 }
@@ -1224,6 +1243,62 @@ mod tests {
             let mut e = RerankEngine::new(req(Protocol::Rerank, "m", typed), t());
             assert_eq!(e.run().await.unwrap_err().http_status, 400);
         }
+    }
+
+    #[tokio::test]
+    async fn billed_units_come_from_search_units_seconds_and_input_characters() {
+        let params = Some(TypedParams::Rerank(gw_models::RerankParams {
+            query: "q".into(),
+            documents: vec!["a".into(), "b".into()],
+            top_n: None,
+        }));
+        let out = RerankEngine::new(
+            req(Protocol::Rerank, "rerank-v3.5", params),
+            Arc::new(BytesReply(
+                br#"{"results":[{"index":0,"relevance_score":0.9}],"meta":{"billed_units":{"search_units":1}}}"#,
+            )),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            (out.response.billed_units, out.response.total_tokens),
+            (1, 0)
+        );
+
+        let mut stt = AudioEngine::new(
+            req(
+                Protocol::Stt,
+                "whisper-1",
+                Some(TypedParams::AudioStt(SttParams {
+                    audio_b64: "TU9DSw==".into(),
+                    language: None,
+                    translate: false,
+                })),
+            ),
+            Arc::new(BytesReply(
+                br#"{"text":"hi","usage":{"type":"duration","seconds":4}}"#,
+            )),
+            AudioKind::Stt,
+        );
+        assert_eq!(stt.run().await.unwrap().response.billed_units, 4);
+        assert_eq!(whole_seconds(&json!(4.1)), Some(5));
+        assert_eq!(whole_seconds(&json!(0)), None);
+
+        let mut tts = AudioEngine::new(
+            req(
+                Protocol::Tts,
+                "tts-1",
+                Some(TypedParams::AudioTts(TtsParams {
+                    input: "héllo wörld".into(),
+                    voice: None,
+                    response_format: None,
+                })),
+            ),
+            t(),
+            AudioKind::Tts,
+        );
+        assert_eq!(tts.run().await.unwrap().response.billed_units, 11);
     }
 
     #[test]

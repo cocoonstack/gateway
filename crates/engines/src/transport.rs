@@ -651,9 +651,10 @@ impl MockTransport {
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         if req.url.ends_with("/audio/transcriptions") {
             let language = Self::form_field(&req.body, "language");
-            return Self::ok_json(
-                json!({"text": "[mock-stt] transcribed audio", "language": language}),
-            );
+            return Self::ok_json(json!({
+                "text": "[mock-stt] transcribed audio", "language": language,
+                "usage": {"type": "duration", "seconds": 5}
+            }));
         } else if req.url.ends_with("/audio/translations") {
             return Self::ok_json(json!({"text": "[mock-stt] translated audio"}));
         }
