@@ -3059,6 +3059,72 @@ async fn responses_stream_forwards_native_events_with_names_and_bills() {
 }
 
 #[tokio::test]
+async fn responses_model_streams_as_chat_and_messages_on_the_other_surfaces() {
+    let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+
+    let body =
+        r#"{"model":"gpt-5-responses","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let frames: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|f| *f != "[DONE]")
+        .map(|f| serde_json::from_str(f).unwrap())
+        .collect();
+    let content: String = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert!(
+        content.starts_with("[mock-responses:gpt-5-responses]"),
+        "chat deltas carry the text: {content:?}"
+    );
+    assert!(
+        !text.contains("event: response."),
+        "no Responses events on the chat wire"
+    );
+    let last = frames.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert_eq!(last["usage"]["completion_tokens"], 10);
+
+    let body = r#"{"model":"gpt-5-responses","stream":true,"max_tokens":50,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app
+        .oneshot(post("/v1/messages", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        !text.contains("event: response."),
+        "no Responses events on the messages wire"
+    );
+    let deltas: String = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter_map(|f| f["delta"]["text"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        deltas.starts_with("[mock-responses:gpt-5-responses]"),
+        "{deltas:?}"
+    );
+    assert!(text.contains("\"stop_reason\":\"end_turn\""));
+}
+
+#[tokio::test]
 async fn responses_stream_is_incremental_with_dlp_off() {
     let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
     let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());

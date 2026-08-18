@@ -873,11 +873,12 @@ impl ResponsesEngine {
         crate::pump::reject_json_error("responses", status, &reply.body)?;
         let mut full = String::new();
         let model_override = self.base.model_override();
+        let native = self.base.request.preserve_responses_wire;
         let r = crate::pump::pump_sse(
             "responses",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| responses_apply_frame(v, status, model_override, &mut resp, &mut full),
+            |v| responses_apply_frame(v, status, model_override, native, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;
@@ -935,6 +936,7 @@ impl ResponsesEngine {
         let mut full = String::new();
         let mut chunks = Vec::new();
         let model_override = self.base.model_override();
+        let native = self.base.request.preserve_responses_wire;
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
@@ -942,6 +944,7 @@ impl ResponsesEngine {
                 v,
                 status,
                 model_override,
+                native,
                 &mut resp,
                 &mut full,
             )?);
@@ -1022,12 +1025,14 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame: every frame moves out as a native event; text
-/// accumulates from `output_text.delta`, usage/status from `response.completed`.
+/// Apply one Responses SSE frame: on the native surface every frame moves out
+/// as a native event, elsewhere the text rides `delta`; text accumulates from
+/// `output_text.delta`, usage/status from `response.completed`.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,
     model_override: Option<&str>,
+    native: bool,
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
@@ -1045,6 +1050,9 @@ fn responses_apply_frame(
         "response.output_text.delta" => {
             if let Some(d) = v["delta"].as_str() {
                 full.push_str(d);
+                if !native {
+                    chunk.delta = d.to_owned();
+                }
             }
         }
         "response.completed" => {
@@ -1064,7 +1072,11 @@ fn responses_apply_frame(
         }
         _ => {}
     }
-    chunk.native_event = Some(v);
+    if native {
+        chunk.native_event = Some(v);
+    } else if chunk.delta.is_empty() && chunk.finish_reason.is_none() {
+        return Ok(Vec::new());
+    }
     Ok(vec![chunk])
 }
 
@@ -1407,6 +1419,7 @@ mod tests {
     async fn responses_api_streaming() {
         let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.stream = true;
+        r.preserve_responses_wire = true;
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"input": "stream this"});
         let out = ResponsesEngine::new(r, t()).run().await.unwrap();
         assert!(out.chunks.len() >= 2, "chunks: {:?}", out.chunks);
@@ -1558,6 +1571,7 @@ mod tests {
         );
         let mut r = req(Protocol::Responses, "gpt-5-served", None);
         r.stream = true;
+        r.preserve_responses_wire = true;
         let param = r.model_param_v2.as_mut().unwrap();
         param.raw = serde_json::json!({"input": "go"});
         param.fallback_from = Some("gpt-5-public".to_owned());
