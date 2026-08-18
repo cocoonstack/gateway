@@ -20,6 +20,7 @@ type UsageRow struct {
 	TotalTokens      int64  `json:"total_tokens"`
 	CostMicros       int64  `json:"cost_micros"`
 	VendorCostMicros int64  `json:"vendor_cost_micros"`
+	BilledUnits      int64  `json:"billed_units"`
 }
 
 type SeriesPoint struct {
@@ -31,6 +32,7 @@ type SeriesPoint struct {
 	TotalTokens      int64 `json:"total_tokens"`
 	CostMicros       int64 `json:"cost_micros"`
 	VendorCostMicros int64 `json:"vendor_cost_micros"`
+	BilledUnits      int64 `json:"billed_units"`
 }
 
 type Series struct {

@@ -15,6 +15,7 @@ export default function OverviewPage() {
   const available = data.models.filter((model) => model.state === "available").length;
   const vendorCost = data.totals.vendor_cost_micros ?? 0;
   const margin = vendorCost > 0 ? data.totals.cost_micros - vendorCost : 0;
+  const hasUnits = data.totals.billed_units > 0;
 
   return (
     <>
@@ -49,8 +50,8 @@ export default function OverviewPage() {
       <Card>
         <div className="card-heading"><div><p className="eyebrow">Breakdown</p><h2>Usage by model</h2></div></div>
         <div className="table-wrap">
-          <table><thead><tr><th>Model</th>{isSystem && <th>User</th>}<th>Requests</th><th>Tokens</th><th>Charge</th>{isSystem && <th>Vendor cost</th>}</tr></thead>
-            <tbody>{data.usage.map((row) => <tr key={`${row.user_id}-${row.model}`}><td><strong>{row.model}</strong></td>{isSystem && <td>{row.user_id || "Anonymous"}</td>}<td>{compact(row.requests)}</td><td>{compact(row.total_tokens)}</td><td>{money(row.cost_micros)}</td>{isSystem && <td>{money(row.vendor_cost_micros)}</td>}</tr>)}</tbody>
+          <table><thead><tr><th>Model</th>{isSystem && <th>User</th>}<th>Requests</th><th>Tokens</th>{hasUnits && <th>Units</th>}<th>Charge</th>{isSystem && <th>Vendor cost</th>}</tr></thead>
+            <tbody>{data.usage.map((row) => <tr key={`${row.user_id}-${row.model}`}><td><strong>{row.model}</strong></td>{isSystem && <td>{row.user_id || "Anonymous"}</td>}<td>{compact(row.requests)}</td><td>{compact(row.total_tokens)}</td>{hasUnits && <td>{compact(row.billed_units)}</td>}<td>{money(row.cost_micros)}</td>{isSystem && <td>{money(row.vendor_cost_micros)}</td>}</tr>)}</tbody>
           </table>
         </div>
       </Card>

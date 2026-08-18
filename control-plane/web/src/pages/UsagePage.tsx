@@ -15,6 +15,7 @@ export default function UsagePage() {
   const { data: usageData, error: usageError } = useAPI<{ usage: UsageRow[] }>(`/api/v1/usage?since=${since}&until=${until}`);
   const { data: series, error: seriesError } = useAPI<UsageSeries>(`/api/v1/usage/series?bucket=day&since=${since}&until=${until}`);
   const isSystem = session.user.role === "system_admin";
+  const hasUnits = usageData?.usage.some((row) => row.billed_units > 0) ?? false;
 
   return (
     <>
@@ -33,8 +34,8 @@ export default function UsagePage() {
           </div>
           <Card>
             <div className="card-heading"><div><p className="eyebrow">Billing dimensions</p><h2>Model detail</h2></div><span className="muted">Through {dateTime(until)}</span></div>
-            <div className="table-wrap"><table><thead><tr>{isSystem && <th>User</th>}<th>Model</th><th>Requests</th><th>Prompt</th><th>Completion</th><th>Total tokens</th><th>Charge</th>{isSystem && <th>Vendor</th>}</tr></thead>
-              <tbody>{usageData.usage.map((row) => <tr key={`${row.user_id}-${row.model}`}>{isSystem && <td>{row.user_id || "Anonymous"}</td>}<td><strong>{row.model}</strong></td><td>{compact(row.requests)}</td><td>{compact(row.prompt_tokens)}</td><td>{compact(row.completion_tokens)}</td><td>{compact(row.total_tokens)}</td><td>{money(row.cost_micros)}</td>{isSystem && <td>{money(row.vendor_cost_micros)}</td>}</tr>)}</tbody>
+            <div className="table-wrap"><table><thead><tr>{isSystem && <th>User</th>}<th>Model</th><th>Requests</th><th>Prompt</th><th>Completion</th><th>Total tokens</th>{hasUnits && <th>Units</th>}<th>Charge</th>{isSystem && <th>Vendor</th>}</tr></thead>
+              <tbody>{usageData.usage.map((row) => <tr key={`${row.user_id}-${row.model}`}>{isSystem && <td>{row.user_id || "Anonymous"}</td>}<td><strong>{row.model}</strong></td><td>{compact(row.requests)}</td><td>{compact(row.prompt_tokens)}</td><td>{compact(row.completion_tokens)}</td><td>{compact(row.total_tokens)}</td>{hasUnits && <td>{compact(row.billed_units)}</td>}<td>{money(row.cost_micros)}</td>{isSystem && <td>{money(row.vendor_cost_micros)}</td>}</tr>)}</tbody>
             </table></div>
           </Card>
         </>
