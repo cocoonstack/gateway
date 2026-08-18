@@ -17,7 +17,8 @@ CI runs fmt/clippy/test and `cargo deny` on every push to `main` and every pull 
 GitHub release (`.github/workflows/release.yml`): native runners build `gw`
 for linux/darwin × amd64/arm64, goreleaser builds the `control-plane` binaries
 and the web-asset tarball, attaches everything, and generates the changelog.
-Bump the workspace version in `Cargo.toml` before tagging. Multi-arch container
+The tag is the version — the release build stamps it into the workspace before
+compiling, so nothing needs bumping in `Cargo.toml`. Multi-arch container
 images for both components go to ghcr on the same tag
 (`.github/workflows/docker.yml`). Edition 2024; the workspace denies
 `unwrap`/`expect`/undocumented `unsafe` outside tests.
