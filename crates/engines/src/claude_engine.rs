@@ -134,8 +134,13 @@ impl ClaudeEngine {
             if let Some(tc) = p.tool_choice {
                 body.insert("tool_choice".into(), normalize_tool_choice_anthropic(tc));
             }
-            // Anthropic's field is `stop_sequences` (array), not OpenAI's `stop`
+            // Anthropic's field is `stop_sequences` (always an array), not
+            // OpenAI's `stop` (string or array)
             if let Some(stop) = p.stop {
+                let stop = match stop {
+                    Value::String(_) => Value::Array(vec![stop]),
+                    stop => stop,
+                };
                 body.insert("stop_sequences".into(), stop);
             }
         }

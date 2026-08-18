@@ -32,17 +32,11 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
         ("max_tokens", "maxTokens"),
         ("temperature", "temperature"),
         ("top_p", "topP"),
+        ("stop_sequences", "stopSequences"),
     ] {
         if let Some(v) = body.remove(from) {
             inference.insert(to.into(), v);
         }
-    }
-    if let Some(stop) = body.remove("stop_sequences") {
-        let stop = match stop {
-            Value::String(_) => Value::Array(vec![stop]),
-            stop => stop,
-        };
-        inference.insert("stopSequences".into(), stop);
     }
     if !inference.is_empty() {
         out.insert("inferenceConfig".into(), Value::Object(inference));
@@ -368,7 +362,7 @@ mod tests {
     fn messages_body_transcodes_to_converse() {
         let body: Map<String, Value> = serde_json::from_value(json!({
             "model": "x", "stream": true, "max_tokens": 64, "temperature": 0.2,
-            "stop_sequences": "END",
+            "stop_sequences": ["END"],
             "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             "messages": [
                 {"role": "user", "content": "hi"},

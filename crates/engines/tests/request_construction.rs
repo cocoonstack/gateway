@@ -166,6 +166,23 @@ async fn anthropic_request_shape() {
         Some("application/json")
     );
     assert_eq!(t.header("anthropic-version").as_deref(), Some("2023-06-01"));
+
+    let t = RecordingTransport::new(
+        r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            stop: Some(serde_json::json!("5")),
+            ..Default::default()
+        }));
+    }
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["stop_sequences"],
+        serde_json::json!(["5"]),
+        "OpenAI's string stop becomes Anthropic's array"
+    );
 }
 
 #[tokio::test]
