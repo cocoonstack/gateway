@@ -73,6 +73,7 @@ impl Transport for RecordingTransport {
         Ok(UpstreamResponse {
             status: 200,
             body: UpstreamBody::Json(bytes::Bytes::from(self.reply.clone())),
+            headers: Default::default(),
         })
     }
 }

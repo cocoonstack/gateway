@@ -73,8 +73,8 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `dashscope` | Alibaba Qwen (native) | `https://dashscope-intl.aliyuncs.com` | `Bearer`; streams via `X-DashScope-SSE` + `incremental_output` |
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
-| `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id (`cohere.command-r-v1:0`); signing and path verified against AWS, model bodies not yet exercised on an allowlisted account |
-| `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id (`meta.llama3-1-8b-instruct-v1:0`); same verification status |
+| `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id; Command R (`{message, chat_history, preamble}` → `text`) and the legacy Command `generations[]` shape; usage from Bedrock's `x-amzn-bedrock-*-token-count` headers |
+| `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id (`meta.llama3-1-8b-instruct-v1:0`); usage from the token-count headers, else the body counts |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
 The factory also dispatches `video`, `search`, generic `audio`, and
@@ -114,7 +114,10 @@ Anthropic, tool loops and reasoning on both), Anthropic, Gemini, DeepSeek,
 MiniMax and Moonshot/Kimi (OpenAI- and Anthropic-compatible endpoints), Qwen/DashScope
 (both compatible endpoints), Baidu Qianfan v2 and the native Ernie wire,
 Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), OpenRouter, and OpenAI/Anthropic relays. AWS Bedrock is verified
-up to an accepted SigV4 signature (see the table above).
+against AWS up to an accepted SigV4 signature (the account was not
+allowlisted for models) and end to end against the
+[ministack](https://github.com/ministackorg/ministack) Bedrock emulator's
+family-faithful InvokeModel replies and token-count headers.
 
 `GW_TRANSPORT` overrides transport routing: unset (or any value other than
 `mock`/`http`) routes `mock://` sentinel URLs in-process and real URLs over
@@ -142,4 +145,6 @@ client disconnect counts as neither.
 
 AWS Bedrock accounts sign requests with SigV4. Set `api_key_env` to the access
 key id's env var and `secret_key_env` to the secret key's; both must resolve or
-the account falls back to inert mock credentials.
+the account falls back to inert mock credentials. The signing region is read
+from the endpoint host (`bedrock-runtime.<region>.amazonaws.com`, default
+`us-east-1`), so a local emulator works with `endpoint: http://localhost:4566`.

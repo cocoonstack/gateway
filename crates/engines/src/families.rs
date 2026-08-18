@@ -503,6 +503,7 @@ impl ModelEngine for AudioEngine {
                     body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
                         status,
                         body,
+                        headers: reply.headers,
                     })?,
                 }
             }
@@ -1380,6 +1381,7 @@ mod tests {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(self.0.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -1393,6 +1395,7 @@ mod tests {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Json(self.0.to_vec().into()),
+                headers: Default::default(),
             })
         }
     }

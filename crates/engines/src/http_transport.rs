@@ -130,7 +130,7 @@ impl Transport for HttpTransport {
             });
         let body = bytes::Bytes::from(req.body);
         let mut attempt = 0u32;
-        let resp = loop {
+        let mut resp = loop {
             let mut builder = self.client.request(method.clone(), &req.url);
             // reqwest's request timeout is a TOTAL deadline including the body,
             // which would kill a streaming generation longer than the policy —
@@ -204,6 +204,7 @@ impl Transport for HttpTransport {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|ct| ct.starts_with("text/event-stream"));
+        let headers = std::mem::take(resp.headers_mut());
         if is_sse {
             use futures::TryStreamExt;
             let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
@@ -213,6 +214,7 @@ impl Transport for HttpTransport {
             return Ok(UpstreamResponse {
                 status,
                 body: idle_capped(stream, timeout),
+                headers,
             });
         }
         let read = resp.bytes();
@@ -240,6 +242,7 @@ impl Transport for HttpTransport {
         Ok(UpstreamResponse {
             status,
             body: UpstreamBody::Json(bytes),
+            headers,
         })
     }
 }

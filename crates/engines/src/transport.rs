@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use gw_consts::Protocol;
 use gw_models::{GResult, GatewayError, StreamError};
+pub use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 
 /// Fixed "created" timestamp for deterministic mock payloads.
@@ -96,6 +97,8 @@ impl std::fmt::Debug for UpstreamBody {
 pub struct UpstreamResponse {
     pub status: u16,
     pub body: UpstreamBody,
+    /// Response headers, moved out of the HTTP reply (empty on the mock).
+    pub headers: HeaderMap,
 }
 
 impl UpstreamResponse {
@@ -181,6 +184,7 @@ impl MockTransport {
         Ok(UpstreamResponse {
             status: 200,
             body: UpstreamBody::Json(bytes::Bytes::from(v.to_string())),
+            headers: HeaderMap::new(),
         })
     }
 
@@ -224,6 +228,7 @@ impl MockTransport {
                 return Ok(UpstreamResponse {
                     status: 200,
                     body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
+                    headers: HeaderMap::new(),
                 });
             }
             return Self::ok_json(json!({
@@ -251,6 +256,7 @@ impl MockTransport {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
+                headers: HeaderMap::new(),
             })
         } else {
             Self::ok_json(json!({
@@ -328,6 +334,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
+                headers: HeaderMap::new(),
             });
         }
 
@@ -367,6 +374,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(sse.into_bytes()),
+                headers: HeaderMap::new(),
             });
         }
         Self::ok_json(json!({
@@ -456,6 +464,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
+                headers: HeaderMap::new(),
             });
         }
         Self::ok_json(json!({
@@ -668,6 +677,7 @@ impl MockTransport {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
+                headers: HeaderMap::new(),
             });
         }
         Self::ok_json(json!({

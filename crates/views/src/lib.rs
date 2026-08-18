@@ -4290,6 +4290,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
                     br#"{"audio_b64":"%%%"}"#,
                 )),
+                headers: Default::default(),
             })
         }
     }
@@ -4312,6 +4313,7 @@ mod tests {
                     b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n"
                         .to_vec(),
                 ),
+                headers: Default::default(),
             })
         }
     }

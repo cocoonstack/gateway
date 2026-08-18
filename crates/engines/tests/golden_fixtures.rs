@@ -28,6 +28,7 @@ impl Transport for FixtureTransport {
             } else {
                 UpstreamBody::Json(bytes::Bytes::from(self.bytes.clone()))
             },
+            headers: Default::default(),
         })
     }
 }

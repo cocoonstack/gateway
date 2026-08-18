@@ -1659,6 +1659,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
                     br#"{"error":{"message":"provider failed"}}"#,
                 )),
+                headers: Default::default(),
             })
         }
     }
@@ -1697,6 +1698,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
                     br#"{"model":"gpt-4o","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"probe","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
                 )),
+                headers: Default::default(),
             })
         }
     }
@@ -1749,6 +1751,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -1796,6 +1799,7 @@ mod tests {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::SseStream(first.chain(second).boxed()),
+                headers: Default::default(),
             })
         }
     }
@@ -1930,6 +1934,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -1982,6 +1987,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2035,6 +2041,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2136,6 +2143,7 @@ mod tests {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -2161,6 +2169,7 @@ mod tests {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -2189,6 +2198,7 @@ mod tests {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -2285,6 +2295,7 @@ mod tests {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }

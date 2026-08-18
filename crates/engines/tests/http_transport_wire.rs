@@ -451,6 +451,7 @@ async fn client_disconnect_midstream_is_499_not_500() {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+                headers: Default::default(),
             })
         }
     }
@@ -494,6 +495,7 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+                headers: Default::default(),
             })
         }
     }
@@ -552,6 +554,7 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
             Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+                headers: Default::default(),
             })
         }
     }

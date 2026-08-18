@@ -355,6 +355,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
                         .unwrap()
                         .into(),
                     ),
+                    headers: Default::default(),
                 });
             }
             let is_seed = request["messages"]
@@ -374,6 +375,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
                 return Ok(gw_engines::transport::UpstreamResponse {
                     status: 200,
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                    headers: Default::default(),
                 });
             }
             let response = if is_seed {
@@ -408,6 +410,7 @@ async fn anthropic_thinking_signature_exact_passes_tamper_is_local_400_and_miss_
                 body: gw_engines::transport::UpstreamBody::Json(
                     serde_json::to_vec(&response).unwrap().into(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2357,6 +2360,7 @@ async fn dlp_redacts_streaming_output_from_the_vendor() {
                 body: gw_engines::transport::UpstreamBody::SseStream(
                     futures::stream::iter(frames).boxed(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2471,6 +2475,7 @@ async fn outbound_dlp_redacts_the_responses_body() {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Json(body.to_string().into()),
+                headers: Default::default(),
             })
         }
     }
@@ -2689,6 +2694,7 @@ async fn chat_surface_reasoning_round_trips_through_claude() {
                 return Ok(gw_engines::transport::UpstreamResponse {
                     status: 200,
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                    headers: Default::default(),
                 });
             }
             Ok(gw_engines::transport::UpstreamResponse {
@@ -2707,6 +2713,7 @@ async fn chat_surface_reasoning_round_trips_through_claude() {
                     .unwrap()
                     .into(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -2855,6 +2862,7 @@ async fn responses_stream_forwards_native_events_with_names_and_bills() {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -4245,6 +4253,7 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                 return Ok(gw_engines::transport::UpstreamResponse {
                     status: 200,
                     body: gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec()),
+                    headers: Default::default(),
                 });
             }
             let mut tool_use =
@@ -4263,6 +4272,7 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                 body: gw_engines::transport::UpstreamBody::Json(
                     serde_json::to_vec(&response).unwrap().into(),
                 ),
+                headers: Default::default(),
             })
         }
     }
@@ -4409,6 +4419,7 @@ async fn model_prompt_cache_knob_reaches_the_anthropic_wire() {
                 body: gw_engines::transport::UpstreamBody::Json(
                     serde_json::to_vec(&response).unwrap().into(),
                 ),
+                headers: Default::default(),
             })
         }
     }

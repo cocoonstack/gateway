@@ -771,6 +771,7 @@ mod tests {
             Ok(crate::transport::UpstreamResponse {
                 status: 200,
                 body: crate::transport::UpstreamBody::Sse(self.0.as_bytes().to_vec()),
+                headers: Default::default(),
             })
         }
     }
@@ -787,6 +788,7 @@ mod tests {
             Ok(crate::transport::UpstreamResponse {
                 status: 200,
                 body: crate::transport::UpstreamBody::Json(self.0.to_vec().into()),
+                headers: Default::default(),
             })
         }
     }

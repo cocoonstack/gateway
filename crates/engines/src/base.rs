@@ -7,7 +7,9 @@ use std::sync::Arc;
 use gw_models::{GResult, GatewayError};
 use serde_json::Value;
 
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use crate::transport::{
+    HeaderMap, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse,
+};
 
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
@@ -262,14 +264,16 @@ impl Base {
         url: &str,
         mut headers: Vec<(String, String)>,
         body: Vec<u8>,
-    ) -> GResult<(u16, Value)> {
+    ) -> GResult<(u16, Value, HeaderMap)> {
         ensure_json_content_type(&mut headers);
-        let reply = self
+        let mut reply = self
             .send_bytes(url, headers, body, false)
             .await?
             .buffered()
             .await?;
-        parse_json_reply(reply)
+        let reply_headers = std::mem::take(&mut reply.headers);
+        let (status, v) = parse_json_reply(reply)?;
+        Ok((status, v, reply_headers))
     }
 }
 

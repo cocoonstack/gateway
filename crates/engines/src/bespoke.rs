@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sigv4::{SigV4Params, sign};
+use crate::transport::HeaderMap;
 
 /// Deterministic SigV4 date for the mock round; live calls stamp now.
 const MOCK_AMZ_DATE: &str = "20250101T000000Z";
@@ -107,7 +108,11 @@ fn canonical_uri(path: &str) -> String {
 /// (else the mock sentinel); SigV4 signs this same host so URL and signature
 /// agree. Raw extras merge before signing so the signature covers the exact
 /// bytes sent — and the body serializes once, not per layer.
-async fn bedrock_invoke(base: &mut Base, uri: &str, mut body: Value) -> GResult<(u16, Value)> {
+async fn bedrock_invoke(
+    base: &mut Base,
+    uri: &str,
+    mut body: Value,
+) -> GResult<(u16, Value, HeaderMap)> {
     if let Some(obj) = body.as_object_mut() {
         let raw = base.take_raw();
         crate::base::merge_raw_extras_owned(obj, raw);
@@ -126,6 +131,25 @@ async fn bedrock_invoke(base: &mut Base, uri: &str, mut body: Value) -> GResult<
     );
     base.post_json_bytes(&format!("{root}{uri}"), headers, payload)
         .await
+}
+
+/// Bedrock stamps every InvokeModel reply with the billed token counts; the
+/// bodies carry them only for some families (Llama yes, Command R only when
+/// streaming), so the headers win when present.
+fn bedrock_header_usage(headers: &HeaderMap, body: (i64, i64)) -> (i64, i64) {
+    let count = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+    };
+    match (
+        count("x-amzn-bedrock-input-token-count"),
+        count("x-amzn-bedrock-output-token-count"),
+    ) {
+        (Some(input), Some(output)) => (input, output),
+        _ => body,
+    }
 }
 
 base_engine!(ErnieEngine);
@@ -294,17 +318,33 @@ impl ModelEngine for CohereEngine {
             body["max_tokens"] = json!(mt);
         }
         let uri = invoke_uri(self.base.model_name()?);
-        let (status, mut v) = bedrock_invoke(&mut self.base, &uri, body).await?;
-        let message = crate::engine::take_string(&mut v, "/text").unwrap_or_default();
-        let tokens = &v["meta"]["tokens"];
-        let (input, output) = (
-            crate::engine::tok(&tokens["input_tokens"]),
-            crate::engine::tok(&tokens["output_tokens"]),
+        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &uri, body).await?;
+        // Command R answers {text, finish_reason}; the legacy Command models
+        // answer {generations: [{text, finish_reason}]}
+        let message = crate::engine::take_string(&mut v, "/text")
+            .or_else(|| crate::engine::take_string(&mut v, "/generations/0/text"))
+            .unwrap_or_default();
+        let finish_reason = match v["finish_reason"]
+            .as_str()
+            .or_else(|| v["generations"][0]["finish_reason"].as_str())
+        {
+            None | Some("COMPLETE") => "stop".to_owned(),
+            Some("MAX_TOKENS") => "length".to_owned(),
+            Some(other) => other.to_lowercase(),
+        };
+        let meta = &v["meta"];
+        let body_count = |key: &str| match crate::engine::tok(&meta["billed_units"][key]) {
+            0 => crate::engine::tok(&meta["tokens"][key]),
+            n => n,
+        };
+        let (input, output) = bedrock_header_usage(
+            &headers,
+            (body_count("input_tokens"), body_count("output_tokens")),
         );
         let resp = GatewayResponse {
             message,
             model,
-            finish_reason: v["finish_reason"].as_str().unwrap_or("stop").to_lowercase(),
+            finish_reason,
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
@@ -344,10 +384,13 @@ impl ModelEngine for LlamaEngine {
             }
         }
         let uri = invoke_uri(self.base.model_name()?);
-        let (status, mut v) = bedrock_invoke(&mut self.base, &uri, body).await?;
-        let (pt, ct) = (
-            crate::engine::tok(&v["prompt_token_count"]),
-            crate::engine::tok(&v["generation_token_count"]),
+        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &uri, body).await?;
+        let (pt, ct) = bedrock_header_usage(
+            &headers,
+            (
+                crate::engine::tok(&v["prompt_token_count"]),
+                crate::engine::tok(&v["generation_token_count"]),
+            ),
         );
         let total = pt.saturating_add(ct);
         let resp = GatewayResponse {
@@ -553,7 +596,33 @@ mod tests {
     use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 
     use super::*;
-    use crate::transport::{MockTransport, SharedTransport};
+    use crate::transport::{
+        MockTransport, SharedTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
+    };
+
+    /// A Bedrock reply with the billed-token headers AWS stamps on InvokeModel.
+    #[derive(Debug)]
+    struct BedrockReply(&'static str, i64, i64);
+
+    #[async_trait::async_trait]
+    impl Transport for BedrockReply {
+        async fn send(&self, _req: UpstreamRequest) -> GResult<UpstreamResponse> {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-amzn-bedrock-input-token-count",
+                self.1.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "x-amzn-bedrock-output-token-count",
+                self.2.to_string().parse().unwrap(),
+            );
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Json(self.0.as_bytes().to_vec().into()),
+                headers,
+            })
+        }
+    }
 
     fn req(mt: Protocol, name: &str) -> GatewayRequest {
         GatewayRequest {
@@ -625,6 +694,52 @@ mod tests {
                 .contains("[mock-cohere] you said: hello bespoke")
         );
         assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn bedrock_headers_bill_command_r_and_the_legacy_command_shape_parses() {
+        let mut e = CohereEngine::new(
+            req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
+            Arc::new(BedrockReply(
+                r#"{"response_id":"r","text":"hi there","finish_reason":"COMPLETE"}"#,
+                57,
+                9,
+            )),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(out.response.message, "hi there");
+        assert_eq!(out.response.finish_reason, "stop");
+        assert_eq!(
+            (out.response.prompt_tokens, out.response.completion_tokens),
+            (57, 9)
+        );
+
+        let mut e = CohereEngine::new(
+            req(Protocol::AwsCohere, "cohere.command-text-v14"),
+            Arc::new(BedrockReply(
+                r#"{"generations":[{"id":"g","text":"legacy hi","finish_reason":"MAX_TOKENS"}],"prompt":""}"#,
+                12,
+                4,
+            )),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(out.response.message, "legacy hi");
+        assert_eq!(out.response.finish_reason, "length");
+        assert_eq!(out.response.total_tokens, 16);
+
+        let mut e = LlamaEngine::new(
+            req(Protocol::AwsLlama, "meta.llama3-1-8b-instruct-v1:0"),
+            Arc::new(BedrockReply(
+                r#"{"generation":"yo","prompt_token_count":1,"generation_token_count":1,"stop_reason":"stop"}"#,
+                30,
+                20,
+            )),
+        );
+        let out = e.run().await.unwrap();
+        assert_eq!(
+            (out.response.prompt_tokens, out.response.completion_tokens),
+            (30, 20)
+        );
     }
 
     #[tokio::test]
