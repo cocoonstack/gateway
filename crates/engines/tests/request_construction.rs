@@ -1251,6 +1251,25 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         assert_eq!(b["reasoning_effort"], want);
         assert!(b.get("thinking").is_none() && b.get("output_config").is_none());
     }
+    for (budget, want) in [
+        (1024, "low"),
+        (4096, "medium"),
+        (16384, "high"),
+        (24576, "xhigh"),
+        (32768, "max"),
+    ] {
+        let t = RecordingTransport::new(OPENAI_OK);
+        let req = reasoning_req(
+            Protocol::OpenaiChat,
+            "gpt-5",
+            gw_models::ReasoningParam {
+                thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":budget})),
+                ..Default::default()
+            },
+        );
+        let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        assert_eq!(t.body_json()["reasoning_effort"], want, "budget {budget}");
+    }
 
     let t = RecordingTransport::new(OPENAI_OK);
     let mut req = reasoning_req(

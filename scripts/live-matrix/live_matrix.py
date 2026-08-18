@@ -249,12 +249,13 @@ def case_messages(
     prompt: str = "Reply with exactly one word: hello",
     thinking: dict[str, Any] | None = None,
     expect_thinking: bool = False,
+    max_tokens: int = 4000,
 ) -> None:
     name = f"{model} messages{' stream' if stream else ''}{(' ' + label) if label else ''}"
     before, _ = gw.ledger()
     body: dict[str, Any] = {
         "model": model,
-        "max_tokens": 4000,
+        "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
         "stream": stream,
     }
@@ -552,6 +553,33 @@ def case_thinking_replay(gw: Gateway, model: str, native: bool = True) -> None:
     record(name, bool(ok) and after == before + 2, detail + f"; ledger +{after - before}")
 
 
+def case_thinking_tiers(gw: Gateway, model: str, native: bool, tiers: list[Any], expect_reasoning: bool) -> None:
+    """Every effort/budget tier through one model: budgets on /v1/messages (max_tokens above the budget,
+    as Anthropic requires), efforts on chat; the reasoning share per tier lands in the note."""
+    prompt = "Solve 23*47 step by step briefly."
+    for tier in tiers:
+        if native:
+            case_messages(
+                gw,
+                model,
+                f"budget {tier}",
+                thinking={"type": "enabled", "budget_tokens": tier},
+                prompt=prompt,
+                expect_thinking=expect_reasoning,
+                max_tokens=tier + 4000,
+            )
+        else:
+            case_chat(
+                gw,
+                model,
+                f"effort {tier}",
+                prompt=prompt,
+                expect_reasoning=expect_reasoning,
+                reasoning_effort=tier,
+                max_tokens=40000,
+            )
+
+
 def run_group(gw: Gateway, group: str) -> None:
     prime = "Is 17 prime? One word."
     if group == "anthropic":
@@ -585,6 +613,9 @@ def run_group(gw: Gateway, group: str) -> None:
         case_prompt_cache_anthropic(gw, sonnet45, native=False)
         case_thinking_replay(gw, haiku, native=True)
         case_thinking_replay(gw, haiku, native=False)
+        case_thinking_tiers(gw, haiku, native=True, tiers=[1024, 4096, 16384], expect_reasoning=True)
+        # adaptive thinking may skip reasoning at low effort on an easy prompt: presence is reported, not asserted
+        case_thinking_tiers(gw, sonnet46, native=False, tiers=["low", "medium", "high", "max"], expect_reasoning=False)
     elif group == "openai":
         case_chat(gw, "gpt-4o-mini")
         case_chat(gw, "gpt-4o-mini", stream=True)
@@ -600,6 +631,9 @@ def run_group(gw: Gateway, group: str) -> None:
             thinking={"type": "enabled", "budget_tokens": 2048},
             prompt=prime,
         )
+        # gpt-5-mini accepts minimal..high, gpt-5.4-mini none..xhigh; past the last tier the vendor answers 400
+        case_thinking_tiers(gw, "gpt-5-mini", native=True, tiers=[1024, 4096, 16384], expect_reasoning=False)
+        case_thinking_tiers(gw, "gpt-5.4-mini", native=True, tiers=[1024, 4096, 16384, 24576], expect_reasoning=False)
         case_embeddings(gw, "text-embedding-3-small")
     elif group == "gemini":
         case_chat(gw, "gemini-3.6-flash")

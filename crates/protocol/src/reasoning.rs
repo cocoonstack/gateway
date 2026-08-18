@@ -42,7 +42,9 @@ pub fn budget_effort(budget: i64) -> &'static str {
     match budget {
         ..=2559 => "low",
         2560..=10239 => "medium",
-        _ => "high",
+        10240..=20479 => "high",
+        20480..=28671 => "xhigh",
+        _ => "max",
     }
 }
 
@@ -145,11 +147,11 @@ mod tests {
         assert!(effort_budget("xhigh") < effort_budget("max"));
         assert_eq!(effort_budget("none"), None);
         assert_eq!(effort_budget("bogus"), None);
-        for effort in ["low", "medium", "high"] {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
             assert_eq!(budget_effort(effort_budget(effort).unwrap()), effort);
         }
         assert_eq!(budget_effort(8192), "medium");
-        assert_eq!(budget_effort(32768), "high");
+        assert_eq!(budget_effort(65536), "max");
     }
 
     #[test]
