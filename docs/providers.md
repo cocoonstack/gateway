@@ -27,7 +27,7 @@ models:
 | `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
 | `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` |
-| `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` |
+| `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` (Kimi K2 thinking: `reasoning_content` in and out, `thinking: {type: disabled}` passes through; the vendor's `/anthropic` base also works as `kind: anthropic` + `endpoint`) |
 | `siliconflow` | `https://api.siliconflow.cn` | openai-chat, embeddings, rerank | `Bearer` |
 
 Any other OpenAI-compatible vendor (Qwen, Ollama, vLLM, a relay) uses
@@ -111,7 +111,7 @@ over the preset.
 Exercised against the real vendors, end to end through the gateway: OpenAI
 (every surface above including realtime, files/batches, prompt caching on
 Anthropic, tool loops and reasoning on both), Anthropic, Gemini, DeepSeek,
-MiniMax (OpenAI- and Anthropic-compatible endpoints), Qwen/DashScope
+MiniMax and Moonshot/Kimi (OpenAI- and Anthropic-compatible endpoints), Qwen/DashScope
 (both compatible endpoints), Baidu Qianfan v2 and the native Ernie wire,
 Cohere and Jina rerank, and OpenAI/Anthropic relays. AWS Bedrock is verified
 up to an accepted SigV4 signature (see the table above).
