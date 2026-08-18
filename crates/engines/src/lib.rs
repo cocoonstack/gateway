@@ -10,6 +10,7 @@ pub mod bedrock;
 pub mod bespoke;
 pub mod claude_engine;
 pub mod engine;
+pub mod eventstream;
 pub mod factory;
 pub mod families;
 pub mod http_transport;

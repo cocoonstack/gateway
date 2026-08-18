@@ -2,12 +2,12 @@
 //! signing (region from the endpoint host, the configured model id in the
 //! invoke path) and the billed-token headers every InvokeModel reply carries.
 
-use gw_models::GResult;
+use gw_models::{GResult, GatewayResponse, StreamChunk};
 use serde_json::Value;
 
 use crate::base::Base;
 use crate::sigv4::{SigV4Params, sign};
-use crate::transport::HeaderMap;
+use crate::transport::{HeaderMap, UpstreamBody, UpstreamResponse};
 
 /// Deterministic SigV4 date for the mock round; live calls stamp now.
 const MOCK_AMZ_DATE: &str = "20250101T000000Z";
@@ -52,7 +52,8 @@ pub(crate) fn aws_headers(
         ("host".into(), host.into()),
         ("x-amz-date".into(), amz_date.into()),
         ("authorization".into(), authorization),
-        // Bedrock InvokeModel requires accept; content-type is added by post_json.
+        // Bedrock InvokeModel requires accept; content-type is unsigned and
+        // added by the caller.
         ("accept".into(), "application/json".into()),
     ]
 }
@@ -83,8 +84,12 @@ fn amz_date(secs: i64) -> String {
     format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z")
 }
 
-pub(crate) fn invoke_uri(model: &str) -> String {
-    format!("/model/{model}/invoke")
+pub(crate) fn invoke_uri(model: &str, stream: bool) -> String {
+    if stream {
+        format!("/model/{model}/invoke-with-response-stream")
+    } else {
+        format!("/model/{model}/invoke")
+    }
 }
 
 /// SigV4's canonical URI: the wire path with every byte outside the
@@ -102,33 +107,86 @@ fn canonical_uri(path: &str) -> String {
     out
 }
 
-/// One Bedrock invoke: host + scheme from the account endpoint at go-live
-/// (else the mock sentinel); SigV4 signs this same host so URL and signature
-/// agree. Raw extras merge before signing so the signature covers the exact
-/// bytes sent — and the body serializes once, not per layer.
-pub(crate) async fn bedrock_invoke(
+/// One Bedrock InvokeModel[WithResponseStream] call: host + scheme from the
+/// account endpoint at go-live (else the mock sentinel); SigV4 signs this same
+/// host so URL and signature agree. Raw extras merge before signing so the
+/// signature covers the exact bytes sent — and the body serializes once. A
+/// streamed reply comes back already re-framed as SSE `data:` lines.
+pub(crate) async fn bedrock_send(
     base: &mut Base,
-    uri: &str,
+    model: &str,
     mut body: Value,
-) -> GResult<(u16, Value, HeaderMap)> {
+) -> GResult<UpstreamResponse> {
     if let Some(obj) = body.as_object_mut() {
         let raw = base.take_raw();
         crate::base::merge_raw_extras_owned(obj, raw);
     }
+    let stream = base.request.stream;
+    let uri = invoke_uri(model, stream);
     let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
     let host = root.split_once("://").map(|(_, h)| h).unwrap_or(root);
     let payload = crate::base::body_bytes(&body)?;
     let creds = base.aws_credentials();
-    let headers = aws_headers(
+    let mut headers = aws_headers(
         host,
-        uri,
+        &uri,
         &payload,
         creds
             .as_ref()
             .map(|(a, s): &(String, String)| (a.as_str(), s.as_str())),
     );
-    base.post_json_bytes(&format!("{root}{uri}"), headers, payload)
-        .await
+    headers.push(("content-type".into(), "application/json".into()));
+    let mut reply = base
+        .send_bytes(&format!("{root}{uri}"), headers, payload, stream)
+        .await?;
+    if let UpstreamBody::SseStream(s) = reply.body {
+        reply.body = UpstreamBody::SseStream(crate::eventstream::to_sse(s));
+    }
+    Ok(reply)
+}
+
+/// The streamed form: the family's frame handler runs inside the shared pump;
+/// an error status (always a JSON body) surfaces the vendor envelope first.
+pub(crate) async fn bedrock_stream<F>(
+    base: &mut Base,
+    body: Value,
+    apply: F,
+) -> GResult<(u16, crate::pump::PumpResult)>
+where
+    F: FnMut(Value) -> GResult<Vec<StreamChunk>>,
+{
+    let model = base.model_name()?.to_owned();
+    let reply = bedrock_send(base, &model, body).await?;
+    let status = reply.status;
+    crate::pump::reject_json_error("bedrock", status, &reply.body)?;
+    let r =
+        crate::pump::pump_sse("bedrock", reply.body, base.request.stream_tx.clone(), apply).await?;
+    Ok((status, r))
+}
+
+/// The last streamed frame carries `amazon-bedrock-invocationMetrics` with the
+/// billed counts, authoritative over whatever the family's frames said.
+pub(crate) fn invocation_metrics(frame: &Value, resp: &mut GatewayResponse) {
+    let metrics = &frame["amazon-bedrock-invocationMetrics"];
+    if let Some(n) = metrics["inputTokenCount"].as_i64() {
+        resp.prompt_tokens = n;
+    }
+    if let Some(n) = metrics["outputTokenCount"].as_i64() {
+        resp.completion_tokens = n;
+    }
+}
+
+/// The buffered form for the non-streaming engines: parsed JSON plus the reply
+/// headers the billed counts ride in.
+pub(crate) async fn bedrock_invoke(
+    base: &mut Base,
+    model: &str,
+    body: Value,
+) -> GResult<(u16, Value, HeaderMap)> {
+    let mut reply = bedrock_send(base, model, body).await?.buffered().await?;
+    let headers = std::mem::take(&mut reply.headers);
+    let (status, v) = crate::base::parse_json_reply(reply)?;
+    Ok((status, v, headers))
 }
 
 /// Bedrock stamps every InvokeModel reply with the billed token counts; the

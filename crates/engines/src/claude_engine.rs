@@ -13,7 +13,9 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 base_engine!(ClaudeEngine);
 
 impl ClaudeEngine {
-    fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
+    /// The Messages body. On Bedrock the model rides in the invoke path and
+    /// streaming in the URL, and the API version is a body field.
+    fn build_body(&mut self) -> GResult<Map<String, Value>> {
         let system_text = self.base.system_text();
         let mut messages: Vec<Value> = Vec::new();
         for m in std::mem::take(&mut self.base.request.message) {
@@ -70,11 +72,15 @@ impl ClaudeEngine {
             last["content"] = Value::Array(cached_blocks(last["content"].take()));
         }
         let param = self.base.param()?;
-        let protocol = param.protocol;
+        let bedrock = param.protocol == gw_consts::Protocol::AwsAnthropic;
         let mut body = Map::new();
-        body.insert("model".into(), param.model_name.clone().into());
+        if bedrock {
+            body.insert("anthropic_version".into(), "bedrock-2023-05-31".into());
+        } else {
+            body.insert("model".into(), param.model_name.clone().into());
+            body.insert("stream".into(), self.base.request.stream.into());
+        }
         body.insert("messages".into(), Value::Array(messages));
-        body.insert("stream".into(), self.base.request.stream.into());
         let mut max_tokens = 1024;
         // only gateway-mapped thinking drops the sampling knobs Anthropic rejects
         let mut mapped = false;
@@ -140,13 +146,23 @@ impl ClaudeEngine {
             body.insert("system".into(), system);
         }
         let mut raw = self.base.take_raw();
-        if mapped && let Some(extra) = raw.as_object_mut() {
-            extra.remove("top_k");
+        if let Some(extra) = raw.as_object_mut() {
+            if mapped {
+                extra.remove("top_k");
+            }
+            if bedrock {
+                extra.remove("model");
+                extra.remove("stream");
+            }
         }
         crate::base::merge_raw_extras_owned(&mut body, raw);
+        Ok(body)
+    }
 
+    fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
+        let body = self.build_body()?;
         Ok(UpstreamRequest {
-            protocol,
+            protocol: self.base.param()?.protocol,
             method: "POST".to_owned(),
             url: format!(
                 "{}/v1/messages",
@@ -249,8 +265,14 @@ impl ClaudeEngine {
 #[async_trait::async_trait]
 impl ModelEngine for ClaudeEngine {
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let up = self.build_upstream()?;
-        let reply = self.base.transport.send(up).await?;
+        let reply = if self.base.param()?.protocol == gw_consts::Protocol::AwsAnthropic {
+            let body = Value::Object(self.build_body()?);
+            let model = self.base.model_name()?.to_owned();
+            crate::bedrock::bedrock_send(&mut self.base, &model, body).await?
+        } else {
+            let up = self.build_upstream()?;
+            self.base.transport.send(up).await?
+        };
         match reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
             body => self.run_sse(reply.status, body).await,
@@ -743,6 +765,22 @@ mod tests {
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said: ping"));
         assert!(out.response.is_messages_protocol);
+        assert_eq!(out.response.finish_reason, "end_turn");
+        assert!(out.response.total_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn bedrock_stream_decodes_the_eventstream_chunks_like_native_sse() {
+        let mut r = base_req();
+        r.stream = true;
+        r.model_param_v2 = Some(ModelParamV2::with_name(
+            Protocol::AwsAnthropic,
+            "anthropic.claude-3-haiku-20240307-v1:0",
+        ));
+        let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
+        let out = e.run().await.unwrap();
+        assert!(out.chunks.len() >= 2, "chunks: {:?}", out.chunks);
+        assert!(out.response.message.contains("you said: ping"));
         assert_eq!(out.response.finish_reason, "end_turn");
         assert!(out.response.total_tokens > 0);
     }

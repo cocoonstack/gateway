@@ -414,6 +414,82 @@ impl MockTransport {
         }))
     }
 
+    /// Bedrock InvokeModel by model-id family; a stream request answers in
+    /// the EventStream wire (`chunk` events carrying the family's frames).
+    fn bedrock_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let u = req.url.as_str();
+        let reply = if u.contains("/model/anthropic.") {
+            self.anthropic_reply(req)?
+        } else if u.contains("cohere") {
+            self.cohere_reply(req)?
+        } else {
+            self.llama_reply(req)?
+        };
+        if !req.stream {
+            return Ok(reply);
+        }
+        let frames: Vec<Vec<u8>> = match reply.body {
+            UpstreamBody::Sse(bytes) => crate::sse::SseDecoder::decode_all(&bytes)
+                .map_err(GatewayError::internal)?
+                .0
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            UpstreamBody::Json(bytes) => {
+                let mut v: Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| GatewayError::internal("mock bedrock reply").with_source(e))?;
+                if v.get("generation").is_some() {
+                    let text = v["generation"].as_str().unwrap_or_default().to_owned();
+                    let (a, b) = Self::split_half(&text);
+                    vec![
+                        json!({"generation": a, "prompt_token_count": v["prompt_token_count"],
+                               "generation_token_count": null, "stop_reason": null}),
+                        json!({"generation": b, "prompt_token_count": null,
+                               "generation_token_count": v["generation_token_count"],
+                               "stop_reason": "stop"}),
+                    ]
+                } else if v.get("text").is_some() {
+                    let text = v["text"].as_str().unwrap_or_default().to_owned();
+                    let (a, b) = Self::split_half(&text);
+                    vec![
+                        json!({"is_finished": false, "event_type": "text-generation", "text": a}),
+                        json!({"is_finished": false, "event_type": "text-generation", "text": b}),
+                        json!({"is_finished": true, "event_type": "stream-end",
+                               "finish_reason": "COMPLETE",
+                               "amazon-bedrock-invocationMetrics": {
+                                   "inputTokenCount": v["meta"]["tokens"]["input_tokens"].take(),
+                                   "outputTokenCount": v["meta"]["tokens"]["output_tokens"].take()}}),
+                    ]
+                } else {
+                    // a JSON answer to a stream request (the tool-use reply) stays JSON
+                    return Ok(UpstreamResponse {
+                        status: reply.status,
+                        body: UpstreamBody::Json(bytes),
+                        headers: reply.headers,
+                    });
+                }
+                .into_iter()
+                .map(|f| f.to_string().into_bytes())
+                .collect()
+            }
+            UpstreamBody::SseStream(_) => Vec::new(),
+        };
+        let mut wire = Vec::new();
+        for frame in frames {
+            wire.extend(crate::eventstream::encode_event(
+                "chunk",
+                &crate::eventstream::chunk_payload(&frame),
+            ));
+        }
+        Ok(UpstreamResponse {
+            status: 200,
+            body: UpstreamBody::SseStream(Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from(wire))
+            }))),
+            headers: reply.headers,
+        })
+    }
+
     fn cohere_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "cohere")?;
         let user = body["message"].as_str().unwrap_or_default();
@@ -714,7 +790,9 @@ impl Transport for MockTransport {
             }));
         }
         let u = req.url.as_str();
-        if u.contains("dashscope") {
+        if u.contains("/model/") {
+            self.bedrock_reply(&req)
+        } else if u.contains("dashscope") {
             self.dashscope_reply(&req)
         } else if u.contains("wenxinworkshop") {
             self.ernie_reply(&req)

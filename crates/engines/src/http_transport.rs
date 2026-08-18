@@ -203,7 +203,10 @@ impl Transport for HttpTransport {
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|ct| ct.starts_with("text/event-stream"));
+                .is_some_and(|ct| {
+                    ct.starts_with("text/event-stream")
+                        || ct.starts_with("application/vnd.amazon.eventstream")
+                });
         let headers = std::mem::take(resp.headers_mut());
         if is_sse {
             use futures::TryStreamExt;

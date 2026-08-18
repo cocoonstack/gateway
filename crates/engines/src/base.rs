@@ -7,9 +7,7 @@ use std::sync::Arc;
 use gw_models::{GResult, GatewayError};
 use serde_json::Value;
 
-use crate::transport::{
-    HeaderMap, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse,
-};
+use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
@@ -254,26 +252,6 @@ impl Base {
             .buffered()
             .await?;
         parse_json_reply(reply)
-    }
-
-    /// [`Self::send_bytes`] + buffer + parse for a pre-serialized body (no raw
-    /// merge — the caller already folded extras in before signing/sending).
-    /// The ensured content-type is an unsigned header on the AWS engines.
-    pub async fn post_json_bytes(
-        &self,
-        url: &str,
-        mut headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    ) -> GResult<(u16, Value, HeaderMap)> {
-        ensure_json_content_type(&mut headers);
-        let mut reply = self
-            .send_bytes(url, headers, body, false)
-            .await?
-            .buffered()
-            .await?;
-        let reply_headers = std::mem::take(&mut reply.headers);
-        let (status, v) = parse_json_reply(reply)?;
-        Ok((status, v, reply_headers))
     }
 }
 

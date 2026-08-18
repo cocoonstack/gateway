@@ -1346,3 +1346,54 @@ async fn image_parts_cross_the_wires() {
         serde_json::json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}})
     );
 }
+
+#[tokio::test]
+async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
+    let t = RecordingTransport::new(
+        r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#,
+    );
+    let mut req = chat_req(
+        Protocol::AwsAnthropic,
+        "anthropic.claude-3-haiku-20240307-v1:0",
+    );
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            max_tokens: Some(64),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"model": "smuggled", "stream": true, "top_k": 3});
+    }
+    let out = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(out.response.message, "ok");
+    assert_eq!(out.response.prompt_tokens, 3);
+    let b = t.body_json();
+    assert_eq!(b["anthropic_version"], "bedrock-2023-05-31");
+    assert!(b.get("model").is_none() && b.get("stream").is_none(), "{b}");
+    assert_eq!(b["top_k"], 3);
+    assert_eq!(b["system"], "be brief");
+    assert_eq!(b["max_tokens"], 64);
+    assert!(
+        t.url()
+            .ends_with("/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
+        "url: {}",
+        t.url()
+    );
+    let auth = t.header("authorization").expect("sigv4");
+    assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential="), "{auth}");
+    assert_eq!(
+        t.header("content-type").as_deref(),
+        Some("application/json")
+    );
+
+    let t = RecordingTransport::new("{}");
+    let mut req = chat_req(Protocol::AwsAnthropic, "anthropic.claude-sonnet-5-v1:0");
+    req.stream = true;
+    let _ = ClaudeEngine::new(req, t.clone()).run().await;
+    assert!(
+        t.url()
+            .ends_with("/model/anthropic.claude-sonnet-5-v1:0/invoke-with-response-stream"),
+        "url: {}",
+        t.url()
+    );
+    assert!(t.body_json().get("stream").is_none());
+}

@@ -7,7 +7,7 @@ use gw_models::{GResult, GatewayError, GatewayResponse};
 use serde_json::{Value, json};
 
 use crate::base::base_engine;
-use crate::bedrock::{bedrock_header_usage, bedrock_invoke, invoke_uri};
+use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 
 base_engine!(ErnieEngine);
@@ -137,12 +137,8 @@ impl ModelEngine for MinimaxV1Engine {
 
 base_engine!(CohereEngine);
 
-#[async_trait::async_trait]
-impl ModelEngine for CohereEngine {
-    /// AWS Bedrock Cohere Command: {message, chat_history[{role USER/CHATBOT, message}]};
-    /// response {text, finish_reason, meta{tokens{input_tokens,output_tokens}}}.
-    async fn run(&mut self) -> GResult<EngineOutcome> {
-        let model = self.base.model_name()?.to_owned();
+impl CohereEngine {
+    fn build_body(&self) -> Value {
         let mut history: Vec<Value> = self
             .base
             .request
@@ -175,21 +171,64 @@ impl ModelEngine for CohereEngine {
         {
             body["max_tokens"] = json!(mt);
         }
-        let uri = invoke_uri(self.base.model_name()?);
-        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &uri, body).await?;
-        // Command R answers {text, finish_reason}; the legacy Command models
-        // answer {generations: [{text, finish_reason}]}
+        body
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelEngine for CohereEngine {
+    /// AWS Bedrock Cohere Command: {message, chat_history[{role USER/CHATBOT, message}]};
+    /// response {text, finish_reason} (legacy Command: {generations: [{text, finish_reason}]}),
+    /// billed counts in the Bedrock headers; streams `{text, event_type, finish_reason}` frames.
+    async fn run(&mut self) -> GResult<EngineOutcome> {
+        let model = self.base.model_name()?.to_owned();
+        let body = self.build_body();
+        if self.base.request.stream {
+            let mut resp = GatewayResponse {
+                model,
+                is_messages_protocol: true,
+                ..Default::default()
+            };
+            let mut full = String::new();
+            let (status, r) = bedrock_stream(&mut self.base, body, |v| {
+                let mut chunks = Vec::new();
+                if let Some(t) = v["text"].as_str()
+                    && !t.is_empty()
+                    && v["event_type"] != "stream-end"
+                {
+                    full.push_str(t);
+                    chunks.push(StreamChunk {
+                        delta: t.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                if let Some(fr) = v["finish_reason"].as_str() {
+                    resp.finish_reason = cohere_finish_reason(Some(fr));
+                    chunks.push(StreamChunk {
+                        finish_reason: Some(resp.finish_reason.clone()),
+                        ..Default::default()
+                    });
+                }
+                invocation_metrics(&v, &mut resp);
+                Ok(chunks)
+            })
+            .await?;
+            resp.message = full;
+            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
+            resp.raw_usage = Some(
+                json!({"input_tokens": resp.prompt_tokens, "output_tokens": resp.completion_tokens}),
+            );
+            return Ok(EngineOutcome::from_pump(resp, status, r));
+        }
+        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
         let message = crate::engine::take_string(&mut v, "/text")
             .or_else(|| crate::engine::take_string(&mut v, "/generations/0/text"))
             .unwrap_or_default();
-        let finish_reason = match v["finish_reason"]
-            .as_str()
-            .or_else(|| v["generations"][0]["finish_reason"].as_str())
-        {
-            None | Some("COMPLETE") => "stop".to_owned(),
-            Some("MAX_TOKENS") => "length".to_owned(),
-            Some(other) => other.to_lowercase(),
-        };
+        let finish_reason = cohere_finish_reason(
+            v["finish_reason"]
+                .as_str()
+                .or_else(|| v["generations"][0]["finish_reason"].as_str()),
+        );
         let meta = &v["meta"];
         let body_count = |key: &str| match crate::engine::tok(&meta["billed_units"][key]) {
             0 => crate::engine::tok(&meta["tokens"][key]),
@@ -214,12 +253,21 @@ impl ModelEngine for CohereEngine {
     }
 }
 
+fn cohere_finish_reason(vendor: Option<&str>) -> String {
+    match vendor {
+        None | Some("COMPLETE") => "stop".to_owned(),
+        Some("MAX_TOKENS") => "length".to_owned(),
+        Some(other) => other.to_lowercase(),
+    }
+}
+
 base_engine!(LlamaEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for LlamaEngine {
     /// AWS Bedrock Llama: {prompt, max_gen_len, temperature};
-    /// response {generation, prompt_token_count, generation_token_count, stop_reason}.
+    /// response {generation, prompt_token_count, generation_token_count, stop_reason},
+    /// streamed as the same shape per delta.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         // llama is completion-style: collapse the conversation into a prompt
@@ -241,8 +289,50 @@ impl ModelEngine for LlamaEngine {
                 body["temperature"] = json!(t);
             }
         }
-        let uri = invoke_uri(self.base.model_name()?);
-        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &uri, body).await?;
+        if self.base.request.stream {
+            let mut resp = GatewayResponse {
+                model,
+                ..Default::default()
+            };
+            let mut full = String::new();
+            let (status, r) = bedrock_stream(&mut self.base, body, |v| {
+                let mut chunks = Vec::new();
+                if let Some(t) = v["generation"].as_str()
+                    && !t.is_empty()
+                {
+                    full.push_str(t);
+                    chunks.push(StreamChunk {
+                        delta: t.to_owned(),
+                        ..Default::default()
+                    });
+                }
+                if let Some(n) = v["prompt_token_count"].as_i64() {
+                    resp.prompt_tokens = n;
+                }
+                if let Some(n) = v["generation_token_count"].as_i64() {
+                    resp.completion_tokens = n;
+                }
+                if let Some(sr) = v["stop_reason"].as_str() {
+                    resp.finish_reason = sr.to_owned();
+                    chunks.push(StreamChunk {
+                        finish_reason: Some(sr.to_owned()),
+                        ..Default::default()
+                    });
+                }
+                invocation_metrics(&v, &mut resp);
+                Ok(chunks)
+            })
+            .await?;
+            resp.message = full;
+            let total = resp.prompt_tokens.saturating_add(resp.completion_tokens);
+            resp.total_tokens = total;
+            resp.raw_usage = Some(json!({
+                "prompt_tokens": resp.prompt_tokens, "completion_tokens": resp.completion_tokens,
+                "total_tokens": total
+            }));
+            return Ok(EngineOutcome::from_pump(resp, status, r));
+        }
+        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
         let (pt, ct) = bedrock_header_usage(
             &headers,
             (
@@ -576,6 +666,34 @@ mod tests {
             (out.response.prompt_tokens, out.response.completion_tokens),
             (30, 20)
         );
+    }
+
+    #[tokio::test]
+    async fn bedrock_streams_reassemble_text_and_take_the_invocation_metrics() {
+        let mut r = req(Protocol::AwsLlama, "meta.llama3-1-8b-instruct-v1:0");
+        r.stream = true;
+        let out = LlamaEngine::new(r, t()).run().await.unwrap();
+        assert!(
+            out.response.message.contains("[mock-llama]"),
+            "{:?}",
+            out.response
+        );
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.chunks.iter().any(|c| c.finish_reason.is_some()));
+        assert!(out.response.total_tokens > 0);
+
+        let mut r = req(Protocol::AwsCohere, "cohere.command-r-v1:0");
+        r.stream = true;
+        let out = CohereEngine::new(r, t()).run().await.unwrap();
+        assert!(
+            out.response
+                .message
+                .contains("[mock-cohere] you said: hello bespoke"),
+            "{:?}",
+            out.response
+        );
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
     }
 
     #[tokio::test]

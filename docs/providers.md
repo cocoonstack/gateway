@@ -73,8 +73,9 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `dashscope` | Alibaba Qwen (native) | `https://dashscope-intl.aliyuncs.com` | `Bearer`; streams via `X-DashScope-SSE` + `incremental_output` |
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
-| `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id; Command R (`{message, chat_history, preamble}` → `text`) and the legacy Command `generations[]` shape; usage from Bedrock's `x-amzn-bedrock-*-token-count` headers |
-| `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below; non-streaming); model name = the Bedrock model id (`meta.llama3-1-8b-instruct-v1:0`); usage from the token-count headers, else the body counts |
+| `aws-anthropic` | Anthropic Claude on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`anthropic.claude-…`, `us.anthropic.claude-…`); the full Messages engine (system, tools, thinking dialects by generation, prompt-cache breakpoints, signed reasoning) on the InvokeModel wire — `anthropic_version` in the body, model and streaming in the path; streams via InvokeModelWithResponseStream (EventStream frames decoded into the same event sequence) |
+| `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id; Command R (`{message, chat_history, preamble}` → `text`) and the legacy Command `generations[]` shape; usage from Bedrock's `x-amzn-bedrock-*-token-count` headers, or `amazon-bedrock-invocationMetrics` on a stream |
+| `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`meta.llama3-1-8b-instruct-v1:0`); usage from the token-count headers / invocation metrics, else the body counts |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
 The factory also dispatches `video`, `search`, generic `audio`, and
@@ -115,9 +116,11 @@ MiniMax and Moonshot/Kimi (OpenAI- and Anthropic-compatible endpoints), Qwen/Das
 (both compatible endpoints), Baidu Qianfan v2 and the native Ernie wire,
 Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), OpenRouter, and OpenAI/Anthropic relays. AWS Bedrock is verified
 against AWS up to an accepted SigV4 signature (the account was not
-allowlisted for models) and end to end against the
+allowlisted for models) and end to end — Claude, Llama and Cohere, buffered
+and streamed — against the
 [ministack](https://github.com/ministackorg/ministack) Bedrock emulator's
-family-faithful InvokeModel replies and token-count headers.
+family-faithful InvokeModel replies, EventStream framing and token-count
+headers.
 
 `GW_TRANSPORT` overrides transport routing: unset (or any value other than
 `mock`/`http`) routes `mock://` sentinel URLs in-process and real URLs over
@@ -148,3 +151,13 @@ key id's env var and `secret_key_env` to the secret key's; both must resolve or
 the account falls back to inert mock credentials. The signing region is read
 from the endpoint host (`bedrock-runtime.<region>.amazonaws.com`, default
 `us-east-1`), so a local emulator works with `endpoint: http://localhost:4566`.
+
+```yaml
+accounts:
+  - {name: bedrock, provider: aws, endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
+     api_key_env: AWS_ACCESS_KEY_ID, secret_key_env: AWS_SECRET_ACCESS_KEY,
+     protocols: ["aws-anthropic", "aws-llama", "aws-cohere"]}
+models:
+  - {name: us.anthropic.claude-sonnet-4-5-20250929-v1:0, protocol: aws-anthropic}
+  - {name: meta.llama3-1-8b-instruct-v1:0, protocol: aws-llama}
+```

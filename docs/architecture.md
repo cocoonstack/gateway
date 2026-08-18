@@ -14,7 +14,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 | `protocol`  | L1    | OpenAI / Anthropic wire types + cross-protocol conversions |
 | `config`    | L1    | YAML config loading (`conf/gateway.yaml`) |
 | `state`     | L2    | auth, account pool, quotas, rate limits, ledger, batch/file stores (in-process defaults; Postgres/Redis fleet backends) |
-| `engines`   | L3    | engine implementations behind the `Transport` seam, SSE decoding, usage extraction, SigV4 |
+| `engines`   | L3    | engine implementations behind the `Transport` seam, SSE + AWS EventStream decoding, usage extraction, SigV4 |
 | `dag`       | L3    | 4-layer pipeline executor + nodes |
 | `handler`   | L4    | online/offline orchestration, DLP/blocklist plugins |
 | `task`      | L5    | background tasks (quota reset, content purge, usage rollup, availability flush/alerts, webhook dispatch) |

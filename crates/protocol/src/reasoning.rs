@@ -50,6 +50,8 @@ pub fn budget_effort(budget: i64) -> &'static str {
 /// The thinking dialect of a model on the Anthropic wire, by name. Vendors
 /// speaking that wire (MiniMax, GLM, Kimi) cloned the budget dialect.
 pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
+    // Bedrock ids carry a vendor (and region) prefix: `us.anthropic.claude-…`
+    let model = model.find("claude").map_or(model, |i| &model[i..]);
     if !model.starts_with("claude") || model.starts_with("claude-3") {
         return ThinkingDialect::Budget;
     }
@@ -169,6 +171,10 @@ mod tests {
             ("claude-mythos-5", AdaptiveSummarized),
             ("claude-opus-5-1", AdaptiveSummarized),
             ("MiniMax-M3", Budget),
+            ("anthropic.claude-3-5-sonnet-20241022-v2:0", Budget),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", Budget),
+            ("anthropic.claude-opus-4-6-v1:0", Adaptive),
+            ("global.anthropic.claude-sonnet-5-v1:0", AdaptiveSummarized),
         ] {
             assert_eq!(anthropic_thinking_dialect(model), want, "{model}");
         }
