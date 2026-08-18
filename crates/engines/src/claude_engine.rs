@@ -770,12 +770,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bedrock_stream_decodes_the_eventstream_chunks_like_native_sse() {
+    async fn bedrock_regional_model_stream_decodes_the_eventstream_chunks_like_native_sse() {
         let mut r = base_req();
         r.stream = true;
         r.model_param_v2 = Some(ModelParamV2::with_name(
             Protocol::AwsAnthropic,
-            "anthropic.claude-3-haiku-20240307-v1:0",
+            "us.anthropic.claude-3-haiku-20240307-v1:0",
         ));
         let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();

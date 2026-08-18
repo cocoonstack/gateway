@@ -49,9 +49,9 @@ speed sit orders of magnitude below that; the gateway is not the ceiling.
 - Resources: the gateway used ~8 cores at 256 concurrency. Memory grows only
   in the in-memory store, which keeps every ledger row (~1 KB per request);
   point `storage` at SQLite/Postgres for anything longer than a benchmark.
-- Reasoning, tool-call, cache and DLP work all rides the same path: the
-  in-process bench is re-run before every merge and gates on parity with
-  `main` (see [Development](development.md)).
+- Reasoning, tool-call, cache and DLP work all rides the same path. The
+  in-process benchmark is a manual diagnostic rather than a CI merge gate
+  (see [Development](development.md)).
 
 ## Reproduce
 

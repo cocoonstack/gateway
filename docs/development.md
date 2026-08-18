@@ -69,5 +69,5 @@ is unset. A release micro-benchmark lives in `crates/server/tests/bench.rs`:
 cargo test --release -p gw-server --test bench -- --ignored --nocapture
 ```
 
-It gates every merge on parity with `main`; measured HTTP-level numbers and
-the load-test recipe are in [Performance](performance.md).
+It is a manual diagnostic rather than a CI merge gate; measured HTTP-level
+numbers and the load-test recipe are in [Performance](performance.md).

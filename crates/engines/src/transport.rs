@@ -145,7 +145,7 @@ pub type SharedTransport = Arc<dyn Transport>;
 
 /// Deterministic fake vendor: parses the engine-built request body (so request
 /// construction is exercised too) and answers in the vendor's wire shape,
-/// routed by URL path segment. An account whose name contains "down" gets a
+/// routed by protocol or URL path. An account whose name contains "down" gets a
 /// 503 — the DAG failover trigger.
 #[derive(Debug, Default)]
 pub struct MockTransport;
@@ -414,16 +414,14 @@ impl MockTransport {
         }))
     }
 
-    /// Bedrock InvokeModel by model-id family; a stream request answers in
+    /// Bedrock InvokeModel by request protocol; a stream request answers in
     /// the EventStream wire (`chunk` events carrying the family's frames).
     fn bedrock_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let u = req.url.as_str();
-        let reply = if u.contains("/model/anthropic.") {
-            self.anthropic_reply(req)?
-        } else if u.contains("cohere") {
-            self.cohere_reply(req)?
-        } else {
-            self.llama_reply(req)?
+        let reply = match req.protocol {
+            Protocol::AwsAnthropic => self.anthropic_reply(req)?,
+            Protocol::AwsCohere => self.cohere_reply(req)?,
+            Protocol::AwsLlama => self.llama_reply(req)?,
+            _ => return Err(GatewayError::internal("mock bedrock protocol")),
         };
         if !req.stream {
             return Ok(reply);
