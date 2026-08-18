@@ -629,7 +629,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "siliconflow" => ProviderPreset {
             endpoint: "https://api.siliconflow.cn",
-            wires: &["openai-chat", "embeddings", "rerank"],
+            wires: &["openai-chat", "embeddings", "rerank", "tts", "stt", "image"],
             default_model_wire: "openai-chat",
         },
         _ => return None,
@@ -1241,7 +1241,11 @@ models:
         let kimi = cfg.accounts.iter().find(|a| a.name == "kimi").unwrap();
         assert_eq!(kimi.endpoint, "https://api.moonshot.cn");
         let sf = cfg.accounts.iter().find(|a| a.name == "sf").unwrap();
-        assert!(sf.protocols.iter().any(|w| w == "rerank"));
+        assert!(
+            ["rerank", "tts", "stt", "image"]
+                .iter()
+                .all(|w| sf.protocols.iter().any(|p| p == w))
+        );
         let orr = cfg
             .accounts
             .iter()
