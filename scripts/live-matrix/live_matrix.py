@@ -300,6 +300,9 @@ def case_messages(
                     text += d["text"]
                 if d.get("type") == "signature_delta":
                     signatures += 1
+            elif t == "error":
+                record(name + " [upstream fault]", False, f"stream ended with {json.dumps(e)[:200]}")
+                return
     else:
         j = json.loads(txt)
         wire = j.get("usage") or {}
@@ -658,10 +661,11 @@ def run_group(gw: Gateway, group: str) -> None:
         case_embeddings(gw, "text-embedding-3-small")
         case_responses_surfaces(gw, "gpt-4.1-nano")
     elif group == "gemini":
-        case_chat(gw, "gemini-3.6-flash")
-        case_chat(gw, "gemini-3.6-flash", stream=True)
-        case_chat(gw, "gemini-3.6-flash", "reasoning_effort low", prompt=prime, reasoning_effort="low")
-        case_messages(gw, "gemini-3.6-flash", "cross-protocol")
+        for model in ("gemini-3.6-flash", "gemini-3.7-flash"):
+            case_chat(gw, model)
+            case_chat(gw, model, stream=True)
+            case_chat(gw, model, "reasoning_effort low", prompt=prime, reasoning_effort="low")
+            case_messages(gw, model, "cross-protocol")
     elif group == "deepseek":
         case_chat(gw, "deepseek-chat")
         case_chat(gw, "deepseek-chat", stream=True)

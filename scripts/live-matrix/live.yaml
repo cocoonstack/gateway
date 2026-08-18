@@ -42,6 +42,7 @@ models:
   - {name: gpt-4.1-nano, provider: openai, protocol: responses, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
   # gemini
   - {name: gemini-3.6-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
+  - {name: gemini-3.7-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
   # deepseek
   - {name: deepseek-chat, provider: deepseek, input_price_per_1k_micros: 270, output_price_per_1k_micros: 1100, token_rate: {read_cache: 0.1}}
   - {name: deepseek-reasoner, provider: deepseek, input_price_per_1k_micros: 550, output_price_per_1k_micros: 2190, token_rate: {read_cache: 0.25}}
