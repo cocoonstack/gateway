@@ -102,7 +102,10 @@ dropped — the vendor rejects it), and go to OpenAI-compatible vendors as
 `reasoning_content` / `reasoning_details`. Requests that engage reasoning or
 replay signed units are pinned to their requested model (see [Extended
 thinking](#extended-thinking)); `usage.completion_tokens_details.reasoning_tokens`
-reports the reasoning share when the vendor does.
+reports the reasoning share when the vendor does, and
+`usage.prompt_tokens_details` carries `cached_tokens` (cache reads) plus, on
+Anthropic-family models, `cache_creation_input_tokens` — cache writes ride
+inside `prompt_tokens` there, so a client can reconcile the write premium.
 
 ## Anthropic-compatible
 

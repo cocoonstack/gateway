@@ -20,8 +20,7 @@ var (
 	ErrConflict = errors.New("user already exists")
 )
 
-// User is one human control-plane identity. Non-system users belong to one
-// gateway tenant; GatewayUserID is the billing attribution key.
+// User is one human control-plane identity; GatewayUserID is the billing attribution key.
 type User struct {
 	ID            string `json:"id"`
 	Email         string `json:"email"`

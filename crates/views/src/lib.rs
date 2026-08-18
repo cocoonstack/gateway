@@ -2516,11 +2516,12 @@ fn openai_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) ->
         prompt_tokens: pt,
         completion_tokens: ct,
         total_tokens: tt,
-        prompt_tokens_details: u.filter(|d| d.read_cache > 0).map(|d| {
-            gw_protocol::openai::PromptTokensDetails {
+        prompt_tokens_details: u
+            .filter(|d| d.read_cache > 0 || d.write_cache > 0)
+            .map(|d| gw_protocol::openai::PromptTokensDetails {
                 cached_tokens: d.read_cache,
-            }
-        }),
+                cache_creation_input_tokens: d.write_cache,
+            }),
         completion_tokens_details: u.filter(|d| d.reason > 0).map(|d| {
             gw_protocol::openai::CompletionTokensDetails {
                 reasoning_tokens: d.reason,
@@ -5755,7 +5756,11 @@ mod tests {
             "cache reads/writes belong inside OpenAI prompt_tokens"
         );
         assert_eq!(w.total_tokens, 16);
-        assert_eq!(w.prompt_tokens_details.unwrap().cached_tokens, 2);
+        let details = w.prompt_tokens_details.unwrap();
+        assert_eq!(
+            (details.cached_tokens, details.cache_creation_input_tokens),
+            (2, 1)
+        );
 
         let w = openai_usage(8, 5, 13, None);
         assert_eq!((w.prompt_tokens, w.total_tokens), (8, 13));

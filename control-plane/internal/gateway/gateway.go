@@ -121,9 +121,8 @@ type Scope struct {
 	User   string
 }
 
-// Client is the control plane's only dependency on the Rust gateway. Key
-// mutations carry the acting tenant ("" = global operator) so the gateway's
-// own AdminScope enforcement — not this process — draws the tenant boundary.
+// Client is the control plane's only dependency on the Rust gateway; key mutations
+// carry the acting tenant ("" = global) so the gateway's own AdminScope draws the boundary.
 type Client interface {
 	Usage(ctx context.Context, scope Scope, since, until int64) ([]UsageRow, error)
 	UsageSeries(ctx context.Context, scope Scope, bucket string, since, until int64) (Series, error)
@@ -144,8 +143,7 @@ type Client interface {
 
 type ridKey struct{}
 
-// WithRequestID tags ctx so every gateway call made under it carries the
-// X-Request-ID header end to end.
+// WithRequestID tags ctx so every gateway call under it carries X-Request-ID end to end.
 func WithRequestID(ctx context.Context, rid string) context.Context {
 	return context.WithValue(ctx, ridKey{}, rid)
 }

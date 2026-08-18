@@ -33,14 +33,6 @@ impl Default for MessageContent {
     }
 }
 
-fn parts_text(parts: &[Value]) -> String {
-    parts
-        .iter()
-        .filter(|p| p["type"] == "text")
-        .filter_map(|p| p["text"].as_str())
-        .collect()
-}
-
 /// One function call requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -141,6 +133,10 @@ pub struct Usage {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: i64,
+    /// Anthropic cache writes ride inside `prompt_tokens`; surfaced so a client
+    /// can reconcile the write premium it was billed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_input_tokens: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -348,6 +344,18 @@ impl<'a> ChatCompletionChunk<'a> {
             usage,
         }
     }
+}
+
+fn parts_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|p| p["type"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .collect()
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 #[cfg(test)]
