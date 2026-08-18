@@ -32,30 +32,34 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
         ("max_tokens", "maxTokens"),
         ("temperature", "temperature"),
         ("top_p", "topP"),
-        ("stop_sequences", "stopSequences"),
     ] {
         if let Some(v) = body.remove(from) {
             inference.insert(to.into(), v);
         }
+    }
+    if let Some(stop) = body.remove("stop_sequences") {
+        let stop = match stop {
+            Value::String(_) => Value::Array(vec![stop]),
+            stop => stop,
+        };
+        inference.insert("stopSequences".into(), stop);
     }
     if !inference.is_empty() {
         out.insert("inferenceConfig".into(), Value::Object(inference));
     }
 
     let tools: Vec<Value> = match body.remove("tools") {
-        Some(Value::Array(tools)) => tools.into_iter().map(tool_spec).collect(),
+        Some(Value::Array(tools)) => tools.into_iter().flat_map(tool_spec).collect(),
         _ => Vec::new(),
     };
-    let tool_choice = body.remove("tool_choice");
-    if !tools.is_empty() {
+    let (disable_tools, tool_choice) = body
+        .remove("tool_choice")
+        .map(converse_tool_choice)
+        .unwrap_or_default();
+    if !tools.is_empty() && !disable_tools {
         let mut config = Map::with_capacity(2);
         config.insert("tools".into(), Value::Array(tools));
-        if let Some(choice) = tool_choice.and_then(|c| match c["type"].as_str() {
-            Some("any") => Some(json!({"any": {}})),
-            Some("tool") => Some(json!({"tool": {"name": c["name"]}})),
-            Some("auto") => Some(json!({"auto": {}})),
-            _ => None,
-        }) {
+        if let Some(choice) = tool_choice {
             config.insert("toolChoice".into(), choice);
         }
         out.insert("toolConfig".into(), Value::Object(config));
@@ -203,7 +207,7 @@ fn message(mut m: Value) -> Value {
 /// One Messages content block as Converse blocks; a `cache_control` marker
 /// becomes a following `cachePoint`.
 fn content_block(mut block: Value) -> Vec<Value> {
-    let cached = block.get("cache_control").is_some();
+    let cache_control = block.get_mut("cache_control").map(Value::take);
     let mapped = match block["type"].as_str() {
         Some("text") => json!({"text": block["text"].take()}),
         Some("image") => {
@@ -241,15 +245,16 @@ fn content_block(mut block: Value) -> Vec<Value> {
         }
         _ => return Vec::new(),
     };
-    if cached {
-        vec![mapped, json!({"cachePoint": {"type": "default"}})]
-    } else {
-        vec![mapped]
+    let mut blocks = vec![mapped];
+    if let Some(control) = cache_control {
+        blocks.push(cache_point(control));
     }
+    blocks
 }
 
-fn tool_spec(mut tool: Value) -> Value {
-    let mut spec = Map::with_capacity(3);
+fn tool_spec(mut tool: Value) -> Vec<Value> {
+    let cache_control = tool.get_mut("cache_control").map(Value::take);
+    let mut spec = Map::with_capacity(4);
     spec.insert("name".into(), tool["name"].take());
     if let Some(d) = tool.get_mut("description").filter(|d| !d.is_null()) {
         spec.insert("description".into(), d.take());
@@ -261,7 +266,39 @@ fn tool_spec(mut tool: Value) -> Value {
             schema => schema,
         }}),
     );
-    json!({"toolSpec": spec})
+    if let Some(strict) = tool.get_mut("strict").filter(|strict| !strict.is_null()) {
+        spec.insert("strict".into(), strict.take());
+    }
+    let mut tools = vec![json!({"toolSpec": spec})];
+    if let Some(control) = cache_control {
+        tools.push(cache_point(control));
+    }
+    tools
+}
+
+fn cache_point(mut control: Value) -> Value {
+    let mut point = Map::with_capacity(2);
+    point.insert("type".into(), "default".into());
+    if let Some(ttl) = control.get_mut("ttl").filter(|ttl| !ttl.is_null()) {
+        point.insert("ttl".into(), ttl.take());
+    }
+    json!({"cachePoint": point})
+}
+
+fn converse_tool_choice(choice: Value) -> (bool, Option<Value>) {
+    let Value::Object(mut fields) = choice else {
+        return (false, None);
+    };
+    match fields.remove("type").as_ref().and_then(Value::as_str) {
+        Some("none") => (true, None),
+        Some("any") => (false, Some(json!({"any": {}}))),
+        Some("auto") => (false, Some(json!({"auto": {}}))),
+        Some("tool") => (
+            false,
+            Some(json!({"tool": {"name": fields.remove("name").unwrap_or(Value::Null)}})),
+        ),
+        _ => (false, None),
+    }
 }
 
 fn anthropic_block(mut block: Value) -> Option<Value> {
@@ -285,7 +322,7 @@ fn anthropic_block(mut block: Value) -> Option<Value> {
 }
 
 fn usage(u: &Value) -> Value {
-    let mut out = Map::with_capacity(4);
+    let mut out = Map::with_capacity(5);
     for (from, to) in [
         ("inputTokens", "input_tokens"),
         ("outputTokens", "output_tokens"),
@@ -296,6 +333,17 @@ fn usage(u: &Value) -> Value {
             out.insert(to.into(), n.clone());
         }
     }
+    if let Some(tokens) = u["cacheDetails"].as_array().and_then(|details| {
+        details
+            .iter()
+            .find(|detail| detail["ttl"] == "1h")
+            .and_then(|detail| detail["inputTokens"].as_i64())
+    }) {
+        out.insert(
+            "cache_creation".into(),
+            json!({"ephemeral_1h_input_tokens": tokens}),
+        );
+    }
     Value::Object(out)
 }
 
@@ -305,6 +353,9 @@ fn stop_reason(converse: Option<&str>) -> &'static str {
         Some("max_tokens") => "max_tokens",
         Some("stop_sequence") => "stop_sequence",
         Some("guardrail_intervened" | "content_filtered") => "refusal",
+        Some("malformed_model_output") => "malformed_model_output",
+        Some("malformed_tool_use") => "malformed_tool_use",
+        Some("model_context_window_exceeded") => "model_context_window_exceeded",
         _ => "end_turn",
     }
 }
@@ -317,7 +368,8 @@ mod tests {
     fn messages_body_transcodes_to_converse() {
         let body: Map<String, Value> = serde_json::from_value(json!({
             "model": "x", "stream": true, "max_tokens": 64, "temperature": 0.2,
-            "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+            "stop_sequences": "END",
+            "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             "messages": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": [
@@ -327,7 +379,8 @@ mod tests {
                     {"type": "tool_result", "tool_use_id": "t1", "content": "sunny"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}
             ],
-            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}, "strict": true,
+                       "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             "tool_choice": {"type": "any"},
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "seed": 7
@@ -336,7 +389,7 @@ mod tests {
         let out = request(body, true);
         assert_eq!(
             out["system"],
-            json!([{"text": "be brief"}, {"cachePoint": {"type": "default"}}])
+            json!([{"text": "be brief"}, {"cachePoint": {"type": "default", "ttl": "1h"}}])
         );
         assert_eq!(
             out["messages"][0],
@@ -358,11 +411,14 @@ mod tests {
         );
         assert_eq!(
             out["inferenceConfig"],
-            json!({"maxTokens": 64, "temperature": 0.2})
+            json!({"maxTokens": 64, "temperature": 0.2, "stopSequences": ["END"]})
         );
         assert_eq!(
             out["toolConfig"],
-            json!({"tools": [{"toolSpec": {"name": "get_weather", "inputSchema": {"json": {"type": "object"}}}}],
+            json!({"tools": [
+                       {"toolSpec": {"name": "get_weather", "inputSchema": {"json": {"type": "object"}}, "strict": true}},
+                       {"cachePoint": {"type": "default", "ttl": "1h"}}
+                   ],
                    "toolChoice": {"any": {}}})
         );
         assert_eq!(
@@ -382,6 +438,28 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_choices_map_to_converse() {
+        let body = serde_json::from_value(json!({
+            "messages": [],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        }))
+        .unwrap();
+        assert_eq!(
+            request(body, false)["toolConfig"]["toolChoice"],
+            json!({"tool": {"name": "get_weather"}})
+        );
+
+        let body = serde_json::from_value(json!({
+            "messages": [],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"}
+        }))
+        .unwrap();
+        assert!(request(body, false).get("toolConfig").is_none());
+    }
+
+    #[test]
     fn converse_reply_becomes_a_messages_reply() {
         let v = json!({
             "output": {"message": {"role": "assistant", "content": [
@@ -389,7 +467,9 @@ mod tests {
                 {"text": "hello"},
                 {"toolUse": {"toolUseId": "t1", "name": "f", "input": {"a": 1}}}]}},
             "stopReason": "tool_use",
-            "usage": {"inputTokens": 10, "outputTokens": 4, "totalTokens": 14, "cacheReadInputTokens": 3}
+            "usage": {"inputTokens": 10, "outputTokens": 4, "totalTokens": 14,
+                      "cacheReadInputTokens": 3, "cacheWriteInputTokens": 5,
+                      "cacheDetails": [{"ttl": "1h", "inputTokens": 3}, {"ttl": "5m", "inputTokens": 2}]}
         });
         let m = reply(v, "eu.amazon.nova-micro-v1:0");
         assert_eq!(m["stop_reason"], "tool_use");
@@ -398,8 +478,22 @@ mod tests {
         assert_eq!(m["content"][2]["id"], "t1");
         assert_eq!(m["usage"]["input_tokens"], 10);
         assert_eq!(m["usage"]["cache_read_input_tokens"], 3);
-        assert!(m["usage"].get("cache_creation_input_tokens").is_none());
+        assert_eq!(m["usage"]["cache_creation_input_tokens"], 5);
+        assert_eq!(m["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 3);
+        let usage = crate::usage_extract::extract_common_usage(&m["usage"], true).unwrap();
+        assert_eq!((usage.write_cache, usage.write_cache_1h), (5, 3));
         assert_eq!(m["model"], "eu.amazon.nova-micro-v1:0");
+    }
+
+    #[test]
+    fn converse_failure_stop_reasons_survive() {
+        for reason in [
+            "malformed_model_output",
+            "malformed_tool_use",
+            "model_context_window_exceeded",
+        ] {
+            assert_eq!(stop_reason(Some(reason)), reason);
+        }
     }
 
     #[test]

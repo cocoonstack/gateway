@@ -132,7 +132,7 @@ impl ClaudeEngine {
                 body.insert("tools".into(), normalize_tools_anthropic(tools));
             }
             if let Some(tc) = p.tool_choice {
-                body.insert("tool_choice".into(), tc);
+                body.insert("tool_choice".into(), normalize_tool_choice_anthropic(tc));
             }
             // Anthropic's field is `stop_sequences` (array), not OpenAI's `stop`
             if let Some(stop) = p.stop {
@@ -568,7 +568,7 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
             .map(|mut t| {
                 // built by hand: json! would deep-copy the schema
                 if let Some(f) = t.get_mut("function") {
-                    let mut tool = Map::with_capacity(3);
+                    let mut tool = Map::with_capacity(4);
                     tool.insert("name".into(), f["name"].take());
                     // optional on both wires, but Anthropic rejects an explicit null
                     if let Some(description) = f.get_mut("description").filter(|d| !d.is_null()) {
@@ -581,6 +581,9 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
                             schema => schema,
                         },
                     );
+                    if let Some(strict) = f.get_mut("strict").filter(|strict| !strict.is_null()) {
+                        tool.insert("strict".into(), strict.take());
+                    }
                     Value::Object(tool)
                 } else {
                     t
@@ -588,6 +591,22 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
             })
             .collect(),
     )
+}
+
+fn normalize_tool_choice_anthropic(mut choice: Value) -> Value {
+    match choice {
+        Value::String(ref kind) => match kind.as_str() {
+            "none" => json!({"type": "none"}),
+            "required" => json!({"type": "any"}),
+            "auto" => json!({"type": "auto"}),
+            _ => choice,
+        },
+        Value::Object(ref mut fields) if fields["type"] == "function" => {
+            let name = fields["function"]["name"].take();
+            json!({"type": "tool", "name": name})
+        }
+        _ => choice,
+    }
 }
 
 /// Accumulating state for the anthropic streaming event sequence, shared by
@@ -844,16 +863,31 @@ mod tests {
     #[test]
     fn openai_tools_without_description_or_parameters_normalize_cleanly() {
         let tools = normalize_tools_anthropic(json!([
-            {"type":"function","function":{"name":"ping"}},
+            {"type":"function","function":{"name":"ping","strict":true}},
             {"type":"function","function":{"name":"echo","description":null,"parameters":{"type":"object","properties":{"s":{"type":"string"}}}}}
         ]));
         assert_eq!(
             tools,
             json!([
-                {"name":"ping","input_schema":{"type":"object","properties":{}}},
+                {"name":"ping","input_schema":{"type":"object","properties":{}},"strict":true},
                 {"name":"echo","input_schema":{"type":"object","properties":{"s":{"type":"string"}}}}
             ])
         );
+    }
+
+    #[test]
+    fn openai_tool_choices_normalize_to_anthropic() {
+        for (choice, expected) in [
+            (json!("none"), json!({"type": "none"})),
+            (json!("required"), json!({"type": "any"})),
+            (json!("auto"), json!({"type": "auto"})),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                json!({"type": "tool", "name": "get_weather"}),
+            ),
+        ] {
+            assert_eq!(normalize_tool_choice_anthropic(choice), expected);
+        }
     }
 
     #[tokio::test]
