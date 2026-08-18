@@ -26,7 +26,7 @@ models:
 | `anthropic` | `https://api.anthropic.com` | anthropic-messages | `x-api-key` + `anthropic-version` |
 | `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
-| `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` |
+| `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` (its `reasoning_details` shape is the one this gateway emits, so signed Anthropic reasoning round-trips through tool loops; verified live on free and paid models) |
 | `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` (Kimi K2 thinking: `reasoning_content` in and out, `thinking: {type: disabled}` passes through; the vendor's `/anthropic` base also works as `kind: anthropic` + `endpoint`) |
 | `siliconflow` | `https://api.siliconflow.cn` | openai-chat, embeddings, rerank, tts, stt, image | `Bearer` (Qwen3 `enable_thinking`, DeepSeek/GLM/Kimi/MiniMax hosted models, bge/Qwen3 embeddings and rerankers, CosyVoice TTS, SenseVoice STT, Kolors images — all verified live) |
 
@@ -113,7 +113,7 @@ Exercised against the real vendors, end to end through the gateway: OpenAI
 Anthropic, tool loops and reasoning on both), Anthropic, Gemini, DeepSeek,
 MiniMax and Moonshot/Kimi (OpenAI- and Anthropic-compatible endpoints), Qwen/DashScope
 (both compatible endpoints), Baidu Qianfan v2 and the native Ernie wire,
-Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), and OpenAI/Anthropic relays. AWS Bedrock is verified
+Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), OpenRouter, and OpenAI/Anthropic relays. AWS Bedrock is verified
 up to an accepted SigV4 signature (see the table above).
 
 `GW_TRANSPORT` overrides transport routing: unset (or any value other than
