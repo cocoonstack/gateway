@@ -43,7 +43,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/chat/completions` | streaming + non-streaming |
 | POST | `/v1/completions` | legacy text completion (`prompt`) |
-| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` streams as that surface's own frames instead |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort`) and streams as that surface's own frames |
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |

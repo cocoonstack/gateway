@@ -3088,9 +3088,9 @@ async fn responses_model_streams_as_chat_and_messages_on_the_other_surfaces() {
         .iter()
         .filter_map(|f| f["choices"][0]["delta"]["content"].as_str())
         .collect();
-    assert!(
-        content.starts_with("[mock-responses:gpt-5-responses]"),
-        "chat deltas carry the text: {content:?}"
+    assert_eq!(
+        content, "[mock-responses:gpt-5-responses] you said: hi",
+        "the chat turns became Responses input and the reply rides chat deltas"
     );
     assert!(
         !text.contains("event: response."),
@@ -3098,7 +3098,7 @@ async fn responses_model_streams_as_chat_and_messages_on_the_other_surfaces() {
     );
     let last = frames.last().unwrap();
     assert_eq!(last["choices"][0]["finish_reason"], "stop");
-    assert_eq!(last["usage"]["completion_tokens"], 10);
+    assert!(last["usage"]["completion_tokens"].as_i64().unwrap() > 0);
 
     let body = r#"{"model":"gpt-5-responses","stream":true,"max_tokens":50,"messages":[{"role":"user","content":"hi"}]}"#;
     let resp = app
@@ -3117,10 +3117,7 @@ async fn responses_model_streams_as_chat_and_messages_on_the_other_surfaces() {
         .filter_map(|f| serde_json::from_str::<Value>(f).ok())
         .filter_map(|f| f["delta"]["text"].as_str().map(str::to_owned))
         .collect();
-    assert!(
-        deltas.starts_with("[mock-responses:gpt-5-responses]"),
-        "{deltas:?}"
-    );
+    assert_eq!(deltas, "[mock-responses:gpt-5-responses] you said: hi");
     assert!(text.contains("\"stop_reason\":\"end_turn\""));
 }
 

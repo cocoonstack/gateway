@@ -580,6 +580,47 @@ def case_thinking_tiers(gw: Gateway, model: str, native: bool, tiers: list[Any],
             )
 
 
+def case_responses_surfaces(gw: Gateway, model: str) -> None:
+    """A `protocol: responses` model reached natively and from the chat/messages surfaces, streaming."""
+    prompt = "Reply with exactly one word: hello"
+    name = f"{model} responses native stream"
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/responses", {"model": model, "input": prompt, "stream": True})
+    events = parse_sse(txt) if st == 200 else []
+    text = "".join(
+        e.get("delta", "") for e in events if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    )
+    done = [e for e in events if isinstance(e, dict) and e.get("type") == "response.completed"]
+    if st != 200 or not done:
+        record(name, False, f"HTTP {st}: {txt[:300]}")
+    else:
+        usage = done[-1]["response"]["usage"]
+        wire = {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0)}
+        check_ledger(gw, name, model, wire, False, before, f"text={text[:30]!r}")
+    case_chat(gw, model, "responses model", stream=True, prompt=prompt)
+    case_messages(gw, model, "responses model", stream=True, prompt=prompt)
+    name = f"{model} responses model tool loop (chat)"
+    question = [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]
+    before, _ = gw.ledger()
+    st, t1 = gw.call("/v1/chat/completions", {"model": model, "tools": WEATHER_TOOL_OPENAI, "messages": question})
+    calls = json.loads(t1)["choices"][0]["message"].get("tool_calls") or [] if st == 200 else []
+    if not calls:
+        record(name, False, f"turn1 HTTP {st}: {t1[:200]}")
+        return
+    replay = question + [
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        {"role": "tool", "tool_call_id": calls[0]["id"], "content": "Sunny, 25C"},
+    ]
+    st2, t2 = gw.call("/v1/chat/completions", {"model": model, "tools": WEATHER_TOOL_OPENAI, "messages": replay})
+    answer = (json.loads(t2)["choices"][0]["message"].get("content") or "") if st2 == 200 else t2[:200]
+    after, _ = gw.ledger()
+    record(
+        name,
+        st2 == 200 and after == before + 2,
+        f"turn1 tool_calls={len(calls)}; turn2 HTTP {st2} text={answer[:40]!r}",
+    )
+
+
 def run_group(gw: Gateway, group: str) -> None:
     prime = "Is 17 prime? One word."
     if group == "anthropic":
@@ -635,6 +676,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_thinking_tiers(gw, "gpt-5-mini", native=True, tiers=[1024, 4096, 16384], expect_reasoning=False)
         case_thinking_tiers(gw, "gpt-5.4-mini", native=True, tiers=[1024, 4096, 16384, 24576], expect_reasoning=False)
         case_embeddings(gw, "text-embedding-3-small")
+        case_responses_surfaces(gw, "gpt-4.1-nano")
     elif group == "gemini":
         case_chat(gw, "gemini-3.6-flash")
         case_chat(gw, "gemini-3.6-flash", stream=True)

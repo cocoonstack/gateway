@@ -436,6 +436,7 @@ async fn responses_api_forwards_native_body() {
         r#"{"id":"resp_1","object":"response","model":"gpt-5","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#,
     );
     let mut req = GatewayRequest {
+        preserve_responses_wire: true,
         model_param_v2: Some(ModelParamV2::with_name(Protocol::Responses, "gpt-5")),
         ..Default::default()
     };
