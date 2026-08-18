@@ -679,13 +679,38 @@ struct MemoryLedger {
     request_ids: HashSet<String>,
 }
 
-/// First epoch second NOT yet folded into the rollup: rows at or above it are
-/// still the ledger's to report.
-fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
-    rollup
-        .keys()
-        .next_back()
-        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+#[derive(Debug, Default)]
+struct MemoryContent {
+    rows: Vec<crate::ContentRecord>,
+    terminal_keys: HashSet<(String, String, String)>,
+}
+
+impl MemoryContent {
+    fn push_terminal(&mut self, record: &crate::ContentRecord) {
+        if self.terminal_keys.insert(Self::terminal_key(record)) {
+            self.rows.push(record.clone());
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
+        let before = self.rows.len();
+        self.rows.retain(|record| {
+            let retained = keep(record);
+            if !retained && record.kind == "terminal" {
+                self.terminal_keys.remove(&Self::terminal_key(record));
+            }
+            retained
+        });
+        (before - self.rows.len()) as u64
+    }
+
+    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
+        (
+            record.tenant.clone(),
+            record.user_id.clone(),
+            record.request_id.clone(),
+        )
+    }
 }
 
 /// In-process store: append-only ledger, DashMap-backed files and batches.
@@ -722,45 +747,6 @@ impl MemoryStore {
     pub(crate) fn fail_next_ledger_writes(&self, count: usize) {
         self.ledger_failures.store(count, Ordering::Relaxed);
     }
-}
-
-#[derive(Debug, Default)]
-struct MemoryContent {
-    rows: Vec<crate::ContentRecord>,
-    terminal_keys: HashSet<(String, String, String)>,
-}
-
-impl MemoryContent {
-    fn push_terminal(&mut self, record: &crate::ContentRecord) {
-        if self.terminal_keys.insert(Self::terminal_key(record)) {
-            self.rows.push(record.clone());
-        }
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
-        let before = self.rows.len();
-        self.rows.retain(|record| {
-            let retained = keep(record);
-            if !retained && record.kind == "terminal" {
-                self.terminal_keys.remove(&Self::terminal_key(record));
-            }
-            retained
-        });
-        (before - self.rows.len()) as u64
-    }
-
-    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
-        (
-            record.tenant.clone(),
-            record.user_id.clone(),
-            record.request_id.clone(),
-        )
-    }
-}
-
-/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[async_trait::async_trait]
@@ -1175,6 +1161,20 @@ macro_rules! row_mapper {
             $ty { $($field),+ }
         }
     };
+}
+
+/// First epoch second NOT yet folded into the rollup: rows at or above it are
+/// still the ledger's to report.
+fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
+    rollup
+        .keys()
+        .next_back()
+        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+}
+
+/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn next_col(col: &mut usize) -> usize {

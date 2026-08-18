@@ -15,16 +15,6 @@ const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
 const MAX_RESERVE: i64 = 1_000_000;
 
-/// The shared 429 for throttling-style denials (rate/QPM/TPM); hard quota
-/// exhaustion answers with [`quota_denied`] instead.
-fn limit_denied(msg: String) -> GatewayError {
-    GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
-}
-
-fn quota_denied(msg: String) -> GatewayError {
-    GatewayError::new(ErrCode::QUOTA_EXHAUSTED, 400, msg)
-}
-
 /// preprocess/model_quota: per-(AK, model) daily token cap (AK override, else
 /// tenant default, else unmetered); over-quota degrades to the tenant's
 /// fallback model, so it runs before resolve_model. Soft check-then-consume:
@@ -1017,6 +1007,16 @@ fn requested_model(param: Option<&gw_models::ModelParamV2>) -> &str {
     param
         .map(|p| p.fallback_from.as_deref().unwrap_or(p.model_name.as_str()))
         .unwrap_or_default()
+}
+
+/// The shared 429 for throttling-style denials (rate/QPM/TPM); hard quota
+/// exhaustion answers with [`quota_denied`] instead.
+fn limit_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
+}
+
+fn quota_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::QUOTA_EXHAUSTED, 400, msg)
 }
 
 #[cfg(test)]

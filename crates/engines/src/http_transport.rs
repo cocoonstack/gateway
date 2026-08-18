@@ -36,24 +36,6 @@ impl Default for UpstreamPolicy {
     }
 }
 
-/// The vendor's `Retry-After` seconds, capped; unparseable waits at least a
-/// second, absent falls back to the connect path's linear backoff.
-fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
-    const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
-    const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
-    match headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(v) => v
-            .trim()
-            .parse::<u64>()
-            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
-            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT)),
-        None => RETRY_BACKOFF * attempt,
-    }
-}
-
 /// The default plus per-account upstream policies, swapped as one unit on reload.
 #[derive(Debug, Default)]
 struct Policies {
@@ -246,32 +228,6 @@ impl Transport for HttpTransport {
     }
 }
 
-/// A live SSE byte stream that yields one terminal error when no chunk arrives
-/// within `gap`; an actively flowing stream lives as long as the generation.
-fn idle_capped(
-    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
-    gap: Duration,
-) -> UpstreamBody {
-    use futures::StreamExt;
-    UpstreamBody::SseStream(Box::pin(futures::stream::unfold(
-        Some(stream),
-        move |state| async move {
-            let mut s = state?;
-            match tokio::time::timeout(gap, s.next()).await {
-                Ok(Some(item)) => Some((item, Some(s))),
-                Ok(None) => None,
-                Err(_) => Some((
-                    Err(StreamFault {
-                        timeout: true,
-                        message: format!("stream idle for {gap:?}"),
-                    }),
-                    None,
-                )),
-            }
-        },
-    )))
-}
-
 /// Default transport: `mock://` sentinel URLs (accounts with no configured
 /// endpoint) stay in-process, everything else goes over real HTTP.
 #[derive(Debug)]
@@ -316,6 +272,50 @@ impl Transport for DispatchTransport {
             self.http.send(req).await
         }
     }
+}
+
+/// The vendor's `Retry-After` seconds, capped; unparseable waits at least a
+/// second, absent falls back to the connect path's linear backoff.
+fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+    const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
+    match headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT)),
+        None => RETRY_BACKOFF * attempt,
+    }
+}
+
+/// A live SSE byte stream that yields one terminal error when no chunk arrives
+/// within `gap`; an actively flowing stream lives as long as the generation.
+fn idle_capped(
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
+    gap: Duration,
+) -> UpstreamBody {
+    use futures::StreamExt;
+    UpstreamBody::SseStream(Box::pin(futures::stream::unfold(
+        Some(stream),
+        move |state| async move {
+            let mut s = state?;
+            match tokio::time::timeout(gap, s.next()).await {
+                Ok(Some(item)) => Some((item, Some(s))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(StreamFault {
+                        timeout: true,
+                        message: format!("stream idle for {gap:?}"),
+                    }),
+                    None,
+                )),
+            }
+        },
+    )))
 }
 
 #[cfg(test)]

@@ -346,6 +346,223 @@ impl ModelEngine for ClaudeEngine {
     }
 }
 
+/// Accumulating state for the anthropic streaming event sequence, shared by
+/// the buffered and live decode paths.
+struct SseState {
+    preserve_native: bool,
+    model_override: Option<String>,
+    full: String,
+    input: i64,
+    output: i64,
+    /// message_start's usage overlaid by message_delta's, for the CommonUsage step
+    usage: Map<String, Value>,
+    tool_blocks: Vec<Value>,
+    native_blocks: Vec<Value>,
+    /// the in-flight non-tool block: every block natively, thinking blocks on the chat surface
+    open_native: Option<Value>,
+    open_native_index: usize,
+    /// in-flight tool_use block: (skeleton from content_block_start,
+    /// accumulated input_json_delta fragments)
+    open_tool: Option<(Value, String)>,
+}
+
+impl SseState {
+    fn new(preserve_native: bool, model_override: Option<String>) -> Self {
+        Self {
+            preserve_native,
+            model_override,
+            full: String::new(),
+            input: 0,
+            output: 0,
+            usage: Map::new(),
+            tool_blocks: Vec::new(),
+            native_blocks: Vec::new(),
+            open_native: None,
+            open_native_index: 0,
+            open_tool: None,
+        }
+    }
+
+    fn push_visible(chunks: &mut Vec<StreamChunk>, chunk: StreamChunk) {
+        if chunk.native_event.is_some()
+            || !chunk.delta.is_empty()
+            || !chunk.reasoning.is_empty()
+            || chunk.reasoning_details.is_some()
+            || chunk.tool_calls.is_some()
+            || chunk.finish_reason.is_some()
+        {
+            chunks.push(chunk);
+        }
+    }
+
+    /// Apply one decoded event; returns the chunks it yields. Takes the event
+    /// by value so the native forward is a move, not a per-event deep clone.
+    fn apply(
+        &mut self,
+        mut v: Value,
+        status: u16,
+        resp: &mut GatewayResponse,
+    ) -> GResult<Vec<StreamChunk>> {
+        if let Some(err) = crate::engine::vendor_error(status, &v) {
+            return Err(err);
+        }
+        let mut chunks = Vec::new();
+        let mut native_chunk = StreamChunk::default();
+        match v["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                resp.model = v["message"]["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
+                let usage = v.get_mut("message").and_then(|m| m.get_mut("usage"));
+                self.overlay_usage(usage);
+            }
+            "content_block_start" => {
+                let index = v["index"].as_u64().unwrap_or_default() as usize;
+                if v["content_block"]["type"] == "tool_use" {
+                    // one open block for both the native replay and tool_calls
+                    self.open_tool = Some((v["content_block"].clone(), String::new()));
+                } else if self.preserve_native {
+                    self.open_native = Some(v["content_block"].clone());
+                } else if is_thinking_block(&v["content_block"]) {
+                    self.open_native = Some(v["content_block"].take());
+                    self.open_native_index = index;
+                }
+            }
+            "content_block_delta" => {
+                if let Some(t) = v["delta"]["text"].as_str() {
+                    self.full.push_str(t);
+                    // native consumers read the event; the delta would be dead weight
+                    if !self.preserve_native {
+                        native_chunk.delta = t.to_owned();
+                    }
+                    if let Some(block) = self.open_native.as_mut()
+                        && let Some(Value::String(text)) = block.get_mut("text")
+                    {
+                        text.push_str(t);
+                    }
+                }
+                // the native event keeps its delta; the chat surface moves it out
+                if self.preserve_native {
+                    if let Some(t) = v["delta"]["thinking"].as_str() {
+                        self.append_thinking(t);
+                    }
+                } else if let Some(Value::String(t)) = v
+                    .get_mut("delta")
+                    .and_then(|delta| delta.get_mut("thinking"))
+                    .map(Value::take)
+                {
+                    self.append_thinking(&t);
+                    resp.reasoning.push_str(&t);
+                    native_chunk.reasoning = t;
+                }
+                if let Some(signature) = v["delta"]["signature"].as_str()
+                    && let Some(block) = self.open_native.as_mut()
+                {
+                    block["signature"] = signature.into();
+                }
+                if let Some(pj) = v["delta"]["partial_json"].as_str()
+                    && let Some((_, buf)) = self.open_tool.as_mut()
+                {
+                    buf.push_str(pj);
+                }
+            }
+            "content_block_stop" => {
+                if let Some(block) = self.open_native.take() {
+                    if self.preserve_native {
+                        self.native_blocks.push(block);
+                    } else {
+                        native_chunk.reasoning_details =
+                            gw_protocol::reasoning::thinking_block_to_detail(
+                                block,
+                                self.open_native_index,
+                            )
+                            .map(|detail| vec![detail]);
+                    }
+                }
+                if let Some((mut block, buf)) = self.open_tool.take() {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
+                        block["input"] = parsed;
+                    }
+                    if self.preserve_native {
+                        self.native_blocks.push(block.clone());
+                    }
+                    native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
+                    self.tool_blocks.push(block);
+                }
+            }
+            "message_delta" => {
+                if let Some(sr) = v["delta"]["stop_reason"].as_str() {
+                    resp.finish_reason = sr.to_owned();
+                    native_chunk.finish_reason = Some(sr.to_owned());
+                }
+                self.output = v["usage"]["output_tokens"].as_i64().unwrap_or(self.output);
+                // some compatible vendors (MiniMax) report input_tokens only here
+                if let Some(it) = v["usage"]["input_tokens"].as_i64() {
+                    self.input = it;
+                }
+                let usage = v.get_mut("usage");
+                self.overlay_usage(usage);
+            }
+            _ => {}
+        }
+        if self.preserve_native {
+            let mut event = v;
+            if event["type"] == "message_start"
+                && let Some(model) = self.model_override.as_ref()
+                && let Some(message) = event.get_mut("message").and_then(Value::as_object_mut)
+            {
+                message.insert("model".to_owned(), model.clone().into());
+            }
+            native_chunk.native_event = Some(event);
+        }
+        Self::push_visible(&mut chunks, native_chunk);
+        Ok(chunks)
+    }
+
+    fn finish(self, resp: &mut GatewayResponse) {
+        if !self.tool_blocks.is_empty() {
+            resp.tool_calls = Some(Value::Array(self.tool_blocks));
+        }
+        if self.preserve_native && !self.native_blocks.is_empty() {
+            resp.anthropic_content = Some(Value::Array(self.native_blocks));
+        }
+        resp.message = self.full;
+        let (input, output) = (self.input.max(0), self.output.max(0));
+        resp.prompt_tokens = input;
+        resp.completion_tokens = output;
+        crate::engine::fill_total_if_zero(resp);
+        if !self.usage.is_empty() {
+            resp.raw_usage = Some(Value::Object(self.usage));
+        }
+    }
+
+    fn append_thinking(&mut self, t: &str) {
+        if let Some(block) = self.open_native.as_mut()
+            && let Some(Value::String(thinking)) = block.get_mut("thinking")
+        {
+            thinking.push_str(t);
+        }
+    }
+
+    /// The native event keeps its usage; the chat surface moves it out.
+    fn overlay_usage(&mut self, usage: Option<&mut Value>) {
+        let usage = match usage {
+            Some(usage) if self.preserve_native => usage.clone(),
+            Some(usage) => usage.take(),
+            None => return,
+        };
+        if let Value::Object(usage) = usage {
+            for (key, value) in usage {
+                if !value.is_null() {
+                    self.usage.insert(key, value);
+                }
+            }
+        }
+    }
+}
+
 /// The native event sequence for a complete JSON message (some compatible
 /// upstreams ignore `stream:true`), so thinking proof survives the streaming surface.
 pub fn anthropic_native_chunks(
@@ -601,223 +818,6 @@ fn normalize_tool_choice_anthropic(mut choice: Value) -> Value {
             json!({"type": "tool", "name": name})
         }
         _ => choice,
-    }
-}
-
-/// Accumulating state for the anthropic streaming event sequence, shared by
-/// the buffered and live decode paths.
-struct SseState {
-    preserve_native: bool,
-    model_override: Option<String>,
-    full: String,
-    input: i64,
-    output: i64,
-    /// message_start's usage overlaid by message_delta's, for the CommonUsage step
-    usage: Map<String, Value>,
-    tool_blocks: Vec<Value>,
-    native_blocks: Vec<Value>,
-    /// the in-flight non-tool block: every block natively, thinking blocks on the chat surface
-    open_native: Option<Value>,
-    open_native_index: usize,
-    /// in-flight tool_use block: (skeleton from content_block_start,
-    /// accumulated input_json_delta fragments)
-    open_tool: Option<(Value, String)>,
-}
-
-impl SseState {
-    fn new(preserve_native: bool, model_override: Option<String>) -> Self {
-        Self {
-            preserve_native,
-            model_override,
-            full: String::new(),
-            input: 0,
-            output: 0,
-            usage: Map::new(),
-            tool_blocks: Vec::new(),
-            native_blocks: Vec::new(),
-            open_native: None,
-            open_native_index: 0,
-            open_tool: None,
-        }
-    }
-
-    fn push_visible(chunks: &mut Vec<StreamChunk>, chunk: StreamChunk) {
-        if chunk.native_event.is_some()
-            || !chunk.delta.is_empty()
-            || !chunk.reasoning.is_empty()
-            || chunk.reasoning_details.is_some()
-            || chunk.tool_calls.is_some()
-            || chunk.finish_reason.is_some()
-        {
-            chunks.push(chunk);
-        }
-    }
-
-    /// Apply one decoded event; returns the chunks it yields. Takes the event
-    /// by value so the native forward is a move, not a per-event deep clone.
-    fn apply(
-        &mut self,
-        mut v: Value,
-        status: u16,
-        resp: &mut GatewayResponse,
-    ) -> GResult<Vec<StreamChunk>> {
-        if let Some(err) = crate::engine::vendor_error(status, &v) {
-            return Err(err);
-        }
-        let mut chunks = Vec::new();
-        let mut native_chunk = StreamChunk::default();
-        match v["type"].as_str().unwrap_or_default() {
-            "message_start" => {
-                resp.model = v["message"]["model"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
-                let usage = v.get_mut("message").and_then(|m| m.get_mut("usage"));
-                self.overlay_usage(usage);
-            }
-            "content_block_start" => {
-                let index = v["index"].as_u64().unwrap_or_default() as usize;
-                if v["content_block"]["type"] == "tool_use" {
-                    // one open block for both the native replay and tool_calls
-                    self.open_tool = Some((v["content_block"].clone(), String::new()));
-                } else if self.preserve_native {
-                    self.open_native = Some(v["content_block"].clone());
-                } else if is_thinking_block(&v["content_block"]) {
-                    self.open_native = Some(v["content_block"].take());
-                    self.open_native_index = index;
-                }
-            }
-            "content_block_delta" => {
-                if let Some(t) = v["delta"]["text"].as_str() {
-                    self.full.push_str(t);
-                    // native consumers read the event; the delta would be dead weight
-                    if !self.preserve_native {
-                        native_chunk.delta = t.to_owned();
-                    }
-                    if let Some(block) = self.open_native.as_mut()
-                        && let Some(Value::String(text)) = block.get_mut("text")
-                    {
-                        text.push_str(t);
-                    }
-                }
-                // the native event keeps its delta; the chat surface moves it out
-                if self.preserve_native {
-                    if let Some(t) = v["delta"]["thinking"].as_str() {
-                        self.append_thinking(t);
-                    }
-                } else if let Some(Value::String(t)) = v
-                    .get_mut("delta")
-                    .and_then(|delta| delta.get_mut("thinking"))
-                    .map(Value::take)
-                {
-                    self.append_thinking(&t);
-                    resp.reasoning.push_str(&t);
-                    native_chunk.reasoning = t;
-                }
-                if let Some(signature) = v["delta"]["signature"].as_str()
-                    && let Some(block) = self.open_native.as_mut()
-                {
-                    block["signature"] = signature.into();
-                }
-                if let Some(pj) = v["delta"]["partial_json"].as_str()
-                    && let Some((_, buf)) = self.open_tool.as_mut()
-                {
-                    buf.push_str(pj);
-                }
-            }
-            "content_block_stop" => {
-                if let Some(block) = self.open_native.take() {
-                    if self.preserve_native {
-                        self.native_blocks.push(block);
-                    } else {
-                        native_chunk.reasoning_details =
-                            gw_protocol::reasoning::thinking_block_to_detail(
-                                block,
-                                self.open_native_index,
-                            )
-                            .map(|detail| vec![detail]);
-                    }
-                }
-                if let Some((mut block, buf)) = self.open_tool.take() {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
-                        block["input"] = parsed;
-                    }
-                    if self.preserve_native {
-                        self.native_blocks.push(block.clone());
-                    }
-                    native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
-                    self.tool_blocks.push(block);
-                }
-            }
-            "message_delta" => {
-                if let Some(sr) = v["delta"]["stop_reason"].as_str() {
-                    resp.finish_reason = sr.to_owned();
-                    native_chunk.finish_reason = Some(sr.to_owned());
-                }
-                self.output = v["usage"]["output_tokens"].as_i64().unwrap_or(self.output);
-                // some compatible vendors (MiniMax) report input_tokens only here
-                if let Some(it) = v["usage"]["input_tokens"].as_i64() {
-                    self.input = it;
-                }
-                let usage = v.get_mut("usage");
-                self.overlay_usage(usage);
-            }
-            _ => {}
-        }
-        if self.preserve_native {
-            let mut event = v;
-            if event["type"] == "message_start"
-                && let Some(model) = self.model_override.as_ref()
-                && let Some(message) = event.get_mut("message").and_then(Value::as_object_mut)
-            {
-                message.insert("model".to_owned(), model.clone().into());
-            }
-            native_chunk.native_event = Some(event);
-        }
-        Self::push_visible(&mut chunks, native_chunk);
-        Ok(chunks)
-    }
-
-    fn finish(self, resp: &mut GatewayResponse) {
-        if !self.tool_blocks.is_empty() {
-            resp.tool_calls = Some(Value::Array(self.tool_blocks));
-        }
-        if self.preserve_native && !self.native_blocks.is_empty() {
-            resp.anthropic_content = Some(Value::Array(self.native_blocks));
-        }
-        resp.message = self.full;
-        let (input, output) = (self.input.max(0), self.output.max(0));
-        resp.prompt_tokens = input;
-        resp.completion_tokens = output;
-        crate::engine::fill_total_if_zero(resp);
-        if !self.usage.is_empty() {
-            resp.raw_usage = Some(Value::Object(self.usage));
-        }
-    }
-
-    fn append_thinking(&mut self, t: &str) {
-        if let Some(block) = self.open_native.as_mut()
-            && let Some(Value::String(thinking)) = block.get_mut("thinking")
-        {
-            thinking.push_str(t);
-        }
-    }
-
-    /// The native event keeps its usage; the chat surface moves it out.
-    fn overlay_usage(&mut self, usage: Option<&mut Value>) {
-        let usage = match usage {
-            Some(usage) if self.preserve_native => usage.clone(),
-            Some(usage) => usage.take(),
-            None => return,
-        };
-        if let Value::Object(usage) = usage {
-            for (key, value) in usage {
-                if !value.is_null() {
-                    self.usage.insert(key, value);
-                }
-            }
-        }
     }
 }
 

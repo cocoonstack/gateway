@@ -635,10 +635,6 @@ impl RedisResponseCache {
     }
 }
 
-fn redis_cache_key(key: &str) -> String {
-    format!("gw:cache:{key}")
-}
-
 #[async_trait::async_trait]
 impl ResponseCache for RedisResponseCache {
     async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
@@ -674,6 +670,10 @@ impl ResponseCache for RedisResponseCache {
             tracing::warn!(error = %e, "redis cache put failed");
         }
     }
+}
+
+fn redis_cache_key(key: &str) -> String {
+    format!("gw:cache:{key}")
 }
 
 struct PerEntryTtl;

@@ -403,6 +403,13 @@ impl OnlineHandler {
     }
 }
 
+/// The realtime-surface subset of [`Moderation`]: no degrade mid-session.
+pub enum RtModeration {
+    Allow,
+    Mask(Vec<std::ops::Range<usize>>),
+    Deny(String),
+}
+
 /// One resolved moderator verdict: `Unavailable` is a moderator error under a
 /// fail-closed posture (fail-open resolves to `Allow`).
 enum Moderation {
@@ -413,11 +420,24 @@ enum Moderation {
     Unavailable,
 }
 
-/// The realtime-surface subset of [`Moderation`]: no degrade mid-session.
-pub enum RtModeration {
-    Allow,
-    Mask(Vec<std::ops::Range<usize>>),
-    Deny(String),
+struct TerminalSubject {
+    request_id: String,
+    ak: String,
+    user_id: String,
+    tenant: String,
+}
+
+impl TerminalSubject {
+    fn new(ak: &AkInfo, request: &GatewayRequest) -> Self {
+        Self {
+            request_id: request.request_id.clone(),
+            ak: ak.ak.clone(),
+            user_id: ak
+                .attributed_user(request.user_id.as_deref().unwrap_or_default())
+                .to_owned(),
+            tenant: ak.tenant.clone(),
+        }
+    }
 }
 
 /// A fleet-unique request id, `req-<process instance>-<seq>`: one relaxed atomic
@@ -571,26 +591,6 @@ async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i
     }
     .record(ctx.state.store.as_ref())
     .await;
-}
-
-struct TerminalSubject {
-    request_id: String,
-    ak: String,
-    user_id: String,
-    tenant: String,
-}
-
-impl TerminalSubject {
-    fn new(ak: &AkInfo, request: &GatewayRequest) -> Self {
-        Self {
-            request_id: request.request_id.clone(),
-            ak: ak.ak.clone(),
-            user_id: ak
-                .attributed_user(request.user_id.as_deref().unwrap_or_default())
-                .to_owned(),
-            tenant: ak.tenant.clone(),
-        }
-    }
 }
 
 /// Persist one lifecycle result row (no provider message or user content).
