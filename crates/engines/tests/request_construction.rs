@@ -646,15 +646,32 @@ async fn llama_request_shape_with_sigv4() {
     .await
     .unwrap();
     let b = t.body_json();
-    assert!(
-        b["prompt"].as_str().unwrap().contains("hello"),
-        "prompt: {}",
-        b["prompt"]
+    assert_eq!(
+        b["prompt"],
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nbe brief<|eot_id|>\
+         <|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n\n",
+        "the Llama 3 chat template is rendered into the raw prompt"
     );
     assert!(
         t.header("authorization")
             .unwrap()
             .starts_with("AWS4-HMAC-SHA256")
+    );
+
+    let t = RecordingTransport::new(r#"{"generation":"ok","stop_reason":"stop"}"#);
+    let _ = LlamaEngine::new(
+        chat_req(Protocol::AwsLlama, "us.meta.llama4-scout-17b-instruct-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
+    assert!(
+        t.body_json()["prompt"].as_str().unwrap().starts_with(
+            "<|begin_of_text|><|header_start|>system<|header_end|>\n\nbe brief<|eot|>"
+        ),
+        "Llama 4 renames the header tokens"
     );
 }
 

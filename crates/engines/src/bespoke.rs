@@ -253,6 +253,36 @@ impl ModelEngine for CohereEngine {
     }
 }
 
+/// Bedrock Llama takes a raw prompt, so the chat template is ours to render:
+/// Llama 3 header tokens, Llama 4's renamed ones; a bare `role: text` prompt
+/// makes the model keep inventing turns until max_gen_len.
+fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
+    let (start, end, eot) = if model.contains("llama4") {
+        ("<|header_start|>", "<|header_end|>", "<|eot|>")
+    } else {
+        ("<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>")
+    };
+    let mut prompt = String::from("<|begin_of_text|>");
+    for m in messages {
+        let role = match m.role.as_str() {
+            gw_consts::role::SYSTEM => "system",
+            gw_consts::role::AI => "assistant",
+            _ => "user",
+        };
+        prompt.push_str(start);
+        prompt.push_str(role);
+        prompt.push_str(end);
+        prompt.push_str("\n\n");
+        prompt.push_str(&m.content);
+        prompt.push_str(eot);
+    }
+    prompt.push_str(start);
+    prompt.push_str("assistant");
+    prompt.push_str(end);
+    prompt.push_str("\n\n");
+    prompt
+}
+
 fn cohere_finish_reason(vendor: Option<&str>) -> String {
     match vendor {
         None | Some("COMPLETE") => "stop".to_owned(),
@@ -270,15 +300,7 @@ impl ModelEngine for LlamaEngine {
     /// streamed as the same shape per delta.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // llama is completion-style: collapse the conversation into a prompt
-        let prompt: String = self
-            .base
-            .request
-            .message
-            .iter()
-            .map(|m| format!("{}: {}\n", m.role, m.content))
-            .collect::<String>()
-            + "assistant: ";
+        let prompt = llama_prompt(&model, &self.base.request.message);
         let mut body = json!({});
         body["prompt"] = prompt.into();
         if let Some(p) = self.base.chat_params() {
