@@ -200,6 +200,10 @@ fn rt_error(class: ErrClass, message: impl Into<String>) -> Value {
     }})
 }
 
+fn rt_error_frame(class: ErrClass, message: impl Into<String>) -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Text(rt_error(class, message).to_string().into())
+}
+
 /// The AK carried as `gw-api-key.<ak>` in `Sec-WebSocket-Protocol` — the one
 /// header a browser WebSocket can set; a query param would leak into LB logs.
 fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
@@ -745,10 +749,9 @@ async fn realtime_bridge(
         Err(e) => {
             s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
-                .send(CMsg::Text(
-                    rt_error(ErrClass::InternalServer, format!("bad upstream url: {e}"))
-                        .to_string()
-                        .into(),
+                .send(rt_error_frame(
+                    ErrClass::InternalServer,
+                    format!("bad upstream url: {e}"),
                 ))
                 .await;
             return;
@@ -763,13 +766,9 @@ async fn realtime_bridge(
         Err(e) => {
             s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
-                .send(CMsg::Text(
-                    rt_error(
-                        ErrClass::ModelError,
-                        format!("upstream realtime connect failed: {e}"),
-                    )
-                    .to_string()
-                    .into(),
+                .send(rt_error_frame(
+                    ErrClass::ModelError,
+                    format!("upstream realtime connect failed: {e}"),
                 ))
                 .await;
             return;
@@ -803,7 +802,7 @@ async fn realtime_bridge(
                     match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
                         Err(reason) => {
                             if cl_tx
-                                .send(CMsg::Text(rt_error(ErrClass::AccessDenied, reason).to_string().into()))
+                                .send(rt_error_frame(ErrClass::AccessDenied, reason))
                                 .await
                                 .is_err()
                             {
@@ -829,7 +828,7 @@ async fn realtime_bridge(
                             }
                             Err((class, denied)) => {
                                 if cl_tx
-                                    .send(CMsg::Text(rt_error(class, denied).to_string().into()))
+                                    .send(rt_error_frame(class, denied))
                                     .await
                                     .is_err()
                                 {
@@ -862,7 +861,7 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 let mut relay = true;
-                let mut redacted: Option<String> = None;
+                let mut redacted: Option<Value> = None;
                 let mut turn_ended = false;
                 let mut output_units = 0;
                 match frame {
@@ -882,9 +881,7 @@ async fn realtime_bridge(
                                     let _ = up_tx
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
                                         .await;
-                                    let _ = cl_tx
-                                        .send(CMsg::Text(rt_error(class, denied).to_string().into()))
-                                        .await;
+                                    let _ = cl_tx.send(rt_error_frame(class, denied)).await;
                                     suppress = true;
                                     relay = false;
                                 }
@@ -959,9 +956,6 @@ async fn realtime_bridge(
                         } else {
                             0
                         };
-                        if n > 0 {
-                            redacted = Some(v.to_string());
-                        }
                         if relay {
                             let (text, opaque) = realtime_output_delta(&v);
                             output_units = text.map_or(0, |text| {
@@ -970,6 +964,9 @@ async fn realtime_bridge(
                                 tokens as i64
                             });
                             output_units = output_units.saturating_add(opaque as i64);
+                        }
+                        if n > 0 {
+                            redacted = Some(v);
                         }
                         // per-token events would be too hot: sum the turn, record once at its
                         // boundary
@@ -992,8 +989,10 @@ async fn realtime_bridge(
                 }
                 if relay {
                     let out = match (redacted, was_text, raw_text, raw_bytes) {
-                        (Some(json), true, _, _) => CMsg::Text(json.into()),
-                        (Some(json), false, _, _) => CMsg::Binary(json.into_bytes().into()),
+                        (Some(v), true, _, _) => CMsg::Text(v.to_string().into()),
+                        (Some(v), false, _, _) => {
+                            CMsg::Binary(serde_json::to_vec(&v).unwrap_or_default().into())
+                        }
                         (None, _, Some(t), _) => upstream_text_to_client(t),
                         (None, _, _, Some(b)) => CMsg::Binary(b),
                         (None, _, None, None) => continue,

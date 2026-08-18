@@ -97,15 +97,6 @@ pub fn thinking_block_to_detail(mut block: Value, index: usize) -> Option<Value>
     Some(Value::Object(detail))
 }
 
-/// `display: omitted` may leave the prose out; a missing string is `""`, not
-/// `null`, on either wire.
-fn take_string_or_empty(block: &mut Value, key: &str) -> Value {
-    match block.get_mut(key).map(Value::take) {
-        Some(value @ Value::String(_)) => value,
-        _ => Value::String(String::new()),
-    }
-}
-
 /// Inverse of [`thinking_block_to_detail`]: only signed text and Anthropic
 /// encrypted data become blocks (the vendor rejects unsigned thinking).
 pub fn detail_to_thinking_block(mut detail: Value) -> Option<Value> {
@@ -128,6 +119,15 @@ pub fn detail_to_thinking_block(mut detail: Value) -> Option<Value> {
         _ => return None,
     }
     Some(Value::Object(block))
+}
+
+/// `display: omitted` may leave the prose out; a missing string is `""`, not
+/// `null`, on either wire.
+fn take_string_or_empty(block: &mut Value, key: &str) -> Value {
+    match block.get_mut(key).map(Value::take) {
+        Some(value @ Value::String(_)) => value,
+        _ => Value::String(String::new()),
+    }
 }
 
 #[cfg(test)]

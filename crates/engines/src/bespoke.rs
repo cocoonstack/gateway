@@ -4,9 +4,9 @@
 //! real SigV4 Authorization header.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::base::base_engine;
+use crate::base::{Base, base_engine};
 use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::transport::Headers;
@@ -15,26 +15,15 @@ base_engine!(ErnieEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for ErnieEngine {
-    /// Baidu Ernie (Wenxin): /wenxinworkshop/chat/{model}, a v2 API key
-    /// (`bce-v3/…`) as Bearer or a legacy OAuth token as `?access_token=`.
-    /// Request {messages,[temperature]}; response {result, usage{...}, is_truncated}.
+    /// Baidu Ernie: `/wenxinworkshop/chat/{model}`, a `bce-v3/…` key as Bearer
+    /// or a legacy token as `?access_token=`; reply `{result, usage}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let messages: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
-            .filter(|m| m.role != gw_consts::role::SYSTEM)
-            .map(|m| {
-                json!({"role": if m.role == gw_consts::role::AI {"assistant"} else {"user"},
-                             "content": m.content})
-            })
-            .collect();
-        let mut body = json!({});
-        body["messages"] = Value::Array(messages);
         // ernie's system is a top-level field (system turns are filtered above)
         let system = self.base.system_text();
+        let messages = simple_turns(&mut self.base, ("assistant", "user"), ("role", "content"));
+        let mut body = json!({});
+        body["messages"] = Value::Array(messages);
         if !system.is_empty() {
             body["system"] = system.into();
         }
@@ -87,21 +76,11 @@ impl ModelEngine for MinimaxV1Engine {
     /// response {reply, usage{total_tokens}, base_resp{status_code,status_msg}}.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let messages: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
-            .filter(|m| m.role != gw_consts::role::SYSTEM)
-            .map(|m| {
-                json!({"sender_type": if m.role == gw_consts::role::AI {"BOT"} else {"USER"},
-                       "text": m.content})
-            })
-            .collect();
-        let mut body = json!({"model": model});
-        body["messages"] = Value::Array(messages);
         // v1 carries the system instruction as top-level `prompt` + role_meta
         let system = self.base.system_text();
+        let messages = simple_turns(&mut self.base, ("BOT", "USER"), ("sender_type", "text"));
+        let mut body = json!({"model": model});
+        body["messages"] = Value::Array(messages);
         if !system.is_empty() {
             body["prompt"] = system.into();
             body["role_meta"] = json!({"user_name": "USER", "bot_name": "BOT"});
@@ -139,22 +118,10 @@ impl ModelEngine for MinimaxV1Engine {
 base_engine!(CohereEngine);
 
 impl CohereEngine {
-    fn build_body(&self) -> Value {
-        let mut history: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
-            .filter(|m| m.role != gw_consts::role::SYSTEM)
-            .map(|m| {
-                let role = if m.role == gw_consts::role::AI {
-                    "CHATBOT"
-                } else {
-                    "USER"
-                };
-                json!({"role": role, "message": m.content})
-            })
-            .collect();
+    fn build_body(&mut self) -> Value {
+        // cohere's system slot is `preamble` (system turns are filtered above)
+        let system = self.base.system_text();
+        let mut history = simple_turns(&mut self.base, ("CHATBOT", "USER"), ("role", "message"));
         let message = history
             .pop()
             .map(|mut last| last["message"].take())
@@ -162,8 +129,6 @@ impl CohereEngine {
         let mut body = json!({});
         body["message"] = message;
         body["chat_history"] = Value::Array(history);
-        // cohere's system slot is `preamble` (system turns are filtered above)
-        let system = self.base.system_text();
         if !system.is_empty() {
             body["preamble"] = system.into();
         }
@@ -178,9 +143,8 @@ impl CohereEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for CohereEngine {
-    /// AWS Bedrock Cohere Command: {message, chat_history[{role USER/CHATBOT, message}]};
-    /// response {text, finish_reason} (legacy Command: {generations: [{text, finish_reason}]}),
-    /// billed counts in the Bedrock headers; streams `{text, event_type, finish_reason}` frames.
+    /// Bedrock Cohere Command: `{message, chat_history}` → `{text, finish_reason}`
+    /// (legacy `generations[0]`), billed counts in the Bedrock headers.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let body = self.build_body();
@@ -254,6 +218,30 @@ impl ModelEngine for CohereEngine {
     }
 }
 
+/// The non-system turns as `{role_key: ai|user, content_key: text}` objects,
+/// moved out of the request (the vendors' flat two-role wires).
+fn simple_turns(
+    base: &mut Base,
+    (ai, user): (&str, &str),
+    (role_key, content_key): (&str, &str),
+) -> Vec<Value> {
+    std::mem::take(&mut base.request.message)
+        .into_iter()
+        .filter(|m| m.role != gw_consts::role::SYSTEM)
+        .map(|m| {
+            let mut turn = Map::with_capacity(2);
+            let role = if m.role == gw_consts::role::AI {
+                ai
+            } else {
+                user
+            };
+            turn.insert(role_key.to_owned(), role.into());
+            turn.insert(content_key.to_owned(), Value::String(m.content));
+            Value::Object(turn)
+        })
+        .collect()
+}
+
 /// The Llama 3/4 chat template for Bedrock's raw prompt; a bare `role: text`
 /// prompt makes the model invent turns until max_gen_len.
 fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
@@ -295,9 +283,8 @@ base_engine!(LlamaEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for LlamaEngine {
-    /// AWS Bedrock Llama: {prompt, max_gen_len, temperature};
-    /// response {generation, prompt_token_count, generation_token_count, stop_reason},
-    /// streamed as the same shape per delta.
+    /// Bedrock Llama: `{prompt, max_gen_len, temperature}` → `{generation,
+    /// prompt_token_count, generation_token_count, stop_reason}`, streamed per delta.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let prompt = llama_prompt(&model, &self.base.request.message);
@@ -466,10 +453,8 @@ impl DashScopeEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for DashScopeEngine {
-    /// Ali DashScope native wire (not the openai-compatible mode):
-    /// {model, input:{messages}, parameters:{result_format:"message",…}};
-    /// response {output:{choices:[{message,finish_reason}]}, usage{input/output/total_tokens}}.
-    /// Streaming: `X-DashScope-SSE: enable` + `incremental_output`.
+    /// DashScope native wire: `{model, input:{messages}, parameters}` →
+    /// `{output:{choices}, usage}`; streams via `X-DashScope-SSE` + `incremental_output`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         if self.base.request.stream {
             return self.run_stream().await;
@@ -570,7 +555,6 @@ mod tests {
         UpstreamResponse,
     };
 
-    /// A Bedrock reply with the billed-token headers AWS stamps on InvokeModel.
     #[derive(Debug)]
     struct BedrockReply(&'static str, i64, i64);
 

@@ -40,7 +40,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 | `engines` | per-protocol engines behind the `Transport` seam, SSE, SigV4 |
 | `dag` | the 4-layer request pipeline (precomputed plan) |
 | `handler` | online/offline orchestration, DLP/blocklist plugins |
-| `task` | background tasks (daily quota reset) |
+| `task` | background tasks: quota reset, content purge, usage rollup, availability flush + alerts, alert dispatch |
 | `views` | axum HTTP/WebSocket handlers, streaming, metrics |
 | `server` | binary: wires config + state + transport, serves the router |
 

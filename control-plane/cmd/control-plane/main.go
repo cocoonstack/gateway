@@ -44,7 +44,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, cfg config.Config) error {
+func run(ctx context.Context, cfg config.Config) (err error) {
 	users, closeUsers, err := buildUserStore(ctx, cfg)
 	if err != nil {
 		return err
@@ -54,7 +54,7 @@ func run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	defer sessions.Close()
+	defer func() { err = errors.Join(err, sessions.Close()) }()
 	gw, err := buildGateway(cfg)
 	if err != nil {
 		return err

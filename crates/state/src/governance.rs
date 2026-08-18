@@ -2,6 +2,7 @@
 //! in-process counters) and [`RedisGovernance`] (multi-replica, same semantics
 //! via atomic server-side ops — INCR + EXPIRE windows, token-bucket Lua).
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -145,17 +146,19 @@ impl RedisGovernance {
     /// corrects), rolling the increment back on denial. A failed round-trip
     /// admits — limits fail open on a Redis blip.
     async fn reserve_capped(&self, key: String, amount: i64, limit: i64, ttl_ms: i64) -> bool {
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+                 if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+                 if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
+                   redis.call('DECRBY', KEYS[1], ARGV[1])
+                   return 0
+                 end
+                 return 1",
+            )
+        });
         let mut conn = self.conn.clone();
-        let script = redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
-             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
-               redis.call('DECRBY', KEYS[1], ARGV[1])
-               return 0
-             end
-             return 1",
-        );
-        match script
+        match SCRIPT
             .key(&key)
             .arg(amount)
             .arg(limit)
@@ -176,13 +179,15 @@ impl RedisGovernance {
     /// count. A failed round-trip returns 0 so limits fail open rather than
     /// wedging the gateway on a Redis blip.
     async fn incr_window(&self, key: &str, by: i64, window: Duration) -> i64 {
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+                 if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+                 return v",
+            )
+        });
         let mut conn = self.conn.clone();
-        let script = redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
-             return v",
-        );
-        match script
+        match SCRIPT
             .key(key)
             .arg(by)
             .arg(window.as_millis() as i64)
@@ -309,16 +314,18 @@ async fn settle_floored(
     delta: i64,
     window: Duration,
 ) {
+    static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+        redis::Script::new(
+            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+             if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
+             if redis.call('PTTL', KEYS[1]) < 0 then
+               redis.call('PEXPIRE', KEYS[1], ARGV[2])
+             end
+             return v",
+        )
+    });
     let mut conn = conn.clone();
-    let script = redis::Script::new(
-        "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-         if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
-         if redis.call('PTTL', KEYS[1]) < 0 then
-           redis.call('PEXPIRE', KEYS[1], ARGV[2])
-         end
-         return v",
-    );
-    if let Err(e) = script
+    if let Err(e) = SCRIPT
         .key(key)
         .arg(delta)
         .arg(window.as_millis() as i64)

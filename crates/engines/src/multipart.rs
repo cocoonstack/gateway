@@ -220,7 +220,6 @@ mod tests {
 
     #[test]
     fn wav_and_mp3_play_lengths_are_read_from_the_container() {
-        // 16-bit mono 8 kHz WAV: byte rate 16000, 32000 data bytes = 2 s
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36u32 + 32_000).to_le_bytes());
@@ -237,8 +236,6 @@ mod tests {
         wav.resize(wav.len() + 32_000, 0);
         assert_eq!(audio_seconds(&wav), Some(2.0));
 
-        // MPEG-1 Layer III, 128 kbps, 44.1 kHz, no padding: 417-byte frames of
-        // 1152 samples; an ID3v2 tag of 10+5 bytes in front
         let mut mp3 = vec![b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0];
         for _ in 0..100 {
             mp3.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);

@@ -985,7 +985,6 @@ pub fn default_layers() -> Vec<Layer> {
     ]
 }
 
-/// The provider a model is bound to in config, if any.
 fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {
     cfg.find_model(model_name).and_then(|m| m.cache_ttl_seconds)
 }

@@ -272,8 +272,10 @@ impl ClaudeEngine {
             is_messages_protocol: true,
             ..Default::default()
         };
-        let model_override = self.base.model_override().map(str::to_owned);
-        let mut st = SseState::new(self.base.request.preserve_anthropic_wire, model_override);
+        let mut st = SseState::new(
+            self.base.request.preserve_anthropic_wire,
+            self.base.model_override(),
+        );
         let tx = self.base.request.stream_tx.clone();
         let r = match converse {
             None => {
@@ -348,9 +350,9 @@ impl ModelEngine for ClaudeEngine {
 
 /// Accumulating state for the anthropic streaming event sequence, shared by
 /// the buffered and live decode paths.
-struct SseState {
+struct SseState<'a> {
     preserve_native: bool,
-    model_override: Option<String>,
+    model_override: Option<&'a str>,
     full: String,
     input: i64,
     output: i64,
@@ -366,8 +368,8 @@ struct SseState {
     open_tool: Option<(Value, String)>,
 }
 
-impl SseState {
-    fn new(preserve_native: bool, model_override: Option<String>) -> Self {
+impl<'a> SseState<'a> {
+    fn new(preserve_native: bool, model_override: Option<&'a str>) -> Self {
         Self {
             preserve_native,
             model_override,
@@ -422,7 +424,12 @@ impl SseState {
                 let index = v["index"].as_u64().unwrap_or_default() as usize;
                 if v["content_block"]["type"] == "tool_use" {
                     // one open block for both the native replay and tool_calls
-                    self.open_tool = Some((v["content_block"].clone(), String::new()));
+                    let block = if self.preserve_native {
+                        v["content_block"].clone()
+                    } else {
+                        v["content_block"].take()
+                    };
+                    self.open_tool = Some((block, String::new()));
                 } else if self.preserve_native {
                     self.open_native = Some(v["content_block"].clone());
                 } else if is_thinking_block(&v["content_block"]) {
@@ -510,10 +517,10 @@ impl SseState {
         if self.preserve_native {
             let mut event = v;
             if event["type"] == "message_start"
-                && let Some(model) = self.model_override.as_ref()
+                && let Some(model) = self.model_override
                 && let Some(message) = event.get_mut("message").and_then(Value::as_object_mut)
             {
-                message.insert("model".to_owned(), model.clone().into());
+                message.insert("model".to_owned(), model.into());
             }
             native_chunk.native_event = Some(event);
         }

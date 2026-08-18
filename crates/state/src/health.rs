@@ -1,6 +1,7 @@
 //! Account health (cooldown/recovery) behind a trait: in-process for a single
 //! node, Redis so a bad upstream account cools down across the whole fleet.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -76,16 +77,18 @@ impl HealthStore for RedisHealth {
     async fn record_failure(&self, name: &str, threshold: usize, cooldown: Duration) -> bool {
         let mut conn = self.conn.clone();
         // atomic trip; an expired flag no longer EXISTS, so a still-failing account re-arms
-        let script = redis::Script::new(
-            "local f = redis.call('INCR', KEYS[1])
-             redis.call('PEXPIRE', KEYS[1], ARGV[3])
-             if f >= tonumber(ARGV[1]) and redis.call('EXISTS', KEYS[2]) == 0 then
-               redis.call('SET', KEYS[2], '1', 'PX', ARGV[2])
-               return 1
-             end
-             return 0",
-        );
-        let tripped: i64 = match script
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local f = redis.call('INCR', KEYS[1])
+                 redis.call('PEXPIRE', KEYS[1], ARGV[3])
+                 if f >= tonumber(ARGV[1]) and redis.call('EXISTS', KEYS[2]) == 0 then
+                   redis.call('SET', KEYS[2], '1', 'PX', ARGV[2])
+                   return 1
+                 end
+                 return 0",
+            )
+        });
+        let tripped: i64 = match SCRIPT
             .key(fails_key(name))
             .key(cd_key(name))
             .arg(threshold as i64)

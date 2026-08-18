@@ -293,7 +293,7 @@ func validRequestID(rid string) bool {
 		return false
 	}
 	return !strings.ContainsFunc(rid, func(r rune) bool {
-		return !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || r == '-' || r == '_' || r == '.')
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.'
 	})
 }
 

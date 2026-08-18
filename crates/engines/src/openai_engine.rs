@@ -14,9 +14,8 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 base_engine!(OpenAiEngine);
 
 impl OpenAiEngine {
-    /// Rebuild the OpenAI wire message, moving each turn's payload out:
-    /// multimodal parts win over flat text; assistant tool_calls and tool
-    /// results pass through losslessly.
+    /// The OpenAI wire messages, each turn's payload moved out: parts win over
+    /// flat text, tool_calls and tool results pass through.
     fn wire_messages(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
         for m in std::mem::take(&mut self.base.request.message) {

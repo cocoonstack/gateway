@@ -51,19 +51,21 @@ type ModelStatus struct {
 }
 
 type Key struct {
-	AK                      string           `json:"ak"`
-	Product                 string           `json:"product"`
-	Tenant                  string           `json:"tenant"`
-	Owner                   *string          `json:"owner"`
-	QPS                     float64          `json:"qps"`
-	DailyTokenQuota         int64            `json:"daily_token_quota"`
-	TokensPerMinute         *int64           `json:"tokens_per_minute"`
-	ExpiresAtEpochSecs      *int64           `json:"expires_at_epoch_secs"`
-	Banned                  bool             `json:"banned"`
-	SuspendedUntilEpochSecs *int64           `json:"suspended_until_epoch_secs"`
-	Status                  string           `json:"status"`
-	Available               bool             `json:"available"`
-	ModelQuotas             map[string]int64 `json:"model_quotas,omitempty"`
+	AK      string  `json:"ak"`
+	Product string  `json:"product"`
+	Tenant  string  `json:"tenant"`
+	Owner   *string `json:"owner"`
+
+	QPS                float64          `json:"qps"`
+	DailyTokenQuota    int64            `json:"daily_token_quota"`
+	TokensPerMinute    *int64           `json:"tokens_per_minute"`
+	ExpiresAtEpochSecs *int64           `json:"expires_at_epoch_secs"`
+	ModelQuotas        map[string]int64 `json:"model_quotas,omitempty"`
+
+	Banned                  bool   `json:"banned"`
+	SuspendedUntilEpochSecs *int64 `json:"suspended_until_epoch_secs"`
+	Status                  string `json:"status"`
+	Available               bool   `json:"available"`
 }
 
 type Account struct {

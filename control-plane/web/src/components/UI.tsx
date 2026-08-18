@@ -118,19 +118,19 @@ export function FormModal({
   );
 }
 
-export function LineChart({
+export function LineChart<T extends { start: number }>({
   data,
   value,
   format = compact,
 }: {
-  data: { start: number }[];
-  value: string;
+  data: T[];
+  value: { [K in keyof T]: T[K] extends number ? K : never }[keyof T] & string;
   format?: (value: number) => string;
 }) {
   const width = 720;
   const height = 230;
   const padding = 18;
-  const values = data.map((item) => (item as Record<string, number>)[value] ?? 0);
+  const values = data.map((item) => item[value] as number);
   const max = Math.max(...values, 1);
   const points = values
     .map((item, index) => {

@@ -157,6 +157,14 @@ impl MockTransport {
         ((s.chars().count() as i64) / 4).max(1)
     }
 
+    fn sys_note(sys: &str) -> String {
+        if sys.is_empty() {
+            String::new()
+        } else {
+            format!("[sys:{sys}] ")
+        }
+    }
+
     fn last_user_text(messages: &[Value]) -> String {
         messages
             .iter()
@@ -296,12 +304,7 @@ impl MockTransport {
         let body = Self::parse(&req.body, "anthropic")?;
         let model = body["model"].as_str().unwrap_or("mock-claude");
         let user = Self::last_user_text(body["messages"].as_array().unwrap_or(&vec![]));
-        let sys = body["system"].as_str().unwrap_or_default();
-        let sys_note = if sys.is_empty() {
-            String::new()
-        } else {
-            format!("[sys:{sys}] ")
-        };
+        let sys_note = Self::sys_note(body["system"].as_str().unwrap_or_default());
         let reply = format!("[mock-anthropic:{model}] {sys_note}you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
 
@@ -508,12 +511,7 @@ impl MockTransport {
             .and_then(|m| m["content"][0]["text"].as_str())
             .unwrap_or_default()
             .to_owned();
-        let sys = body["system"][0]["text"].as_str().unwrap_or_default();
-        let sys_note = if sys.is_empty() {
-            String::new()
-        } else {
-            format!("[sys:{sys}] ")
-        };
+        let sys_note = Self::sys_note(body["system"][0]["text"].as_str().unwrap_or_default());
         let reply = format!("[mock-converse:{model}] {sys_note}you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         if let Some(tool) = body["toolConfig"]["tools"][0]["toolSpec"]["name"].as_str() {
@@ -632,7 +630,6 @@ impl MockTransport {
             Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
             _ => vec![],
         };
-        // deterministic 8-dim vector from byte sums
         let data: Vec<Value> = inputs
             .iter()
             .enumerate()
@@ -682,7 +679,6 @@ impl MockTransport {
             .map(|arr| {
                 arr.iter()
                     .map(|i| {
-                        // deterministic: the literal token "unsafe" flags
                         let flagged = i.as_str().is_some_and(|s| s.contains("unsafe"));
                         json!({"flagged": flagged, "categories": {"unsafe": flagged}})
                     })
@@ -701,7 +697,6 @@ impl MockTransport {
                 arr.iter()
                     .enumerate()
                     .map(|(i, d)| {
-                        // deterministic relevance: shared-word count with the query
                         let doc = d.as_str().unwrap_or_default().to_lowercase();
                         let hits = query.split_whitespace().filter(|w| doc.contains(w)).count();
                         (i, hits as f64)
@@ -790,7 +785,6 @@ impl MockTransport {
     /// output_text content; usage uses the Responses input/output dialect.
     fn responses_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "responses")?;
-        // `input` may be a plain string or an array of input items.
         let input: std::borrow::Cow<str> = match &body["input"] {
             Value::String(s) => s.as_str().into(),
             Value::Array(items) => items

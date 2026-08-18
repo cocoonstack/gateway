@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -284,12 +285,12 @@ func (c *HTTPClient) doText(ctx context.Context, target Target, method, path, in
 	return c.send(req, output)
 }
 
-func (c *HTTPClient) send(req *http.Request, output any) error {
+func (c *HTTPClient) send(req *http.Request, output any) (err error) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request gateway: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { err = errors.Join(err, resp.Body.Close()) }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return fmt.Errorf("read gateway response: %w", err)

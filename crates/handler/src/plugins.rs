@@ -662,6 +662,7 @@ pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::Stream
     hits += fragments
         .values
         .values()
+        .flat_map(|item| item.values())
         .map(|text| redaction_hits(text, pii, secrets))
         .sum::<usize>();
     hits
@@ -669,7 +670,9 @@ pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::Stream
 
 #[derive(Default)]
 struct EventFragments {
-    values: std::collections::HashMap<(u64, String), String>,
+    /// output item index → delta path → accumulated text
+    values: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    fields: usize,
     bytes: usize,
     overflowed: bool,
 }
@@ -679,20 +682,25 @@ impl EventFragments {
         if self.overflowed {
             return;
         }
-        let key = (index, path.to_owned());
-        let new_key = !self.values.contains_key(&key);
+        let item = self.values.entry(index).or_default();
+        let new_key = !item.contains_key(path);
         let added = text
             .len()
             .saturating_add(if new_key { path.len() } else { 0 });
         if self.bytes.saturating_add(added) > MAX_NATIVE_EVENT_SCAN_BYTES
-            || (new_key && self.values.len() >= MAX_NATIVE_EVENT_SCAN_FIELDS)
+            || (new_key && self.fields >= MAX_NATIVE_EVENT_SCAN_FIELDS)
         {
             self.overflowed = true;
             self.values.clear();
             return;
         }
         self.bytes = self.bytes.saturating_add(added);
-        self.values.entry(key).or_default().push_str(text);
+        if new_key {
+            self.fields += 1;
+            item.insert(path.to_owned(), text.to_owned());
+        } else if let Some(buf) = item.get_mut(path) {
+            buf.push_str(text);
+        }
     }
 }
 
