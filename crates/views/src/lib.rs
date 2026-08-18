@@ -3131,7 +3131,10 @@ async fn messages(
         return anthropic_error(400, "messages must not be empty");
     }
 
-    let native_system = body.system.take().filter(Value::is_array);
+    let native_system = match body.system {
+        Some(Value::Array(_)) => body.system.take(),
+        _ => None,
+    };
     let system = match &native_system {
         Some(Value::Array(blocks)) => {
             let text = gw_protocol::anthropic::blocks_text(blocks);
