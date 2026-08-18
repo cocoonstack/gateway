@@ -991,11 +991,10 @@ impl ResponsesEngine {
         }
         let native = self.base.request.preserve_responses_wire;
         let (text, mut tool_calls) = responses_output(&v);
-        let vendor_status = v["status"].as_str().unwrap_or("completed");
         let finish_reason = if native {
-            vendor_status.to_owned()
+            v["status"].as_str().unwrap_or("completed").to_owned()
         } else {
-            responses_finish(vendor_status, !tool_calls.is_empty())
+            responses_finish(&v, !tool_calls.is_empty())
         };
         if !native {
             tool_calls = tool_calls
@@ -1149,13 +1148,16 @@ fn function_call_output(call_id: Value, output: String) -> Value {
     ])
 }
 
-/// The Responses `status` in the shared finish vocabulary for the other surfaces.
-fn responses_finish(status: &str, tool_calls: bool) -> String {
-    match status {
+/// A Responses object's `status` (+ `incomplete_details.reason`) in the shared
+/// finish vocabulary for the other surfaces.
+fn responses_finish(response: &Value, tool_calls: bool) -> String {
+    let status = response["status"].as_str().unwrap_or("completed");
+    match (status, response["incomplete_details"]["reason"].as_str()) {
         _ if tool_calls => "tool_calls",
-        "completed" => "stop",
-        "incomplete" => "length",
-        other => other,
+        ("completed", _) => "stop",
+        ("incomplete", Some("content_filter")) => "content_filter",
+        ("incomplete", _) => "length",
+        (other, _) => other,
     }
     .to_owned()
 }
@@ -1235,7 +1237,7 @@ fn responses_apply_frame(
                 chunk.tool_calls = Some(Value::Array(vec![call]));
             }
         }
-        "response.completed" => {
+        "response.completed" | "response.incomplete" => {
             let r = &v["response"];
             if let Some(m) = r["model"].as_str() {
                 resp.model = m.to_owned();
@@ -1244,7 +1246,7 @@ fn responses_apply_frame(
                 resp.finish_reason = if native {
                     st.to_owned()
                 } else {
-                    responses_finish(st, resp.tool_calls.is_some())
+                    responses_finish(r, resp.tool_calls.is_some())
                 };
             }
             let (input, output, common) = responses_usage(&r["usage"]);
@@ -1868,5 +1870,25 @@ mod tests {
         .unwrap();
         assert_eq!(chunks[0].finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(resp.finish_reason, "tool_calls");
+
+        for (reason, want) in [
+            ("max_output_tokens", "length"),
+            ("content_filter", "content_filter"),
+        ] {
+            let mut resp = GatewayResponse::default();
+            let chunks = responses_apply_frame(
+                json!({"type": "response.incomplete", "response": {
+                    "status": "incomplete", "incomplete_details": {"reason": reason},
+                    "usage": {"input_tokens": 5, "output_tokens": 7}}}),
+                200,
+                None,
+                false,
+                &mut resp,
+                &mut String::new(),
+            )
+            .unwrap();
+            assert_eq!(chunks[0].finish_reason.as_deref(), Some(want), "{reason}");
+            assert_eq!((resp.prompt_tokens, resp.completion_tokens), (5, 7));
+        }
     }
 }
