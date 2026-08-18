@@ -71,3 +71,30 @@ cargo test --release -p gw-server --test bench -- --ignored --nocapture
 
 It is a manual diagnostic rather than a CI merge gate; measured HTTP-level
 numbers and the load-test recipe are in [Performance](performance.md).
+
+## Live vendor matrix
+
+`scripts/live-matrix/` drives a running gateway against real vendors with real
+keys — the check the mock cannot make. `live.yaml` declares one account per
+vendor (keys come from the named env vars, never from the file) with prices
+and `token_rate` weights chosen so every billing dimension is visible;
+`live_matrix.py` runs, per provider group, non-streaming and streaming chat,
+`/v1/messages` (native and cross-protocol), thinking (budget/adaptive/effort
+dialects, signed replay through a tool loop), prompt cache (Anthropic
+breakpoints, automatic prefix caching on OpenAI/DeepSeek/Qwen), the response
+cache, embeddings and rerank. For every call it recomputes the weighted total
+and cost from the *wire* usage with the configured prices and compares them
+to the newest ledger row — an oracle independent of the gateway's own
+arithmetic — and asserts that reasoning content and cache reads/writes reached
+the client.
+
+```bash
+export OPENAI_API_KEY=... ANTHROPIC_API_KEY=...          # every api_key_env in live.yaml
+GW_ADMIN_TOKEN=admin-live GW_CONFIG=scripts/live-matrix/live.yaml ./target/release/gw &
+python3 scripts/live-matrix/live_matrix.py               # or: ... anthropic bedrock
+```
+
+Last full run (2026-08-18, `fix/live-wire-round`): 86/86 cases across Anthropic,
+OpenAI, Gemini, DeepSeek, MiniMax, Qwen/DashScope, Qianfan, Moonshot,
+SiliconFlow, OpenRouter, Cohere/Jina rerank and Bedrock (InvokeModel,
+Converse, Llama) — every ledger row matched the oracle exactly.

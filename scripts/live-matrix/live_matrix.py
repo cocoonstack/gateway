@@ -1,0 +1,774 @@
+"""Live vendor matrix: every provider through a running gateway, with billing, cache and thinking oracles.
+
+Usage:
+    export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... (every api_key_env named in live.yaml)
+    GW_ADMIN_TOKEN=admin-live GW_CONFIG=scripts/live-matrix/live.yaml ./target/release/gw &
+    python3 scripts/live-matrix/live_matrix.py [--gateway http://127.0.0.1:18080] [group ...]
+
+Each case calls a surface, reads the newest ledger row and recomputes the
+weighted total and cost from the WIRE usage with the model's configured prices
+and weights (an independent oracle); thinking cases additionally assert that
+reasoning reached the client, cache cases that a write is followed by a read.
+Groups: anthropic openai gemini deepseek minimax qwen qianfan moonshot
+siliconflow openrouter rerank bedrock (default: all).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any
+
+MODELS: dict[str, dict[str, Any]] = {}
+RESULTS: list[tuple[str, bool, str]] = []
+PREFIX_SENTENCE = "The gateway is a Rust service that fronts many model vendors. "
+
+WEATHER_TOOL_ANTHROPIC = [
+    {
+        "name": "get_weather",
+        "description": "Weather for a city",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    }
+]
+WEATHER_TOOL_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        },
+    }
+]
+
+
+class Gateway:
+    """HTTP client for one gateway: the client key for surfaces, the admin token for the ledger."""
+
+    def __init__(self, base: str, ak: str, admin: str) -> None:
+        self.base = base
+        self.ak = ak
+        self.admin = admin
+
+    def call(self, path: str, body: Any = None, admin: bool = False, timeout: int = 300) -> tuple[int, str]:
+        headers = {"content-type": "application/json", "Authorization": f"Bearer {self.admin if admin else self.ak}"}
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method="POST" if data else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read().decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="replace")
+
+    def ledger(self) -> tuple[int, dict[str, Any]]:
+        """(row count, newest row) — read after a short settle so the async ledger write has landed."""
+        time.sleep(0.3)
+        _, body = self.call("/internal/ledger?limit=1", admin=True)
+        j = json.loads(body)
+        return j["count"], (j["records"][-1] if j["records"] else {})
+
+
+def load_models(yaml_path: str) -> None:
+    """Prices and weights per model from the flow-mapping lines of live.yaml (the oracle's inputs)."""
+    with open(yaml_path) as f:
+        lines = f.read().splitlines()
+    for line in lines:
+        m = re.match(r'- \{name: "?([^,"]+)"?, (.*)\}$', line.strip())
+        if not m:
+            continue
+        name, rest = m.group(1), m.group(2)
+        conf: dict[str, Any] = {"in": 0, "out": 0, "unit": 0, "rate": {}}
+        for key, field in (
+            ("in", "input_price_per_1k_micros"),
+            ("out", "output_price_per_1k_micros"),
+            ("unit", "unit_price_micros"),
+        ):
+            mm = re.search(field + r": (\d+)", rest)
+            conf[key] = int(mm.group(1)) if mm else 0
+        mm = re.search(r"token_rate: \{([^}]*)\}", rest)
+        if mm:
+            for kv in mm.group(1).split(","):
+                k, v = kv.split(":")
+                conf["rate"][k.strip()] = float(v)
+        MODELS[name] = conf
+
+
+def rnd(x: float) -> int:
+    return 0 if x < 0 else int(math.floor(x + 0.5))
+
+
+def oracle(model: str, wire: dict[str, Any], messages_protocol: bool) -> tuple[int, int, int, int]:
+    """(prompt_total, completion_total, weighted_total, cost_micros) recomputed from the wire usage."""
+    conf = MODELS.get(model, {"in": 0, "out": 0, "unit": 0, "rate": {}})
+    rate = conf["rate"]
+
+    def w(k: str, d: float = 1.0) -> float:
+        return rate.get(k, d)
+
+    if messages_protocol:
+        inp = max(wire.get("input_tokens", 0), 0)
+        out = max(wire.get("output_tokens", 0), 0)
+        rc = max(wire.get("cache_read_input_tokens") or 0, 0)
+        wc = max(wire.get("cache_creation_input_tokens") or 0, 0)
+        wc1h = min(max((wire.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0), 0), wc)
+        prompt_total, completion_total = inp + rc + wc, out
+        bp = rnd(
+            inp * w("prompt")
+            + rc * w("read_cache")
+            + (wc - wc1h) * w("write_cache")
+            + wc1h * w("write_cache_1h", w("write_cache"))
+        )
+        bc = rnd(out * w("completion"))
+    else:
+        p = max(wire.get("prompt_tokens", 0), 0)
+        c = max(wire.get("completion_tokens", 0), 0)
+        details = wire.get("prompt_tokens_details") or {}
+        cached = min(max(details.get("cached_tokens") or 0, 0), p)
+        written = min(max(details.get("cache_creation_input_tokens") or 0, 0), p - cached)
+        reason = min(max((wire.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0, 0), c)
+        prompt_total, completion_total = p, c
+        bp = rnd((p - cached - written) * w("prompt") + cached * w("read_cache") + written * w("write_cache"))
+        bc = rnd((c - reason) * w("completion") + reason * w("reasoning"))
+    return prompt_total, completion_total, bp + bc, (bp * conf["in"]) // 1000 + (bc * conf["out"]) // 1000
+
+
+def record(name: str, ok: bool, detail: str) -> None:
+    RESULTS.append((name, ok, detail))
+    print(("PASS " if ok else "FAIL ") + name + " — " + detail, flush=True)
+
+
+def parse_sse(text: str) -> list[Any]:
+    events: list[Any] = []
+    for block in text.split("\n\n"):
+        data = [line[5:].strip() for line in block.split("\n") if line.startswith("data:")]
+        if not data:
+            continue
+        joined = "\n".join(data)
+        if joined == "[DONE]":
+            continue
+        try:
+            events.append(json.loads(joined))
+        except ValueError:
+            events.append(joined)
+    return events
+
+
+def check_ledger(
+    gw: Gateway, name: str, model: str, wire: dict[str, Any], messages_protocol: bool, before: int, note: str
+) -> None:
+    count, row = gw.ledger()
+    if count != before + 1:
+        record(name, False, f"ledger count {before}->{count} (expected +1) {note}")
+        return
+    pt, ct, tot, cost = oracle(model, wire, messages_protocol)
+    got = (row["prompt_tokens"], row["completion_tokens"], row["total_tokens"], row["cost_micros"])
+    ok = got == (pt, ct, tot, cost)
+    record(
+        name,
+        ok,
+        f"wire={json.dumps(wire, separators=(',', ':'))} ledger p/c/t/cost={got} oracle={(pt, ct, tot, cost)} {note}",
+    )
+
+
+def case_chat(
+    gw: Gateway,
+    model: str,
+    label: str = "",
+    stream: bool = False,
+    prompt: str = "Reply with exactly one word: hello",
+    expect_reasoning: bool = False,
+    **extra: Any,
+) -> None:
+    name = f"{model} chat{' stream' if stream else ''}{(' ' + label) if label else ''}"
+    before, _ = gw.ledger()
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": stream,
+        **extra,
+    }
+    st, txt = gw.call("/v1/chat/completions", body)
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:300]}")
+        return
+    text, reasoning = "", ""
+    if stream:
+        usage = None
+        events = parse_sse(txt)
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            if e.get("usage"):
+                usage = e["usage"]
+            for ch in e.get("choices", []):
+                d = ch.get("delta", {})
+                text += d.get("content") or ""
+                reasoning += (d.get("reasoning_content") or d.get("reasoning") or "") + (
+                    "[details]" if d.get("reasoning_details") else ""
+                )
+        if usage is None:
+            faults = [e for e in events if isinstance(e, dict) and e.get("error")]
+            count, row = gw.ledger()
+            if faults:
+                record(
+                    name + " [upstream fault]",
+                    count == before + 1,
+                    f"vendor failed mid-stream; terminal frame {json.dumps(faults[-1])[:200]}; "
+                    f"billed p/c/t={row.get('prompt_tokens')}/{row.get('completion_tokens')}/{row.get('total_tokens')} "
+                    f"estimated={row.get('estimated')}",
+                )
+            else:
+                record(name, False, f"stream carried no usage frame; frames={len(events)} tail={txt[-300:]!r}")
+            return
+        wire = usage
+    else:
+        j = json.loads(txt)
+        wire = j.get("usage") or {}
+        m = j["choices"][0]["message"]
+        text = m.get("content") or ""
+        reasoning = (m.get("reasoning_content") or m.get("reasoning") or "") + (
+            "[details]" if m.get("reasoning_details") else ""
+        )
+    note = f"text={text[:30]!r}" + (f" reasoning_len={len(reasoning)}" if expect_reasoning else "")
+    check_ledger(gw, name, model, wire, False, before, note)
+    if expect_reasoning:
+        record(name + " [reasoning present]", bool(reasoning), f"reasoning_len={len(reasoning)}")
+
+
+def case_messages(
+    gw: Gateway,
+    model: str,
+    label: str = "",
+    stream: bool = False,
+    prompt: str = "Reply with exactly one word: hello",
+    thinking: dict[str, Any] | None = None,
+    expect_thinking: bool = False,
+) -> None:
+    name = f"{model} messages{' stream' if stream else ''}{(' ' + label) if label else ''}"
+    before, _ = gw.ledger()
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 4000,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": stream,
+    }
+    if thinking:
+        body["thinking"] = thinking
+    st, txt = gw.call("/v1/messages", body)
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:300]}")
+        return
+    thinking_blocks = signatures = 0
+    text = ""
+    if stream:
+        wire: dict[str, Any] = {}
+        for e in parse_sse(txt):
+            if not isinstance(e, dict):
+                continue
+            t = e.get("type")
+            if t == "message_start":
+                wire.update(e["message"].get("usage") or {})
+            elif t == "message_delta":
+                wire.update(e.get("usage") or {})
+            elif t == "content_block_start" and e["content_block"].get("type") == "thinking":
+                thinking_blocks += 1
+            elif t == "content_block_delta":
+                d = e["delta"]
+                if d.get("type") == "text_delta":
+                    text += d["text"]
+                if d.get("type") == "signature_delta":
+                    signatures += 1
+    else:
+        j = json.loads(txt)
+        wire = j.get("usage") or {}
+        for b in j.get("content") or []:
+            if b.get("type") == "thinking":
+                thinking_blocks += 1
+                signatures += 1 if b.get("signature") else 0
+            if b.get("type") == "text":
+                text += b.get("text", "")
+    note = f"text={text[:30]!r} thinking_blocks={thinking_blocks} signatures={signatures}"
+    check_ledger(gw, name, model, wire, True, before, note)
+    if expect_thinking:
+        record(name + " [thinking present]", thinking_blocks > 0, note)
+
+
+def case_embeddings(gw: Gateway, model: str) -> None:
+    name = f"{model} embeddings"
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/embeddings", {"model": model, "input": ["gateway live test", "second input"]})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    j = json.loads(txt)
+    wire = {"prompt_tokens": (j.get("usage") or {}).get("prompt_tokens", 0), "completion_tokens": 0}
+    check_ledger(gw, name, model, wire, False, before, f"dims={len(j['data'][0]['embedding'])} n={len(j['data'])}")
+
+
+def case_rerank(gw: Gateway, model: str, unit_priced: bool = False) -> None:
+    name = f"{model} rerank"
+    before, _ = gw.ledger()
+    docs = [
+        "A gateway routes requests to model providers.",
+        "Bananas are yellow.",
+        "An API gateway fronts upstream services.",
+    ]
+    st, txt = gw.call("/v1/rerank", {"model": model, "query": "what is a gateway", "documents": docs, "top_n": 2})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    j = json.loads(txt)
+    count, row = gw.ledger()
+    conf = MODELS[model]
+    results = len(j.get("results", []))
+    if unit_priced:
+        units = ((j.get("meta") or {}).get("billed_units") or {}).get("search_units", 0)
+        ok = (
+            count == before + 1
+            and row["billed_units"] == units
+            and row["cost_micros"] == units * conf["unit"]
+            and row["total_tokens"] == 0
+        )
+        record(
+            name,
+            ok,
+            f"units={units} ledger units/cost={row['billed_units']}/{row['cost_micros']} "
+            f"expected {units}/{units * conf['unit']} results={results}",
+        )
+        return
+    meta_tokens = (j.get("meta") or {}).get("tokens") or {}
+    tokens = (j.get("usage") or {}).get("total_tokens", 0) or (
+        meta_tokens.get("input_tokens", 0) + meta_tokens.get("output_tokens", 0)
+    )
+    ok = count == before + 1 and row["prompt_tokens"] == tokens and row["cost_micros"] == (tokens * conf["in"]) // 1000
+    record(
+        name,
+        ok,
+        f"tokens={tokens} ledger p/cost={row['prompt_tokens']}/{row['cost_micros']} "
+        f"expected {tokens}/{(tokens * conf['in']) // 1000} results={results}",
+    )
+
+
+def case_response_cache(gw: Gateway, model: str) -> None:
+    """A model with cache_ttl_seconds: the second identical request is served unbilled from the response cache."""
+    name = f"{model} response cache"
+    prompt = f"Cache probe: reply with the single word cache-{int(time.time())}"
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
+    before, _ = gw.ledger()
+    st1, t1 = gw.call("/v1/chat/completions", body)
+    mid, _ = gw.ledger()
+    st2, t2 = gw.call("/v1/chat/completions", body)
+    after, _ = gw.ledger()
+    if st1 != 200 or st2 != 200:
+        record(name, False, f"HTTP {st1}/{st2}")
+        return
+    j1, j2 = json.loads(t1), json.loads(t2)
+    same = (
+        j1["choices"][0]["message"]["content"] == j2["choices"][0]["message"]["content"] and j1["usage"] == j2["usage"]
+    )
+    record(
+        name,
+        mid == before + 1 and after == mid and same,
+        f"first billed (+{mid - before}), second unbilled (+{after - mid}), identical body={same}",
+    )
+
+
+def case_prompt_cache_anthropic(gw: Gateway, model: str, native: bool = True, words: int = 220) -> None:
+    """A long system prefix (haiku 4.5 needs >= 4096 tokens): the first call writes the cache, the second reads it."""
+    name = f"{model} prompt cache ({'messages' if native else 'chat'})"
+    prefix = f"Run nonce {int(time.time())}. " + PREFIX_SENTENCE * words
+    before, _ = gw.ledger()
+
+    def go(q: str) -> tuple[int, str]:
+        if native:
+            return gw.call(
+                "/v1/messages",
+                {"model": model, "max_tokens": 50, "system": prefix, "messages": [{"role": "user", "content": q}]},
+            )
+        return gw.call(
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "max_tokens": 50,
+                "messages": [{"role": "system", "content": prefix}, {"role": "user", "content": q}],
+            },
+        )
+
+    st1, t1 = go("Say ONE word: alpha")
+    c1, row1 = gw.ledger()
+    st2, t2 = go("Say ONE word: beta")
+    c2, row2 = gw.ledger()
+    if st1 != 200 or st2 != 200:
+        record(name, False, f"HTTP {st1}/{st2}: {t1[:200]} {t2[:200]}")
+        return
+    u1, u2 = json.loads(t1)["usage"], json.loads(t2)["usage"]
+    if native:
+        written, read = u1.get("cache_creation_input_tokens") or 0, u2.get("cache_read_input_tokens") or 0
+    else:
+        written = (u1.get("prompt_tokens_details") or {}).get("cache_creation_input_tokens") or 0
+        read = (u2.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    o1, o2 = oracle(model, u1, native), oracle(model, u2, native)
+    ok = (
+        c1 == before + 1
+        and c2 == c1 + 1
+        and written > 0
+        and read > 0
+        and (row1["total_tokens"], row1["cost_micros"]) == o1[2:]
+        and (row2["total_tokens"], row2["cost_micros"]) == o2[2:]
+    )
+    record(
+        name,
+        ok,
+        f"write={written} read={read} | row1 t/cost={row1['total_tokens']}/{row1['cost_micros']} oracle={o1[2:]} | "
+        f"row2 t/cost={row2['total_tokens']}/{row2['cost_micros']} oracle={o2[2:]} | "
+        f"wire1={json.dumps(u1)} wire2={json.dumps(u2)}",
+    )
+
+
+def case_prompt_cache_openai_like(gw: Gateway, model: str, words: int = 1300) -> None:
+    """Vendors with automatic prefix caching: two calls sharing a long prefix, cached_tokens must show on the second."""
+    name = f"{model} auto prompt cache"
+    prefix = f"Run nonce {int(time.time())}. " + PREFIX_SENTENCE * words
+
+    def body(q: str) -> dict[str, Any]:
+        return {
+            "model": model,
+            "max_tokens": 20,
+            "messages": [{"role": "system", "content": prefix}, {"role": "user", "content": q}],
+        }
+
+    before, _ = gw.ledger()
+    st1, t1 = gw.call("/v1/chat/completions", body("Say ONE word: alpha"))
+    c1, row1 = gw.ledger()
+    st2, t2 = gw.call("/v1/chat/completions", body("Say ONE word: beta"))
+    c2, row2 = gw.ledger()
+    if st1 != 200 or st2 != 200:
+        record(name, False, f"HTTP {st1}/{st2}: {t1[:200]} {t2[:200]}")
+        return
+    u1, u2 = json.loads(t1)["usage"], json.loads(t2)["usage"]
+    read = (u2.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    o1, o2 = oracle(model, u1, False), oracle(model, u2, False)
+    ok = (
+        c1 == before + 1
+        and c2 == c1 + 1
+        and read > 0
+        and (row1["total_tokens"], row1["cost_micros"]) == o1[2:]
+        and (row2["total_tokens"], row2["cost_micros"]) == o2[2:]
+    )
+    record(
+        name,
+        ok,
+        f"read2={read} | row1 t/cost={row1['total_tokens']}/{row1['cost_micros']} oracle={o1[2:]} | "
+        f"row2 t/cost={row2['total_tokens']}/{row2['cost_micros']} oracle={o2[2:]} | wire2={json.dumps(u2)}",
+    )
+
+
+def case_thinking_replay(gw: Gateway, model: str, native: bool = True) -> None:
+    """Tool loop with thinking: turn 1 yields signed thinking + a tool call, turn 2 replays both with the result."""
+    name = f"{model} signed thinking replay ({'messages' if native else 'chat'})"
+    question = [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]
+    before, _ = gw.ledger()
+    if native:
+        b1: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 4000,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "tools": WEATHER_TOOL_ANTHROPIC,
+            "messages": question,
+        }
+        st, t = gw.call("/v1/messages", b1)
+        if st != 200:
+            record(name, False, f"turn1 HTTP {st}: {t[:300]}")
+            return
+        content = json.loads(t)["content"]
+        thinking = [b for b in content if b["type"] == "thinking"]
+        tool_use = [b for b in content if b["type"] == "tool_use"]
+        if not tool_use:
+            record(name, False, f"turn1 produced no tool_use: {json.dumps(content)[:300]}")
+            return
+        b2 = {
+            **b1,
+            "messages": question
+            + [
+                {"role": "assistant", "content": content},
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tool_use[0]["id"], "content": "Sunny, 25C"}],
+                },
+            ],
+        }
+        st2, t2 = gw.call("/v1/messages", b2)
+        answer = (
+            "".join(b.get("text", "") for b in json.loads(t2).get("content", []) if b.get("type") == "text")
+            if st2 == 200
+            else t2[:200]
+        )
+        signed = sum(1 for b in thinking if b.get("signature"))
+        ok = st2 == 200 and thinking and signed == len(thinking)
+        detail = (
+            f"turn1 thinking={len(thinking)} signed={signed} tool_use={len(tool_use)}; "
+            f"turn2 HTTP {st2} text={answer[:40]!r}"
+        )
+    else:
+        b1 = {
+            "model": model,
+            "max_tokens": 4000,
+            "reasoning_effort": "low",
+            "tools": WEATHER_TOOL_OPENAI,
+            "messages": question,
+        }
+        st, t = gw.call("/v1/chat/completions", b1)
+        if st != 200:
+            record(name, False, f"turn1 HTTP {st}: {t[:300]}")
+            return
+        m = json.loads(t)["choices"][0]["message"]
+        calls, details = m.get("tool_calls") or [], m.get("reasoning_details") or []
+        if not calls:
+            record(name, False, f"turn1 produced no tool_calls: {json.dumps(m)[:300]}")
+            return
+        assistant: dict[str, Any] = {"role": "assistant", "content": m.get("content"), "tool_calls": calls}
+        if details:
+            assistant["reasoning_details"] = details
+        b2 = {
+            **b1,
+            "messages": question
+            + [assistant, {"role": "tool", "tool_call_id": calls[0]["id"], "content": "Sunny, 25C"}],
+        }
+        st2, t2 = gw.call("/v1/chat/completions", b2)
+        answer = (json.loads(t2)["choices"][0]["message"].get("content") or "") if st2 == 200 else t2[:200]
+        signed = sum(1 for d in details if d.get("signature"))
+        ok = st2 == 200 and details and signed > 0
+        detail = (
+            f"turn1 details={len(details)} signed={signed} tool_calls={len(calls)}; "
+            f"turn2 HTTP {st2} text={answer[:40]!r}"
+        )
+    after, _ = gw.ledger()
+    record(name, bool(ok) and after == before + 2, detail + f"; ledger +{after - before}")
+
+
+def run_group(gw: Gateway, group: str) -> None:
+    prime = "Is 17 prime? One word."
+    if group == "anthropic":
+        haiku, sonnet45, sonnet46 = "claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-sonnet-4-6"
+        case_chat(gw, haiku)
+        case_chat(gw, haiku, stream=True)
+        case_messages(gw, haiku)
+        case_messages(gw, haiku, stream=True)
+        case_messages(
+            gw,
+            haiku,
+            "thinking budget",
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_messages(
+            gw,
+            sonnet46,
+            "thinking adaptive",
+            stream=True,
+            thinking={"type": "adaptive"},
+            prompt="Solve 23*47 step by step briefly.",
+            expect_thinking=True,
+        )
+        case_chat(gw, haiku, "reasoning_effort low", prompt=prime, expect_reasoning=True, reasoning_effort="low")
+        case_chat(
+            gw, haiku, "reasoning_effort", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
+        )
+        case_prompt_cache_anthropic(gw, haiku, native=True, words=340)
+        case_prompt_cache_anthropic(gw, sonnet45, native=False)
+        case_thinking_replay(gw, haiku, native=True)
+        case_thinking_replay(gw, haiku, native=False)
+    elif group == "openai":
+        case_chat(gw, "gpt-4o-mini")
+        case_chat(gw, "gpt-4o-mini", stream=True)
+        case_response_cache(gw, "gpt-4o-mini")
+        case_chat(gw, "gpt-5-mini", "reasoning_effort low", prompt=prime, reasoning_effort="low")
+        case_chat(gw, "gpt-5-mini", "reasoning", stream=True, prompt=prime, reasoning_effort="low")
+        case_prompt_cache_openai_like(gw, "gpt-4.1-mini")
+        case_messages(gw, "gpt-4o-mini", "cross-protocol")
+        case_messages(
+            gw,
+            "gpt-5-mini",
+            "cross-protocol thinking→effort",
+            thinking={"type": "enabled", "budget_tokens": 2048},
+            prompt=prime,
+        )
+        case_embeddings(gw, "text-embedding-3-small")
+    elif group == "gemini":
+        case_chat(gw, "gemini-3.6-flash")
+        case_chat(gw, "gemini-3.6-flash", stream=True)
+        case_chat(gw, "gemini-3.6-flash", "reasoning_effort low", prompt=prime, reasoning_effort="low")
+        case_messages(gw, "gemini-3.6-flash", "cross-protocol")
+    elif group == "deepseek":
+        case_chat(gw, "deepseek-chat")
+        case_chat(gw, "deepseek-chat", stream=True)
+        case_chat(gw, "deepseek-reasoner", "reasoning", prompt=prime, expect_reasoning=True)
+        case_chat(gw, "deepseek-reasoner", "reasoning", stream=True, prompt=prime, expect_reasoning=True)
+        case_prompt_cache_openai_like(gw, "deepseek-chat", words=400)
+        case_messages(gw, "deepseek-chat", "cross-protocol")
+    elif group == "minimax":
+        case_messages(gw, "MiniMax-M2.5", "anthropic-compat")
+        case_messages(
+            gw,
+            "MiniMax-M2.5",
+            "anthropic-compat thinking",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_chat(gw, "MiniMax-M2.5", "cross-protocol chat")
+        case_chat(
+            gw,
+            "MiniMax-M2.7",
+            "openai-compat reasoning_split",
+            prompt=prime,
+            expect_reasoning=True,
+            reasoning_split=True,
+        )
+        case_chat(gw, "MiniMax-M2.7", "openai-compat", stream=True)
+    elif group == "qwen":
+        case_chat(gw, "qwen-plus")
+        case_chat(
+            gw, "qwen-plus", "enable_thinking", stream=True, prompt=prime, expect_reasoning=True, enable_thinking=True
+        )
+        case_chat(gw, "qwen3-max", stream=True)
+        case_messages(
+            gw,
+            "qwen3-235b-a22b",
+            "anthropic-compat thinking",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_prompt_cache_openai_like(gw, "qwen-plus", words=400)
+    elif group == "qianfan":
+        case_chat(gw, "ernie-4.5-turbo-128k")
+        case_chat(gw, "ernie-x1.1", "reasoning", prompt=prime, expect_reasoning=True)
+        case_chat(gw, "ernie-x1.1", "reasoning", stream=True, prompt=prime, expect_reasoning=True)
+    elif group == "moonshot":
+        # the org's RPM is 3: pace the calls
+        case_chat(gw, "kimi-k2.6", prompt=prime, expect_reasoning=True)
+        time.sleep(21)
+        case_chat(gw, "kimi-k2.6", stream=True, prompt=prime, expect_reasoning=True)
+        time.sleep(21)
+        case_messages(gw, "kimi-k2.6", "cross-protocol")
+    elif group == "siliconflow":
+        case_chat(
+            gw,
+            "Qwen/Qwen3-8B",
+            "enable_thinking",
+            stream=True,
+            prompt=prime,
+            expect_reasoning=True,
+            enable_thinking=True,
+        )
+        case_chat(gw, "Qwen/Qwen3-8B", enable_thinking=False)
+        case_embeddings(gw, "BAAI/bge-m3")
+        case_rerank(gw, "BAAI/bge-reranker-v2-m3")
+    elif group == "openrouter":
+        case_chat(
+            gw,
+            "openai/gpt-oss-20b:free",
+            "reasoning_effort low",
+            prompt=prime,
+            expect_reasoning=True,
+            reasoning_effort="low",
+        )
+        case_chat(
+            gw, "openai/gpt-oss-20b:free", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
+        )
+    elif group == "rerank":
+        case_rerank(gw, "rerank-v3.5", unit_priced=True)
+        case_rerank(gw, "jina-reranker-v3")
+    elif group == "bedrock":
+        haiku, sonnet = "us.anthropic.claude-haiku-4-5-20251001-v1:0", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        case_messages(gw, haiku, "aws-anthropic")
+        case_messages(
+            gw,
+            haiku,
+            "aws-anthropic thinking",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_chat(
+            gw, haiku, "aws-anthropic chat reasoning", prompt=prime, expect_reasoning=True, reasoning_effort="low"
+        )
+        case_messages(gw, sonnet, "converse")
+        case_messages(
+            gw,
+            sonnet,
+            "converse thinking",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_prompt_cache_anthropic(gw, sonnet, native=True)
+        case_thinking_replay(gw, sonnet, native=True)
+        case_chat(gw, "us.amazon.nova-lite-v1:0", "converse chat")
+        case_chat(gw, "us.amazon.nova-lite-v1:0", "converse chat", stream=True)
+        case_chat(gw, "us.deepseek.r1-v1:0", "converse reasoning", prompt=prime, expect_reasoning=True)
+        case_chat(gw, "us.meta.llama3-1-8b-instruct-v1:0", "aws-llama")
+        case_chat(gw, "us.meta.llama3-1-8b-instruct-v1:0", "aws-llama", stream=True)
+    else:
+        raise SystemExit(f"unknown group {group}")
+
+
+def write_report(path: str) -> int:
+    ok = sum(1 for _, passed, _ in RESULTS if passed)
+    lines = [f"# Live matrix — {ok}/{len(RESULTS)} passed", "", "| result | case | detail |", "|---|---|---|"]
+    for name, passed, detail in RESULTS:
+        lines.append(f"| {'PASS' if passed else 'FAIL'} | {name} | {detail.replace('|', '/')} |")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\n{ok}/{len(RESULTS)} passed; report {path}")
+    return 0 if ok == len(RESULTS) else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("groups", nargs="*", help="provider groups to run (default: all)")
+    ap.add_argument("--gateway", default="http://127.0.0.1:18080")
+    ap.add_argument("--ak", default="ak-live")
+    ap.add_argument("--admin-token", default="admin-live")
+    ap.add_argument(
+        "--config",
+        default=__file__.rsplit("/", 1)[0] + "/live.yaml",
+        help="the gateway config the oracle reads prices from",
+    )
+    ap.add_argument("--report", default="live-matrix-report.md")
+    args = ap.parse_args()
+    load_models(args.config)
+    gw = Gateway(args.gateway, args.ak, args.admin_token)
+    all_groups = [
+        "anthropic",
+        "openai",
+        "gemini",
+        "deepseek",
+        "minimax",
+        "qwen",
+        "qianfan",
+        "moonshot",
+        "siliconflow",
+        "openrouter",
+        "rerank",
+        "bedrock",
+    ]
+    for group in args.groups or all_groups:
+        run_group(gw, group)
+    return write_report(args.report)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
