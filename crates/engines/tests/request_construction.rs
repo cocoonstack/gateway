@@ -1446,3 +1446,23 @@ async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
         t.url()
     );
 }
+
+#[tokio::test]
+async fn native_system_blocks_keep_the_clients_cache_control() {
+    let t = RecordingTransport::new(
+        r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.prompt_cache = true;
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.raw = serde_json::json!({"system": [
+            {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+        ]});
+    }
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["system"],
+        serde_json::json!([{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
+        "the client's breakpoint and ttl survive; prompt_cache adds none on top"
+    );
+}

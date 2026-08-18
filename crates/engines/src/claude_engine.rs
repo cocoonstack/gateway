@@ -140,15 +140,23 @@ impl ClaudeEngine {
             }
         }
         body.insert("max_tokens".into(), json!(max_tokens));
-        if !system_text.is_empty() {
-            let system = if prompt_cache {
-                Value::Array(cached_blocks(Value::String(system_text)))
-            } else {
-                Value::String(system_text)
-            };
+        let mut raw = self.base.take_raw();
+        // a native system-block array keeps the client's own cache_control
+        // (and its ttl); the joined text is what every other wire sees
+        let native_system = raw
+            .as_object_mut()
+            .and_then(|extra| extra.remove("system"))
+            .filter(Value::is_array);
+        let system = match native_system {
+            Some(blocks) if prompt_cache => Some(Value::Array(cached_blocks(blocks))),
+            Some(blocks) => Some(blocks),
+            None if system_text.is_empty() => None,
+            None if prompt_cache => Some(Value::Array(cached_blocks(Value::String(system_text)))),
+            None => Some(Value::String(system_text)),
+        };
+        if let Some(system) = system {
             body.insert("system".into(), system);
         }
-        let mut raw = self.base.take_raw();
         if let Some(extra) = raw.as_object_mut() {
             if mapped {
                 extra.remove("top_k");

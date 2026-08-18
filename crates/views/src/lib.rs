@@ -3131,7 +3131,14 @@ async fn messages(
         return anthropic_error(400, "messages must not be empty");
     }
 
-    let system = body.system_text();
+    let native_system = body.system.take().filter(Value::is_array);
+    let system = match &native_system {
+        Some(Value::Array(blocks)) => {
+            let text = gw_protocol::anthropic::blocks_text(blocks);
+            (!text.is_empty()).then_some(text)
+        }
+        _ => body.system_text(),
+    };
     let typed = TypedParams::Chat(ChatParams {
         temperature: body.temperature,
         top_p: body.top_p,
@@ -3154,6 +3161,9 @@ async fn messages(
     let stream_model = body.stream.then(|| body.model.clone());
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, body.model);
     param.typed = Some(typed);
+    if let Some(blocks) = native_system {
+        body.extra.insert("system".into(), blocks);
+    }
     param.raw = Value::Object(body.extra);
     let user_id = user_hint(&headers, &param.raw["metadata"]["user_id"]);
 
