@@ -156,9 +156,8 @@ pub struct VariantConf {
     pub weight: u32,
 }
 
-/// Cumulative-weight pick over a model's variants, keyed by a stable hash so
-/// every instance (REST DAG and realtime handshake alike) maps the same key
-/// to the same bucket with no shared state.
+/// Cumulative-weight pick over a model's variants by a stable hash, so every
+/// instance maps the same key to the same bucket with no shared state.
 pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
     let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
     let mut roll = fnv1a(key) % total.max(1);
@@ -291,9 +290,8 @@ fn default_priority() -> i32 {
     1
 }
 
-/// What a fired content rule does. `block` denies the request; `flag` lets it
-/// through but records the hit; `shadow` is `flag` for a rule under evaluation —
-/// same recording, and the caller can tell trial rules apart when auditing.
+/// What a fired content rule does: `block` denies, `flag` records, `shadow`
+/// is `flag` for a rule under evaluation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -323,9 +321,8 @@ pub struct RegexRule {
     pub action: Action,
 }
 
-/// Local security policy (rule-based; no cloud security service). Lives globally
-/// (`security:`) and per-tenant ([`TenantConf::security`]); the tenant's wins
-/// whole when present.
+/// Local rule-based security policy, global (`security:`) and per-tenant
+/// ([`TenantConf::security`], which wins whole when present).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConf {
     /// Blocklist terms; normalized to lower-case (empties dropped) at load.
@@ -436,10 +433,8 @@ pub struct AbuseTier {
     pub suspend_hours: u64,
 }
 
-/// Automatic abuse suspension; empty tiers = disabled (no counting at all).
-/// Tiers must ascend in both fields (validated) — the highest reject
-/// threshold met wins. Counts REST admission rejections only: the realtime
-/// gate denies per turn without feeding this counter.
+/// Automatic abuse suspension (empty tiers = disabled); tiers ascend in both
+/// fields, the highest reject threshold met wins; REST admission rejections only.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AbuseConf {
     #[serde(default)]
@@ -735,8 +730,8 @@ impl GatewayConfig {
         cfg.normalize()?;
         cfg.validate()?;
         cfg.build_indices();
-        // a hash of the document, not a per-process counter: every replica must
-        // agree on it, and a restarted node must not hit stale cache entries
+        // a document hash, not a counter: replicas must agree and a restart must not hit stale
+        // entries
         cfg.generation = stable_hash(yaml);
         Ok(cfg)
     }
@@ -804,8 +799,7 @@ impl GatewayConfig {
                     protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
                 });
             }
-            // an empty endpoint here would answer from the mock transport beside
-            // the provider's real one — fabricated replies that read as successes
+            // an empty endpoint would answer from the mock transport with fabricated successes
             for a in self.accounts.iter_mut().filter(|a| a.provider == p.name) {
                 if a.endpoint.is_empty() {
                     a.endpoint = if p.endpoint.is_empty() {
@@ -846,8 +840,7 @@ impl GatewayConfig {
         if self.storage.shared_cache && self.storage.redis_url.is_empty() {
             return Err(ConfigError::SharedCacheNeedsRedis);
         }
-        // negative prices would make cost accounting non-monotonic (the usage
-        // rollup's max-upsert relies on per-column monotone sums)
+        // negative prices would break the usage rollup's monotone max-upsert
         let neg = |i: i64, o: i64| i < 0 || o < 0;
         let neg_or_nan = |v: f64| !v.is_finite() || v < 0.0;
         for m in &self.models {
@@ -946,8 +939,7 @@ impl GatewayConfig {
                 }
             }
         }
-        // a negative quota/qps is a typo that would silently deny (or never
-        // limit); a NaN qps would bypass the rate bucket — reject both at load
+        // a negative quota/qps would silently deny (or never limit), a NaN qps bypasses the bucket
         let neg_limit = |owner: String| ConfigError::NegativeLimit { owner };
         for k in &self.access_keys {
             if neg_or_nan(k.qps)
@@ -986,8 +978,7 @@ impl GatewayConfig {
         }
         let st = &self.stability;
         let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
-        // upper bound mirrors the store's one-hour retention — a longer window
-        // would silently judge over already-evicted buckets
+        // the store retains one hour; a longer window would judge over evicted buckets
         if !(1..=60).contains(&st.availability_window_minutes) {
             return Err(ConfigError::BadStability {
                 field: "availability_window_minutes (1..=60)",
@@ -1037,8 +1028,7 @@ impl GatewayConfig {
                 });
             }
         }
-        // a colon in an ak would collide with the prefixed governance keyspaces
-        // (`abuse:{ak}` above all — a key named `abuse:X` could force-suspend X)
+        // a colon in an ak would collide with the prefixed governance keyspaces (`abuse:{ak}`)
         for k in &self.access_keys {
             if k.ak.contains(':') {
                 return Err(ConfigError::DuplicateName {
@@ -1191,9 +1181,8 @@ impl GatewayConfig {
     }
 }
 
-/// Normalize a security policy at load: lower-case the blocklist (so scans
-/// don't rebuild it per request) and compile the regex rules (dropping any that
-/// fail to compile, loudly).
+/// Normalize a security policy at load: lower-case the blocklist and compile
+/// the regex rules (dropping any that fail, loudly).
 fn compile_security(sec: &mut SecurityConf) {
     sec.blocklist = sec
         .blocklist
@@ -1227,10 +1216,8 @@ fn token_from_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|t| !t.is_empty())
 }
 
-/// Deterministic hash of the config document. sha256, NOT `DefaultHasher`:
-/// the generation feeds fleet-shared cache keys, and std's hasher is not
-/// guaranteed stable across Rust releases — mixed-build replicas would
-/// disagree on the identical document and collapse the shared-cache hit rate.
+/// Deterministic hash of the config document — sha256, not `DefaultHasher`,
+/// which is not stable across Rust releases while this feeds fleet-shared cache keys.
 fn stable_hash(yaml: &str) -> u64 {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(yaml.as_bytes());

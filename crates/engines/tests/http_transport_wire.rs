@@ -71,9 +71,9 @@ async fn http_transport_json_over_real_socket() {
     let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
     let req = UpstreamRequest {
         protocol: Protocol::OpenaiChat,
-        method: "POST".into(),
+        method: "POST",
         url: format!("{base}/v1/chat/completions"),
-        headers: vec![("content-type".into(), "application/json".into())],
+        headers: vec![("content-type", "application/json".into())],
         body: json!({"model":"srv","messages":[{"role":"user","content":"wire"}]})
             .to_string()
             .into_bytes(),
@@ -123,9 +123,9 @@ async fn non_stream_body_timeout_classifies_as_model_timeout() {
     let err = transport
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
-            method: "POST".into(),
+            method: "POST",
             url: spawn_stalled_json_vendor().await,
-            headers: vec![("content-type".into(), "application/json".into())],
+            headers: vec![("content-type", "application/json".into())],
             body: b"{}".to_vec(),
             stream: false,
             account: "slow-body".into(),
@@ -166,9 +166,9 @@ async fn non_stream_body_break_classifies_as_model_error() {
     let err = transport
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
-            method: "POST".into(),
+            method: "POST",
             url: spawn_breaking_json_vendor().await,
-            headers: vec![("content-type".into(), "application/json".into())],
+            headers: vec![("content-type", "application/json".into())],
             body: b"{}".to_vec(),
             stream: false,
             account: "broken-body".into(),
@@ -190,9 +190,9 @@ async fn http_transport_sse_over_real_socket() {
     let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
     let req = UpstreamRequest {
         protocol: Protocol::OpenaiChat,
-        method: "POST".into(),
+        method: "POST",
         url: format!("{base}/v1/chat/completions"),
-        headers: vec![("content-type".into(), "application/json".into())],
+        headers: vec![("content-type", "application/json".into())],
         body: json!({"model":"srv","stream":true,"messages":[{"role":"user","content":"wire"}]})
             .to_string()
             .into_bytes(),
@@ -219,9 +219,9 @@ async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
 
     let req = |url: String| UpstreamRequest {
         protocol: Protocol::OpenaiChat,
-        method: "POST".into(),
+        method: "POST",
         url,
-        headers: vec![("content-type".into(), "application/json".into())],
+        headers: vec![("content-type", "application/json".into())],
         body: json!({"model":"srv","messages":[{"role":"user","content":"route"}]})
             .to_string()
             .into_bytes(),
@@ -329,7 +329,7 @@ async fn per_account_policy_and_connect_retry() {
     let err = transport
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
-            method: "POST".into(),
+            method: "POST",
             url: format!("http://{closed}/v1/chat/completions"),
             headers: vec![],
             body: b"{}".to_vec(),
@@ -376,9 +376,9 @@ async fn spawn_paced_vendor(frames: usize, gap: Duration) -> String {
 fn paced_req(url: String) -> UpstreamRequest {
     UpstreamRequest {
         protocol: Protocol::OpenaiChat,
-        method: "POST".into(),
+        method: "POST",
         url,
-        headers: vec![("content-type".into(), "application/json".into())],
+        headers: vec![("content-type", "application/json".into())],
         body: b"{}".to_vec(),
         stream: true,
         account: "paced".into(),
@@ -611,9 +611,9 @@ async fn an_error_status_under_an_sse_content_type_is_a_body_not_a_stream() {
     let resp = transport
         .send(UpstreamRequest {
             protocol: Protocol::Gemini,
-            method: "POST".into(),
+            method: "POST",
             url: format!("http://{addr}/v1beta/models/nope:streamGenerateContent"),
-            headers: vec![("content-type".into(), "application/json".into())],
+            headers: vec![("content-type", "application/json".into())],
             body: b"{}".to_vec(),
             stream: true,
             account: "gemini".into(),

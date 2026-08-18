@@ -17,8 +17,7 @@ use crate::transport::{
 };
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
-// A hung connect (black-holed SYN) must surface as a connect error — which the
-// retry predicate covers — instead of burning the whole request timeout.
+// a hung connect must surface as a (retryable) connect error, not burn the request timeout
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Live per-account request timeout and connect-phase retry budget.
@@ -132,14 +131,13 @@ impl Transport for HttpTransport {
         let mut attempt = 0u32;
         let mut resp = loop {
             let mut builder = self.client.request(method.clone(), &req.url);
-            // reqwest's request timeout is a TOTAL deadline including the body,
-            // which would kill a streaming generation longer than the policy —
+            // reqwest's timeout is a TOTAL deadline that would kill a long generation:
             // streams get a header-phase deadline here and an idle gap cap below
             if !req.stream {
                 builder = builder.timeout(timeout);
             }
             for (k, v) in &req.headers {
-                builder = builder.header(k, v);
+                builder = builder.header(*k, v);
             }
             let sent = builder.body(body.clone()).send();
             let result = if req.stream {
@@ -196,8 +194,7 @@ impl Transport for HttpTransport {
             }
         };
         let status = resp.status().as_u16();
-        // an error status is a body to parse, never a stream: Google sends a failed
-        // streamGenerateContent as text/event-stream carrying a bare JSON error
+        // an error status is a body, never a stream (Google sends failures as text/event-stream)
         let is_sse = status < 400
             && resp
                 .headers()
@@ -233,8 +230,7 @@ impl Transport for HttpTransport {
             read.await
         };
         let bytes = bytes.map_err(|e| {
-            // both stay 502 (failover-eligible); the code split preserves the
-            // external 408-vs-424 classification
+            // both stay 502 (failover-eligible); the code split keeps the external 408-vs-424 class
             let what = if e.is_timeout() {
                 "read upstream body timed out"
             } else {
@@ -250,9 +246,8 @@ impl Transport for HttpTransport {
     }
 }
 
-/// Wrap a live SSE byte stream so a vendor that stops sending for `gap` yields
-/// one terminal error item — no gap between chunks may exceed the policy
-/// timeout, but an actively flowing stream lives as long as the generation.
+/// A live SSE byte stream that yields one terminal error when no chunk arrives
+/// within `gap`; an actively flowing stream lives as long as the generation.
 fn idle_capped(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, StreamFault>>,
     gap: Duration,
@@ -375,7 +370,7 @@ mod tests {
     fn request(url: String) -> UpstreamRequest {
         UpstreamRequest {
             protocol: gw_consts::Protocol::OpenaiChat,
-            method: "POST".into(),
+            method: "POST",
             url,
             headers: Vec::new(),
             body: b"{}".to_vec(),

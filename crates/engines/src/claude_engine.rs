@@ -134,8 +134,7 @@ impl ClaudeEngine {
             if let Some(tc) = p.tool_choice {
                 body.insert("tool_choice".into(), normalize_tool_choice_anthropic(tc));
             }
-            // Anthropic's field is `stop_sequences` (always an array), not
-            // OpenAI's `stop` (string or array)
+            // Anthropic takes `stop_sequences` (array); OpenAI's `stop` may be a string
             if let Some(stop) = p.stop {
                 let stop = match stop {
                     Value::String(_) => Value::Array(vec![stop]),
@@ -146,8 +145,7 @@ impl ClaudeEngine {
         }
         body.insert("max_tokens".into(), json!(max_tokens));
         let mut raw = self.base.take_raw();
-        // a native system-block array keeps the client's own cache_control
-        // (and its ttl); the joined text is what every other wire sees
+        // a native system-block array keeps the client's cache_control (and ttl)
         let native_system = raw
             .as_object_mut()
             .and_then(|extra| extra.remove("system"))
@@ -179,16 +177,16 @@ impl ClaudeEngine {
         let body = self.build_body()?;
         Ok(UpstreamRequest {
             protocol: self.base.param()?.protocol,
-            method: "POST".to_owned(),
+            method: "POST",
             url: format!(
                 "{}/v1/messages",
                 self.base.base_url("mock://api.anthropic.com")
             ),
             headers: vec![
-                ("content-type".into(), "application/json".into()),
-                ("x-api-key".into(), self.base.api_key()),
+                ("content-type", "application/json".into()),
+                ("x-api-key", self.base.api_key()),
                 // Anthropic API mandates this header; a real call 400s without it.
-                ("anthropic-version".into(), "2023-06-01".into()),
+                ("anthropic-version", "2023-06-01".into()),
             ],
             body: crate::base::body_bytes(&Value::Object(body))?,
             stream: self.base.request.stream,
@@ -348,16 +346,14 @@ impl ModelEngine for ClaudeEngine {
     }
 }
 
-/// Some compatible upstreams ignore `stream:true` and return a complete JSON
-/// message. Re-emit standard native events so thinking proof is not lost at
-/// the streaming surface.
+/// The native event sequence for a complete JSON message (some compatible
+/// upstreams ignore `stream:true`), so thinking proof survives the streaming surface.
 pub fn anthropic_native_chunks(
     response: &GatewayResponse,
     model_override: Option<&str>,
 ) -> Vec<StreamChunk> {
     let stream_model = model_override.unwrap_or(&response.model);
-    // Replay the upstream's own usage object so cache-token detail survives;
-    // it is not on GatewayResponse yet (common_usage is a later DAG step).
+    // replay the upstream usage so cache-token detail survives (CommonUsage is a later DAG step)
     let start_usage = response
         .raw_usage
         .as_ref()
@@ -524,9 +520,8 @@ fn content_blocks(content: Value) -> Vec<Value> {
     }
 }
 
-/// Append a turn; empty content is dropped and same-role neighbours merge into
-/// one block list, since the anthropic wire alternates roles and rejects empty
-/// turns.
+/// Append a turn: empty content is dropped and same-role neighbours merge, since
+/// the anthropic wire alternates roles and rejects empty turns.
 fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     if is_empty_content(&content) {
         return;
@@ -539,17 +534,14 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
         last["content"] = Value::Array(blocks);
         return;
     }
-    // built by hand — json! interpolation would deep-copy the moved content
     let mut msg = Map::new();
     msg.insert("role".into(), role.into());
     msg.insert("content".into(), content);
     messages.push(Value::Object(msg));
 }
 
-/// Content as blocks with a prompt-cache breakpoint on the last one; a
-/// breakpoint caches everything before it (tools, system, history), so each
-/// turn of a conversation re-reads the previous prefix at the cache rate. A
-/// breakpoint the client already placed there wins (it may carry a ttl).
+/// Content as blocks with a prompt-cache breakpoint on the last one (a breakpoint
+/// caches everything before it); a client-placed breakpoint wins (it may carry a ttl).
 fn cached_blocks(content: Value) -> Vec<Value> {
     let mut blocks = content_blocks(content);
     if let Some(Value::Object(block)) = blocks.last_mut() {
@@ -560,9 +552,8 @@ fn cached_blocks(content: Value) -> Vec<Value> {
     blocks
 }
 
-/// Tool definitions in the anthropic wire shape. Cross-protocol requests carry
-/// OpenAI-shaped defs ({type:"function", function:{name, parameters}}) —
-/// flatten those; native defs pass through.
+/// Tool definitions in the anthropic wire shape: OpenAI-shaped defs are
+/// flattened, native defs pass through.
 fn normalize_tools_anthropic(tools: Value) -> Value {
     let arr = match tools {
         Value::Array(arr) => arr,
@@ -571,7 +562,6 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
     Value::Array(
         arr.into_iter()
             .map(|mut t| {
-                // built by hand: json! would deep-copy the schema
                 if let Some(f) = t.get_mut("function") {
                     let mut tool = Map::with_capacity(4);
                     tool.insert("name".into(), f["name"].take());
@@ -766,16 +756,13 @@ impl SseState {
                     native_chunk.finish_reason = Some(sr.to_owned());
                 }
                 self.output = v["usage"]["output_tokens"].as_i64().unwrap_or(self.output);
-                // Anthropic reports input_tokens in message_start; some
-                // compatible vendors (MiniMax) only report it here.
+                // some compatible vendors (MiniMax) report input_tokens only here
                 if let Some(it) = v["usage"]["input_tokens"].as_i64() {
                     self.input = it;
                 }
                 let usage = v.get_mut("usage");
                 self.overlay_usage(usage);
             }
-            // message_stop and forward-compatible events carry no normalized
-            // fields; they reach the client only via the native event below.
             _ => {}
         }
         if self.preserve_native {

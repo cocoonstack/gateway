@@ -6,9 +6,8 @@
 
 use serde_json::{Map, Value, json};
 
-/// A Messages request body as a Converse body. Claude-only knobs (`thinking`,
-/// `output_config`) and any passthrough extras ride in
-/// `additionalModelRequestFields`; on non-Claude ids the Claude knobs drop.
+/// A Messages body as a Converse body; Claude-only knobs and passthrough extras
+/// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids).
 pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
     let mut out = Map::with_capacity(6);
     if let Some(system) = body.remove("system") {
@@ -94,11 +93,9 @@ pub(crate) fn reply(mut v: Value, model: &str) -> Value {
     })
 }
 
-/// Converse stream events (typed by the EventStream adapter) as the Anthropic
-/// event sequence. Converse opens text and reasoning blocks implicitly, so
-/// their `content_block_start` is synthesized on the first delta; usage
-/// arrives in a trailing `metadata` event, which becomes the `message_delta`
-/// usage overlay followed by `message_stop`.
+/// Converse stream events as the Anthropic sequence: implicit text/reasoning
+/// blocks get a synthesized `content_block_start`, the trailing `metadata`
+/// becomes the `message_delta` usage overlay plus `message_stop`.
 #[derive(Debug)]
 pub(crate) struct Events {
     model: String,

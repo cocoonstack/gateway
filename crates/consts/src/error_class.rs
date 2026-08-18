@@ -136,8 +136,7 @@ impl ErrClass {
             | ErrCode::FED_RESP_STATUS_NOT_ZERO
             | ErrCode::PARSE_FED_RESP
             | ErrCode::GEN_RES_NOT_NULL
-            // a terminal upstream 429/503 keeps its transient retry
-            // semantics instead of collapsing into the 424 "don't retry"
+            // a terminal upstream 429/503 keeps its transient retry semantics
             | ErrCode::EMPTY_RESP => match status {
                 408 => ErrClass::ModelTimeout,
                 429 => ErrClass::Throttling,
@@ -168,8 +167,7 @@ impl ErrClass {
             499 => return None,
             503 => ErrClass::ServiceUnavailable,
             s if s >= 500 => ErrClass::InternalServer,
-            // 400, 405, 415, 422, 501 and the remaining 4xx tail: the request
-            // as sent cannot be served
+            // 400, 405, 415, 422, 501 and the 4xx tail: the request as sent cannot be served
             _ => ErrClass::Validation,
         };
         Some(class)

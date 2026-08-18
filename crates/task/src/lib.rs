@@ -93,9 +93,8 @@ pub fn spawn_avail_flush(
     })
 }
 
-/// Drain the alert bus and POST each event to the configured webhook, muting
-/// repeats of the same (kind, subject) within the dedup window. Exits when the
-/// bus's receiver was already taken or every sender is gone.
+/// Drain the alert bus to the configured webhook, muting repeats of one
+/// (kind, subject) within the dedup window; exits when the bus is gone.
 pub fn spawn_alert_dispatch(shared: SharedConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let Some(mut rx) = shared.load().state.alerts.take_receiver() else {
@@ -190,9 +189,8 @@ async fn avail_alert_sweep(
     }
 }
 
-/// Whether `key` is outside its dedup window (records the send when so).
-/// Bounded: past 1024 entries the elapsed ones are swept, so a long-lived
-/// dispatcher with many distinct subjects can't grow without limit.
+/// Whether `key` is outside its dedup window (records the send when so);
+/// elapsed entries are swept past 1024 so the map stays bounded.
 fn should_send(sent: &mut HashMap<String, Instant>, key: String, window: Duration) -> bool {
     let now = Instant::now();
     if sent.len() > 1024 {

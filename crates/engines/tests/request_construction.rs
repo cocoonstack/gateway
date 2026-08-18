@@ -47,7 +47,7 @@ impl RecordingTransport {
         let content_type = req
             .headers
             .iter()
-            .find(|(k, _)| k == "content-type")
+            .find(|(k, _)| *k == "content-type")
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
         (
@@ -61,7 +61,7 @@ impl RecordingTransport {
             .unwrap()
             .headers
             .iter()
-            .find(|(k, _)| k == name)
+            .find(|(k, _)| *k == name)
             .map(|(_, v)| v.clone())
     }
 }

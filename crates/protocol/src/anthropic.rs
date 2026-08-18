@@ -73,9 +73,8 @@ pub struct AnthUsage {
     pub cache_creation_input_tokens: i64,
 }
 
-/// An OpenAI `image_url` content part as an Anthropic `image` block: a data
-/// URI becomes a base64 source, anything else a URL source. Other parts pass
-/// through untouched.
+/// An OpenAI `image_url` part as an Anthropic `image` block (data URI → base64
+/// source, else URL source); other parts pass through.
 pub fn image_url_to_image(mut part: Value) -> Value {
     if part["type"] != "image_url" {
         return part;
@@ -117,10 +116,8 @@ pub fn image_to_image_url(mut block: Value) -> Value {
     serde_json::json!({"type": "image_url", "image_url": {"url": url}})
 }
 
-/// Convert OpenAI-shaped tool calls (`{id, function: {name, arguments}}`) into
-/// Anthropic `tool_use` content blocks. `arguments` is a JSON string on the
-/// OpenAI wire; it parses into the block's structured `input` (kept verbatim
-/// when unparseable). Entries without a `function` object are skipped.
+/// OpenAI-shaped tool calls as Anthropic `tool_use` blocks; the `arguments`
+/// string parses into `input` (kept verbatim when unparseable).
 pub fn tool_calls_to_tool_use(calls: Vec<Value>) -> Vec<Value> {
     calls
         .into_iter()
@@ -143,8 +140,7 @@ pub fn tool_calls_to_tool_use(calls: Vec<Value>) -> Vec<Value> {
 }
 
 /// Inverse of [`tool_calls_to_tool_use`]: `input` becomes the JSON-encoded
-/// `arguments`, each converted call takes the next `index` (streamed deltas
-/// accumulate by it); other entries pass through so a misfit fails at the caller.
+/// `arguments`, each call takes the next `index`; other entries pass through.
 pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Value> {
     blocks
         .into_iter()

@@ -172,9 +172,8 @@ pub enum KeySource {
     Admin,
 }
 
-/// AK auth: the live key table. Config keys seed it at boot and are re-applied
-/// on reload; admin keys are created/updated/revoked at runtime and survive a
-/// reload. A preserved seam, so those runtime edits outlive a config swap.
+/// AK auth, the live key table: config keys seed it and re-apply on reload,
+/// admin keys survive it (a preserved seam).
 #[derive(Debug, Default)]
 pub struct AkAuth {
     keys: DashMap<String, (AkInfo, KeySource)>,
@@ -198,8 +197,7 @@ impl AkAuth {
                 } else {
                     source
                 };
-                // an upsert never clears a runtime suspension — only a patch
-                // does (mirrors the Postgres upsert, which omits the column)
+                // an upsert never clears a runtime suspension — only a patch does
                 if info.suspended_until_epoch_secs.is_none() {
                     info.suspended_until_epoch_secs = e.get().0.suspended_until_epoch_secs;
                 }
@@ -361,9 +359,8 @@ impl QuotaStore {
     }
 }
 
-/// Account pool: pick the highest-priority slot serving a model type, round-robin
-/// within the tie. Slots are `Arc`'d — selection is per-request, so handing out
-/// a refcount bump beats copying the account's strings every time.
+/// Account pool: the highest-priority slot serving a model type, round-robin
+/// within the tie; slots are `Arc`'d since selection is per-request.
 #[derive(Debug, Default)]
 pub struct AccountPool {
     accounts: Vec<Arc<Account>>,
@@ -462,8 +459,7 @@ impl AccountPool {
         is_excluded: impl Fn(&str) -> bool,
     ) -> Option<Arc<Account>> {
         let eligible = |a: &&Arc<Account>| serves(a, p, provider) && !is_excluded(&a.name);
-        // pass 1 finds the preferred tier (PTU when any) and its best priority;
-        // pass 2 materializes only that tier's ties for the round-robin pick
+        // pass 1 finds the preferred tier (PTU when any) and its best priority; pass 2 its ties
         let mut has_ptu = false;
         let mut best = None;
         for a in self.accounts.iter().filter(|a| eligible(a)) {
@@ -537,9 +533,8 @@ struct HealthEntry {
     cooldown_until: Option<Instant>,
 }
 
-/// Account health: consecutive-failure cooldown with auto-recovery. A streak
-/// idle past [`FAILS_DECAY`] restarts at 1 — the same self-expiry the Redis
-/// backend's failure-key TTL applies, so both backends trip identically.
+/// Account health: consecutive-failure cooldown with auto-recovery; a streak
+/// idle past [`FAILS_DECAY`] restarts at 1, as the Redis backend's key TTL does.
 #[derive(Debug, Default)]
 pub struct AccountHealth {
     entries: DashMap<String, HealthEntry>,
@@ -894,8 +889,7 @@ impl SharedConfig {
     pub async fn reload(&self, cfg: GatewayConfig) -> gw_models::GResult<()> {
         let _serialized = self.reload_lock.lock().await;
         let prev = self.inner.load();
-        // cfg.generation (a stable hash set at parse) keys the preserved cache so
-        // it can't serve a pre-reload entry across a model remap
+        // cfg.generation keys the preserved cache so it can't serve a pre-reload entry
         let state = GatewayState::reload_from(&cfg, &prev.state).await?;
         self.inner.store(Arc::new(Snapshot {
             cfg: Arc::new(cfg),
@@ -947,9 +941,8 @@ fn slot_mut<'a, V>(
     map.entry(key.to_owned()).or_insert_with(init)
 }
 
-/// Admit while spent-before < `limit`, adding `amount` so in-flight work
-/// counts — the one in-process reserve semantics (Redis mirrors it in
-/// `reserve_capped`).
+/// Admit while spent-before < `limit`, adding `amount` so in-flight work counts
+/// (Redis mirrors it in `reserve_capped`).
 fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
     if *counter >= limit {
         return false;

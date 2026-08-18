@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::base::base_engine;
 use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
+use crate::transport::Headers;
 
 base_engine!(ErnieEngine);
 
@@ -49,7 +50,7 @@ impl ModelEngine for ErnieEngine {
         );
         let mut headers = Vec::new();
         if key.starts_with("bce-v3/") {
-            headers.push(("authorization".to_owned(), format!("Bearer {key}")));
+            headers.push(("authorization", format!("Bearer {key}")));
         } else {
             url.push_str("?access_token=");
             url.push_str(&key);
@@ -253,9 +254,8 @@ impl ModelEngine for CohereEngine {
     }
 }
 
-/// Bedrock Llama takes a raw prompt, so the chat template is ours to render:
-/// Llama 3 header tokens, Llama 4's renamed ones; a bare `role: text` prompt
-/// makes the model keep inventing turns until max_gen_len.
+/// The Llama 3/4 chat template for Bedrock's raw prompt; a bare `role: text`
+/// prompt makes the model invent turns until max_gen_len.
 fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
     let (start, end, eot) = if model.contains("llama4") {
         ("<|header_start|>", "<|header_end|>", "<|eot|>")
@@ -426,11 +426,11 @@ impl DashScopeEngine {
         )
     }
 
-    fn headers(&self, stream: bool) -> Vec<(String, String)> {
+    fn headers(&self, stream: bool) -> Headers {
         let mut h = self.base.bearer_headers();
         if stream {
             // DashScope streams only when this header is present
-            h.push(("X-DashScope-SSE".into(), "enable".into()));
+            h.push(("X-DashScope-SSE", "enable".into()));
         }
         h
     }
@@ -494,9 +494,8 @@ impl ModelEngine for DashScopeEngine {
     }
 }
 
-/// Apply one DashScope SSE frame; returns the chunks it yields. Running
-/// frames carry the literal string "null" as finish_reason; usage is
-/// cumulative — the last frame's counts win.
+/// Apply one DashScope SSE frame: running frames carry the literal "null"
+/// finish_reason and cumulative usage (last frame wins).
 fn dashscope_apply_frame(
     v: &Value,
     status: u16,

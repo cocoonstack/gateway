@@ -4,20 +4,13 @@
 
 use serde_json::Value;
 
-/// Whether a client frame is the OpenAI-dialect generation trigger. The bridge
-/// parses text and binary frames alike, so a binary-encoded event can't slip
-/// past the gate.
+/// Whether a client frame is the OpenAI-dialect generation trigger.
 pub fn is_response_create(frame: &Value) -> bool {
     frame["type"] == "response.create"
 }
 
-/// String values that never carry human text: base64 media payloads (which a
-/// rewrite would corrupt) and protocol identifiers (whose rewrite would break
-/// frame correlation). Everything else is scanned — fail closed, matching the
-/// REST surfaces' walk-every-string-leaf posture, so a new protocol text
-/// field is covered by default instead of silently bypassing blocklist/DLP.
-/// Only scalars are skipped: an `audio`/`format` CONFIG object still recurses
-/// (the transcription prompt rides inside it).
+/// String values that never carry human text (base64 media, protocol ids);
+/// everything else is scanned, fail closed, and config objects still recurse.
 fn skip_scalar(k: &str, text_delta: bool) -> bool {
     matches!(
         k,
@@ -38,19 +31,16 @@ fn skip_scalar(k: &str, text_delta: bool) -> bool {
         || k.ends_with("_id")
 }
 
-/// Whether a frame's top-level `delta` carries text. Audio deltas reuse the
-/// same key for base64 payloads (`response.output_audio.delta`), which a
-/// rewrite would corrupt — only text/transcript/argument deltas are visited.
+/// Whether a frame's top-level `delta` carries text (audio deltas reuse the key
+/// for base64 a rewrite would corrupt).
 fn delta_is_text(frame_type: &str) -> bool {
     frame_type.contains("text")
         || frame_type.contains("transcript")
         || frame_type.contains("arguments")
 }
 
-/// Visit the text-bearing string leaves of a realtime frame with a visitor
-/// that may rewrite them; returns summed hits. The content-security seam for
-/// the WebSocket surface — which fields are NOT text is dialect knowledge
-/// owned here (see [`skip_scalar`]).
+/// Visit a realtime frame's text-bearing string leaves with a visitor that may
+/// rewrite them; returns summed hits (see [`skip_scalar`] for what is not text).
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     let text_delta = v["type"].as_str().map(delta_is_text).unwrap_or(false);
     walk(v, text_delta, f)
@@ -101,9 +91,8 @@ pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
     }
 }
 
-/// Per-dialect turn boundary → the turn's (input, output) tokens: `Some((0, 0))`
-/// for a cancelled/empty turn (so its reservation settles instead of orphaning),
-/// `None` for a non-boundary frame. Keyed by provider so every dialect is metered.
+/// A per-dialect turn boundary's (input, output) tokens — `Some((0, 0))` for a
+/// cancelled/empty turn so its reservation settles, `None` off a boundary.
 pub fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
     let usage = if is_gemini_realtime(provider) {
         // cumulative usage rides many frames — settle only on turnComplete or it double-counts

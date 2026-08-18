@@ -111,9 +111,7 @@ impl OnlineHandler {
         retention: Option<gw_config::RetentionConf>,
     ) -> GResult<DagContext> {
         let sec = snap.cfg.security_for(&ak.tenant);
-        // outbound redaction (PII or secrets) is a response-buffering boundary:
-        // a masked span can straddle deltas, so no engine may stream raw ones —
-        // enforced here so no caller can opt out
+        // outbound redaction buffers the response: a masked span can straddle deltas
         let dlp = sec.redacts_output();
         if dlp {
             request.stream_tx = None;
@@ -246,9 +244,8 @@ impl OnlineHandler {
             emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
         }
 
-        // a panicking node must refund too, not leak the reserves; unwind-safe —
-        // the refund reads only plain ctx fields (ak, state, quota_at, the
-        // reserves), each written whole by its node, so a panic can't tear them
+        // a panicking node must refund too; unwind-safe: the refund reads only plain ctx
+        // fields each written whole by its node
         let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.plan, &mut ctx))
             .catch_unwind()
             .await
@@ -312,11 +309,8 @@ impl OnlineHandler {
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
             let native_event_hits = plugins::native_event_dlp_hits(sec, &mut outcome.chunks);
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
-            // Raw decoded deltas are pre-redaction. Drop them when either the
-            // normalized response was rewritten or a native-only payload
-            // (for example a citation) hit DLP. Clean native events survive;
-            // so do the signed reasoning units the strip pass kept, which
-            // only the chunks carry on the chat surface.
+            // raw deltas are pre-redaction: drop them when anything hit DLP, keeping only the
+            // signed reasoning units the strip pass kept (the chat surface carries them in chunks)
             if dlp && (n > 0 || native_event_hits > 0) {
                 for chunk in outcome.chunks.drain(..) {
                     if let Some(units) = chunk.reasoning_details {
@@ -426,9 +420,8 @@ pub enum RtModeration {
     Deny(String),
 }
 
-/// A fleet-unique request correlation id: `req-<process instance>-<seq>`.
-/// The 128-bit random instance tag is drawn once per process, keeping per-id
-/// cost at one relaxed atomic add instead of an OS RNG draw.
+/// A fleet-unique request id, `req-<process instance>-<seq>`: one relaxed atomic
+/// add per id, the random instance tag drawn once per process.
 pub fn new_request_id() -> String {
     format!(
         "req-{}-{}",
@@ -467,9 +460,8 @@ async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_jso
     persist_terminal(ctx.state.store.as_ref(), &subject, retention, body()).await;
 }
 
-/// Count one admission rejection against the key's daily abuse counter and
-/// suspend it when a configured tier trips. Deny-path only, so the serving
-/// path never pays for it; the day-scoped quota counter is fleet-shared.
+/// Count one admission rejection against the key's fleet-shared daily abuse
+/// counter and suspend it when a configured tier trips (deny path only).
 async fn note_abuse(ctx: &DagContext) {
     let tiers = &ctx.cfg.abuse.tiers;
     if tiers.is_empty() {
@@ -554,8 +546,7 @@ fn content_filter_outcome(block: Block) -> EngineOutcome {
 }
 
 /// Record a content-safety outcome (no prompt text) against this request's
-/// key/user/tenant. Best-effort. Surface = the request protocol, or "batch"
-/// for offline items.
+/// key/user/tenant; best-effort.
 async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
     let surface = if ctx.request.is_online {
         ctx.request
@@ -693,11 +684,8 @@ fn retention_expiry(retention: gw_config::RetentionConf, now: i64) -> i64 {
     }
 }
 
-/// Persist this request's prompt and response per the tenant's retention policy.
-/// `inbound` is the pre-DLP prompt text; `store_full` (resolved once by the
-/// caller: full level AND a content key) stores it sealed, else it is stored
-/// PII/secret-stripped — retention owns that redaction, so a row can't hold
-/// raw content even with DLP off. Best-effort — a store failure is logged.
+/// Persist the pre-DLP prompt and the response per the tenant's retention:
+/// sealed when `store_full` (full level AND a content key), else PII/secret-stripped; best-effort.
 async fn persist_content(
     ctx: &DagContext,
     retention: gw_config::RetentionConf,

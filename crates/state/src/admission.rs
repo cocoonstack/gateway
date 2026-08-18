@@ -57,8 +57,7 @@ impl BillingLedger {
         }
     }
 
-    // Backpressure only after the bounded repair queue fills: every accepted
-    // bill remains owned until the store recovers instead of being dropped.
+    // backpressure only once the bounded repair queue fills; no accepted bill is dropped
     async fn write(&self, record: &BillingRecord) {
         let Err(e) = self.store.ledger_add(record).await else {
             return;
@@ -103,9 +102,8 @@ fn user_budget_limit(cfg: &GatewayConfig, tenant: &str) -> Option<i64> {
         .and_then(|t| t.user_daily_token_quota)
 }
 
-/// Per-user daily token budget (a soft cap): admit while the user is under the
-/// tenant's limit. Skipped when the tenant sets no limit or the request carries
-/// no user attribution. Consumed at billing via [`consume_user_budget`].
+/// Per-user daily token budget (soft cap): admit while under the tenant's limit;
+/// skipped without a limit or user attribution, consumed via [`consume_user_budget`].
 pub async fn check_user_budget(
     gov: &dyn Governance,
     cfg: &GatewayConfig,
@@ -154,9 +152,8 @@ pub fn model_quota_limit(cfg: &GatewayConfig, ak: &AkInfo, model: &str) -> Optio
     })
 }
 
-/// Outcome of a tenant-fallback swap attempt. `AlreadyServing` is distinct
-/// from `Unconfigured`: a request already on the fallback has nowhere further
-/// to degrade but IS degraded — callers must not deny it as unconfigured.
+/// Outcome of a tenant-fallback swap; `AlreadyServing` IS degraded (nowhere
+/// further to go) and must not be denied as `Unconfigured`.
 pub enum FallbackSwap {
     /// Swapped; carries `(requested, fallback)` for the decision trail.
     Swapped(String, String),
@@ -164,9 +161,8 @@ pub enum FallbackSwap {
     Unconfigured,
 }
 
-/// Swap `param` to the tenant's fallback model, threading `fallback_from` so
-/// billing/echo semantics follow. The one fallback swap the quota gate and
-/// moderation degrade share.
+/// Swap `param` to the tenant's fallback model, threading `fallback_from` for
+/// billing/echo; shared by the quota gate and the moderation degrade.
 pub fn swap_to_fallback(
     cfg: &GatewayConfig,
     tenant: &str,
@@ -289,10 +285,8 @@ pub struct SettleInput<'a> {
     pub model_quota_key: Option<String>,
 }
 
-/// Settle admission reserves to actuals, accrue the per-(AK, model) counter,
-/// and write the ledger — one round of concurrent independent ops. Token
-/// counts are clamped before metering; a transient ledger failure is handed to
-/// a bounded queue for asynchronous, idempotent repair.
+/// Settle reserves to actuals, accrue the per-(AK, model) counter and write the
+/// ledger concurrently; a transient ledger failure goes to the bounded repair queue.
 pub async fn settle_and_bill(
     state: &GatewayState,
     cfg: &GatewayConfig,
@@ -304,8 +298,8 @@ pub async fn settle_and_bill(
     let settle_daily = gov.quota_settle(s.billing.ak, total - s.reserved, s.reserved_at);
     let consume_model = async {
         if let Some(key) = &s.model_quota_key {
-            // accrues to the CURRENT day, not the admission day — this counter
-            // has no paired reserve that must land on the admission bucket
+            // accrues to the CURRENT day: this counter has no paired reserve on the admission
+            // bucket
             gov.quota_consume(key, total).await;
         }
     };

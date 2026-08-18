@@ -105,8 +105,7 @@ pub fn long_context_scale(
 }
 
 /// Weighted (prompt, completion) for the paths carrying no cache/reasoning
-/// components (estimates, realtime turns) — one implementation, so no billing
-/// surface can skip the rate.
+/// components (estimates, realtime turns).
 pub fn weighted_pair(prompt: i64, completion: i64, rate: &TokenRate) -> (i64, i64) {
     let input = TokenInput {
         prompt,

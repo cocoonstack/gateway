@@ -17,13 +17,16 @@ pub const MOCK_CREATED: i64 = 1_720_000_000;
 pub const MOCK_B64: &str = "TU9DS0JZVEVT"; // "MOCKBYTES"
 pub(crate) const DEFAULT_CONNECT_RETRIES: u32 = 1;
 
+/// Wire headers an engine attaches; names are always literals.
+pub type Headers = Vec<(&'static str, String)>;
+
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
     pub protocol: Protocol,
-    pub method: String,
+    pub method: &'static str,
     pub url: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Headers,
     pub body: Vec<u8>,
     pub stream: bool,
     /// upstream account slot handling this call (used by failover/downtime simulation).
@@ -143,10 +146,8 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 
 pub type SharedTransport = Arc<dyn Transport>;
 
-/// Deterministic fake vendor: parses the engine-built request body (so request
-/// construction is exercised too) and answers in the vendor's wire shape,
-/// routed by protocol or URL path. An account whose name contains "down" gets a
-/// 503 — the DAG failover trigger.
+/// Deterministic fake vendor: parses the engine-built body and answers in the
+/// vendor's wire shape; an account named "…down…" gets a 503 (the failover trigger).
 #[derive(Debug, Default)]
 pub struct MockTransport;
 
@@ -352,9 +353,8 @@ impl MockTransport {
         let reply = format!("[mock-dashscope] you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         if req.stream {
-            // real wire: LF framing, `data:` without a space, id:/event:/comment
-            // lines, finish_reason the literal string "null" until the final
-            // frame, usage cumulative per frame
+            // real wire: LF framing, `data:` sans space, id:/event:/comment lines, "null"
+            // finish_reason
             let (a, b) = Self::split_half(&reply);
             let frame = |i: usize, content: &str, fr: &str, out: i64| {
                 format!(
@@ -849,7 +849,8 @@ impl MockTransport {
 #[async_trait::async_trait]
 impl Transport for MockTransport {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
-        // downtime simulation: account name containing "down" → upstream 503 (triggers DAG failover)
+        // downtime simulation: account name containing "down" → upstream 503 (triggers DAG
+        // failover)
         if req.account.contains("down") {
             return Err(GatewayError::new(
                 gw_consts::ErrCode::FED_RESP_RPC_FAILED,

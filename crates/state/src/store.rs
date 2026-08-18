@@ -19,36 +19,29 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
      FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
      RETURNING id";
 
-/// Per-call token ceiling: usage is floored at 0 upstream but not capped, so
-/// clamping keeps a hostile count from overflowing downstream accumulators.
-/// Far above any real response, so real traffic is never clamped.
+/// Per-call token ceiling so a hostile count cannot overflow downstream
+/// accumulators; far above any real response.
 const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
-/// Prune the SQL ledger every Nth insert instead of per write (the cap becomes
-/// approximate by at most this many rows, saving a round-trip per billing).
-/// Pruning spares rows the rollup hasn't folded yet (created at or past the
-/// watermark), so a burst can exceed `ledger_max_rows` briefly rather than
-/// lose usage — billing integrity outranks a strict cap.
+/// Prune the SQL ledger every Nth insert (the cap is approximate by that many
+/// rows); rows the rollup has not folded yet are spared, so a burst may exceed
+/// `ledger_max_rows` briefly rather than lose usage.
 const LEDGER_PRUNE_EVERY: usize = 64;
 
 /// Usage-rollup bucket width.
 const ROLLUP_BUCKET_SECS: i64 = 60;
 
 /// Each rollup advance recomputes at least this trailing window (more when the
-/// watermark trails it — first run rolls the whole ledger, a stalled task
-/// catches up whole), so late rows and missed ticks self-heal.
+/// watermark trails it), so late rows and missed ticks self-heal.
 const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 
-/// A minute is rolled only once it has been closed for at least this long, so
-/// an in-flight billing write (or a replica whose clock trails by less than a
-/// minute) can never land a row in an already-rolled minute — which is what
-/// makes the max-upsert sound: a rolled minute's source set can only shrink
-/// (pruning), never grow.
+/// A minute is rolled only once closed for this long, so no in-flight write or
+/// trailing replica lands a row in a rolled minute — a rolled minute's source
+/// set can only shrink, which keeps the max-upsert sound.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 
 /// Postgres advisory-lock key serializing the fleet's rollup: one replica
-/// advances per tick, the rest skip (the upsert is idempotent either way —
-/// the lock only avoids N replicas repeating the same scan).
+/// advances per tick (the upsert is idempotent; the lock only avoids repeated scans).
 const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 
 /// One minute past the newest rolled bucket — where the raw ledger tail
@@ -227,12 +220,10 @@ pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_model
     }
 }
 
-/// Price one call into a [`BillingRecord`]: the tenant's price for the served
-/// model, vendor cost from the serving account. Shared by the request pipeline
-/// and the realtime surface so the two can't drift; token counts are clamped.
-/// Cost multiplies the weighted billable sides; the prompt/completion columns
-/// keep the vendor-reported counts, while `total_tokens` is the weighted
-/// platform total that quota metering consumed.
+/// Price one call into a [`BillingRecord`] (tenant price for the served model,
+/// vendor cost from the account), shared by the pipeline and the realtime
+/// surface; prompt/completion keep the vendor counts, `total_tokens` is the
+/// weighted platform total quota metering consumed.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
@@ -437,8 +428,7 @@ fn bucket_floor(ts: i64) -> i64 {
     ts - ts.rem_euclid(ROLLUP_BUCKET_SECS)
 }
 
-/// Minute-align a query window: identical semantics whether a minute is served
-/// from its bucket or still raw, so a repeated query can't drift as the
+/// Minute-align a query window so a repeated query cannot drift as the
 /// watermark advances past its bounds.
 fn align_bounds(since: i64, until: i64) -> (i64, i64) {
     (
@@ -447,9 +437,8 @@ fn align_bounds(since: i64, until: i64) -> (i64, i64) {
     )
 }
 
-/// A content-safety outcome, recorded WITHOUT the offending text — only which
-/// key/user/rule fired and what the gateway did, so hits are queryable per
-/// ak/tenant without retaining prompt content.
+/// A content-safety outcome recorded WITHOUT the offending text: which
+/// key/user/rule fired and what the gateway did.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SecurityEvent {
     pub created_at_epoch_secs: i64,
@@ -797,10 +786,8 @@ impl Store for MemoryStore {
         }
         ledger.rows.push(r.clone());
         if self.ledger_max_rows > 0 && ledger.rows.len() > self.ledger_max_rows {
-            // spare rows the rollup hasn't folded yet — lost here means lost
-            // from usage forever; the cap yields to billing integrity. A full
-            // scan, not a prefix cut: completion order can wedge a young row
-            // ahead of prunable ones, which must not defeat the cap.
+            // spare unrolled rows (the cap yields to billing integrity); a full scan, since
+            // completion order can wedge a young row ahead of prunable ones
             let mut excess = ledger.rows.len() - self.ledger_max_rows;
             let mut removed = Vec::new();
             ledger.rows.retain(|r| {
@@ -848,9 +835,7 @@ impl Store for MemoryStore {
                     vendor_cost_micros: 0,
                     billed_units: 0,
                 });
-            // saturating: a hostile upstream can drive a single record's counts
-            // to i64::MAX (usage is floored, not capped), so the rollup sum must
-            // not overflow across records
+            // saturating: a hostile record can carry i64::MAX counts (usage is floored, not capped)
             e.requests += 1;
             e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
             e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
@@ -1173,9 +1158,8 @@ impl Store for MemoryStore {
     }
 }
 
-/// Positional row → record mappers shared by the SQL backends: fields decode
-/// in the SELECT's column order. One macro so the sqlx trait-bound boilerplate
-/// lives once.
+/// Positional row → record mappers shared by the SQL backends (fields decode in
+/// the SELECT's column order).
 macro_rules! row_mapper {
     ($name:ident -> $ty:path { $($field:ident),+ $(,)? }) => {
         fn $name<'r, R>(row: &'r R) -> $ty
@@ -1363,7 +1347,8 @@ impl SqliteStore {
                 return Err(crate::sqlx_err("migrate billing schema", e));
             }
         }
-        // a dead process's jobs can never progress single-instance — fail them, don't let clients poll forever
+        // a dead process's jobs can never progress single-instance — fail them, don't let clients
+        // poll forever
         sqlx::query("UPDATE batches SET status = 'failed' WHERE status IN ('pending', 'running')")
             .execute(&pool)
             .await
@@ -1405,11 +1390,8 @@ macro_rules! dialect_sql {
     }};
 }
 
-/// One `impl Store` per SQL backend. The methods in the macro body are
-/// dialect-independent (placeholder syntax aside) and expand once per backend
-/// from this single source; `$specific` carries the genuinely dialect-bound
-/// methods (id generation, rollup locking, batch fencing, erasure shape,
-/// NULL-parameter and SUM casts).
+/// One `impl Store` per SQL backend: the dialect-independent methods expand from
+/// this body, `$specific` carries the dialect-bound ones.
 macro_rules! sql_store_impl {
     ($T:ty, $dialect:ident, { $($specific:item)* }) => {
         #[async_trait::async_trait]
@@ -1946,8 +1928,7 @@ sql_store_impl!(SqliteStore, sqlite, {
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
-        // ids derive from the AUTOINCREMENT sequence (sqlite_sequence), which a
-        // delete never rewinds — MAX(n)+1 would recycle a deleted file's id
+        // ids come from the AUTOINCREMENT sequence: MAX(n)+1 would recycle a deleted file's id
         let id: String = sqlx::query_scalar(
             "INSERT INTO files (id, tenant, purpose, bytes, content)
              VALUES ('file-' || (SELECT COALESCE(
@@ -2049,9 +2030,8 @@ sql_store_impl!(SqliteStore, sqlite, {
     }
 });
 
-/// A terminal batch's input rows have served their purpose — delete them in
-/// the same transaction as the status write, so submitted prompt text cannot
-/// outlive the run even across a crash between statements.
+/// Delete a terminal batch's input rows in the status write's transaction, so
+/// submitted prompt text cannot outlive the run.
 async fn prune_terminal_items(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
@@ -2068,9 +2048,8 @@ async fn prune_terminal_items(
     Ok(())
 }
 
-/// Postgres-backed store shared across a fleet. Unlike [`SqliteStore`] there
-/// is no orphan sweep on open — a starting instance must not fail batches
-/// another live instance is still executing.
+/// Postgres-backed store shared across a fleet; no orphan sweep on open, since
+/// another live instance may still be executing those batches.
 #[derive(Debug)]
 pub struct PostgresStore {
     pool: sqlx::PgPool,
@@ -2155,9 +2134,8 @@ impl PostgresStore {
             // per-item end-user attribution so a fleet drainer still bills/budgets it
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
-            // pre-upgrade results predate the user_id column; their items rows
-            // (pruned only at terminal status from this version on) still carry
-            // the owner — backfill so erasure reaches history. Idempotent.
+            // pre-upgrade results predate user_id; backfill it from the items rows so erasure
+            // reaches history (idempotent)
             "UPDATE batch_results r SET user_id = i.user_id FROM batch_items i
              WHERE r.batch_id = i.batch_id AND r.idx = i.idx
                AND r.user_id = '' AND i.user_id <> ''",
@@ -2426,8 +2404,7 @@ sql_store_impl!(PostgresStore, postgres, {
         .execute(&mut *tx)
         .await
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
-        // pending/running batches included: the emptied item fails at execution
-        // instead of running erased content (terminal batches already pruned)
+        // pending/running batches included: an emptied item fails at execution instead of running
         let i = sqlx::query(
             "UPDATE batch_items i SET messages = '[]' FROM batches b
              WHERE i.batch_id = b.id AND i.user_id = $1 AND i.messages <> '[]'
@@ -2586,8 +2563,7 @@ sql_store_impl!(PostgresStore, postgres, {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
-        // DO NOTHING (first-writer-wins) + non-terminal guard; the FOR UPDATE row
-        // lock serializes with batch_finalize so no result lands after finalize.
+        // first-writer-wins + non-terminal guard; FOR UPDATE serializes with batch_finalize
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens, user_id)
              SELECT $1, $2, $3, $4, $5, $6
@@ -2608,9 +2584,8 @@ sql_store_impl!(PostgresStore, postgres, {
     }
 
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
-        // Lock the row, THEN aggregate separately: a single UPDATE reads its
-        // subquery on the statement-start snapshot and would miss a result that
-        // commits while it waits for the lock, wrongly reporting Failed.
+        // lock the row, THEN aggregate: a single UPDATE's subquery reads the statement-start
+        // snapshot and would miss a result committing while it waits for the lock
         let mut tx = self
             .pool
             .begin()

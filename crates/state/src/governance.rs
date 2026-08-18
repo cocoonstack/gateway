@@ -191,7 +191,8 @@ impl RedisGovernance {
         {
             Ok(v) => v,
             Err(e) => {
-                // fail open, but loudly — a persistent outage would otherwise silently disable limits
+                // fail open, but loudly — a persistent outage would otherwise silently disable
+                // limits
                 let key_id = crate::access_key_fingerprint(key);
                 tracing::warn!(error = %e, key_id, "redis governance unavailable; limit skipped");
                 0
@@ -206,8 +207,7 @@ impl Governance for RedisGovernance {
         if qps <= 0.0 {
             return false;
         }
-        // qps >= 1: round(qps) permits per 1s (the in-memory bucket's rounding,
-        // so fleet and single-node enforce alike); qps < 1: 1 permit per 1/qps s
+        // qps >= 1: round(qps) per 1s (the in-memory bucket's rounding); qps < 1: 1 per 1/qps s
         let (limit, window) = if qps < 1.0 {
             (1, Duration::from_secs_f64(1.0 / qps))
         } else {
@@ -241,8 +241,7 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        // floor at 0 atomically on the SAME day bucket the reserve used, so a
-        // request straddling midnight doesn't hit the next day's counter
+        // floor at 0 on the SAME day bucket the reserve used (a request may straddle midnight)
         settle_floored(
             &self.conn,
             &quota_key_at(key, at),
@@ -260,8 +259,8 @@ impl Governance for RedisGovernance {
         .await;
     }
     async fn quota_reset_all(&self) {
-        // no-op: quota keys are date-stamped by UTC day, so rollover is automatic;
-        // a per-instance sweep would wipe the shared keyspace repeatedly
+        // no-op: quota keys are stamped by UTC day, a per-instance sweep would wipe the shared
+        // keyspace
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
@@ -288,8 +287,7 @@ impl Governance for RedisGovernance {
 }
 
 /// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
-/// rollover is implicit and identical across replicas. Callers pass the
-/// admission time so a reserve and its settle hit the same day.
+/// callers pass the admission time so a reserve and its settle hit the same day.
 fn tpm_key(key: &str) -> String {
     format!("gw:tpm:{key}")
 }
@@ -303,10 +301,8 @@ fn quota_key(key: &str) -> String {
     quota_key_at(key, crate::epoch_secs())
 }
 
-/// Apply a settle delta and floor at 0 in one atomic step, so a reset or window
-/// rollover between reserve and settle can't plant a negative value that
-/// over-admits. Preserves an existing TTL (KEEPTTL across the floor), arming
-/// `window` when none is set.
+/// Apply a settle delta and floor at 0 atomically (a rollover between reserve
+/// and settle must not plant a negative); keeps an existing TTL, arms `window` otherwise.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,

@@ -22,9 +22,7 @@ impl SseDecoder {
     /// Push bytes; returns the `data:` payloads of every event completed so far.
     /// `[DONE]` flips `is_done` and is not returned as a payload.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, String> {
-        // Buffer raw bytes and only decode complete events: a network chunk can
-        // end mid-way through a multi-byte UTF-8 character, and decoding each
-        // chunk separately would corrupt it permanently.
+        // decode only complete events: a chunk can end inside a multi-byte UTF-8 char
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(end) = event_boundary(&self.buf, self.scanned) {
@@ -64,9 +62,8 @@ impl SseDecoder {
     }
 }
 
-/// Index just past the first blank-line event separator. Vendors frame with
-/// either LF (`\n\n`, OpenAI) or CRLF (`\r\n\r\n`, Google) — a decoder that
-/// only splits on `\n\n` never completes a CRLF-framed event.
+/// Index just past the first blank-line separator, LF (`\n\n`, OpenAI) or CRLF
+/// (`\r\n\r\n`, Google) framed.
 fn event_boundary(buf: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 1 < buf.len() {

@@ -22,10 +22,8 @@ pub enum ThinkingDialect {
     AdaptiveSummarized,
 }
 
-/// Reasoning effort → thinking budget in tokens; `None` for `none` and for
-/// unknown vocabulary. Fixed per level, not a share of `max_tokens`: Anthropic
-/// renders the budget into the prompt, so a moving budget thrashes the cache.
-/// `max` stays under the 64K output cap with the answer budget on top.
+/// Reasoning effort → thinking budget, fixed per level (a `max_tokens` share
+/// would thrash the prompt cache); `None` for `none` and unknown vocabulary.
 pub fn effort_budget(effort: &str) -> Option<i64> {
     Some(match effort {
         "minimal" | "low" => 1024,
@@ -78,9 +76,8 @@ pub fn is_thinking_block(block: &Value) -> bool {
     )
 }
 
-/// An Anthropic `thinking` / `redacted_thinking` block as a `reasoning_details`
-/// unit: `reasoning.text` carrying the signature, `reasoning.encrypted`
-/// carrying the opaque data. Other blocks yield `None`.
+/// A `thinking` / `redacted_thinking` block as a `reasoning_details` unit
+/// (`reasoning.text` + signature, or `reasoning.encrypted`); other blocks yield `None`.
 pub fn thinking_block_to_detail(mut block: Value, index: usize) -> Option<Value> {
     let mut detail = Map::new();
     match block["type"].as_str() {
@@ -109,10 +106,8 @@ fn take_string_or_empty(block: &mut Value, key: &str) -> Value {
     }
 }
 
-/// Inverse of [`thinking_block_to_detail`] for a replayed unit: only signed
-/// text and Anthropic-format encrypted data become blocks — the vendor rejects
-/// an unsigned thinking block, so unsigned prose is dropped rather than
-/// forwarded to fail. Anthropic-shaped units pass through as they are.
+/// Inverse of [`thinking_block_to_detail`]: only signed text and Anthropic
+/// encrypted data become blocks (the vendor rejects unsigned thinking).
 pub fn detail_to_thinking_block(mut detail: Value) -> Option<Value> {
     let mut block = Map::new();
     match detail["type"].as_str() {

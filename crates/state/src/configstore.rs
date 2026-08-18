@@ -12,8 +12,7 @@ pub const CONFIG_CHANNEL: &str = "gw_config";
 const KEEP_VERSIONS: i64 = 20;
 
 /// Every publish serializes on this advisory lock: a `MAX(id)`-guarded insert
-/// is not atomic under READ COMMITTED — two concurrent guarded publishes both
-/// see the old head and both insert.
+/// is not atomic under READ COMMITTED.
 const PG_PUBLISH_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('gw_config_publish'))";
 
 /// Metadata for one retained config document, newest first in list responses.
@@ -155,9 +154,8 @@ impl PostgresConfigStore {
     }
 }
 
-/// Subscribe to the config change feed: yields each published version id.
-/// The channel closes when the Postgres connection drops — the caller loops
-/// and re-subscribes (missed versions don't matter; a reload reads latest).
+/// Subscribe to the config change feed of published version ids; the channel
+/// closes when the connection drops and the caller re-subscribes (a reload reads latest).
 pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
     let mut listener = sqlx::postgres::PgListener::connect(url)
         .await

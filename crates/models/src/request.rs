@@ -121,10 +121,8 @@ pub(crate) fn is_protected_anthropic_block(block: &serde_json::Value) -> bool {
     )
 }
 
-/// One queued batch item: a message list plus the client-supplied end-user
-/// attribution. `user` is persisted with the item so a distributed drainer on
-/// another instance still attributes and budgets it (owner still overrides at
-/// billing time); empty when the submitter gave no `user`/`x-gw-user`.
+/// One queued batch item: messages plus the end-user attribution, persisted so
+/// a distributed drainer still attributes and budgets it (owner overrides at billing).
 #[derive(Debug, Clone)]
 pub struct BatchItem {
     pub messages: Vec<ChatMsg>,

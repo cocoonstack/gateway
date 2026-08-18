@@ -7,9 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// `content` accepts a plain string or the multimodal parts array
-/// (`[{type:"text",...},{type:"image_url",...}]`). Parts stay untyped `Value`s
-/// so unknown modalities pass through untouched.
+/// `content` as a plain string or the multimodal parts array; parts stay
+/// untyped so unknown modalities pass through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gw_models::{GResult, GatewayError};
 use serde_json::Value;
 
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use crate::transport::{Headers, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
@@ -157,10 +157,10 @@ impl Base {
 
     /// Bearer auth headers (the OpenAI-shaped families); real key when the
     /// account is live, inert "mock" otherwise.
-    pub fn bearer_headers(&self) -> Vec<(String, String)> {
+    pub fn bearer_headers(&self) -> Headers {
         vec![
-            ("content-type".into(), "application/json".into()),
-            ("authorization".into(), format!("Bearer {}", self.api_key())),
+            ("content-type", "application/json".into()),
+            ("authorization", format!("Bearer {}", self.api_key())),
         ]
     }
 
@@ -169,7 +169,7 @@ impl Base {
     pub async fn send_upstream(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -184,7 +184,7 @@ impl Base {
     pub async fn send_upstream_raw(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -197,14 +197,14 @@ impl Base {
     pub async fn send_bytes(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Vec<u8>,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
         let param = self.param()?;
         let up = UpstreamRequest {
             protocol: param.protocol,
-            method: "POST".to_owned(),
+            method: "POST",
             url: url.to_owned(),
             headers,
             body,
@@ -224,7 +224,7 @@ impl Base {
     pub async fn round_trip_with(
         &self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
     ) -> GResult<(u16, Value)> {
         let reply = self.send_upstream(url, headers, body, false).await?;
@@ -237,7 +237,7 @@ impl Base {
     pub async fn post_raw(
         &mut self,
         url: &str,
-        mut headers: Vec<(String, String)>,
+        mut headers: Headers,
         mut body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
@@ -253,7 +253,7 @@ impl Base {
     pub async fn post_json(
         &mut self,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Headers,
         body: Value,
     ) -> GResult<(u16, Value)> {
         let reply = self
@@ -281,18 +281,17 @@ pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, 
     }
 }
 
-fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
+fn ensure_json_content_type(headers: &mut Headers) {
     if !headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
     {
-        headers.insert(0, ("content-type".into(), "application/json".into()));
+        headers.insert(0, ("content-type", "application/json".into()));
     }
 }
 
 /// Decode a buffered JSON reply, surfacing vendor error envelopes instead of
-/// parsing them as broken success (bespoke engines add their own vendor-
-/// specific checks, e.g. minimax base_resp, on top of this).
+/// parsing them as broken success.
 pub(crate) fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)> {
     let bytes = match &reply.body {
         UpstreamBody::Json(b) => b,

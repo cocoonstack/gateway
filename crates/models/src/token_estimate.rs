@@ -47,14 +47,9 @@ pub fn default_encoder() -> &'static dyn TokenEncoder {
     &**ENC
 }
 
-/// Documented approximation of cl100k_base token counting — NOT real tiktoken.
-/// Captures the dominant error sources of a naive bytes/4 estimate:
-/// - runs of ASCII letters → ~1 token per 4 chars (subword merges)
-/// - runs of digits → cl100k emits ≤3-digit groups → 1 tok / 3
-/// - ASCII punctuation/symbols → ~1 token each
-/// - non-ASCII (CJK etc.) → ~1 token per char (rarely merged)
-///
-/// Whitespace folds into the following word, contributing no standalone tokens.
+/// Approximation of cl100k_base counting (NOT tiktoken): ASCII letters ~1 token
+/// per 4 chars, digits per 3, punctuation 1 each, non-ASCII 1 per char;
+/// whitespace folds into the following word.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HeuristicEncoder;
 
@@ -118,9 +113,8 @@ impl Run {
     }
 }
 
-/// Estimate the prompt tokens a chat request will cost upstream. `tools` is the
-/// request's tool definitions (OpenAI wire shape); their serialized schema is
-/// encoded as text.
+/// Estimate the prompt tokens a chat request will cost upstream; `tools` (OpenAI
+/// wire shape) count as their serialized schema.
 pub fn estimate_prompt_tokens(
     messages: &[ChatMsg],
     tools: Option<&Value>,
@@ -177,9 +171,8 @@ fn tokens_per_message(model_name: &str) -> usize {
     }
 }
 
-/// Extract the text a message contributes: multimodal `parts` → concatenated
-/// text parts only (vision tokens are the vendor's to count); else `content`,
-/// borrowed — the common case allocates nothing.
+/// The text a message contributes: concatenated text parts (vision tokens are
+/// the vendor's to count), else `content` borrowed.
 fn message_text(msg: &ChatMsg) -> std::borrow::Cow<'_, str> {
     if let Some(Value::Array(parts)) = &msg.parts {
         let mut out = String::new();

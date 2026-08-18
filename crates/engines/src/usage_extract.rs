@@ -7,10 +7,8 @@
 use gw_models::CommonUsage;
 use serde_json::Value;
 
-/// Extract a normalized usage view from the vendor's usage subtree.
-/// `messages_protocol` selects the Anthropic field map; otherwise OpenAI's.
-/// `None` when none of the mapped part fields are present (a total-only
-/// vendor) — callers fall back to the top-level counts.
+/// A normalized usage view of the vendor's usage subtree (Anthropic or OpenAI
+/// field map); `None` for a total-only vendor, callers keep the top-level counts.
 pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<CommonUsage> {
     fn get(v: &Value, path: &[&str]) -> i64 {
         let mut cur = v;
@@ -32,9 +30,8 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
         return None;
     }
     Some(if messages_protocol {
-        // Anthropic: input/output (+ cache fields). Never trust upstream — floor
-        // each part at 0 and sum saturating, so a malformed/hostile usage can't
-        // go negative (which would refund quota) or overflow the total.
+        // floor each part at 0 and sum saturating: a hostile usage must not refund quota or
+        // overflow
         let input = get(v, &["input_tokens"]).max(0);
         let output = get(v, &["output_tokens"]).max(0);
         let read_cache = get(v, &["cache_read_input_tokens"]).max(0);

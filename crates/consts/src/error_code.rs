@@ -9,9 +9,8 @@ use std::fmt;
 
 /// Stable numeric error code, backed by `i64`.
 ///
-/// Kept as a newtype over i64 (rather than a closed enum) because callers
-/// construct `ErrorException` from arbitrary upstream/business codes; a closed
-/// enum would lose the long tail. Named constants below cover the known set.
+/// A newtype over i64 rather than a closed enum: callers construct errors from
+/// arbitrary upstream/business codes; the named constants cover the known set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct ErrCode(pub i64);

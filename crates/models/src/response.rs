@@ -77,9 +77,8 @@ impl GatewayResponse {
     }
 }
 
-/// A mid-stream failure as rendered to the client: the contract
-/// classification, a human-readable message (no internal numeric codes), and
-/// the upstream's original status when an upstream HTTP response was received.
+/// A mid-stream failure as rendered to the client: the contract classification,
+/// a human-readable message and the upstream's original status when one was received.
 #[derive(Debug, Clone)]
 pub struct StreamError {
     pub class: gw_consts::ErrClass,

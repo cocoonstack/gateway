@@ -11,12 +11,10 @@ use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::multipart::{Form, audio_kind, image_kind};
 use crate::sse::SseDecoder;
-use crate::transport::{SharedTransport, UpstreamBody};
+use crate::transport::{Headers, SharedTransport, UpstreamBody};
 
-/// Build Gemini `parts` from a unified message: text → `{"text":…}`, data-URI
-/// images → `{"inlineData":…}`. Non-data image URLs can't be inlined offline
-/// (no fetch), so they're skipped rather than forwarded as an unusable OpenAI
-/// block; without this, multimodal requests silently drop every image.
+/// Gemini `parts` from a unified message: text and data-URI images (`inlineData`);
+/// remote image URLs cannot be inlined without a fetch and are skipped.
 fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
     if let Some(Value::Array(parts)) = &m.parts {
         let mut out = Vec::new();
@@ -59,17 +57,15 @@ base_engine!(VertexEngine);
 impl VertexEngine {
     /// Gemini API auth: the x-goog-api-key header — an API key is not an OAuth
     /// Bearer token and Google rejects it as one.
-    fn gemini_headers(&self) -> Vec<(String, String)> {
+    fn gemini_headers(&self) -> Headers {
         vec![
-            ("content-type".into(), "application/json".into()),
-            ("x-goog-api-key".into(), self.base.api_key()),
+            ("content-type", "application/json".into()),
+            ("x-goog-api-key", self.base.api_key()),
         ]
     }
 
     fn build_body(&self) -> Value {
-        // system turns go to systemInstruction, never the contents: Gemini has
-        // no system content role, and a `user`-role downgrade both loses the
-        // directive's authority and breaks turn alternation
+        // Gemini has no system role: system turns go to systemInstruction, never contents
         let contents: Vec<Value> = self
             .base
             .request
@@ -183,9 +179,8 @@ impl ModelEngine for VertexEngine {
     }
 }
 
-/// Gemini finishReason → the shared vocabulary: safety-family values become
-/// `content_filter` so clients detect moderation blocks; the rest lowercase
-/// (`finish_openai` already maps `max_tokens` → `length`).
+/// Gemini finishReason in the shared vocabulary: safety-family values become
+/// `content_filter`, the rest lowercase.
 fn vertex_finish_reason(fr: &str) -> String {
     match fr {
         "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" => {
@@ -229,10 +224,9 @@ fn vertex_apply_frame(
     Ok(chunks)
 }
 
-/// Fold a cumulative `usageMetadata` object into the response (last frame wins).
-/// Thinking models report `thoughtsTokenCount` outside `candidatesTokenCount`;
-/// OpenAI semantics fold reasoning into completion, so map thoughts → reasoning
-/// ⊆ completion or billing loses them.
+/// Fold a cumulative `usageMetadata` into the response (last frame wins);
+/// `thoughtsTokenCount` sits outside `candidatesTokenCount`, so thoughts fold
+/// into completion or billing loses them.
 fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if um.is_null() {
         return;
@@ -378,11 +372,8 @@ impl ModelEngine for ImageEngine {
             }
             let (content_type, body) = form.finish();
             let headers = vec![
-                ("content-type".into(), content_type),
-                (
-                    "authorization".into(),
-                    format!("Bearer {}", self.base.api_key()),
-                ),
+                ("content-type", content_type),
+                ("authorization", format!("Bearer {}", self.base.api_key())),
             ];
             let reply = self
                 .base
@@ -416,8 +407,7 @@ impl ModelEngine for ImageEngine {
         };
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
-        // gpt-image reports input/output tokens; every model bills per image
-        // when the model carries a unit price
+        // gpt-image reports tokens; every model bills per image when it carries a unit price
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
@@ -465,9 +455,8 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // speech bills per input character; the reply carries no usage.
-        // Transcription bills per second: the vendor's count, else the
-        // upload's own play length.
+        // speech bills per input character; transcription per second (vendor count, else play
+        // length)
         let mut units = 0;
         let mut local_seconds = None;
         let (status, v) = match self.kind {
@@ -500,8 +489,7 @@ impl ModelEngine for AudioEngine {
                         false,
                     )
                     .await?;
-                // the vendor answers with the audio bytes themselves; a JSON
-                // body is an error envelope (or a compatible upstream's b64)
+                // a JSON body is an error envelope (or a compatible upstream's b64), not audio
                 let status = reply.status;
                 match reply.body {
                     UpstreamBody::Json(bytes) if status < 400 && !looks_like_json(&bytes) => {
@@ -537,11 +525,8 @@ impl ModelEngine for AudioEngine {
                 form.file("file", &format!("audio.{ext}"), content_type, &audio);
                 let (content_type, body) = form.finish();
                 let headers = vec![
-                    ("content-type".into(), content_type),
-                    (
-                        "authorization".into(),
-                        format!("Bearer {}", self.base.api_key()),
-                    ),
+                    ("content-type", content_type),
+                    ("authorization", format!("Bearer {}", self.base.api_key())),
                 ];
                 let reply = self
                     .base
@@ -572,8 +557,8 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        // token-priced transcription models report input/output tokens;
-        // duration-priced ones report `usage.seconds` (or `duration`)
+        // token-priced transcription reports tokens; duration-priced `usage.seconds` (or
+        // `duration`)
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
@@ -1055,9 +1040,8 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame: every frame moves out as a native event for
-/// the view to forward verbatim; text accumulates from `output_text.delta`,
-/// usage/status come from `response.completed`.
+/// Apply one Responses SSE frame: every frame moves out as a native event; text
+/// accumulates from `output_text.delta`, usage/status from `response.completed`.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,

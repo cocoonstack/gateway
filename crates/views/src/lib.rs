@@ -323,11 +323,9 @@ async fn realtime_ws(
     }
 }
 
-/// A realtime session's model identity: the public name the client asked for
-/// and the variant actually served (equal without a split). Entitlement and
-/// the per-(AK, model) counter judge `requested`; capacity (QPM), pricing,
-/// the upstream URL, and availability's success/error samples follow the REST
-/// semantics — samples attribute to `requested`.
+/// A realtime session's model identity: entitlement, the per-(AK, model)
+/// counter and availability samples judge `requested`; QPM, pricing and the
+/// upstream URL follow `served` (the REST semantics).
 struct RtModel {
     requested: String,
     served: String,
@@ -336,10 +334,9 @@ struct RtModel {
     from_config: bool,
 }
 
-/// A turn admitted by [`realtime_gate`]: the freshly re-authenticated key,
-/// the reserves taken, the admission day (the paired settle/refund lands on
-/// the same bucket), and the admission snapshot (settlement must not drift
-/// from the admission config when a reload lands mid-turn).
+/// A turn admitted by [`realtime_gate`]: the re-authenticated key, the reserves,
+/// the admission day (settle/refund land on the same bucket) and the admission
+/// snapshot (settlement must not drift when a reload lands mid-turn).
 struct RealtimeAdmit {
     ak: AkInfo,
     /// Effective attribution user for this turn: the key's owner if set, else
@@ -393,16 +390,11 @@ impl RealtimeTurn {
     }
 }
 
-/// The REST admission chain applied per realtime generation via the shared
-/// [`admission`] checks, with the key re-fetched each turn so mid-session
-/// bans/de-entitlements take effect. Denials carry the rendering class
-/// directly ((ErrClass, message), no ErrCode): the WS surface is deliberately
-/// outside the ErrCode-keyed hooks (abuse noting stays a REST-pipeline
-/// concern). Two deliberate divergences from the DAG:
-/// over-quota denies instead of degrading (a session can't swap models
-/// mid-stream), and the reserve is a fixed turn estimate. Reserves are taken
-/// last so a denial never leaves one behind; a failed TPM reserve rolls back
-/// the daily reserve just taken.
+/// The REST admission chain per realtime generation (key re-fetched each turn
+/// so mid-session bans apply). Divergences from the DAG: over-quota denies
+/// instead of degrading, the reserve is a fixed turn estimate, denials carry
+/// an ErrClass (no ErrCode hooks). Reserves are taken last so a denial never
+/// leaves one behind.
 async fn realtime_gate(
     s: &AppState,
     ak: &AkInfo,
@@ -431,10 +423,9 @@ async fn realtime_gate(
             ),
         ));
     }
-    // the session pinned `served` at handshake; a reload may have removed it,
-    // and pricing an unknown model silently bills zero — deny so the client
-    // reconnects and picks against the live config. Wire-direct sessions
-    // (`?model=realtime`, never in config) are exempt: nothing to vanish.
+    // a reload may have removed the pinned model and an unknown model bills zero: deny
+    // so the client reconnects against the live config (wire-direct sessions have nothing to
+    // vanish)
     if m.from_config && cfg.find_model(&m.served).is_none() {
         return Err((
             ErrClass::ResourceNotFound,
@@ -492,11 +483,8 @@ async fn realtime_gate(
     })
 }
 
-/// Settle one realtime turn via the shared [`admission::settle_and_bill`]
-/// orchestration, on the turn's admission snapshot; a zero-usage terminal
-/// frame (cancelled/empty turn) refunds the reserves and writes nothing.
-/// Settle one realtime turn: `tokens` carries the turn's prompt/completion
-/// counts and their audio share.
+/// Settle one realtime turn through [`admission::settle_and_bill`] on the turn's
+/// admission snapshot; a zero-usage terminal frame refunds and writes nothing.
 async fn bill_realtime_turn(
     admit: &RealtimeAdmit,
     m: &RtModel,
@@ -516,8 +504,7 @@ async fn bill_realtime_turn(
         return;
     }
     let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
-    // pipeline parity: the same shared weighting the DAG estimate paths use;
-    // the audio share of each side takes the model's audio weight
+    // pipeline parity: the same weighting the DAG paths use, audio share at the audio weight
     let rate = gw_state::model_token_rate(cfg, &m.served);
     let input = gw_models::TokenInput {
         prompt: it,
@@ -706,9 +693,8 @@ async fn realtime_session(
     }
 }
 
-/// Cross the axum↔tungstenite text-frame boundary without copying: both wrap
-/// `bytes::Bytes`, so the payload stays refcounted and is only re-validated as
-/// UTF-8. The lossy fallback is unreachable in practice (input was validated).
+/// Cross the axum↔tungstenite text-frame boundary without copying (both wrap
+/// `bytes::Bytes`); the lossy fallback is unreachable, the input was validated.
 fn client_text_to_upstream(
     t: axum::extract::ws::Utf8Bytes,
 ) -> tokio_tungstenite::tungstenite::Message {
@@ -732,11 +718,9 @@ fn upstream_text_to_client(
     }
 }
 
-/// Bridge one realtime session to a real upstream over WebSocket: transparent
-/// relay plus auth, per-generation gates, and per-turn billing. Only the OpenAI
-/// dialect reaches here — [`realtime_ws`] refuses providers it can't gate; the
-/// Gemini metering in [`realtime_usage`] is groundwork for a future adapter.
-/// Per-dialect frame semantics live in [`gw_engines::realtime`].
+/// Bridge one realtime session to a real upstream: transparent relay plus auth,
+/// per-generation gates and per-turn billing; only the OpenAI dialect reaches
+/// here ([`realtime_ws`] refuses providers it cannot gate).
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -797,8 +781,8 @@ async fn realtime_bridge(
     let mut generations = 0u64;
     // boundary frames recognized; zero while generations flowed = unmetered dialect
     let mut recognized = 0u64;
-    // the one admitted turn awaiting settle (the OpenAI dialect allows a single
-    // active response); refunded on exit so its reserve never leaks
+    // the one admitted turn awaiting settle (OpenAI allows a single active response); refunded on
+    // exit
     let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
@@ -807,9 +791,8 @@ async fn realtime_bridge(
     loop {
         tokio::select! {
             m = cl_rx.next() => {
-                // text and binary frames are parsed alike so neither encoding
-                // bypasses the gate or the content-security pass; a non-JSON
-                // frame (raw audio) carries no scannable text and relays as-is
+                // text and binary parse alike so neither encoding bypasses the gate; non-JSON
+                // (audio) relays as-is
                 let (frame, mut forward) = match m {
                     Some(Ok(CMsg::Text(t))) => (serde_json::from_str::<Value>(&t).ok(), client_text_to_upstream(t)),
                     Some(Ok(CMsg::Binary(b))) => (serde_json::from_slice::<Value>(&b).ok(), UMsg::binary(b)),
@@ -834,10 +817,10 @@ async fn realtime_bridge(
                             }
                         }
                     }
-                    // gate each generation trigger, not every control frame.
-                    // With a turn already admitted the trigger relays ungated:
-                    // upstream rejects the duplicate, and a raced accept is
-                    // caught by the response.created gate below
+                    // gate each generation trigger; with a turn already admitted it relays ungated
+                    // —
+                    // upstream rejects the duplicate and a raced accept is caught by the
+                    // response.created gate
                     if is_response_create(&frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
@@ -862,9 +845,7 @@ async fn realtime_bridge(
                 }
             },
             m = up_rx.next() => {
-                // text and binary frames are parsed alike so a vendor encoding
-                // its JSON events as binary can't bypass settlement or DLP;
-                // non-JSON binary (audio) relays unchanged, suppress-gated
+                // text and binary parse alike so binary-encoded JSON can't bypass settlement or DLP
                 let (frame, was_text, raw_text, raw_bytes) = match m {
                     Some(Ok(UMsg::Text(t))) => {
                         (serde_json::from_str::<Value>(&t).ok(), true, Some(t), None)
@@ -892,8 +873,8 @@ async fn realtime_bridge(
                                 suppress = false;
                             }
                         }
-                        // server-VAD: OpenAI auto-starts a turn with no client
-                        // response.create — gate it here like a manual one
+                        // server-VAD auto-starts a turn with no client response.create — gate it
+                        // like a manual one
                         else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
@@ -909,8 +890,8 @@ async fn realtime_bridge(
                                 }
                             }
                         } else if let Some((it, ot)) = realtime_usage(&account.provider, &v) {
-                            // turn boundary — settle the admitted turn;
-                            // a boundary with no gated turn bills unreserved
+                            // turn boundary: settle the admitted turn; one with no gated turn bills
+                            // unreserved
                             match pending.take() {
                                 Some(turn) if it.saturating_add(ot) > 0 => {
                                     bill_realtime_turn(
@@ -931,8 +912,7 @@ async fn realtime_bridge(
                                     settle_realtime_abort(turn, &rtm, mt, &account.name).await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
-                                    // re-authenticate so billing uses the key's current
-                                    // identity, not the stale handshake snapshot
+                                    // re-authenticate so billing uses the key's current identity
                                     let snap = s.handler.config.load();
                                     let billed = snap
                                         .state
@@ -969,8 +949,8 @@ async fn realtime_bridge(
                             recognized += 1;
                             turn_ended = true;
                         }
-                        // outbound DLP, per frame (a span straddling deltas is
-                        // beyond a relay that cannot buffer)
+                        // outbound DLP per frame: a span straddling deltas is beyond an unbuffered
+                        // relay
                         let n = if relay {
                             gw_handler::plugins::dlp_redact_realtime_frame(
                                 s.handler.cfg().security_for(&ak.tenant),
@@ -991,7 +971,8 @@ async fn realtime_bridge(
                             });
                             output_units = output_units.saturating_add(opaque as i64);
                         }
-                        // per-token events would be too hot: sum the turn, record once at its boundary
+                        // per-token events would be too hot: sum the turn, record once at its
+                        // boundary
                         out_redacted += n as i64;
                         if turn_ended {
                             flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
@@ -1030,8 +1011,7 @@ async fn realtime_bridge(
     if let Some(turn) = pending {
         settle_realtime_abort(turn, &rtm, mt, &account.name).await;
     }
-    // a turn aborted before its boundary (upstream drop) still applied its
-    // redactions per frame — flush the pending count so the audit isn't lost
+    // a turn aborted before its boundary still redacted per frame — flush the count for the audit
     flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
     if generations > 0 && recognized == 0 {
         tracing::warn!(
@@ -1169,10 +1149,8 @@ fn user_header(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The one request-metadata attribution precedence the REST surfaces apply:
-/// `x-gw-user` header, else the dialect's own user field (OpenAI `user`,
-/// Anthropic `metadata.user_id`). Batch items invert it — per-item `user`
-/// first — so shared-key batches keep per-item attribution.
+/// The REST attribution precedence: `x-gw-user` header, else the dialect's own
+/// user field (batch items invert it — per-item `user` first).
 fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
     user_header(headers).or_else(|| field.as_str().map(str::to_owned))
 }
@@ -1215,10 +1193,8 @@ fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
     }
 }
 
-/// [`authenticate`] as an extractor, for the surfaces sharing the
-/// OpenAI-shaped error; `messages` (Anthropic error shape) and `realtime_ws`
-/// (subprotocol fallback) run their own. Runs before the body extractor, so
-/// an unauthenticated payload is never parsed.
+/// [`authenticate`] as an extractor for the OpenAI-error surfaces; runs before
+/// the body extractor so an unauthenticated payload is never parsed.
 struct Authed(AkInfo);
 
 impl axum::extract::FromRequestParts<AppState> for Authed {
@@ -1235,9 +1211,8 @@ impl axum::extract::FromRequestParts<AppState> for Authed {
     }
 }
 
-/// The shared body behind [`ApiJson`]/[`AnthJson`]: delegate to `axum::Json`
-/// and render the rejection through the surface's own envelope, so a
-/// malformed body (400/413/415/422) cannot escape the contract.
+/// The shared body behind [`ApiJson`]/[`AnthJson`]: `axum::Json` with the
+/// rejection rendered through the surface's own envelope.
 async fn extract_json<T, S>(
     req: axum::extract::Request,
     state: &S,
@@ -1429,10 +1404,8 @@ async fn flush_rt_out_dlp(s: &AppState, ak: &AkInfo, hint: &str, count: i64) {
     }
 }
 
-/// The full inbound content policy for one realtime frame — the same chain
-/// every REST surface runs (scan + hit events, moderation, DLP + event),
-/// shared by both WebSocket paths. `Err(reason)` denies the frame; `Ok(n)` is
-/// the DLP redaction count (n > 0 means the frame was rewritten).
+/// The REST inbound content chain (scan, moderation, DLP) on one realtime frame;
+/// `Err(reason)` denies it, `Ok(n)` is the redaction count (n > 0 = rewritten).
 async fn rt_inbound_policy(
     s: &AppState,
     ak: &AkInfo,
@@ -1503,11 +1476,9 @@ async fn emit_rt_hits(
     }
 }
 
-/// The caller IP for the admin audit trail, resolved at request entry — before
-/// any config mutation the handler performs — so the op that flips
-/// `trust_proxy_headers` is audited under the policy in effect when it
-/// arrived, not the one it just installed. Empty when the router is driven
-/// without connect info (the test harness).
+/// The caller IP for the admin audit trail, resolved at entry so an op that
+/// flips `trust_proxy_headers` is audited under the policy it arrived with;
+/// empty without connect info (the test harness).
 struct AuditSourceIp(String);
 
 impl axum::extract::FromRequestParts<AppState> for AuditSourceIp {
@@ -1529,10 +1500,8 @@ impl axum::extract::FromRequestParts<AppState> for AuditSourceIp {
     }
 }
 
-/// The caller IP for the audit trail. Roots at the real TCP `peer`, which a
-/// client cannot forge. Only when `trust_proxy` is set (a trusted proxy fronts
-/// the gateway) does it read `x-real-ip`, then the RIGHTMOST `x-forwarded-for`
-/// hop (the one that proxy appended) — never the leftmost, which a client forges.
+/// The audit caller IP: the TCP `peer` unless `trust_proxy`, then `x-real-ip` or
+/// the RIGHTMOST `x-forwarded-for` hop (the leftmost is client-forgeable).
 fn source_ip(peer: Option<std::net::SocketAddr>, headers: &HeaderMap, trust_proxy: bool) -> String {
     if trust_proxy {
         if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
@@ -1574,10 +1543,9 @@ async fn audit_admin(
     }
 }
 
-/// Admin gate: the global token is checked first (a colliding tenant token
-/// grants global, never the reverse), then each tenant's token. 404 while no
-/// admin token is configured, so probing can't tell the surface from a
-/// nonexistent route.
+/// Admin gate: global token first (a colliding tenant token grants global, never
+/// the reverse), then tenant tokens; 404 while none is configured so probing
+/// cannot tell the surface from a missing route.
 #[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
 fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, Response> {
     let cfg = s.handler.cfg();
@@ -1726,8 +1694,7 @@ async fn admin_key_create(
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
-    // same ban as config load: a ':' would collide with the prefixed
-    // governance keyspaces (`abuse:{ak}` could force-suspend another key)
+    // same ban as config load: a ':' would collide with the prefixed governance keyspaces
     if ak.is_empty() || ak.contains(':') {
         return error_response(400, "ak must be non-empty and must not contain ':'");
     }
@@ -2003,8 +1970,8 @@ async fn admin_config_rollback(
         Ok(None) => return error_response(404, format!("config version {source_id} not found")),
         Err(e) => return gateway_error(e),
     };
-    // a retained document can predate stricter validation — republishing it
-    // unvalidated would brick peers' reloads and fresh boots
+    // a retained document can predate stricter validation; republished unvalidated it would brick
+    // reloads
     if let Err(e) = GatewayConfig::from_yaml(&yaml) {
         return error_response(
             400,
@@ -2054,8 +2021,7 @@ async fn admin_key_list(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     if let Some(ak) = q.get("ak") {
-        // exact lookup: an uncovered key answers an empty page, not 404, so a
-        // tenant admin cannot probe foreign key existence through the filter
+        // an uncovered key answers an empty page, not 404, so foreign keys cannot be probed
         let keys: Vec<Value> = s
             .handler
             .state()
@@ -2088,10 +2054,8 @@ async fn admin_key_list(
     Json(resp).into_response()
 }
 
-/// GET /admin/models/status — per-model availability over the configured
-/// window, judged from minute-bucketed success/error counts (REST terminal
-/// outcomes; realtime samples per billed turn and on session-fatal upstream
-/// errors). A tenant admin sees only its entitled models.
+/// GET /admin/models/status — per-model availability over the configured window
+/// from minute-bucketed success/error counts; a tenant admin sees its entitled models.
 async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Response {
     let cfg = s.handler.cfg();
     let st = &cfg.stability;
@@ -2149,9 +2113,8 @@ async fn admin_usage(
     Json(json!({ "usage": usage })).into_response()
 }
 
-/// GET /admin/usage/users?user=&since=&until= — precise per-user cost over a
-/// billing period, grouped by (user, requested model). Tenant-scoped like
-/// [`admin_usage`]; `since`/`until` are unix seconds (default: all time).
+/// GET /admin/usage/users?user=&since=&until= — per-user cost by (user, requested
+/// model); tenant-scoped like [`admin_usage`], bounds in unix seconds.
 async fn admin_usage_users(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -2265,10 +2228,8 @@ async fn admin_usage_series(
     .into_response()
 }
 
-/// A CSV field, RFC-4180 quoted AND neutralized against spreadsheet formula
-/// injection: a field opening with a formula trigger (`= + - @` / tab / CR) is
-/// prefixed with `'` so Excel/Sheets treat it as text (the value is
-/// attacker-controlled — it can carry a user id).
+/// A CSV field, RFC-4180 quoted and neutralized against spreadsheet formula
+/// injection (`= + - @` / tab / CR openers get a `'` prefix; the value can carry a user id).
 fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
     let needs_prefix = s
         .chars()
@@ -2330,9 +2291,8 @@ fn unsealed_content(sealed: bool, content: String) -> Value {
     }
 }
 
-/// GET /admin/audit/content/{request_id} — the retained prompt/response/terminal rows
-/// for one request, unsealed when the content key is present (a sealed row
-/// without it returns `content: null`). Tenant-scoped like the other reads.
+/// GET /admin/audit/content/{request_id} — one request's retained rows, unsealed
+/// when the content key is present (else `content: null`); tenant-scoped.
 async fn admin_content_get(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -2362,10 +2322,8 @@ async fn admin_content_get(
     Json(json!({ "request_id": request_id, "entries": entries })).into_response()
 }
 
-/// GET /admin/audit/content?user=&limit=&include= — retained-content rows for
-/// one end user, newest first; metadata only unless `include=bodies`, which
-/// inlines each row's unsealed content (`null` when the seal key is absent,
-/// as on the per-request read). Tenant-scoped exactly like the erase below.
+/// GET /admin/audit/content?user=&limit=&include= — one end user's retained rows,
+/// newest first, metadata only unless `include=bodies`; tenant-scoped like the erase.
 async fn admin_content_list(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -2406,12 +2364,9 @@ async fn admin_content_list(
     }
 }
 
-/// DELETE /admin/audit/content?user= — erase every retained trace of one end
-/// user's content (the GDPR/PIPL right-to-erasure hook): retained rows, batch
-/// result messages, leftover terminal batch inputs. Tenant-scoped; the
-/// `content_erase` audit entry commits with the deletion, so a recorded
-/// success can't separate from it. Ledger rows and security events carry no
-/// content and are kept.
+/// DELETE /admin/audit/content?user= — the right-to-erasure hook: retained rows,
+/// batch result messages and terminal batch inputs go, the audit entry commits
+/// with the deletion; content-free ledger rows and security events stay.
 async fn admin_content_erase(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -2444,9 +2399,8 @@ async fn admin_content_erase(
     }
 }
 
-/// OpenAI-envelope rendering of an internal error: classified, never a
-/// status passthrough — a terminal vendor 401 lands as 424 ModelError, not
-/// as the client's own 401.
+/// OpenAI-envelope rendering of an internal error: classified, never a status
+/// passthrough (a terminal vendor 401 lands as 424 ModelError).
 fn gateway_error(e: GatewayError) -> Response {
     let Some(class) = ErrClass::classify(e.code, e.http_status) else {
         return bare_status(e.http_status);
@@ -2550,10 +2504,9 @@ fn finish_anthropic(fr: String) -> String {
     }
 }
 
-/// The OpenAI wire usage. When the normalized parts are known they rebuild the
-/// totals — OpenAI counts cached reads inside `prompt_tokens` and reasoning
-/// inside `completion_tokens`, while an Anthropic engine reports cache tokens
-/// OUTSIDE `input_tokens` — so the details always stay subsets of the totals.
+/// The OpenAI wire usage: known normalized parts rebuild the totals (OpenAI
+/// counts cached reads inside `prompt_tokens`, Anthropic outside `input_tokens`)
+/// so the details always stay subsets.
 fn openai_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) -> Usage {
     let (pt, ct, tt) = u.map_or((pt, ct, tt), |d| {
         let (p, c) = (d.prompt_total(), d.completion_total());
@@ -2576,10 +2529,9 @@ fn openai_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) ->
     }
 }
 
-/// The Anthropic wire usage: cache tokens ride OUTSIDE `input_tokens`. When
-/// the normalized parts are known they rebuild input/output — an OpenAI
-/// engine's `prompt_tokens` already contains its cached reads, and passing it
-/// through next to `cache_read_input_tokens` would double-count them.
+/// The Anthropic wire usage: cache tokens ride OUTSIDE `input_tokens`, so known
+/// normalized parts rebuild input/output (an OpenAI `prompt_tokens` already
+/// contains its cached reads).
 fn anthropic_usage(pt: i64, ct: i64, u: Option<gw_models::CommonUsage>) -> AnthUsage {
     match u {
         Some(u) => AnthUsage {
@@ -2597,9 +2549,8 @@ fn anthropic_usage(pt: i64, ct: i64, u: Option<gw_models::CommonUsage>) -> AnthU
     }
 }
 
-/// The Responses wire usage: like OpenAI, cached reads count inside
-/// `input_tokens` and reasoning inside `output_tokens`, so the normalized
-/// parts rebuild the totals and the details stay subsets.
+/// The Responses wire usage: cached reads inside `input_tokens`, reasoning inside
+/// `output_tokens`, rebuilt from the normalized parts like [`openai_usage`].
 fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) -> Value {
     let Some(u) = u else {
         return json!({"input_tokens": pt, "output_tokens": ct, "total_tokens": tt});
@@ -2616,9 +2567,8 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
     usage
 }
 
-/// The chat surface's reasoning request: OpenAI's flat `reasoning_effort`, or
-/// OpenRouter's `reasoning{effort, max_tokens, enabled}` (`enabled` alone means
-/// the vendor's default depth; `enabled: false` turns it off).
+/// The chat surface's reasoning request: OpenAI's flat `reasoning_effort` or
+/// OpenRouter's `reasoning{effort, max_tokens, enabled}`.
 fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Box<ReasoningParam>> {
     let mut param = ReasoningParam {
         effort,
@@ -2769,11 +2719,9 @@ async fn chat_completions(
     terminal_response(&ctx, response).await
 }
 
-/// Run the pipeline on its own task, forwarding stream chunks through a bounded
-/// channel (the backpressure seam); a final chunk carries the usage totals.
-/// Outbound DLP forces buffering — a masked span may straddle deltas — so the
-/// tail is then synthesized from the already-redacted final message instead of
-/// the raw decoded deltas.
+/// Run the pipeline on its own task, forwarding chunks through a bounded channel;
+/// under outbound DLP the tail is synthesized from the redacted final message
+/// (a masked span may straddle deltas).
 fn spawn_stream_pipeline(
     s: &AppState,
     mut request: GatewayRequest,
@@ -2847,8 +2795,7 @@ fn spawn_stream_pipeline(
                 }
             }
             Err(e) => {
-                // 499 client-closed classifies to None: the peer is gone and
-                // no frame is rendered.
+                // 499 client-closed classifies to None: the peer is gone, no frame is rendered
                 if let Some(error) = gw_models::StreamError::from_error(e) {
                     let _ = tx
                         .send(gw_engines::StreamChunk {
@@ -3033,9 +2980,8 @@ fn text_chunks(resp: &mut gw_models::GatewayResponse) -> Vec<gw_engines::StreamC
     chunks
 }
 
-/// A native event's type as its SSE event name. An upstream-controlled name
-/// that is missing or CR/LF-bearing cannot become one (axum asserts): the
-/// caller drops the frame and keeps the stream alive.
+/// A native event's type as its SSE event name; a missing or CR/LF-bearing name
+/// cannot become one (axum asserts), so the caller drops that frame.
 fn native_event_kind(event: &Value) -> Option<&str> {
     event["type"]
         .as_str()
@@ -3285,9 +3231,8 @@ fn anthropic_tool_blocks(tool_calls: Option<Value>) -> Vec<Value> {
     }
 }
 
-/// Streaming /v1/messages as the anthropic event sequence. message_start goes
-/// out before usage is known (input_tokens 0); the final message_delta carries
-/// the real counts, which SDKs accumulate from.
+/// Streaming /v1/messages as the anthropic event sequence; message_start goes
+/// out with input_tokens 0 and the final message_delta carries the real counts.
 fn messages_stream_response(
     s: AppState,
     request: GatewayRequest,
@@ -3600,10 +3545,8 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
     }
 }
 
-/// The engine's native payload; a blocked outcome is the client's 400.
-/// A pre-stage content block answers 400 with the block message — these
-/// surfaces have no in-band content_filter shape, and falling through would
-/// misreport the block as an engine failure.
+/// The engine's native payload; a content block answers 400 with the block
+/// message (these surfaces have no in-band content_filter shape).
 fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
@@ -3723,9 +3666,8 @@ async fn responses(
     terminal_response(&ctx, response).await
 }
 
-/// Streaming /v1/responses: the vendor's event sequence forwarded verbatim; a
-/// synthesized created/delta/completed sequence only for a buffered non-native
-/// reply. Live for real vendors, buffered-then-redacted when outbound DLP is on.
+/// Streaming /v1/responses: the vendor's events verbatim, a synthesized
+/// created/delta/completed sequence only for a buffered non-native reply.
 fn responses_stream_response(
     s: AppState,
     request: GatewayRequest,
@@ -3767,8 +3709,8 @@ fn responses_stream_response(
                 }) => {
                     let err = *err;
                     self.ensure_created();
-                    // the official Responses error event is flat: no nested
-                    // `error` object, sequence_number continues the stream
+                    // the Responses error event is flat (no nested `error`); sequence_number
+                    // continues
                     self.queue.push_back(
                         Event::default().event("error").data(
                             json!({
@@ -4283,16 +4225,14 @@ async fn files_get(
     }
 }
 
-/// DELETE /v1/files/{id} — remove an uploaded file (OpenAI-compatible). Files
-/// are tenant-owned assets; erasing one end user's rows inside an uploaded
-/// JSONL is the tenant's call — delete the file and re-upload if needed.
+/// DELETE /v1/files/{id} — remove an uploaded file; files are tenant-owned, so
+/// per-user erasure inside a JSONL is the tenant's call.
 async fn files_delete(
     State(s): State<AppState>,
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    // one guarded delete — a check-then-delete pair would race a concurrent
-    // delete + id reuse into removing another tenant's file
+    // one guarded delete: check-then-delete would race id reuse into another tenant's file
     match s.handler.state().store.file_delete(&id, &ak.tenant).await {
         Ok(true) => Json(json!({"id": id, "object": "file", "deleted": true})).into_response(),
         Ok(false) => error_response(404, format!("file {id} not found")),

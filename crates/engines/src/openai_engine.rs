@@ -21,8 +21,8 @@ impl OpenAiEngine {
         let mut out = Vec::new();
         for m in std::mem::take(&mut self.base.request.message) {
             match m.parts {
-                // a Messages-surface turn: thinking, tool_use and tool_result
-                // blocks have OpenAI counterparts of their own
+                // a Messages-surface turn: its thinking/tool_use/tool_result blocks have OpenAI
+                // counterparts
                 Some(Value::Array(parts)) if parts.iter().any(is_native_block) => {
                     native_turn(&m.role, parts, m.reasoning_content, &mut out);
                 }
@@ -64,8 +64,7 @@ impl OpenAiEngine {
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), messages);
         body.insert("stream".into(), self.base.request.stream.into());
-        // OpenAI omits usage from streamed responses UNLESS this is set — without
-        // it every streaming call would bill 0 tokens.
+        // without this OpenAI omits usage from streams and every streaming call bills 0
         if self.base.request.stream {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
@@ -80,8 +79,8 @@ impl OpenAiEngine {
             }
             put!("temperature", p.temperature);
             put!("top_p", p.top_p);
-            // OpenAI's reasoning families take max_completion_tokens (max_tokens
-            // is a 400); compatible vendors know max_tokens
+            // OpenAI's reasoning families 400 on max_tokens; compatible vendors know only
+            // max_tokens
             if reasoning_model {
                 put!("max_completion_tokens", p.max_tokens);
             } else {
@@ -109,8 +108,7 @@ impl OpenAiEngine {
                 body.insert("response_format".into(), v);
             }
             if let Some(s) = p.system {
-                // openai surface's system goes through messages; injected here for
-                // cross-protocol (anthropic→openai family) requests
+                // a cross-protocol (anthropic→openai) request carries its system outside messages
                 let mut system = Map::with_capacity(2);
                 system.insert("role".into(), "system".into());
                 system.insert("content".into(), Value::String(s));
@@ -126,7 +124,7 @@ impl OpenAiEngine {
 
         Ok(UpstreamRequest {
             protocol,
-            method: "POST".to_owned(),
+            method: "POST",
             url: self
                 .base
                 .openai_url("mock://api.openai.com", "chat/completions"),
@@ -285,9 +283,8 @@ fn apply_sse_event(
     Ok(chunks)
 }
 
-/// OpenAI streams tool calls as fragments keyed by `index`: the first fragment
-/// of a call carries id/type/function.name, later ones append to
-/// function.arguments. Overwriting would keep only the last fragment.
+/// Merge one `index`-keyed tool-call fragment: the first carries id/type/name,
+/// later ones append to `function.arguments`.
 pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
     let Some(frags) = fragment.as_array() else {
         return;
@@ -378,9 +375,8 @@ fn reemit_withheld_arguments(acc: Option<&mut Value>) -> Option<StreamChunk> {
     })
 }
 
-/// Tool definitions in the OpenAI wire shape. Cross-protocol requests carry
-/// anthropic-shaped defs ({name, description, input_schema}) — wrap those into
-/// the function envelope; native defs pass through.
+/// Tool definitions in the OpenAI wire shape: anthropic-shaped defs are wrapped
+/// into the function envelope, native defs pass through.
 fn normalize_tools_openai(tools: Value) -> Value {
     let arr = match tools {
         Value::Array(arr) => arr,
@@ -407,11 +403,9 @@ fn normalize_tools_openai(tools: Value) -> Value {
     )
 }
 
-/// The request's `reasoning_effort`: the client's own, else derived from an
-/// Anthropic-dialect request — `output_config.effort` (same vocabulary), a
-/// `thinking` budget, or an OpenRouter budget. `adaptive` without an effort
-/// and `disabled` leave the vendor default (`none` is not accepted by every
-/// reasoning model).
+/// The request's `reasoning_effort`: the client's own, else derived from
+/// `output_config.effort`, a `thinking` budget or an OpenRouter budget;
+/// `adaptive` without an effort and `disabled` leave the vendor default.
 fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
     if let Some(effort) = reasoning.effort {
         return Some(effort);
@@ -448,11 +442,9 @@ fn is_native_block(block: &Value) -> bool {
         )
 }
 
-/// A Messages-surface turn on the OpenAI wire: an assistant turn's thinking
-/// blocks fold into `reasoning_content` (unless the client sent one) and its
-/// `tool_use` blocks become `tool_calls`; a user turn's `tool_result` blocks
-/// become `role: tool` messages ahead of whatever else it carried; `image`
-/// blocks become `image_url` parts.
+/// A Messages-surface turn on the OpenAI wire: thinking → `reasoning_content`,
+/// `tool_use` → `tool_calls`, `tool_result` → leading `role: tool` messages,
+/// `image` → `image_url` parts.
 fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &mut Vec<Value>) {
     let mut msg = Map::new();
     msg.insert("role".into(), role.into());
@@ -493,8 +485,7 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
             out.push(Value::Object(result));
         }
     }
-    // OpenAI: content is null only on a tool-call turn; a turn left with
-    // neither is dropped
+    // content is null only on a tool-call turn; a turn left with neither is dropped
     if content.is_empty() {
         if !msg.contains_key("tool_calls") {
             return;

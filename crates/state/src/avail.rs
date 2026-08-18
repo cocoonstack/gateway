@@ -56,9 +56,8 @@ pub fn classify(
     }
 }
 
-/// Minute-bucket availability store. `record` runs on the claim path and must
-/// stay network-free; the flush task calls `flush` so a buffering backend can
-/// drain (sub-period skew across a minute boundary is accepted).
+/// Minute-bucket availability store; `record` runs on the claim path and stays
+/// network-free, the flush task drains a buffering backend.
 #[async_trait]
 pub trait AvailStore: Send + Sync + std::fmt::Debug {
     fn record(&self, model: &str, ok: bool);
@@ -109,9 +108,8 @@ impl AvailStore for MemoryAvail {
     }
 }
 
-/// Fleet-shared buckets: samples buffer in-process and every instance's flush
-/// increments the same keys. A Redis outage drops the increment —
-/// availability is advisory, matching the governance fail-open posture.
+/// Fleet-shared buckets: samples buffer in-process, every instance's flush
+/// increments the same keys; a Redis outage drops the increment (advisory data).
 pub struct RedisAvail {
     conn: redis::aio::ConnectionManager,
     buffer: DashMap<String, (u64, u64)>,

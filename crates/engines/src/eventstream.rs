@@ -159,9 +159,8 @@ pub fn to_sse(
     }))
 }
 
-/// The model frame inside an InvokeModel `chunk` payload; a Converse event
-/// (no `bytes`) is forwarded with its `:event-type` injected as `type`, since
-/// the frame itself does not say which event it is.
+/// The model frame inside an InvokeModel `chunk`; a Converse event (no `bytes`)
+/// gets its `:event-type` injected as `type`.
 fn chunk_bytes(payload: &[u8], event_type: &str) -> Result<Vec<u8>, StreamFault> {
     let mut v: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(v) => v,

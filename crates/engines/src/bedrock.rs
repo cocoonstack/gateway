@@ -8,20 +8,19 @@ use serde_json::Value;
 
 use crate::base::Base;
 use crate::sigv4::{SigV4Params, sign};
-use crate::transport::{HeaderMap, UpstreamBody, UpstreamResponse};
+use crate::transport::{HeaderMap, Headers, UpstreamBody, UpstreamResponse};
 
 /// Deterministic SigV4 date for the mock round; live calls stamp now.
 const MOCK_AMZ_DATE: &str = "20250101T000000Z";
 
-/// SigV4 headers for a bedrock-style call. `creds` = real `(access_key, secret_key)`
-/// at go-live (from the account's env-var pair), else the inert mock credentials.
-/// The region is the endpoint host's (`bedrock-runtime.<region>.amazonaws.com`).
+/// SigV4 headers for a bedrock-style call: real `creds` at go-live, else the
+/// inert mock pair; the region is parsed from the endpoint host.
 pub(crate) fn aws_headers(
     host: &str,
     uri: &str,
     payload: &[u8],
     creds: Option<(&str, &str)>,
-) -> Vec<(String, String)> {
+) -> Headers {
     let stamped;
     let amz_date = match creds {
         Some(_) => {
@@ -50,12 +49,11 @@ pub(crate) fn aws_headers(
         payload,
     });
     vec![
-        ("host".into(), host.into()),
-        ("x-amz-date".into(), amz_date.into()),
-        ("authorization".into(), authorization),
-        // Bedrock InvokeModel requires accept; content-type is unsigned and
-        // added by the caller.
-        ("accept".into(), "application/json".into()),
+        ("host", host.into()),
+        ("x-amz-date", amz_date.into()),
+        ("authorization", authorization),
+        // InvokeModel requires accept; content-type is unsigned and added by the caller
+        ("accept", "application/json".into()),
     ]
 }
 
@@ -116,11 +114,8 @@ fn canonical_uri(path: &str) -> String {
     out
 }
 
-/// One Bedrock InvokeModel[WithResponseStream] call: host + scheme from the
-/// account endpoint at go-live (else the mock sentinel); SigV4 signs this same
-/// host so URL and signature agree. Raw extras merge before signing so the
-/// signature covers the exact bytes sent — and the body serializes once. A
-/// streamed reply comes back already re-framed as SSE `data:` lines.
+/// One InvokeModel[WithResponseStream] call: SigV4 signs the exact bytes sent
+/// (extras merged first, body serialized once); a stream comes back re-framed as SSE.
 pub(crate) async fn bedrock_send(
     base: &mut Base,
     model: &str,
@@ -146,9 +141,9 @@ pub(crate) async fn bedrock_send_uri(
     let payload = crate::base::body_bytes(&body)?;
     let mut headers = match base.bedrock_bearer() {
         Some(token) => vec![
-            ("host".into(), host.to_owned()),
-            ("authorization".into(), format!("Bearer {token}")),
-            ("accept".into(), "application/json".into()),
+            ("host", host.to_owned()),
+            ("authorization", format!("Bearer {token}")),
+            ("accept", "application/json".into()),
         ],
         None => {
             let creds = base.aws_credentials();
@@ -162,7 +157,7 @@ pub(crate) async fn bedrock_send_uri(
             )
         }
     };
-    headers.push(("content-type".into(), "application/json".into()));
+    headers.push(("content-type", "application/json".into()));
     let mut reply = base
         .send_bytes(&format!("{root}{uri}"), headers, payload, stream)
         .await?;
@@ -216,9 +211,8 @@ pub(crate) async fn bedrock_invoke(
     Ok((status, v, headers))
 }
 
-/// Bedrock stamps every InvokeModel reply with the billed token counts; the
-/// bodies carry them only for some families (Llama yes, Command R only when
-/// streaming), so the headers win when present.
+/// Bedrock stamps every InvokeModel reply with the billed counts while only some
+/// family bodies carry them, so the headers win when present.
 pub(crate) fn bedrock_header_usage(headers: &HeaderMap, body: (i64, i64)) -> (i64, i64) {
     let count = |name: &str| {
         headers
@@ -256,9 +250,9 @@ mod tests {
             b"{}",
             Some(("AKIDEXAMPLE", "secret")),
         );
-        let auth = &live.iter().find(|(k, _)| k == "authorization").unwrap().1;
+        let auth = &live.iter().find(|(k, _)| *k == "authorization").unwrap().1;
         assert!(auth.contains("/eu-west-1/bedrock/aws4_request"), "{auth}");
-        let date = &live.iter().find(|(k, _)| k == "x-amz-date").unwrap().1;
+        let date = &live.iter().find(|(k, _)| *k == "x-amz-date").unwrap().1;
         assert_ne!(date, MOCK_AMZ_DATE);
     }
 }
