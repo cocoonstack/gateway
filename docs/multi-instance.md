@@ -56,7 +56,9 @@ config fleet-wide, `PUT /admin/config` (global admin token) on any instance:
 the document is validated, stored as a new version, and every instance —
 including the publisher — reloads through the store's change feed, atomically
 and with no dropped connections. `SIGHUP` and `POST /admin/reload` still
-re-read the source for single-node or file-based setups.
+re-read the source for single-node or file-based setups. Because the stored
+document includes `listen`, give each instance its own port with `GW_PORT`
+(and `GW_HOST`) rather than a per-instance file.
 
 Access keys are higher-churn and have their own seam: `/admin/keys` CRUD
 writes the shared Postgres key table directly (no config publish needed); a

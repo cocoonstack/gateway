@@ -150,3 +150,26 @@ curl -s localhost:8080/v1/chat/completions \
 Add a second provider (`kind: anthropic`, `kind: deepseek`, …) and more
 `models:` to route several vendors through one gateway. See
 [Providers](providers.md) and [Configuration](configuration.md).
+
+## Claude on AWS Bedrock
+
+```yaml
+accounts:
+  - {name: bedrock, provider: aws, endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
+     api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-llama"]}
+models:
+  - {name: us.anthropic.claude-sonnet-4-5-20250929-v1:0, protocol: aws-anthropic, prompt_cache: true}
+  - {name: us.meta.llama3-3-70b-instruct-v1:0, protocol: aws-llama}
+```
+
+```bash
+export AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-...   # or AWS_ACCESS_KEY_ID + secret_key_env
+curl -s localhost:8080/v1/chat/completions \
+  -H 'authorization: Bearer ak-live' -H 'content-type: application/json' \
+  -d '{"model":"us.anthropic.claude-sonnet-4-5-20250929-v1:0","stream":true,"reasoning_effort":"low",
+       "messages":[{"role":"user","content":"What is 17*23?"}]}'
+```
+
+The same request shapes as any other model: reasoning comes back as
+`reasoning_content` + signed `reasoning_details`, tools and thinking replay
+through the loop, and `/v1/messages` speaks to it natively.
