@@ -20,21 +20,30 @@ invisible next to it.
 
 | Surface | Body | Concurrency | Requests/s | p50 | p99 |
 |---|---|---:|---:|---:|---:|
-| `/v1/chat/completions` | 1-turn, ~90 B | 64 | 98,000 | 0.62 ms | 1.30 ms |
-| `/v1/chat/completions` | 1-turn, ~90 B | 256 | 99,300 | 2.40 ms | 5.78 ms |
-| `/v1/chat/completions` | 1-turn, ~90 B | 1024 | 93,500 | 9.40 ms | 29.3 ms |
-| `/v1/chat/completions` `stream: true` | 1-turn, SSE (3 frames + `[DONE]`) | 256 | 69,300 | 3.45 ms | 8.83 ms |
-| `/v1/chat/completions` | 16-turn prose, 52 KB, ~13k tokens reserved | 64 | 54,200 | 1.09 ms | 2.57 ms |
-| `/v1/chat/completions` | 16-turn prose, 52 KB, ~13k tokens reserved | 256 | 40,600 | 5.97 ms | 14.6 ms |
-| `/v1/messages` | 1-turn | 256 | 91,700 | 2.54 ms | 7.58 ms |
-| `/v1/messages` `stream: true` | 1-turn, SSE | 256 | 61,200 | 3.90 ms | 10.2 ms |
-| `/v1/embeddings` | 1 input | 256 | 94,000 | 2.49 ms | 6.27 ms |
+| `/v1/chat/completions` | 1-turn, ~90 B | 64 | 92,800 | 0.64 ms | 1.53 ms |
+| `/v1/chat/completions` | 1-turn, ~90 B | 256 | 89,400 | 2.56 ms | 8.22 ms |
+| `/v1/chat/completions` | 1-turn, ~90 B | 1024 | 92,900 | 9.78 ms | 30.8 ms |
+| `/v1/chat/completions` `stream: true` | 1-turn, SSE (3 frames + `[DONE]`) | 256 | 68,400 | 3.47 ms | 8.72 ms |
+| `/v1/chat/completions` | 16-turn prose, 52 KB, ~13k tokens reserved | 64 | 41,000 | 1.51 ms | 3.17 ms |
+| `/v1/chat/completions` | 16-turn prose, 52 KB, ~13k tokens reserved | 256 | 40,200 | 6.01 ms | 14.5 ms |
+| `/v1/messages` | 1-turn | 256 | 91,700 | 2.57 ms | 6.86 ms |
+| `/v1/messages` `stream: true` | 1-turn, SSE | 256 | 60,400 | 3.79 ms | 13.3 ms |
+| `/v1/embeddings` | 1 input | 256 | 90,000 | 2.53 ms | 8.56 ms |
+
+Run-to-run spread on the same host is about ±5 % on throughput and wider on
+p99 (an earlier run of the same table on a quieter machine read 99k requests/s
+at p99 5.8 ms for the 256-concurrency chat row); compare rows within one run,
+not across days. The 2026-08-18 hygiene round was measured A/B against the
+pre-round binary under identical conditions: every row within ±4 % (chat 256:
+88.2k → 89.4k; 52 KB 256: 39.7k → 40.2k; embeddings 93.4k → 90.0k), no
+directional change.
 
 In-process (router driven directly, no sockets — `crates/server/tests/bench.rs`):
-serial p50 24 µs / p99 34 µs per chat request, ~194,000 requests/s with 64
-workers.
+serial p50 25 µs / p99 34 µs per chat request (52.5 ms per 2,000), ~202,000
+requests/s with 64 workers; the 48 KB-body request clone the CallEngine node
+pays costs ~4–5 µs.
 
-Read as capacity: ~6 M requests/minute on small bodies and ~2.4 M/minute on
+Read as capacity: ~5.5 M requests/minute on small bodies and ~2.4 M/minute on
 52 KB bodies per node — at the 52 KB shape that is ~2 GB/s of request bodies
 and roughly 5×10⁸ reserved tokens/s (3×10¹⁰ tokens/minute) through the
 counting, admission and billing path. Any vendor's rate limits and generation
