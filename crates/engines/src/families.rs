@@ -855,8 +855,7 @@ impl ResponsesEngine {
     }
 
     /// Chat/Messages-surface turns as Responses `input` items (tool calls and
-    /// results as `function_call` / `function_call_output`), the typed chat
-    /// params under their Responses names, `stream` from the request.
+    /// results as `function_call` / `function_call_output`) plus the typed params.
     fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) {
         let system = self.base.system_text();
         if !system.is_empty() {
@@ -868,45 +867,52 @@ impl ResponsesEngine {
                 continue;
             }
             if m.role == gw_consts::role::TOOL {
-                input.push(json!({"type": "function_call_output",
-                    "call_id": m.tool_call_id.unwrap_or_default(), "output": m.content}));
+                input.push(function_call_output(
+                    m.tool_call_id.unwrap_or_default().into(),
+                    m.content,
+                ));
                 continue;
             }
-            let (role, mut calls, mut results) = (
-                if m.role == gw_consts::role::AI {
-                    "assistant"
-                } else {
-                    "user"
-                },
-                Vec::new(),
-                Vec::new(),
-            );
+            let role = if m.role == gw_consts::role::AI {
+                "assistant"
+            } else {
+                "user"
+            };
+            let mut calls = Vec::new();
             if let Some(Value::Array(blocks)) = m.parts {
                 for mut block in blocks {
                     match block["type"].as_str() {
-                        Some("tool_use") => calls.push(json!({"type": "function_call",
-                            "call_id": block["id"].take(), "name": block["name"].take(),
-                            "arguments": block["input"].take().to_string()})),
-                        Some("tool_result") => results.push(json!({"type": "function_call_output",
-                        "call_id": block["tool_use_id"].take(),
-                        "output": match block["content"].take() {
-                            Value::String(s) => s,
-                            Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts),
-                            _ => String::new(),
-                        }})),
+                        Some("tool_use") => calls.push(function_call(
+                            block["id"].take(),
+                            block["name"].take(),
+                            block["input"].take().to_string().into(),
+                        )),
+                        Some("tool_result") => input.push(function_call_output(
+                            block["tool_use_id"].take(),
+                            match block["content"].take() {
+                                Value::String(s) => s,
+                                Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts),
+                                _ => String::new(),
+                            },
+                        )),
                         _ => {}
                     }
                 }
             }
             if let Some(Value::Array(tool_calls)) = m.tool_calls {
                 calls.extend(tool_calls.into_iter().map(|mut c| {
-                    json!({"type": "function_call", "call_id": c["id"].take(),
-                        "name": c["function"]["name"].take(), "arguments": c["function"]["arguments"].take()})
+                    function_call(
+                        c["id"].take(),
+                        c["function"]["name"].take(),
+                        c["function"]["arguments"].take(),
+                    )
                 }));
             }
-            input.extend(results);
             if !m.content.is_empty() {
-                input.push(json!({"role": role, "content": m.content}));
+                input.push(object([
+                    ("role", role.into()),
+                    ("content", m.content.into()),
+                ]));
             }
             input.extend(calls);
         }
@@ -932,7 +938,7 @@ impl ResponsesEngine {
                 body.insert("tool_choice".to_owned(), v);
             }
             if let Some(effort) = p.reasoning.and_then(|r| r.effort) {
-                body.insert("reasoning".to_owned(), json!({"effort": effort}));
+                body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }
     }
@@ -1100,22 +1106,56 @@ fn responses_output(v: &Value) -> (String, Vec<Value>) {
     (text, tool_calls)
 }
 
-/// A chat-shaped tool definition (`{type: function, function: {…}}`) flattened
-/// into the Responses shape; anything else passes through.
+/// A Chat- or Anthropic-shaped tool definition flattened into the Responses shape.
 fn responses_tool(mut tool: Value) -> Value {
-    match tool.get_mut("function").map(Value::take) {
-        Some(Value::Object(mut f)) => {
-            f.insert("type".to_owned(), "function".into());
-            Value::Object(f)
-        }
-        _ => tool,
+    if let Some(Value::Object(mut f)) = tool.get_mut("function").map(Value::take) {
+        f.insert("type".to_owned(), "function".into());
+        return Value::Object(f);
     }
+    if let Value::Object(fields) = &mut tool
+        && let Some(schema) = fields.remove("input_schema")
+    {
+        fields.insert("type".to_owned(), "function".into());
+        fields.insert("parameters".to_owned(), schema);
+    }
+    tool
+}
+
+/// A JSON object from moved values (`json!` would deep-copy each one).
+fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
+    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+}
+
+fn function_call(call_id: Value, name: Value, arguments: Value) -> Value {
+    object([
+        ("type", "function_call".into()),
+        ("call_id", call_id),
+        ("name", name),
+        ("arguments", arguments),
+    ])
+}
+
+fn function_call_output(call_id: Value, output: String) -> Value {
+    object([
+        ("type", "function_call_output".into()),
+        ("call_id", call_id),
+        ("output", output.into()),
+    ])
 }
 
 /// A Responses `function_call` item as a chat-wire tool call.
 fn function_call_to_tool_call(mut item: Value) -> Value {
-    json!({"id": item["call_id"].take(), "type": "function",
-        "function": {"name": item["name"].take(), "arguments": item["arguments"].take()}})
+    object([
+        ("id", item["call_id"].take()),
+        ("type", "function".into()),
+        (
+            "function",
+            object([
+                ("name", item["name"].take()),
+                ("arguments", item["arguments"].take()),
+            ]),
+        ),
+    ])
 }
 
 /// Normalize a Responses `usage` object; returns (input, output, common usage).
@@ -1134,9 +1174,8 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame: on the native surface every frame moves out
-/// as a native event, elsewhere the text rides `delta`; text accumulates from
-/// `output_text.delta`, usage/status from `response.completed`.
+/// Apply one Responses SSE frame: natively every frame moves out as a native
+/// event, elsewhere text/tool calls ride the plain chunk fields.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,
@@ -1156,20 +1195,22 @@ fn responses_apply_frame(
     }
     let mut chunk = StreamChunk::default();
     match v["type"].as_str().unwrap_or_default() {
+        "response.output_text.delta" if native => {
+            full.push_str(v["delta"].as_str().unwrap_or_default());
+        }
         "response.output_text.delta" => {
-            if let Some(d) = v["delta"].as_str() {
-                full.push_str(d);
-                if !native {
-                    chunk.delta = d.to_owned();
-                }
+            if let Some(Value::String(d)) = v.get_mut("delta").map(Value::take) {
+                full.push_str(&d);
+                chunk.delta = d;
             }
         }
         "response.output_item.done" if !native && v["item"]["type"] == "function_call" => {
-            let call = function_call_to_tool_call(v["item"].take());
+            let mut call = function_call_to_tool_call(v["item"].take());
             if let Value::Array(calls) = resp
                 .tool_calls
                 .get_or_insert_with(|| Value::Array(Vec::new()))
             {
+                call["index"] = calls.len().into();
                 calls.push(call.clone());
             }
             chunk.tool_calls = Some(Value::Array(vec![call]));
@@ -1179,7 +1220,9 @@ fn responses_apply_frame(
             if let Some(m) = r["model"].as_str() {
                 resp.model = m.to_owned();
             }
-            if let Some(st) = r["status"].as_str() {
+            if !native && resp.tool_calls.is_some() {
+                resp.finish_reason = "tool_calls".to_owned();
+            } else if let Some(st) = r["status"].as_str() {
                 resp.finish_reason = st.to_owned();
             }
             let (input, output, common) = responses_usage(&r["usage"]);
@@ -1531,8 +1574,12 @@ mod tests {
         ];
         r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(gw_models::ChatParams {
             max_tokens: Some(64),
-            tools: Some(serde_json::json!([{"type": "function",
-                "function": {"name": "now", "parameters": {"type": "object"}}}])),
+            tools: Some(serde_json::json!([
+                {"type": "function", "function": {
+                    "name": "now", "parameters": {"type": "object"}}},
+                {"name": "later", "description": "schedule it",
+                    "input_schema": {"type": "object"}},
+            ])),
             reasoning: Some(Box::new(gw_models::ReasoningParam {
                 effort: Some("low".into()),
                 ..Default::default()
@@ -1546,6 +1593,11 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "now");
+        assert_eq!(
+            body["tools"][1],
+            serde_json::json!({"type": "function", "name": "later",
+                "description": "schedule it", "parameters": {"type": "object"}})
+        );
         assert_eq!(
             body["input"],
             serde_json::json!([
@@ -1764,5 +1816,35 @@ mod tests {
         assert_eq!(out.response.message, "done");
         assert_eq!(out.response.finish_reason, "completed");
         assert_eq!(out.response.common_usage.unwrap().reason, 4);
+    }
+
+    #[test]
+    fn responses_cross_protocol_stream_finishes_with_indexed_tool_calls() {
+        let mut resp = GatewayResponse::default();
+        let mut full = String::new();
+        let chunks = responses_apply_frame(
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call_1", "name": "now", "arguments": "{}"}}),
+            200,
+            None,
+            false,
+            &mut resp,
+            &mut full,
+        )
+        .unwrap();
+        assert_eq!(chunks[0].tool_calls.as_ref().unwrap()[0]["index"], 0);
+
+        let chunks = responses_apply_frame(
+            json!({"type": "response.completed", "response": {
+                "status": "completed", "usage": {"input_tokens": 5, "output_tokens": 2}}}),
+            200,
+            None,
+            false,
+            &mut resp,
+            &mut full,
+        )
+        .unwrap();
+        assert_eq!(chunks[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(resp.finish_reason, "tool_calls");
     }
 }
