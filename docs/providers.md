@@ -114,11 +114,13 @@ Exercised against the real vendors, end to end through the gateway: OpenAI
 Anthropic, tool loops and reasoning on both), Anthropic, Gemini, DeepSeek,
 MiniMax and Moonshot/Kimi (OpenAI- and Anthropic-compatible endpoints), Qwen/DashScope
 (both compatible endpoints), Baidu Qianfan v2 and the native Ernie wire,
-Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), OpenRouter, and OpenAI/Anthropic relays. AWS Bedrock is verified
-against AWS up to an accepted SigV4 signature (the account was not
-allowlisted for models) and end to end — Claude, Llama and Cohere, buffered
-and streamed — against the
-[ministack](https://github.com/ministackorg/ministack) Bedrock emulator's
+Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), OpenRouter, and OpenAI/Anthropic relays. AWS Bedrock Claude is verified
+against AWS itself (eu-north-1 inference profiles: Haiku 4.5, Sonnet 4.5 /
+4.6 / 5 — buffered and streamed on both surfaces, tools, signed thinking
+replayed through a tool loop, the native event stream); the SigV4 path is
+verified up to an accepted signature; Llama and Cohere on Bedrock, buffered
+and streamed, against the
+[ministack](https://github.com/ministackorg/ministack) emulator's
 family-faithful InvokeModel replies, EventStream framing and token-count
 headers.
 
@@ -151,12 +153,16 @@ key id's env var and `secret_key_env` to the secret key's; both must resolve or
 the account falls back to inert mock credentials. The signing region is read
 from the endpoint host (`bedrock-runtime.<region>.amazonaws.com`, default
 `us-east-1`), so a local emulator works with `endpoint: http://localhost:4566`.
+A Bedrock API key (`bedrock-api-key-…`) goes in `api_key_env` alone, with no
+`secret_key_env`, and is sent as a bearer token instead.
 
 ```yaml
 accounts:
   - {name: bedrock, provider: aws, endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
      api_key_env: AWS_ACCESS_KEY_ID, secret_key_env: AWS_SECRET_ACCESS_KEY,
      protocols: ["aws-anthropic", "aws-llama", "aws-cohere"]}
+  - {name: bedrock-eu, provider: aws, endpoint: "https://bedrock-runtime.eu-north-1.amazonaws.com",
+     api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic"]}
 models:
   - {name: us.anthropic.claude-sonnet-4-5-20250929-v1:0, protocol: aws-anthropic}
   - {name: meta.llama3-1-8b-instruct-v1:0, protocol: aws-llama}

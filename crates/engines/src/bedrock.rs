@@ -1,6 +1,7 @@
 //! AWS Bedrock plumbing shared by the engines that speak it: SigV4 request
 //! signing (region from the endpoint host, the configured model id in the
-//! invoke path) and the billed-token headers every InvokeModel reply carries.
+//! invoke path) or a Bedrock API key as bearer, and the billed-token headers
+//! every InvokeModel reply carries.
 
 use gw_models::{GResult, GatewayResponse, StreamChunk};
 use serde_json::Value;
@@ -126,15 +127,24 @@ pub(crate) async fn bedrock_send(
     let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
     let host = root.split_once("://").map(|(_, h)| h).unwrap_or(root);
     let payload = crate::base::body_bytes(&body)?;
-    let creds = base.aws_credentials();
-    let mut headers = aws_headers(
-        host,
-        &uri,
-        &payload,
-        creds
-            .as_ref()
-            .map(|(a, s): &(String, String)| (a.as_str(), s.as_str())),
-    );
+    let mut headers = match base.bedrock_bearer() {
+        Some(token) => vec![
+            ("host".into(), host.to_owned()),
+            ("authorization".into(), format!("Bearer {token}")),
+            ("accept".into(), "application/json".into()),
+        ],
+        None => {
+            let creds = base.aws_credentials();
+            aws_headers(
+                host,
+                &uri,
+                &payload,
+                creds
+                    .as_ref()
+                    .map(|(a, s): &(String, String)| (a.as_str(), s.as_str())),
+            )
+        }
+    };
     headers.push(("content-type".into(), "application/json".into()));
     let mut reply = base
         .send_bytes(&format!("{root}{uri}"), headers, payload, stream)

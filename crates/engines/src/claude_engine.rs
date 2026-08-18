@@ -507,8 +507,17 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
                 if let Some(f) = t.get_mut("function") {
                     let mut tool = Map::with_capacity(3);
                     tool.insert("name".into(), f["name"].take());
-                    tool.insert("description".into(), f["description"].take());
-                    tool.insert("input_schema".into(), f["parameters"].take());
+                    // optional on both wires, but Anthropic rejects an explicit null
+                    if let Some(description) = f.get_mut("description").filter(|d| !d.is_null()) {
+                        tool.insert("description".into(), description.take());
+                    }
+                    tool.insert(
+                        "input_schema".into(),
+                        match f["parameters"].take() {
+                            Value::Null => json!({"type": "object", "properties": {}}),
+                            schema => schema,
+                        },
+                    );
                     Value::Object(tool)
                 } else {
                     t
@@ -767,6 +776,21 @@ mod tests {
         assert!(out.response.is_messages_protocol);
         assert_eq!(out.response.finish_reason, "end_turn");
         assert!(out.response.total_tokens > 0);
+    }
+
+    #[test]
+    fn openai_tools_without_description_or_parameters_normalize_cleanly() {
+        let tools = normalize_tools_anthropic(json!([
+            {"type":"function","function":{"name":"ping"}},
+            {"type":"function","function":{"name":"echo","description":null,"parameters":{"type":"object","properties":{"s":{"type":"string"}}}}}
+        ]));
+        assert_eq!(
+            tools,
+            json!([
+                {"name":"ping","input_schema":{"type":"object","properties":{}}},
+                {"name":"echo","input_schema":{"type":"object","properties":{"s":{"type":"string"}}}}
+            ])
+        );
     }
 
     #[tokio::test]

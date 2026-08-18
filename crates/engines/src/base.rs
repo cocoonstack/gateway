@@ -84,6 +84,16 @@ impl Base {
             .and_then(|a| a.aws_credentials())
     }
 
+    /// A Bedrock API key (bearer auth): an AWS account configured with
+    /// `api_key_env` alone, no secret key.
+    pub fn bedrock_bearer(&self) -> Option<String> {
+        self.request
+            .account
+            .as_ref()
+            .filter(|a| a.secret_key_env.is_empty())
+            .and_then(|a| a.api_key())
+    }
+
     /// Move the raw passthrough bag out (single-use — the run(&mut self) contract).
     pub fn take_raw(&mut self) -> Value {
         self.request

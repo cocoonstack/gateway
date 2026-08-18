@@ -118,6 +118,10 @@ pub struct ChatCompletionRequest {
     /// OpenRouter-style `{effort, max_tokens, enabled}`.
     #[serde(default)]
     pub reasoning: Option<Value>,
+    /// Consumed here: the gateway always streams usage, and non-OpenAI wires
+    /// reject the field.
+    #[serde(default)]
+    pub stream_options: Option<Value>,
     /// unrecognized fields ride along untouched and are passed through to vendors.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -353,10 +357,14 @@ mod tests {
 
     #[test]
     fn request_roundtrip_keeps_extra_fields() {
-        let j = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"seed":7}"#;
+        let j = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"seed":7,"stream_options":{"include_usage":true}}"#;
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
         assert_eq!(req.model, "gpt-4o");
         assert!(!req.stream);
+        assert!(
+            req.extra.get("stream_options").is_none(),
+            "an OpenAI-surface knob must not reach a foreign wire"
+        );
         let (text, parts) = req.messages[0]
             .content
             .clone()
