@@ -125,7 +125,9 @@ ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
 is the weighted platform total. Audio tokens (realtime, audio chat: the
 vendor's `audio_tokens` details), 1-hour cache writes (Anthropic's
 `cache_creation.ephemeral_1h_input_tokens`) are subsets of prompt/completion
-and cache-write with their own weights; `long_context` re-scales both billable
+and cache-write with their own weights (audio tokens are attributed to the
+fresh, non-cached prompt side — the flat OpenAI usage shape does not say
+whether a cached token was audio); `long_context` re-scales both billable
 sides once the prompt crosses the threshold (Anthropic's >200k tier);
 `batch_discount` multiplies the charged and vendor cost of items served
 through `/v1/batches`. `unit_price_micros` prices what the surfaces

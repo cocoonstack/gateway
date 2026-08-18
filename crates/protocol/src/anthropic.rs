@@ -110,7 +110,10 @@ pub fn image_to_image_url(mut block: Value) -> Value {
         ),
         _ => match source.get("url").and_then(Value::as_str) {
             Some(url) => url.to_owned(),
-            None => return block,
+            None => {
+                block["source"] = source;
+                return block;
+            }
         },
     };
     serde_json::json!({"type": "image_url", "image_url": {"url": url}})
@@ -187,6 +190,8 @@ mod tests {
         let text = json!({"type":"text","text":"hi"});
         assert_eq!(image_url_to_image(text.clone()), text);
         assert_eq!(image_to_image_url(text.clone()), text);
+        let file = json!({"type":"image","source":{"type":"file","file_id":"file_1"}});
+        assert_eq!(image_to_image_url(file.clone()), file);
     }
 
     use super::*;

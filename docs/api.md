@@ -85,7 +85,7 @@ mapping per model family:
 | Family | Request | Response |
 |--------|---------|----------|
 | OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
-| Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024 … `max` 65536), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
+| Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024, `medium` 4096, `high` 16384, `xhigh` 24576, `max` 32768), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
 | Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on) | same |
 
 Sampling knobs the client sent along a gateway-mapped effort (`temperature`,

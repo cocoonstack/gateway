@@ -36,11 +36,12 @@ pub fn effort_budget(effort: &str) -> Option<i64> {
 }
 
 /// Thinking budget → reasoning effort (the OpenAI and Anthropic `effort`
-/// vocabularies coincide).
+/// vocabularies coincide); buckets split midway between [`effort_budget`]'s
+/// levels so a canonical budget round-trips to its own effort.
 pub fn budget_effort(budget: i64) -> &'static str {
     match budget {
-        ..=4999 => "low",
-        5000..=9999 => "medium",
+        ..=2559 => "low",
+        2560..=10239 => "medium",
         _ => "high",
     }
 }
@@ -144,7 +145,9 @@ mod tests {
         assert!(effort_budget("xhigh") < effort_budget("max"));
         assert_eq!(effort_budget("none"), None);
         assert_eq!(effort_budget("bogus"), None);
-        assert_eq!(budget_effort(1024), "low");
+        for effort in ["low", "medium", "high"] {
+            assert_eq!(budget_effort(effort_budget(effort).unwrap()), effort);
+        }
         assert_eq!(budget_effort(8192), "medium");
         assert_eq!(budget_effort(32768), "high");
     }
