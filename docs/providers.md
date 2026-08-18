@@ -117,7 +117,8 @@ MiniMax and Moonshot/Kimi (OpenAI- and Anthropic-compatible endpoints), Qwen/Das
 Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images), OpenRouter, and OpenAI/Anthropic relays. AWS Bedrock Claude is verified
 against AWS itself (eu-north-1 inference profiles: Haiku 4.5, Sonnet 4.5 /
 4.6 / 5 — buffered and streamed on both surfaces, tools, signed thinking
-replayed through a tool loop, the native event stream); the SigV4 path is
+replayed through a tool loop, the native event stream, prompt-cache
+breakpoints with weighted billing); the SigV4 path is
 verified up to an accepted signature; Llama and Cohere on Bedrock, buffered
 and streamed, against the
 [ministack](https://github.com/ministackorg/ministack) emulator's
