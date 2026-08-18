@@ -121,12 +121,17 @@ against AWS itself (eu-north-1 inference profiles: Haiku 4.5, Sonnet 4.5 /
 replayed through a tool loop, the native event stream, prompt-cache
 breakpoints with weighted billing), as is Bedrock Llama (us-east-1: Llama 3
 8B on demand, Llama 3.3 70B and Llama 4 Scout profiles — buffered, streamed,
-multi-turn, both surfaces) and Bedrock Converse (Nova micro/lite/pro, Mistral
-Pixtral, Llama 3.3 and Claude Haiku 4.5 through one wire: buffered, streamed,
-tools with a replayed tool result on Nova, thinking with signatures on Claude,
+multi-turn, both surfaces) and Bedrock Converse (Nova micro/lite/pro incl. image input, Mistral Large 3
+and Pixtral, Llama 3.3 / Llama 4 Scout, DeepSeek R1 and V3.2, gpt-oss-20b,
+Qwen3 and Claude through one wire: buffered, streamed, tools — streamed
+`toolUse`, `tool_choice` required/function/none, `strict` on Claude —
+DeepSeek/gpt-oss reasoning as `reasoning_content`, signed thinking replayed
+through a tool loop on both surfaces, 1h cache points billed at the 1h weight,
 the native `/v1/messages` stream); the SigV4 path is verified up to an
-accepted signature. Bedrock's Llama answers a tool request as JSON text
-rather than a `toolUse` block, which is the model's behavior on that wire. Cohere Command R on Bedrock is verified against the
+accepted signature. Vendor limits seen on that wire: Bedrock's Llama answers
+a tool request as JSON text rather than a `toolUse` block, Qwen rejects
+`stopSequences`, non-Claude models reject `strict` (the gateway forwards it
+only to Claude). Cohere Command R on Bedrock is verified against the
 [ministack](https://github.com/ministackorg/ministack) emulator's
 family-faithful InvokeModel replies, EventStream framing and token-count
 headers only — AWS marks Command R / R+ legacy and gates them per account.
@@ -160,8 +165,10 @@ key id's env var and `secret_key_env` to the secret key's; both must resolve or
 the account falls back to inert mock credentials. The signing region is read
 from the endpoint host (`bedrock-runtime.<region>.amazonaws.com`, default
 `us-east-1`), so a local emulator works with `endpoint: http://localhost:4566`.
-A Bedrock API key (`bedrock-api-key-…`) goes in `api_key_env` alone, with no
-`secret_key_env`, and is sent as a bearer token instead.
+A Bedrock API key goes in `api_key_env` alone, with no `secret_key_env`, and
+is sent as a bearer token instead — a long-term key (`ABSK…`) works in every
+region; a short-term one (`bedrock-api-key-…`) is bound to the region and the
+console session it was minted in.
 
 ```yaml
 accounts:

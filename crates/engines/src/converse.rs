@@ -43,7 +43,10 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
     }
 
     let tools: Vec<Value> = match body.remove("tools") {
-        Some(Value::Array(tools)) => tools.into_iter().flat_map(tool_spec).collect(),
+        Some(Value::Array(tools)) => tools
+            .into_iter()
+            .flat_map(|tool| tool_spec(tool, claude))
+            .collect(),
         _ => Vec::new(),
     };
     let (disable_tools, tool_choice) = body
@@ -246,7 +249,9 @@ fn content_block(mut block: Value) -> Vec<Value> {
     blocks
 }
 
-fn tool_spec(mut tool: Value) -> Vec<Value> {
+/// `strict` reaches Bedrock only for Claude — the other families reject the
+/// field outright ("This model doesn't support the strict field").
+fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
     let cache_control = tool.get_mut("cache_control").map(Value::take);
     let mut spec = Map::with_capacity(4);
     spec.insert("name".into(), tool["name"].take());
@@ -260,7 +265,7 @@ fn tool_spec(mut tool: Value) -> Vec<Value> {
             schema => schema,
         }}),
     );
-    if let Some(strict) = tool.get_mut("strict").filter(|strict| !strict.is_null()) {
+    if claude && let Some(strict) = tool.get_mut("strict").filter(|strict| !strict.is_null()) {
         spec.insert("strict".into(), strict.take());
     }
     let mut tools = vec![json!({"toolSpec": spec})];
@@ -435,13 +440,20 @@ mod tests {
     fn anthropic_tool_choices_map_to_converse() {
         let body = serde_json::from_value(json!({
             "messages": [],
-            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}, "strict": true}],
             "tool_choice": {"type": "tool", "name": "get_weather"}
         }))
         .unwrap();
+        let out = request(body, false);
         assert_eq!(
-            request(body, false)["toolConfig"]["toolChoice"],
+            out["toolConfig"]["toolChoice"],
             json!({"tool": {"name": "get_weather"}})
+        );
+        assert!(
+            out["toolConfig"]["tools"][0]["toolSpec"]
+                .get("strict")
+                .is_none(),
+            "non-Claude Bedrock models reject strict"
         );
 
         let body = serde_json::from_value(json!({
