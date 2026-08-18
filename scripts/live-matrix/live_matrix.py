@@ -619,6 +619,13 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
         st2 == 200 and after == before + 2,
         f"turn1 tool_calls={len(calls)}; turn2 HTTP {st2} text={answer[:40]!r}",
     )
+    name = f"{model} responses model anthropic tools (messages)"
+    st, txt = gw.call(
+        "/v1/messages", {"model": model, "max_tokens": 200, "tools": WEATHER_TOOL_ANTHROPIC, "messages": question}
+    )
+    blocks = json.loads(txt).get("content", []) if st == 200 else []
+    tool_use = [b for b in blocks if b.get("type") == "tool_use"]
+    record(name, st == 200 and bool(tool_use), f"HTTP {st} tool_use={len(tool_use)} {txt[:120]!r}")
 
 
 def run_group(gw: Gateway, group: str) -> None:
