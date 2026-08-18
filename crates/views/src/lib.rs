@@ -2486,9 +2486,7 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
 /// finish_reason mapping, anthropic → openai.
 fn finish_openai(fr: String) -> String {
     match fr.as_str() {
-        "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" | "completed" => {
-            "stop".to_owned()
-        }
+        "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => "stop".to_owned(),
         "max_tokens" => "length".to_owned(),
         "tool_use" => "tool_calls".to_owned(),
         _ => fr,
@@ -2498,7 +2496,7 @@ fn finish_openai(fr: String) -> String {
 /// finish_reason mapping, openai → anthropic.
 fn finish_anthropic(fr: String) -> String {
     match fr.as_str() {
-        "" | "stop" | "completed" => "end_turn".to_owned(),
+        "" | "stop" => "end_turn".to_owned(),
         "length" => "max_tokens".to_owned(),
         "tool_calls" => "tool_use".to_owned(),
         _ => fr,

@@ -9,8 +9,7 @@ Each case calls a surface, reads the newest ledger row and recomputes the
 weighted total and cost from the WIRE usage with the model's configured prices
 and weights (an independent oracle); thinking cases additionally assert that
 reasoning reached the client, cache cases that a write is followed by a read.
-Groups: anthropic openai gemini deepseek minimax qwen qianfan moonshot
-siliconflow openrouter rerank bedrock (default: all).
+Groups: see GROUPS (default: all).
 """
 
 from __future__ import annotations
@@ -25,6 +24,20 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+GROUPS = [
+    "anthropic",
+    "openai",
+    "gemini",
+    "deepseek",
+    "minimax",
+    "qwen",
+    "qianfan",
+    "moonshot",
+    "siliconflow",
+    "openrouter",
+    "rerank",
+    "bedrock",
+]
 MODELS: dict[str, dict[str, Any]] = {}
 RESULTS: list[tuple[str, bool, str]] = []
 PREFIX_SENTENCE = "The gateway is a Rust service that fronts many model vendors. "
@@ -143,6 +156,12 @@ def record(name: str, ok: bool, detail: str) -> None:
     print(("PASS " if ok else "FAIL ") + name + " — " + detail, flush=True)
 
 
+def reasoning_of(message: dict[str, Any]) -> str:
+    """The reasoning prose a chat message/delta carries, with a marker when it carries units."""
+    prose = message.get("reasoning_content") or message.get("reasoning") or ""
+    return prose + ("[details]" if message.get("reasoning_details") else "")
+
+
 def parse_sse(text: str) -> list[Any]:
     events: list[Any] = []
     for block in text.split("\n\n"):
@@ -209,9 +228,7 @@ def case_chat(
             for ch in e.get("choices", []):
                 d = ch.get("delta", {})
                 text += d.get("content") or ""
-                reasoning += (d.get("reasoning_content") or d.get("reasoning") or "") + (
-                    "[details]" if d.get("reasoning_details") else ""
-                )
+                reasoning += reasoning_of(d)
         if usage is None:
             faults = [e for e in events if isinstance(e, dict) and e.get("error")]
             count, row = gw.ledger()
@@ -232,9 +249,7 @@ def case_chat(
         wire = j.get("usage") or {}
         m = j["choices"][0]["message"]
         text = m.get("content") or ""
-        reasoning = (m.get("reasoning_content") or m.get("reasoning") or "") + (
-            "[details]" if m.get("reasoning_details") else ""
-        )
+        reasoning = reasoning_of(m)
     note = f"text={text[:30]!r}" + (f" reasoning_len={len(reasoning)}" if expect_reasoning else "")
     check_ledger(gw, name, model, wire, False, before, note)
     if expect_reasoning:
@@ -380,27 +395,23 @@ def case_response_cache(gw: Gateway, model: str) -> None:
     )
 
 
-def case_prompt_cache_anthropic(gw: Gateway, model: str, native: bool = True, words: int = 220) -> None:
-    """A long system prefix (haiku 4.5 needs >= 4096 tokens): the first call writes the cache, the second reads it."""
-    name = f"{model} prompt cache ({'messages' if native else 'chat'})"
+def case_prompt_cache(
+    gw: Gateway, model: str, native: bool = False, words: int = 1300, expect_write: bool = False
+) -> None:
+    """Two calls sharing a long prefix (haiku 4.5 needs >= 4096 tokens): the second must read the cache;
+    on Anthropic wires the first must also write it."""
+    surface = "messages" if native else "chat"
+    name = f"{model} prompt cache ({surface})"
     prefix = f"Run nonce {int(time.time())}. " + PREFIX_SENTENCE * words
-    before, _ = gw.ledger()
 
     def go(q: str) -> tuple[int, str]:
         if native:
-            return gw.call(
-                "/v1/messages",
-                {"model": model, "max_tokens": 50, "system": prefix, "messages": [{"role": "user", "content": q}]},
-            )
-        return gw.call(
-            "/v1/chat/completions",
-            {
-                "model": model,
-                "max_tokens": 50,
-                "messages": [{"role": "system", "content": prefix}, {"role": "user", "content": q}],
-            },
-        )
+            body = {"model": model, "max_tokens": 50, "system": prefix, "messages": [{"role": "user", "content": q}]}
+            return gw.call("/v1/messages", body)
+        messages = [{"role": "system", "content": prefix}, {"role": "user", "content": q}]
+        return gw.call("/v1/chat/completions", {"model": model, "max_tokens": 50, "messages": messages})
 
+    before, _ = gw.ledger()
     st1, t1 = go("Say ONE word: alpha")
     c1, row1 = gw.ledger()
     st2, t2 = go("Say ONE word: beta")
@@ -418,7 +429,7 @@ def case_prompt_cache_anthropic(gw: Gateway, model: str, native: bool = True, wo
     ok = (
         c1 == before + 1
         and c2 == c1 + 1
-        and written > 0
+        and (written > 0 or not expect_write)
         and read > 0
         and (row1["total_tokens"], row1["cost_micros"]) == o1[2:]
         and (row2["total_tokens"], row2["cost_micros"]) == o2[2:]
@@ -429,44 +440,6 @@ def case_prompt_cache_anthropic(gw: Gateway, model: str, native: bool = True, wo
         f"write={written} read={read} | row1 t/cost={row1['total_tokens']}/{row1['cost_micros']} oracle={o1[2:]} | "
         f"row2 t/cost={row2['total_tokens']}/{row2['cost_micros']} oracle={o2[2:]} | "
         f"wire1={json.dumps(u1)} wire2={json.dumps(u2)}",
-    )
-
-
-def case_prompt_cache_openai_like(gw: Gateway, model: str, words: int = 1300) -> None:
-    """Vendors with automatic prefix caching: two calls sharing a long prefix, cached_tokens must show on the second."""
-    name = f"{model} auto prompt cache"
-    prefix = f"Run nonce {int(time.time())}. " + PREFIX_SENTENCE * words
-
-    def body(q: str) -> dict[str, Any]:
-        return {
-            "model": model,
-            "max_tokens": 20,
-            "messages": [{"role": "system", "content": prefix}, {"role": "user", "content": q}],
-        }
-
-    before, _ = gw.ledger()
-    st1, t1 = gw.call("/v1/chat/completions", body("Say ONE word: alpha"))
-    c1, row1 = gw.ledger()
-    st2, t2 = gw.call("/v1/chat/completions", body("Say ONE word: beta"))
-    c2, row2 = gw.ledger()
-    if st1 != 200 or st2 != 200:
-        record(name, False, f"HTTP {st1}/{st2}: {t1[:200]} {t2[:200]}")
-        return
-    u1, u2 = json.loads(t1)["usage"], json.loads(t2)["usage"]
-    read = (u2.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-    o1, o2 = oracle(model, u1, False), oracle(model, u2, False)
-    ok = (
-        c1 == before + 1
-        and c2 == c1 + 1
-        and read > 0
-        and (row1["total_tokens"], row1["cost_micros"]) == o1[2:]
-        and (row2["total_tokens"], row2["cost_micros"]) == o2[2:]
-    )
-    record(
-        name,
-        ok,
-        f"read2={read} | row1 t/cost={row1['total_tokens']}/{row1['cost_micros']} oracle={o1[2:]} | "
-        f"row2 t/cost={row2['total_tokens']}/{row2['cost_micros']} oracle={o2[2:]} | wire2={json.dumps(u2)}",
     )
 
 
@@ -657,8 +630,8 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(
             gw, haiku, "reasoning_effort", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
         )
-        case_prompt_cache_anthropic(gw, haiku, native=True, words=340)
-        case_prompt_cache_anthropic(gw, sonnet45, native=False)
+        case_prompt_cache(gw, haiku, native=True, words=340, expect_write=True)
+        case_prompt_cache(gw, sonnet45, words=220, expect_write=True)
         case_thinking_replay(gw, haiku, native=True)
         case_thinking_replay(gw, haiku, native=False)
         case_thinking_tiers(gw, haiku, native=True, tiers=[1024, 4096, 16384], expect_reasoning=True)
@@ -670,7 +643,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_response_cache(gw, "gpt-4o-mini")
         case_chat(gw, "gpt-5-mini", "reasoning_effort low", prompt=prime, reasoning_effort="low")
         case_chat(gw, "gpt-5-mini", "reasoning", stream=True, prompt=prime, reasoning_effort="low")
-        case_prompt_cache_openai_like(gw, "gpt-4.1-mini")
+        case_prompt_cache(gw, "gpt-4.1-mini")
         case_messages(gw, "gpt-4o-mini", "cross-protocol")
         case_messages(
             gw,
@@ -694,7 +667,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, "deepseek-chat", stream=True)
         case_chat(gw, "deepseek-reasoner", "reasoning", prompt=prime, expect_reasoning=True)
         case_chat(gw, "deepseek-reasoner", "reasoning", stream=True, prompt=prime, expect_reasoning=True)
-        case_prompt_cache_openai_like(gw, "deepseek-chat", words=400)
+        case_prompt_cache(gw, "deepseek-chat", words=400)
         case_messages(gw, "deepseek-chat", "cross-protocol")
     elif group == "minimax":
         case_messages(gw, "MiniMax-M2.5", "anthropic-compat")
@@ -732,7 +705,7 @@ def run_group(gw: Gateway, group: str) -> None:
             prompt=prime,
             expect_thinking=True,
         )
-        case_prompt_cache_openai_like(gw, "qwen-plus", words=400)
+        case_prompt_cache(gw, "qwen-plus", words=400)
     elif group == "qianfan":
         case_chat(gw, "ernie-4.5-turbo-128k")
         case_chat(gw, "ernie-x1.1", "reasoning", prompt=prime, expect_reasoning=True)
@@ -797,7 +770,7 @@ def run_group(gw: Gateway, group: str) -> None:
             prompt=prime,
             expect_thinking=True,
         )
-        case_prompt_cache_anthropic(gw, sonnet, native=True)
+        case_prompt_cache(gw, sonnet, native=True, words=220, expect_write=True)
         case_thinking_replay(gw, sonnet, native=True)
         case_chat(gw, "us.amazon.nova-lite-v1:0", "converse chat")
         case_chat(gw, "us.amazon.nova-lite-v1:0", "converse chat", stream=True)
@@ -834,21 +807,7 @@ def main() -> int:
     args = ap.parse_args()
     load_models(args.config)
     gw = Gateway(args.gateway, args.ak, args.admin_token)
-    all_groups = [
-        "anthropic",
-        "openai",
-        "gemini",
-        "deepseek",
-        "minimax",
-        "qwen",
-        "qianfan",
-        "moonshot",
-        "siliconflow",
-        "openrouter",
-        "rerank",
-        "bedrock",
-    ]
-    for group in args.groups or all_groups:
+    for group in args.groups or GROUPS:
         run_group(gw, group)
     return write_report(args.report)
 

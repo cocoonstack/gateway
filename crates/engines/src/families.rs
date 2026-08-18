@@ -859,8 +859,9 @@ impl ResponsesEngine {
         if !system.is_empty() {
             body.entry("instructions").or_insert(system.into());
         }
-        let mut input = Vec::new();
-        for m in std::mem::take(&mut self.base.request.message) {
+        let messages = std::mem::take(&mut self.base.request.message);
+        let mut input = Vec::with_capacity(messages.len());
+        for m in messages {
             if m.role == gw_consts::role::SYSTEM {
                 continue;
             }
@@ -988,8 +989,15 @@ impl ResponsesEngine {
         {
             body.insert("model".to_owned(), requested.into());
         }
+        let native = self.base.request.preserve_responses_wire;
         let (text, mut tool_calls) = responses_output(&v);
-        if !self.base.request.preserve_responses_wire {
+        let vendor_status = v["status"].as_str().unwrap_or("completed");
+        let finish_reason = if native {
+            vendor_status.to_owned()
+        } else {
+            responses_finish(vendor_status, !tool_calls.is_empty())
+        };
+        if !native {
             tool_calls = tool_calls
                 .into_iter()
                 .map(function_call_to_tool_call)
@@ -1007,7 +1015,7 @@ impl ResponsesEngine {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| self.model_name()),
-            finish_reason: v["status"].as_str().unwrap_or("completed").to_owned(),
+            finish_reason,
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
@@ -1141,6 +1149,17 @@ fn function_call_output(call_id: Value, output: String) -> Value {
     ])
 }
 
+/// The Responses `status` in the shared finish vocabulary for the other surfaces.
+fn responses_finish(status: &str, tool_calls: bool) -> String {
+    match status {
+        _ if tool_calls => "tool_calls",
+        "completed" => "stop",
+        "incomplete" => "length",
+        other => other,
+    }
+    .to_owned()
+}
+
 /// A Responses `function_call` item as a chat-wire tool call.
 fn function_call_to_tool_call(mut item: Value) -> Value {
     object([
@@ -1202,26 +1221,31 @@ fn responses_apply_frame(
                 chunk.delta = d;
             }
         }
-        "response.output_item.done" if !native && v["item"]["type"] == "function_call" => {
-            let mut call = function_call_to_tool_call(v["item"].take());
-            if let Value::Array(calls) = resp
-                .tool_calls
-                .get_or_insert_with(|| Value::Array(Vec::new()))
-            {
-                call["index"] = calls.len().into();
-                calls.push(call.clone());
+        "response.output_item.done" if !native => {
+            let item = v["item"].take();
+            if item["type"] == "function_call" {
+                let mut call = function_call_to_tool_call(item);
+                if let Value::Array(calls) = resp
+                    .tool_calls
+                    .get_or_insert_with(|| Value::Array(Vec::new()))
+                {
+                    call["index"] = calls.len().into();
+                    calls.push(call.clone());
+                }
+                chunk.tool_calls = Some(Value::Array(vec![call]));
             }
-            chunk.tool_calls = Some(Value::Array(vec![call]));
         }
         "response.completed" => {
             let r = &v["response"];
             if let Some(m) = r["model"].as_str() {
                 resp.model = m.to_owned();
             }
-            if !native && resp.tool_calls.is_some() {
-                resp.finish_reason = "tool_calls".to_owned();
-            } else if let Some(st) = r["status"].as_str() {
-                resp.finish_reason = st.to_owned();
+            if let Some(st) = r["status"].as_str() {
+                resp.finish_reason = if native {
+                    st.to_owned()
+                } else {
+                    responses_finish(st, resp.tool_calls.is_some())
+                };
             }
             let (input, output, common) = responses_usage(&r["usage"]);
             resp.prompt_tokens = input;
