@@ -685,9 +685,12 @@ impl DagNode for CostCalc {
             Some(u) => {
                 let ti = gw_models::TokenInput {
                     prompt: u.platform_input,
+                    audio_prompt: u.audio_input,
                     read_cache: u.read_cache,
                     write_cache: u.write_cache,
+                    write_cache_1h: u.write_cache_1h,
                     completion: u.completion,
+                    audio_completion: u.audio_output,
                     reasoning: u.reason,
                 };
                 BillTokens {
@@ -841,7 +844,7 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
 /// Settle reserves and write the ledger for one served request via the shared
 /// [`admission::settle_and_bill`] orchestration. `estimated` marks a bill from
 /// an aborted stream's estimated counts rather than a vendor usage payload.
-async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GResult<()> {
+async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> GResult<()> {
     let ptu_spillover = ctx
         .outcome
         .as_ref()
@@ -852,6 +855,20 @@ async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GRes
     // counter accrues against the requested name
     let served = served_model(param);
     let requested = requested_model(param);
+    let served_conf = ctx.cfg.find_model(served);
+    if let Some(lc) = served_conf.and_then(|m| m.long_context) {
+        (tokens.billable_prompt, tokens.billable_completion) = gw_models::long_context_scale(
+            tokens.prompt,
+            lc.threshold_tokens,
+            (lc.prompt_weight, lc.completion_weight),
+            (tokens.billable_prompt, tokens.billable_completion),
+        );
+    }
+    let discount = if ctx.request.is_online {
+        1.0
+    } else {
+        served_conf.and_then(|m| m.batch_discount).unwrap_or(1.0)
+    };
     // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
     let (reserved, tpm_reserved, model_quota_key) = (
         ctx.quota_reserved.take().unwrap_or(0),
@@ -878,6 +895,7 @@ async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GRes
                 billable_completion: tokens.billable_completion,
                 total: tokens.total(),
                 units: tokens.units,
+                discount,
                 ptu_spillover,
                 estimated,
             },

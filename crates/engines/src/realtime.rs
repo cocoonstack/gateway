@@ -132,6 +132,40 @@ pub fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
     Some((usage.0.max(0), usage.1.max(0)))
 }
 
+/// The audio share of a turn's (input, output) tokens, for models that price
+/// audio apart from text; zero when the vendor reports no modality split.
+pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
+    if is_gemini_realtime(provider) {
+        let modality = |details: &Value| {
+            details
+                .as_array()
+                .map(|ds| {
+                    ds.iter()
+                        .filter(|d| d["modality"] == "AUDIO")
+                        .map(|d| d["tokenCount"].as_i64().unwrap_or(0).max(0))
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        let u = &frame["usageMetadata"];
+        return (
+            modality(&u["promptTokensDetails"]),
+            modality(&u["responseTokensDetails"]),
+        );
+    }
+    let u = &frame["response"]["usage"];
+    (
+        u["input_token_details"]["audio_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+            .max(0),
+        u["output_token_details"]["audio_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+            .max(0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -306,9 +340,20 @@ mod tests {
 
     #[test]
     fn realtime_usage_per_dialect() {
-        let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34}}});
+        let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34,
+            "input_token_details":{"text_tokens":2,"audio_tokens":10},
+            "output_token_details":{"text_tokens":4,"audio_tokens":30}}}});
         assert_eq!(realtime_usage("openai", &done), Some((12, 34)));
         assert_eq!(realtime_usage("azure", &done), Some((12, 34)));
+        assert_eq!(realtime_audio_tokens("openai", &done), (10, 30));
+        assert_eq!(
+            realtime_audio_tokens(
+                "gemini",
+                &json!({"usageMetadata":{"promptTokensDetails":[{"modality":"AUDIO","tokenCount":7},{"modality":"TEXT","tokenCount":1}],
+                                         "responseTokensDetails":[{"modality":"AUDIO","tokenCount":9}]}})
+            ),
+            (7, 9)
+        );
         assert_eq!(
             realtime_usage("openai", &json!({"type":"response.delta","delta":"hi"})),
             None

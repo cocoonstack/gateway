@@ -58,9 +58,12 @@ usage; a failed request refunds it. Charged price is the model's list price, or
 a tenant's `model_prices` override; when an account declares `cost_*_price` the
 ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
 Surfaces that meter no tokens bill per unit instead — TTS characters,
-transcription seconds, rerank search units — at the model's
+transcription seconds, rerank search units, generated images — at the model's
 `unit_price_micros` (see [Configuration](configuration.md)); the unit count
-rides on the ledger row and the usage aggregates as `billed_units`.
+rides on the ledger row and the usage aggregates as `billed_units`. Audio
+tokens and 1-hour cache writes take their own `token_rate` weights, a
+`long_context` tier re-prices calls past a prompt size, and `batch_discount`
+scales what `/v1/batches` items cost.
 
 A streaming response that breaks after delivery has begun (client disconnect or
 upstream failure) is billed for what was delivered: the vendor's usage frame

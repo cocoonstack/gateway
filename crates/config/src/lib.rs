@@ -119,6 +119,13 @@ pub struct ModelConf {
     /// Request-level cache TTL; None = this model isn't cached.
     #[serde(default)]
     pub cache_ttl_seconds: Option<u64>,
+    /// Long-context tier; None = one price regardless of prompt size.
+    #[serde(default)]
+    pub long_context: Option<LongContextConf>,
+    /// Multiplier on the charged and vendor cost of batch (`/v1/batches`)
+    /// items, e.g. 0.5; None = full price.
+    #[serde(default)]
+    pub batch_discount: Option<f64>,
     /// Billing weights per token component; None = every component at 1.0.
     #[serde(default)]
     pub token_rate: Option<TokenRateConf>,
@@ -187,19 +194,47 @@ pub struct TokenRateConf {
     pub completion: f64,
     #[serde(default = "weight_one")]
     pub reasoning: f64,
+    /// Audio-token weights (realtime, audio chat); unset = the text weight.
+    #[serde(default)]
+    pub audio_prompt: Option<f64>,
+    #[serde(default)]
+    pub audio_completion: Option<f64>,
+    /// 1-hour cache-write weight; unset = `write_cache`.
+    #[serde(default)]
+    pub write_cache_1h: Option<f64>,
 }
 
 impl TokenRateConf {
     /// `(field name, value)` pairs for validation.
-    fn fields(&self) -> [(&'static str, f64); 5] {
+    fn fields(&self) -> [(&'static str, f64); 8] {
         [
             ("prompt", self.prompt),
             ("read_cache", self.read_cache),
             ("write_cache", self.write_cache),
             ("completion", self.completion),
             ("reasoning", self.reasoning),
+            ("audio_prompt", self.audio_prompt.unwrap_or(self.prompt)),
+            (
+                "audio_completion",
+                self.audio_completion.unwrap_or(self.completion),
+            ),
+            (
+                "write_cache_1h",
+                self.write_cache_1h.unwrap_or(self.write_cache),
+            ),
         ]
     }
+}
+
+/// A long-context price tier: past `threshold_tokens` prompt tokens the whole
+/// call bills at these multipliers of the model's price.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct LongContextConf {
+    pub threshold_tokens: i64,
+    #[serde(default = "weight_one")]
+    pub prompt_weight: f64,
+    #[serde(default = "weight_one")]
+    pub completion_weight: f64,
 }
 
 fn weight_one() -> f64 {
@@ -833,6 +868,24 @@ impl GatewayConfig {
                         });
                     }
                 }
+            }
+            if let Some(lc) = &m.long_context
+                && (lc.threshold_tokens < 0
+                    || neg_or_nan(lc.prompt_weight)
+                    || neg_or_nan(lc.completion_weight))
+            {
+                return Err(ConfigError::BadTokenRate {
+                    model: m.name.clone(),
+                    field: "long_context",
+                });
+            }
+            if let Some(d) = m.batch_discount
+                && !(d.is_finite() && d > 0.0 && d <= 1.0)
+            {
+                return Err(ConfigError::BadTokenRate {
+                    model: m.name.clone(),
+                    field: "batch_discount",
+                });
             }
             for (i, v) in m.variants.iter().enumerate() {
                 let bad = |reason| ConfigError::BadVariant {
@@ -1515,6 +1568,33 @@ tenants: [{name: t1}, {name: t1}]
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
         ));
 
+        for bad in [
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, batch_discount: 1.5}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, batch_discount: 0}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, long_context: {threshold_tokens: -1}}]",
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, token_rate: {audio_prompt: -2}}]",
+        ] {
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(bad),
+                    Err(ConfigError::BadTokenRate { .. })
+                ),
+                "rejected at load: {bad}"
+            );
+        }
+        let cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, batch_discount: 0.5, long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}, token_rate: {prompt: 3.0, audio_prompt: 12.0}}]",
+        )
+        .unwrap();
+        let m = cfg.find_model("m1").unwrap();
+        assert_eq!(m.batch_discount, Some(0.5));
+        assert_eq!(m.long_context.unwrap().threshold_tokens, 200_000);
+        let rate = m.token_rate.unwrap();
+        assert_eq!(rate.audio_prompt, Some(12.0));
+        assert_eq!(
+            rate.audio_completion, None,
+            "unset audio weight inherits the text weight"
+        );
         for neg_price in [
             "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, input_price_per_1k_micros: -1}]",
             "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: tts, unit_price_micros: -1}]",

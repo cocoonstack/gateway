@@ -1338,6 +1338,116 @@ async fn embeddings_images_audio_families() {
 }
 
 #[tokio::test]
+async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
+    let app = app();
+    // batch items at the model's batch_discount
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/batches",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o-mini","items":[{"messages":[{"role":"user","content":"discounted item"}]}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    for _ in 0..100 {
+        let j = body_json(
+            app.clone()
+                .oneshot(get_authed(&format!("/v1/batches/{id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if j["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // the same prompt online, at list price
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"discounted item"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // long-context tier: a prompt past the threshold bills 2x / 1.5x
+    for content in ["hi", "this prompt is long enough to cross the tier"] {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/v1/messages",
+                Some("ak-demo-123"),
+                &format!(
+                    r#"{{"model":"claude-longctx","max_tokens":32,"messages":[{{"role":"user","content":"{content}"}}]}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // images bill per image
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/images/generations",
+            Some("ak-demo-123"),
+            r#"{"model":"dall-e-3","prompt":"two pandas","n":2}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
+    let j = body_json(resp).await;
+    let rows: Vec<&Value> = j["records"].as_array().unwrap().iter().collect();
+    let mini: Vec<&&Value> = rows
+        .iter()
+        .filter(|r| r["model"] == "gpt-4o-mini")
+        .collect();
+    let (batch, online) = (mini[0], mini[1]);
+    assert_eq!(batch["prompt_tokens"], online["prompt_tokens"]);
+    let half = |v: &Value| (v["cost_micros"].as_f64().unwrap() * 0.5).round() as i64;
+    assert_eq!(
+        batch["cost_micros"],
+        half(online),
+        "batch item at half price: {batch} vs {online}"
+    );
+    assert_eq!(
+        batch["vendor_cost_micros"],
+        (online["vendor_cost_micros"].as_f64().unwrap() * 0.5).round() as i64
+    );
+    let long: Vec<&&Value> = rows
+        .iter()
+        .filter(|r| r["model"] == "claude-longctx")
+        .collect();
+    let (short, tiered) = (long[0], long[1]);
+    assert_eq!(
+        short["total_tokens"],
+        short["prompt_tokens"].as_i64().unwrap() + short["completion_tokens"].as_i64().unwrap(),
+        "under the threshold the weighted total is the plain sum"
+    );
+    let (p, c) = (
+        tiered["prompt_tokens"].as_i64().unwrap(),
+        tiered["completion_tokens"].as_i64().unwrap(),
+    );
+    assert!(p > 8, "prompt {p} must cross the tier");
+    assert_eq!(
+        tiered["total_tokens"].as_i64().unwrap(),
+        p * 2 + (c as f64 * 1.5).round() as i64,
+        "past the threshold both sides scale: {tiered}"
+    );
+    let image = rows.iter().find(|r| r["model"] == "dall-e-3").unwrap();
+    assert_eq!(image["billed_units"], 2);
+    assert_eq!(image["cost_micros"], 80_000);
+}
+
+#[tokio::test]
 async fn unit_priced_surfaces_bill_characters_and_seconds() {
     let app = app();
     for body in [

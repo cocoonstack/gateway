@@ -109,6 +109,11 @@ models:
     token_rate:                      # optional per-component billing weights
       read_cache: 0.1                #   cache reads at 10% of the input price
       write_cache: 1.25              #   (prompt/completion/reasoning default 1.0)
+      write_cache_1h: 2.0            #   1-hour cache writes (default = write_cache)
+      audio_prompt: 16.67            #   audio input tokens (default = prompt weight)
+      audio_completion: 8.33         #   audio output tokens (default = completion weight)
+    long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
+    batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price
     prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
@@ -117,11 +122,17 @@ models:
 
 `token_rate` weights scale cost and quota consumption per token component; the
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
-is the weighted platform total. `unit_price_micros` prices what the surfaces
+is the weighted platform total. Audio tokens (realtime, audio chat: the
+vendor's `audio_tokens` details), 1-hour cache writes (Anthropic's
+`cache_creation.ephemeral_1h_input_tokens`) are subsets of prompt/completion
+and cache-write with their own weights; `long_context` re-scales both billable
+sides once the prompt crosses the threshold (Anthropic's >200k tier);
+`batch_discount` multiplies the charged and vendor cost of items served
+through `/v1/batches`. `unit_price_micros` prices what the surfaces
 without token usage meter — a `tts` model's input characters, an `stt`
 model's audio seconds (the vendor's `usage.seconds` / `duration`, else the
 uploaded WAV/MP3's own play length; fractions rounded up), a `rerank`
-model's `search_units` — and adds to `cost_micros` next to any token cost;
+model's `search_units`, an `image` model's images — and adds to `cost_micros` next to any token cost;
 the count lands in the ledger's `billed_units` and the `/admin/usage`
 aggregates. An account's `cost_unit_price_micros` is the vendor side of the
 same unit, for margin. `prompt_cache` (anthropic-messages models)

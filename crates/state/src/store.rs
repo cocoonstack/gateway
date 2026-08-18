@@ -196,6 +196,8 @@ pub struct BillingInput<'a> {
     pub total: i64,
     /// Non-token units the vendor metered, priced at the model's unit price.
     pub units: i64,
+    /// Multiplier on charged and vendor cost (batch items); 1.0 = list price.
+    pub discount: f64,
     pub ptu_spillover: bool,
     /// Counts are estimated (aborted stream), not vendor-reported.
     pub estimated: bool,
@@ -213,9 +215,12 @@ pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_model
         Some(r) => gw_models::TokenRate {
             prompt_includes_cache: false,
             prompt_weight: r.prompt,
+            audio_prompt_weight: r.audio_prompt.unwrap_or(r.prompt),
             read_cache_weight: r.read_cache,
             write_cache_weight: r.write_cache,
+            write_cache_1h_weight: r.write_cache_1h.unwrap_or(r.write_cache),
             completion_weight: r.completion,
+            audio_completion_weight: r.audio_completion.unwrap_or(r.completion),
             reasoning_weight: r.reasoning,
         },
         None => gw_models::TokenRate::default(),
@@ -241,6 +246,13 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
     let units = clamp_tokens(b.units);
     let unit_cost = units.saturating_mul(cfg.unit_price_for_tenant(b.tenant, b.served_model));
+    let discounted = |cost: i64| {
+        if b.discount == 1.0 {
+            cost
+        } else {
+            (cost as f64 * b.discount).round() as i64
+        }
+    };
     let (vendor, vendor_unit) = cfg
         .accounts
         .iter()
@@ -269,10 +281,14 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged)
-            .saturating_add(unit_cost),
-        vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor)
-            .saturating_add(units.saturating_mul(vendor_unit)),
+        cost_micros: discounted(
+            gw_models::cost_micros(billable_prompt, billable_completion, charged)
+                .saturating_add(unit_cost),
+        ),
+        vendor_cost_micros: discounted(
+            gw_models::cost_micros(billable_prompt, billable_completion, vendor)
+                .saturating_add(units.saturating_mul(vendor_unit)),
+        ),
         billed_units: units,
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
@@ -2832,6 +2848,7 @@ mod tests {
                 billable_completion: 60,
                 total: 310,
                 units: 0,
+                discount: 1.0,
                 ptu_spillover: false,
                 estimated: false,
             },
@@ -2840,6 +2857,19 @@ mod tests {
         assert_eq!(rec.completion_tokens, 60);
         assert_eq!(rec.total_tokens, 310);
         assert_eq!(rec.cost_micros, 250 + 120);
+    }
+
+    #[test]
+    fn token_rate_audio_and_1h_weights_inherit_their_text_and_5m_weights() {
+        let cfg = gw_config::GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, token_rate: {prompt: 3.0, write_cache: 1.25, audio_completion: 8.0}}]",
+        )
+        .unwrap();
+        let rate = model_token_rate(&cfg, "m");
+        assert_eq!(rate.audio_prompt_weight, 3.0);
+        assert_eq!(rate.write_cache_1h_weight, 1.25);
+        assert_eq!(rate.audio_completion_weight, 8.0);
+        assert_eq!(rate.completion_weight, 1.0);
     }
 
     #[test]
@@ -2862,6 +2892,7 @@ mod tests {
             billable_completion: 0,
             total: 0,
             units: 40,
+            discount: 1.0,
             ptu_spillover: false,
             estimated: false,
         };
@@ -2895,6 +2926,7 @@ mod tests {
                 billable_completion: i64::MAX,
                 total: i64::MAX,
                 units: 0,
+                discount: 1.0,
                 ptu_spillover: false,
                 estimated: false,
             },

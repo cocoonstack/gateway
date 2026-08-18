@@ -47,6 +47,10 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
             write_cache,
             completion: output - reason,
             reason,
+            audio_input: 0,
+            audio_output: 0,
+            write_cache_1h: get(v, &["cache_creation", "ephemeral_1h_input_tokens"])
+                .clamp(0, write_cache),
         }
     } else {
         CommonUsage::from_openai_parts(
@@ -54,6 +58,10 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
             get(v, &["completion_tokens"]),
             get(v, &["prompt_tokens_details", "cached_tokens"]),
             get(v, &["completion_tokens_details", "reasoning_tokens"]),
+        )
+        .with_audio(
+            get(v, &["prompt_tokens_details", "audio_tokens"]),
+            get(v, &["completion_tokens_details", "audio_tokens"]),
         )
     })
 }
@@ -99,6 +107,20 @@ mod tests {
         assert_eq!(u.platform_input, 8);
         assert_eq!(u.completion, 6);
         assert_eq!(u.read_cache, 2);
+    }
+
+    #[test]
+    fn audio_and_1h_cache_subsets_are_read_and_clamped() {
+        let raw = serde_json::json!({"prompt_tokens":57,"completion_tokens":233,
+            "prompt_tokens_details":{"text_tokens":16,"audio_tokens":41,"cached_tokens":0},
+            "completion_tokens_details":{"text_tokens":53,"audio_tokens":180}});
+        let u = extract_common_usage(&raw, false).unwrap();
+        assert_eq!((u.audio_input, u.audio_output), (41, 180));
+        let raw = serde_json::json!({"input_tokens":12,"output_tokens":5,
+            "cache_creation_input_tokens":3402,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":9999}});
+        let u = extract_common_usage(&raw, true).unwrap();
+        assert_eq!(u.write_cache_1h, 3402, "capped at the cache-write total");
     }
 
     #[test]

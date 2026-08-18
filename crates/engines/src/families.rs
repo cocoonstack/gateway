@@ -416,7 +416,8 @@ impl ModelEngine for ImageEngine {
         };
         let count = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let verb = if is_edit { "edited" } else { "generated" };
-        // gpt-image reports input/output tokens
+        // gpt-image reports input/output tokens; every model bills per image
+        // when the model carries a unit price
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
@@ -424,6 +425,7 @@ impl ModelEngine for ImageEngine {
         let mut outcome = family_outcome(format!("{count} image(s) {verb}"), &model, v, status);
         outcome.response.prompt_tokens = input;
         outcome.response.completion_tokens = output;
+        outcome.response.billed_units = count as i64;
         crate::engine::fill_total_if_zero(&mut outcome.response);
         Ok(outcome)
     }

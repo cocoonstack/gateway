@@ -1,11 +1,12 @@
 //! Platform-total / platform-input token computation.
 //!
 //! Billing is precision-sensitive, so this applies a weighted-sum formula
-//! exactly: each token component (prompt / read-cache / write-cache / completion
-//! / reasoning) is scaled by a configurable weight and summed, with the result
-//! rounded half-away-from-zero (matching Rust `f64::round`). The default rate
-//! (config miss) is 1:1 across the board, i.e. a plain sum.
-//! `prompt_includes_cache` deducts cache from prompt before weighting.
+//! exactly: each token component (prompt / audio prompt / read-cache /
+//! write-cache incl. the 1h tier / completion / audio completion / reasoning)
+//! is scaled by a configurable weight and summed, with the result rounded
+//! half-away-from-zero (matching Rust `f64::round`). The default rate (config
+//! miss) is 1:1 across the board, i.e. a plain sum. `prompt_includes_cache`
+//! deducts cache from prompt before weighting.
 
 /// Per-channel/model billing weights (default: 1:1).
 #[derive(Debug, Clone, PartialEq)]
@@ -13,9 +14,15 @@ pub struct TokenRate {
     /// upstream prompt_tokens already includes read+write cache → deduct first.
     pub prompt_includes_cache: bool,
     pub prompt_weight: f64,
+    /// audio input tokens (a subset of prompt) at their own price
+    pub audio_prompt_weight: f64,
     pub read_cache_weight: f64,
     pub write_cache_weight: f64,
+    /// 1-hour cache writes (a subset of write_cache) at their premium
+    pub write_cache_1h_weight: f64,
     pub completion_weight: f64,
+    /// audio output tokens (a subset of completion) at their own price
+    pub audio_completion_weight: f64,
     pub reasoning_weight: f64,
 }
 
@@ -25,21 +32,28 @@ impl Default for TokenRate {
         Self {
             prompt_includes_cache: false,
             prompt_weight: 1.0,
+            audio_prompt_weight: 1.0,
             read_cache_weight: 1.0,
             write_cache_weight: 1.0,
+            write_cache_1h_weight: 1.0,
             completion_weight: 1.0,
+            audio_completion_weight: 1.0,
             reasoning_weight: 1.0,
         }
     }
 }
 
-/// Token components of one call.
+/// Token components of one call. `audio_prompt` ⊆ `prompt`,
+/// `write_cache_1h` ⊆ `write_cache`, `audio_completion` ⊆ `completion`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenInput {
     pub prompt: i64,
+    pub audio_prompt: i64,
     pub read_cache: i64,
     pub write_cache: i64,
+    pub write_cache_1h: i64,
     pub completion: i64,
+    pub audio_completion: i64,
     pub reasoning: i64,
 }
 
@@ -50,19 +64,44 @@ pub fn cost_micros(prompt: i64, completion: i64, price_per_1k: (i64, i64)) -> i6
         .saturating_add(completion.saturating_mul(price_per_1k.1) / 1000)
 }
 
-/// Weighted input-side tokens: prompt plus cache reads/writes.
+/// Weighted input-side tokens: prompt (text and audio) plus cache reads and
+/// writes (5m and 1h tiers).
 pub fn weighted_prompt(input: &TokenInput, rate: &TokenRate) -> i64 {
-    let sum = normalize_prompt(input, rate) as f64 * rate.prompt_weight
+    let prompt = normalize_prompt(input, rate);
+    let audio = input.audio_prompt.clamp(0, prompt);
+    let write_1h = input.write_cache_1h.clamp(0, input.write_cache.max(0));
+    let sum = (prompt - audio) as f64 * rate.prompt_weight
+        + audio as f64 * rate.audio_prompt_weight
         + input.read_cache as f64 * rate.read_cache_weight
-        + input.write_cache as f64 * rate.write_cache_weight;
+        + (input.write_cache - write_1h) as f64 * rate.write_cache_weight
+        + write_1h as f64 * rate.write_cache_1h_weight;
     round_tokens(sum)
 }
 
-/// Weighted output-side tokens: completion plus reasoning.
+/// Weighted output-side tokens: completion (text and audio) plus reasoning.
 pub fn weighted_completion(input: &TokenInput, rate: &TokenRate) -> i64 {
-    let sum = input.completion as f64 * rate.completion_weight
+    let audio = input.audio_completion.clamp(0, input.completion.max(0));
+    let sum = (input.completion - audio) as f64 * rate.completion_weight
+        + audio as f64 * rate.audio_completion_weight
         + input.reasoning as f64 * rate.reasoning_weight;
     round_tokens(sum)
+}
+
+/// A long-context tier: past `threshold` prompt tokens the whole call bills
+/// at the tier's multipliers (Anthropic's >200k pricing).
+pub fn long_context_scale(
+    prompt_total: i64,
+    threshold: i64,
+    weights: (f64, f64),
+    billable: (i64, i64),
+) -> (i64, i64) {
+    if prompt_total <= threshold {
+        return billable;
+    }
+    (
+        round_tokens(billable.0 as f64 * weights.0),
+        round_tokens(billable.1 as f64 * weights.1),
+    )
 }
 
 /// Weighted (prompt, completion) for the paths carrying no cache/reasoning
@@ -104,7 +143,49 @@ mod tests {
             write_cache: 1,
             completion: 5,
             reasoning: 2,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn audio_and_1h_cache_subsets_take_their_own_weights() {
+        let rate = TokenRate {
+            audio_prompt_weight: 4.0,
+            audio_completion_weight: 8.0,
+            write_cache_weight: 1.25,
+            write_cache_1h_weight: 2.0,
+            ..Default::default()
+        };
+        let input = TokenInput {
+            prompt: 10,
+            audio_prompt: 4,
+            write_cache: 6,
+            write_cache_1h: 2,
+            completion: 5,
+            audio_completion: 3,
+            ..Default::default()
+        };
+        // 6×1 + 4×4 + 4×1.25 + 2×2 = 31; 2×1 + 3×8 = 26
+        assert_eq!(weighted_prompt(&input, &rate), 31);
+        assert_eq!(weighted_completion(&input, &rate), 26);
+        // subsets never exceed their parent counts
+        let hostile = TokenInput {
+            prompt: 2,
+            audio_prompt: 9,
+            completion: 1,
+            audio_completion: 9,
+            ..Default::default()
+        };
+        assert_eq!(weighted_prompt(&hostile, &rate), 8);
+        assert_eq!(weighted_completion(&hostile, &rate), 8);
+        assert_eq!(
+            long_context_scale(250_000, 200_000, (2.0, 1.5), (100, 10)),
+            (200, 15)
+        );
+        assert_eq!(
+            long_context_scale(200_000, 200_000, (2.0, 1.5), (100, 10)),
+            (100, 10)
+        );
     }
 
     #[test]
@@ -147,6 +228,7 @@ mod tests {
             write_cache: 40,
             completion: 50,
             reasoning: 10,
+            ..Default::default()
         };
         assert_eq!(weighted_prompt(&input, &rate), 250);
         assert_eq!(weighted_completion(&input, &rate), 60);

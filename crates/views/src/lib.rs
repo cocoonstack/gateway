@@ -21,7 +21,8 @@ use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{
-    is_response_create, realtime_output_delta, realtime_turn_started, realtime_usage,
+    is_response_create, realtime_audio_tokens, realtime_output_delta, realtime_turn_started,
+    realtime_usage,
 };
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
@@ -494,26 +495,39 @@ async fn realtime_gate(
 /// Settle one realtime turn via the shared [`admission::settle_and_bill`]
 /// orchestration, on the turn's admission snapshot; a zero-usage terminal
 /// frame (cancelled/empty turn) refunds the reserves and writes nothing.
+/// Settle one realtime turn: `tokens` carries the turn's prompt/completion
+/// counts and their audio share.
 async fn bill_realtime_turn(
     admit: &RealtimeAdmit,
     m: &RtModel,
     mt: gw_consts::Protocol,
     account: &str,
-    it: i64,
-    ot: i64,
+    tokens: gw_models::TokenInput,
     estimated: bool,
 ) {
     let ak = &admit.ak;
     // clamp parts and total so a hostile count can't overflow shared counters
-    let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
+    let (it, ot) = (
+        gw_state::clamp_tokens(tokens.prompt),
+        gw_state::clamp_tokens(tokens.completion),
+    );
     if it.saturating_add(ot) == 0 {
         admit.refund().await;
         return;
     }
     let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
-    // pipeline parity: the same shared weighting the DAG estimate paths use
+    // pipeline parity: the same shared weighting the DAG estimate paths use;
+    // the audio share of each side takes the model's audio weight
     let rate = gw_state::model_token_rate(cfg, &m.served);
-    let (bp, bc) = gw_models::weighted_pair(it, ot, &rate);
+    let input = gw_models::TokenInput {
+        prompt: it,
+        completion: ot,
+        ..tokens
+    };
+    let (bp, bc) = (
+        gw_models::weighted_prompt(&input, &rate),
+        gw_models::weighted_completion(&input, &rate),
+    );
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
@@ -537,6 +551,7 @@ async fn bill_realtime_turn(
                 billable_completion: bc,
                 total,
                 units: 0,
+                discount: 1.0,
                 ptu_spillover: false,
                 estimated,
             },
@@ -562,6 +577,24 @@ async fn bill_realtime_turn(
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot as u64);
 }
 
+fn turn_tokens(prompt: i64, completion: i64) -> gw_models::TokenInput {
+    gw_models::TokenInput {
+        prompt,
+        completion,
+        ..Default::default()
+    }
+}
+
+/// The audio share of a turn's usage frame as the token-input audio fields.
+fn turn_audio(provider: &str, frame: &Value) -> gw_models::TokenInput {
+    let (audio_prompt, audio_completion) = realtime_audio_tokens(provider, frame);
+    gw_models::TokenInput {
+        audio_prompt,
+        audio_completion,
+        ..Default::default()
+    }
+}
+
 async fn settle_realtime_abort(
     turn: RealtimeTurn,
     m: &RtModel,
@@ -569,7 +602,9 @@ async fn settle_realtime_abort(
     account: &str,
 ) {
     match turn.estimated_output_tokens() {
-        Some(output) => bill_realtime_turn(&turn.admit, m, mt, account, 0, output, true).await,
+        Some(output) => {
+            bill_realtime_turn(&turn.admit, m, mt, account, turn_tokens(0, output), true).await
+        }
         None => turn.admit.refund().await,
     }
 }
@@ -648,10 +683,12 @@ async fn realtime_session(
                     .await
                     .is_err()
                 {
-                    bill_realtime_turn(&turn.admit, &rtm, mt, &account, it, ot, false).await;
+                    bill_realtime_turn(&turn.admit, &rtm, mt, &account, turn_tokens(it, ot), false)
+                        .await;
                     return;
                 }
-                bill_realtime_turn(&turn.admit, &rtm, mt, &account, it, ot, false).await;
+                bill_realtime_turn(&turn.admit, &rtm, mt, &account, turn_tokens(it, ot), false)
+                    .await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -881,8 +918,11 @@ async fn realtime_bridge(
                                         &rtm,
                                         mt,
                                         &account.name,
-                                        it,
-                                        ot,
+                                        gw_models::TokenInput {
+                                            prompt: it,
+                                            completion: ot,
+                                            ..turn_audio(&account.provider, &v)
+                                        },
                                         false,
                                     )
                                     .await
@@ -915,8 +955,11 @@ async fn realtime_bridge(
                                         &rtm,
                                         mt,
                                         &account.name,
-                                        it,
-                                        ot,
+                                        gw_models::TokenInput {
+                                            prompt: it,
+                                            completion: ot,
+                                            ..turn_audio(&account.provider, &v)
+                                        },
                                         false,
                                     )
                                     .await
@@ -5456,8 +5499,7 @@ mod tests {
             &rt("gpt-4o"),
             gw_consts::Protocol::Realtime,
             "acc",
-            30,
-            70,
+            turn_tokens(30, 70),
             false,
         )
         .await;
@@ -5480,8 +5522,7 @@ mod tests {
             &rt("gpt-4o"),
             gw_consts::Protocol::Realtime,
             "acc",
-            0,
-            0,
+            turn_tokens(0, 0),
             false,
         )
         .await;
@@ -5515,8 +5556,7 @@ mod tests {
             &rt("rt-m"),
             gw_consts::Protocol::Realtime,
             "acc",
-            100,
-            100,
+            turn_tokens(100, 100),
             false,
         )
         .await;
@@ -5620,8 +5660,7 @@ mod tests {
             &rt("rt"),
             gw_consts::Protocol::Realtime,
             "acc",
-            100,
-            100,
+            turn_tokens(100, 100),
             false,
         )
         .await;
@@ -5656,8 +5695,7 @@ mod tests {
             &rt("rt"),
             gw_consts::Protocol::Realtime,
             "acc",
-            40,
-            60,
+            turn_tokens(40, 60),
             false,
         )
         .await;
@@ -5681,8 +5719,7 @@ mod tests {
             &rt("rt"),
             gw_consts::Protocol::Realtime,
             "acc",
-            10,
-            20,
+            turn_tokens(10, 20),
             false,
         )
         .await;
@@ -5757,6 +5794,7 @@ mod tests {
             write_cache: 1,
             completion: 5,
             reason: 0,
+            ..Default::default()
         };
         let w = openai_usage(999, 999, 999, Some(u));
         assert_eq!(
@@ -5779,6 +5817,7 @@ mod tests {
             write_cache: 0,
             completion: 3,
             reason: 2,
+            ..Default::default()
         };
         let w = anthropic_usage(999, 999, Some(u));
         assert_eq!(
@@ -5800,6 +5839,7 @@ mod tests {
             write_cache: 1,
             completion: 5,
             reason: 2,
+            ..Default::default()
         };
         let w = responses_usage(999, 999, 999, Some(u));
         assert_eq!(
