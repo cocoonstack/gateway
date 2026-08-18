@@ -24,7 +24,7 @@ jobs:
       - name: Stamp the tag into the workspace version
         run: |
           perl -pi -e "s/^version = \"[^\"]*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
-          cargo update --workspace --offline
+          cargo update --workspace
       - name: Build and package gw
         run: |
           cargo build --release -p gw-server --locked
