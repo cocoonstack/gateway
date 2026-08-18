@@ -1189,7 +1189,7 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame: native events on the native surface, plain chunk fields elsewhere.
+/// Apply one Responses SSE frame: a native event natively, plain chunk fields elsewhere.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,
