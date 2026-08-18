@@ -455,8 +455,7 @@ impl ModelEngine for AudioEngine {
     /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // speech bills per input character; transcription per second (vendor count, else play
-        // length)
+        // speech bills per input char, transcription per second (vendor count, else play length)
         let mut units = 0;
         let mut local_seconds = None;
         let (status, v) = match self.kind {
@@ -557,8 +556,7 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        // token-priced transcription reports tokens; duration-priced `usage.seconds` (or
-        // `duration`)
+        // duration-priced transcription reports `usage.seconds` (or `duration`)
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),

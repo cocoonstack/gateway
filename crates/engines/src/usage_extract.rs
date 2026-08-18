@@ -30,8 +30,7 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
         return None;
     }
     Some(if messages_protocol {
-        // floor each part at 0 and sum saturating: a hostile usage must not refund quota or
-        // overflow
+        // floored and saturating: a hostile usage must not refund quota or overflow
         let input = get(v, &["input_tokens"]).max(0);
         let output = get(v, &["output_tokens"]).max(0);
         let read_cache = get(v, &["cache_read_input_tokens"]).max(0);

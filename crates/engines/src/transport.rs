@@ -356,8 +356,7 @@ impl MockTransport {
         let reply = format!("[mock-dashscope] you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         if req.stream {
-            // real wire: LF framing, `data:` sans space, id:/event:/comment lines, "null"
-            // finish_reason
+            // real wire: LF framing, `data:` sans space, id:/event: lines, "null" finish_reason
             let (a, b) = Self::split_half(&reply);
             let frame = |i: usize, content: &str, fr: &str, out: i64| {
                 format!(
@@ -843,8 +842,7 @@ impl MockTransport {
 #[async_trait::async_trait]
 impl Transport for MockTransport {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
-        // downtime simulation: account name containing "down" → upstream 503 (triggers DAG
-        // failover)
+        // an account named …down… answers 503 (the DAG failover trigger)
         if req.account.contains("down") {
             return Err(GatewayError::new(
                 gw_consts::ErrCode::FED_RESP_RPC_FAILED,

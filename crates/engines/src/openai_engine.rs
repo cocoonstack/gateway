@@ -20,8 +20,6 @@ impl OpenAiEngine {
         let mut out = Vec::new();
         for m in std::mem::take(&mut self.base.request.message) {
             match m.parts {
-                // a Messages-surface turn: its thinking/tool_use/tool_result blocks have OpenAI
-                // counterparts
                 Some(Value::Array(parts)) if parts.iter().any(is_native_block) => {
                     native_turn(&m.role, parts, m.reasoning_content, &mut out);
                 }
@@ -78,8 +76,7 @@ impl OpenAiEngine {
             }
             put!("temperature", p.temperature);
             put!("top_p", p.top_p);
-            // OpenAI's reasoning families 400 on max_tokens; compatible vendors know only
-            // max_tokens
+            // reasoning families 400 on max_tokens; compatible vendors know only max_tokens
             if reasoning_model {
                 put!("max_completion_tokens", p.max_tokens);
             } else {

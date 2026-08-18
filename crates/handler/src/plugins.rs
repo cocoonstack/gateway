@@ -514,8 +514,7 @@ pub fn realtime_frame_scan(
     collect_text: bool,
 ) -> (ScanOutcome, String, usize) {
     let scan_rules = !sec.blocklist.is_empty() || !sec.regexes.is_empty();
-    // redaction joins the walk only without moderation text: mask spans address pre-redaction
-    // offsets
+    // mask spans address pre-redaction offsets: no redaction while moderation text is collected
     let redact = (sec.dlp_redact || sec.detect_secrets) && !collect_text;
     let mut counts = ScanCounts::new(sec);
     let mut text = String::new();

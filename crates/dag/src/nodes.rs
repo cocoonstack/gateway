@@ -327,8 +327,7 @@ impl DagNode for SelectAccount {
             .select_healthy(mt, provider, &[], ctx.state.health.as_ref())
             .await;
         let Some(account) = account else {
-            // an exhausted pool is a client-visible failure; unsampled it would read no_data
-            // forever
+            // unsampled, an exhausted pool would read no_data forever
             ctx.state
                 .avail
                 .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
@@ -650,8 +649,7 @@ impl DagNode for CostCalc {
             return Ok(());
         }
         let resp = &outcome.response;
-        // an aborted stream never saw the usage frame — bill it; gate on completion_tokens
-        // (Anthropic reports input up front, output only in the final message_delta)
+        // an aborted stream never saw the usage frame (Anthropic reports output only at the end)
         if resp.aborted && resp.completion_tokens == 0 {
             return bill_aborted_stream(ctx, None).await;
         }

@@ -73,8 +73,7 @@ impl OfflineHandler {
         captured_at: i64,
     ) {
         let store = self.online.state().store.clone();
-        // the distributed claim already set running with the fence; unfenced here it could
-        // resurrect a batch a stale worker no longer owns
+        // unfenced, this write could resurrect a batch a stale worker no longer owns
         if claim == 0
             && let Err(e) = store.batch_set_status(id, BatchStatus::Running).await
         {
@@ -121,14 +120,12 @@ impl OfflineHandler {
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
             }
-            // fence before each item so at most the in-flight one double-runs; fail CLOSED
-            // when ownership cannot be confirmed (claim 0 = in-process, unfenced)
+            // fence per item, fail CLOSED: at most the in-flight item double-runs (claim 0: none)
             if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
                 break;
             }
-            // re-read just before dispatch: a queued-while erasure blanks the persisted item;
-            // fail CLOSED, the stale pre-load copy never dispatches
+            // re-read before dispatch (fail CLOSED): an erasure while queued blanks the stored item
             if store.distributed_batches() {
                 match store.batch_item_snapshot(id, index).await {
                     Ok(Some(fresh)) => item = fresh,
@@ -146,8 +143,7 @@ impl OfflineHandler {
                 }
             }
             let user = ak.attributed_user(&item.user).to_owned();
-            // local backends don't persist items: the erasure marker stops the user's remaining
-            // ones instead (fail closed on a marker read error)
+            // local backends keep no item rows: the erasure marker stops the rest (fail closed)
             let erased_mid_batch = !store.distributed_batches()
                 && store
                     .user_erased_since(&ak.tenant, &user, captured_at)

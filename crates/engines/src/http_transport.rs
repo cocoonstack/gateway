@@ -113,8 +113,7 @@ impl Transport for HttpTransport {
         let mut attempt = 0u32;
         let mut resp = loop {
             let mut builder = self.client.request(method.clone(), &req.url);
-            // reqwest's timeout is a TOTAL deadline that would kill a long generation:
-            // streams get a header-phase deadline here and an idle gap cap below
+            // reqwest's timeout is a total deadline: streams get a header deadline + idle cap
             if !req.stream {
                 builder = builder.timeout(timeout);
             }

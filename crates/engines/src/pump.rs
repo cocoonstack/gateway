@@ -89,8 +89,7 @@ where
             let mut dec = SseDecoder::default();
             let mut sent_any = false;
             while let Some(item) = s.next().await {
-                // after bytes reached the client a fault is a committed abort (terminal frame,
-                // keep what was delivered), before commit a failover-eligible upstream failure
+                // after commit a fault aborts (terminal frame); before commit it may fail over
                 let bytes = match item {
                     Ok(b) => b,
                     Err(fault) if sent_any => {
@@ -116,8 +115,7 @@ where
                     }
                 };
                 for data in events {
-                    // a bad frame after commit is an abort, not a failover: a replay would splice
-                    // a second generation onto the same stream
+                    // a bad frame after commit aborts: a replay would splice a second generation
                     let applied = serde_json::from_str(&data)
                         .map_err(|e| {
                             GatewayError::internal(format!("parse {vendor} sse frame"))

@@ -244,8 +244,7 @@ impl OnlineHandler {
             emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
         }
 
-        // a panicking node must refund too; unwind-safe: the refund reads only plain ctx
-        // fields each written whole by its node
+        // a panicking node must refund too; the refund reads only whole-written ctx fields
         let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.plan, &mut ctx))
             .catch_unwind()
             .await
@@ -309,8 +308,7 @@ impl OnlineHandler {
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
             let native_event_hits = plugins::native_event_dlp_hits(sec, &mut outcome.chunks);
             let n = plugins::dlp_redact_response(sec, &mut outcome.response);
-            // raw deltas are pre-redaction: drop them when anything hit DLP, keeping only the
-            // signed reasoning units the strip pass kept (the chat surface carries them in chunks)
+            // raw deltas are pre-redaction: on any DLP hit keep only the signed reasoning units
             if dlp && (n > 0 || native_event_hits > 0) {
                 for chunk in outcome.chunks.drain(..) {
                     if let Some(units) = chunk.reasoning_details {

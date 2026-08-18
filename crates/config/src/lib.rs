@@ -730,8 +730,7 @@ impl GatewayConfig {
         cfg.normalize()?;
         cfg.validate()?;
         cfg.build_indices();
-        // a document hash, not a counter: replicas must agree and a restart must not hit stale
-        // entries
+        // a document hash, not a counter: replicas must agree across restarts
         cfg.generation = stable_hash(yaml);
         Ok(cfg)
     }
