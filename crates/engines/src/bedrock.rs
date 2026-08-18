@@ -102,21 +102,13 @@ pub(crate) fn converse_uri(model: &str, stream: bool) -> String {
 /// SigV4's canonical URI: the wire path with every byte outside the
 /// unreserved set percent-encoded once (`:` in `…-v1:0` → `%3A`), `/` kept.
 fn canonical_uri(path: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(path.len() + 8);
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(byte as char)
-            }
-            _ => {
-                out.push('%');
-                out.push(HEX[usize::from(byte >> 4)] as char);
-                out.push(HEX[usize::from(byte & 0xF)] as char);
-            }
-        }
-    }
-    out
+    const ESCAPED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~')
+        .remove(b'/');
+    percent_encoding::utf8_percent_encode(path, ESCAPED).to_string()
 }
 
 /// One InvokeModel[WithResponseStream] call: SigV4 signs the exact bytes sent

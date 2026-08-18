@@ -66,6 +66,12 @@ impl Base {
         }
     }
 
+    /// `{base}/v1/{path}` for the generic vendor families (search, rerank,
+    /// video, passthrough) — the mock sentinel is theirs to share.
+    pub fn vendor_url(&self, path: &str) -> String {
+        format!("{}/v1/{path}", self.base_url("mock://api.vendor.com"))
+    }
+
     /// The account's API key (read from its env var at call time when live),
     /// else the inert "mock" sentinel.
     pub fn api_key(&self) -> String {

@@ -83,6 +83,9 @@ hmac = "0.12"
 hex = "0.4"
 chacha20poly1305 = "0.10"
 regex = "1"
+# AWS EventStream framing (already in the lock via sqlx/reqwest)
+crc = "3"
+percent-encoding = "2"
 
 # Faster iterative builds; keep release optimized.
 [profile.dev]

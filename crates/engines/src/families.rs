@@ -616,13 +616,7 @@ impl ModelEngine for VideoEngine {
         }
         let (status, v) = self
             .base
-            .round_trip(
-                &format!(
-                    "{}/v1/videos/generations",
-                    self.base.base_url("mock://api.vendor.com")
-                ),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("videos/generations"), body)
             .await?;
         let message = v["video_url"].as_str().unwrap_or_default().to_owned();
         let step = v["status"].as_str().unwrap_or_default().to_owned();
@@ -647,10 +641,7 @@ impl ModelEngine for SearchEngine {
         let body = json!({"query": query, "count": count});
         let (status, v) = self
             .base
-            .round_trip(
-                &format!("{}/v1/search", self.base.base_url("mock://api.vendor.com")),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("search"), body)
             .await?;
         let titles: Vec<String> = v["results"]
             .as_array()
@@ -735,10 +726,7 @@ impl ModelEngine for RerankEngine {
         }
         let (status, v) = self
             .base
-            .round_trip(
-                &format!("{}/v1/rerank", self.base.base_url("mock://api.vendor.com")),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("rerank"), body)
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
@@ -775,13 +763,7 @@ impl ModelEngine for PassthroughEngine {
         body["payload"] = self.base.take_raw();
         let (status, v) = self
             .base
-            .round_trip(
-                &format!(
-                    "{}/v1/passthrough",
-                    self.base.base_url("mock://api.vendor.com")
-                ),
-                body,
-            )
+            .round_trip(&self.base.vendor_url("passthrough"), body)
             .await?;
         let message = if v["ok"].as_bool().unwrap_or(false) {
             "ok"

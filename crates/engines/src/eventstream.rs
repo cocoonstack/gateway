@@ -17,27 +17,7 @@ use crate::transport::StreamFault;
 /// anything bigger is a framing error, not a payload to buffer.
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
-const CRC_TABLE: [u32; 256] = crc_table();
-
-const fn crc_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
+const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
 /// One decoded message: Bedrock's `chunk` events, or a terminal exception.
 #[derive(Debug, PartialEq, Eq)]
@@ -257,11 +237,7 @@ fn be_u32(b: &[u8]) -> u32 {
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut c = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    !c
+    CRC.checksum(bytes)
 }
 
 #[cfg(test)]
