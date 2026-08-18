@@ -9,6 +9,7 @@
 pub mod bedrock;
 pub mod bespoke;
 pub mod claude_engine;
+pub mod converse;
 pub mod engine;
 pub mod eventstream;
 pub mod factory;

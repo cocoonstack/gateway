@@ -28,7 +28,7 @@ pub fn get_engine(
         Protocol::OpenaiChat => Box::new(OpenAiEngine::new(request, transport)),
         Protocol::Completions => Box::new(CompletionsEngine::new(request, transport)),
         Protocol::Responses => Box::new(ResponsesEngine::new(request, transport)),
-        Protocol::AnthropicMessages | Protocol::AwsAnthropic => {
+        Protocol::AnthropicMessages | Protocol::AwsAnthropic | Protocol::AwsConverse => {
             Box::new(ClaudeEngine::new(request, transport))
         }
         Protocol::Gemini => Box::new(VertexEngine::new(request, transport)),

@@ -93,6 +93,14 @@ pub(crate) fn invoke_uri(model: &str, stream: bool) -> String {
     }
 }
 
+pub(crate) fn converse_uri(model: &str, stream: bool) -> String {
+    if stream {
+        format!("/model/{model}/converse-stream")
+    } else {
+        format!("/model/{model}/converse")
+    }
+}
+
 /// SigV4's canonical URI: the wire path with every byte outside the
 /// unreserved set percent-encoded once (`:` in `…-v1:0` → `%3A`), `/` kept.
 fn canonical_uri(path: &str) -> String {
@@ -116,6 +124,16 @@ fn canonical_uri(path: &str) -> String {
 pub(crate) async fn bedrock_send(
     base: &mut Base,
     model: &str,
+    body: Value,
+) -> GResult<UpstreamResponse> {
+    let uri = invoke_uri(model, base.request.stream);
+    bedrock_send_uri(base, &uri, body).await
+}
+
+/// [`bedrock_send`] at an explicit path (InvokeModel or Converse).
+pub(crate) async fn bedrock_send_uri(
+    base: &mut Base,
+    uri: &str,
     mut body: Value,
 ) -> GResult<UpstreamResponse> {
     if let Some(obj) = body.as_object_mut() {
@@ -123,7 +141,6 @@ pub(crate) async fn bedrock_send(
         crate::base::merge_raw_extras_owned(obj, raw);
     }
     let stream = base.request.stream;
-    let uri = invoke_uri(model, stream);
     let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
     let host = root.split_once("://").map(|(_, h)| h).unwrap_or(root);
     let payload = crate::base::body_bytes(&body)?;
@@ -137,7 +154,7 @@ pub(crate) async fn bedrock_send(
             let creds = base.aws_credentials();
             aws_headers(
                 host,
-                &uri,
+                uri,
                 &payload,
                 creds
                     .as_ref()

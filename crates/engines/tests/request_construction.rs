@@ -1414,3 +1414,35 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
     );
     assert!(t.body_json().get("stream").is_none());
 }
+
+#[tokio::test]
+async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
+    let t = RecordingTransport::new(
+        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AwsConverse, "us.meta.llama3-3-70b-instruct-v1:0");
+    if let Some(p) = req.model_param_v2.as_mut() {
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            max_tokens: Some(64),
+            temperature: Some(0.1),
+            ..Default::default()
+        }));
+    }
+    let out = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(out.response.message, "ok");
+    assert_eq!(out.response.prompt_tokens, 3);
+    let b = t.body_json();
+    assert_eq!(b["system"], serde_json::json!([{"text": "be brief"}]));
+    assert_eq!(b["messages"][0]["content"][0]["text"], "hello");
+    assert_eq!(
+        b["inferenceConfig"],
+        serde_json::json!({"maxTokens": 64, "temperature": 0.1})
+    );
+    assert!(b.get("anthropic_version").is_none() && b.get("model").is_none());
+    assert!(
+        t.url()
+            .ends_with("/model/us.meta.llama3-3-70b-instruct-v1:0/converse"),
+        "url: {}",
+        t.url()
+    );
+}

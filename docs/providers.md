@@ -74,6 +74,7 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
 | `aws-anthropic` | Anthropic Claude on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`anthropic.claude-…`, `us.anthropic.claude-…`); the full Messages engine (system, tools, thinking dialects by generation, prompt-cache breakpoints, signed reasoning) on the InvokeModel wire — `anthropic_version` in the body, model and streaming in the path; streams via InvokeModelWithResponseStream (EventStream frames decoded into the same event sequence) |
+| `aws-converse` | any model on AWS Bedrock via the Converse API | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API key (see below); model name = the Bedrock model id or inference profile (`eu.amazon.nova-micro-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `mistral.pixtral-large-2502-v1:0`, `anthropic.claude-…`); the Messages engine transcoded to Converse — system, tools + tool results, images, thinking replay, prompt-cache points — and back (buffered and `converse-stream`); Claude reasoning knobs ride in `additionalModelRequestFields`, other passthrough extras too |
 | `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id; Command R (`{message, chat_history, preamble}` → `text`) and the legacy Command `generations[]` shape; usage from Bedrock's `x-amzn-bedrock-*-token-count` headers, or `amazon-bedrock-invocationMetrics` on a stream |
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id or inference profile (`meta.llama3-8b-instruct-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.meta.llama4-scout-17b-instruct-v1:0`); the conversation is rendered into the Llama 3 (or Llama 4) chat template; usage from the token-count headers / invocation metrics, else the body counts |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
@@ -120,8 +121,12 @@ against AWS itself (eu-north-1 inference profiles: Haiku 4.5, Sonnet 4.5 /
 replayed through a tool loop, the native event stream, prompt-cache
 breakpoints with weighted billing), as is Bedrock Llama (us-east-1: Llama 3
 8B on demand, Llama 3.3 70B and Llama 4 Scout profiles — buffered, streamed,
-multi-turn, both surfaces); the SigV4 path is verified up to an accepted
-signature. Cohere Command R on Bedrock is verified against the
+multi-turn, both surfaces) and Bedrock Converse (Nova micro/lite/pro, Mistral
+Pixtral, Llama 3.3 and Claude Haiku 4.5 through one wire: buffered, streamed,
+tools with a replayed tool result on Nova, thinking with signatures on Claude,
+the native `/v1/messages` stream); the SigV4 path is verified up to an
+accepted signature. Bedrock's Llama answers a tool request as JSON text
+rather than a `toolUse` block, which is the model's behavior on that wire. Cohere Command R on Bedrock is verified against the
 [ministack](https://github.com/ministackorg/ministack) emulator's
 family-faithful InvokeModel replies, EventStream framing and token-count
 headers only — AWS marks Command R / R+ legacy and gates them per account.
@@ -164,8 +169,9 @@ accounts:
      api_key_env: AWS_ACCESS_KEY_ID, secret_key_env: AWS_SECRET_ACCESS_KEY,
      protocols: ["aws-anthropic", "aws-llama", "aws-cohere"]}
   - {name: bedrock-eu, provider: aws, endpoint: "https://bedrock-runtime.eu-north-1.amazonaws.com",
-     api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic"]}
+     api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse"]}
 models:
   - {name: us.anthropic.claude-sonnet-4-5-20250929-v1:0, protocol: aws-anthropic}
   - {name: meta.llama3-1-8b-instruct-v1:0, protocol: aws-llama}
+  - {name: eu.amazon.nova-pro-v1:0, protocol: aws-converse}
 ```

@@ -72,11 +72,14 @@ impl ClaudeEngine {
             last["content"] = Value::Array(cached_blocks(last["content"].take()));
         }
         let param = self.base.param()?;
-        let bedrock = param.protocol == gw_consts::Protocol::AwsAnthropic;
+        let bedrock = matches!(
+            param.protocol,
+            gw_consts::Protocol::AwsAnthropic | gw_consts::Protocol::AwsConverse
+        );
         let mut body = Map::new();
-        if bedrock {
+        if param.protocol == gw_consts::Protocol::AwsAnthropic {
             body.insert("anthropic_version".into(), "bedrock-2023-05-31".into());
-        } else {
+        } else if !bedrock {
             body.insert("model".into(), param.model_name.clone().into());
             body.insert("stream".into(), self.base.request.stream.into());
         }
@@ -182,8 +185,12 @@ impl ClaudeEngine {
     }
 
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let mut v: Value = serde_json::from_slice(bytes)
+        let v: Value = serde_json::from_slice(bytes)
             .map_err(|e| GatewayError::internal("parse anthropic response").with_source(e))?;
+        self.parse_value(status, v)
+    }
+
+    fn parse_value(&self, status: u16, mut v: Value) -> GResult<EngineOutcome> {
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
@@ -242,21 +249,37 @@ impl ClaudeEngine {
         Ok(outcome)
     }
 
-    /// Buffered or live anthropic event sequence through the shared pump.
-    async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
+    /// Buffered or live anthropic event sequence through the shared pump;
+    /// Converse events are transcoded into that sequence on the way in.
+    async fn run_sse(
+        &self,
+        status: u16,
+        body: UpstreamBody,
+        converse: Option<crate::converse::Events>,
+    ) -> GResult<EngineOutcome> {
         let mut resp = GatewayResponse {
             is_messages_protocol: true,
             ..Default::default()
         };
         let model_override = self.base.model_override().map(str::to_owned);
         let mut st = SseState::new(self.base.request.preserve_anthropic_wire, model_override);
-        let r = crate::pump::pump_sse(
-            "anthropic",
-            body,
-            self.base.request.stream_tx.clone(),
-            |v| st.apply(v, status, &mut resp),
-        )
-        .await?;
+        let tx = self.base.request.stream_tx.clone();
+        let r = match converse {
+            None => {
+                crate::pump::pump_sse("anthropic", body, tx, |v| st.apply(v, status, &mut resp))
+                    .await?
+            }
+            Some(mut events) => {
+                crate::pump::pump_sse("bedrock", body, tx, |v| {
+                    let mut chunks = Vec::new();
+                    for event in events.map(v) {
+                        chunks.extend(st.apply(event, status, &mut resp)?);
+                    }
+                    Ok(chunks)
+                })
+                .await?
+            }
+        };
         st.finish(&mut resp);
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
@@ -265,17 +288,49 @@ impl ClaudeEngine {
 #[async_trait::async_trait]
 impl ModelEngine for ClaudeEngine {
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let reply = if self.base.param()?.protocol == gw_consts::Protocol::AwsAnthropic {
-            let body = Value::Object(self.build_body()?);
-            let model = self.base.model_name()?.to_owned();
-            crate::bedrock::bedrock_send(&mut self.base, &model, body).await?
-        } else {
-            let up = self.build_upstream()?;
-            self.base.transport.send(up).await?
-        };
-        match reply.body {
-            UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
-            body => self.run_sse(reply.status, body).await,
+        match self.base.param()?.protocol {
+            gw_consts::Protocol::AwsAnthropic => {
+                let body = Value::Object(self.build_body()?);
+                let model = self.base.model_name()?.to_owned();
+                let reply = crate::bedrock::bedrock_send(&mut self.base, &model, body).await?;
+                match reply.body {
+                    UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
+                    body => self.run_sse(reply.status, body, None).await,
+                }
+            }
+            gw_consts::Protocol::AwsConverse => {
+                let model = self.base.model_name()?.to_owned();
+                let body = crate::converse::request(self.build_body()?, model.contains("claude"));
+                let uri = crate::bedrock::converse_uri(&model, self.base.request.stream);
+                let reply = crate::bedrock::bedrock_send_uri(&mut self.base, &uri, body).await?;
+                match reply.body {
+                    UpstreamBody::Json(b) => {
+                        let v: Value = serde_json::from_slice(&b).map_err(|e| {
+                            GatewayError::internal("parse converse response").with_source(e)
+                        })?;
+                        if let Some(err) = crate::engine::vendor_error(reply.status, &v) {
+                            return Err(err);
+                        }
+                        self.parse_value(reply.status, crate::converse::reply(v, &model))
+                    }
+                    body => {
+                        self.run_sse(
+                            reply.status,
+                            body,
+                            Some(crate::converse::Events::new(model)),
+                        )
+                        .await
+                    }
+                }
+            }
+            _ => {
+                let up = self.build_upstream()?;
+                let reply = self.base.transport.send(up).await?;
+                match reply.body {
+                    UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
+                    body => self.run_sse(reply.status, body, None).await,
+                }
+            }
         }
     }
 }
@@ -791,6 +846,52 @@ mod tests {
                 {"name":"echo","input_schema":{"type":"object","properties":{"s":{"type":"string"}}}}
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn converse_runs_the_messages_engine_buffered_streamed_and_with_tools() {
+        let mut r = base_req();
+        r.model_param_v2 = Some(ModelParamV2::with_name(
+            Protocol::AwsConverse,
+            "eu.amazon.nova-micro-v1:0",
+        ));
+        let out = ClaudeEngine::new(r.clone(), Arc::new(MockTransport))
+            .run()
+            .await
+            .unwrap();
+        assert!(
+            out.response.message.contains("you said: ping"),
+            "{:?}",
+            out.response
+        );
+        assert_eq!(out.response.finish_reason, "end_turn");
+        assert!(out.response.total_tokens > 0);
+
+        let mut streamed = r.clone();
+        streamed.stream = true;
+        let out = ClaudeEngine::new(streamed, Arc::new(MockTransport))
+            .run()
+            .await
+            .unwrap();
+        assert!(out.chunks.len() >= 2, "chunks: {:?}", out.chunks);
+        assert!(out.response.message.contains("you said: ping"));
+        assert_eq!(out.response.finish_reason, "end_turn");
+        assert!(out.response.total_tokens > 0);
+
+        if let Some(p) = r.model_param_v2.as_mut() {
+            p.typed = Some(TypedParams::Chat(ChatParams {
+                tools: Some(
+                    json!([{"type":"function","function":{"name":"probe","parameters":{"type":"object"}}}]),
+                ),
+                ..Default::default()
+            }));
+        }
+        let out = ClaudeEngine::new(r, Arc::new(MockTransport))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.finish_reason, "tool_use");
+        assert_eq!(out.response.tool_calls.unwrap()[0]["name"], "probe");
     }
 
     #[tokio::test]

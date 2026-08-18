@@ -144,9 +144,12 @@ pub fn to_sse(
         let mut out = Vec::new();
         for frame in frames {
             match frame {
-                Frame::Event { payload, .. } => {
+                Frame::Event {
+                    event_type,
+                    payload,
+                } => {
                     out.extend_from_slice(b"data: ");
-                    out.extend_from_slice(&chunk_bytes(&payload)?);
+                    out.extend_from_slice(&chunk_bytes(&payload, &event_type)?);
                     out.extend_from_slice(b"\n\n");
                 }
                 Frame::Exception(message) => return Err(fault(message)),
@@ -156,10 +159,11 @@ pub fn to_sse(
     }))
 }
 
-/// The model frame inside a `chunk` payload; a payload without `bytes` is
-/// forwarded as it is.
-fn chunk_bytes(payload: &[u8]) -> Result<Vec<u8>, StreamFault> {
-    let v: serde_json::Value = match serde_json::from_slice(payload) {
+/// The model frame inside an InvokeModel `chunk` payload; a Converse event
+/// (no `bytes`) is forwarded with its `:event-type` injected as `type`, since
+/// the frame itself does not say which event it is.
+fn chunk_bytes(payload: &[u8], event_type: &str) -> Result<Vec<u8>, StreamFault> {
+    let mut v: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(_) => return Ok(payload.to_vec()),
     };
@@ -167,7 +171,12 @@ fn chunk_bytes(payload: &[u8]) -> Result<Vec<u8>, StreamFault> {
         Some(b64) => base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| fault(format!("eventstream: chunk bytes not base64: {e}"))),
-        None => Ok(payload.to_vec()),
+        None => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("type".into(), event_type.into());
+            }
+            serde_json::to_vec(&v).map_err(|e| fault(format!("eventstream: {e}")))
+        }
     }
 }
 
@@ -280,7 +289,14 @@ mod tests {
         let Frame::Event { payload, .. } = &frames[1] else {
             panic!("event")
         };
-        assert_eq!(chunk_bytes(payload).unwrap(), br#"{"type":"message_stop"}"#);
+        assert_eq!(
+            chunk_bytes(payload, "chunk").unwrap(),
+            br#"{"type":"message_stop"}"#
+        );
+        assert_eq!(
+            chunk_bytes(br#"{"contentBlockIndex":0}"#, "contentBlockStop").unwrap(),
+            br#"{"contentBlockIndex":0,"type":"contentBlockStop"}"#
+        );
     }
 
     #[test]

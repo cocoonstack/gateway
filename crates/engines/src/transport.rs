@@ -417,6 +417,9 @@ impl MockTransport {
     /// Bedrock InvokeModel by request protocol; a stream request answers in
     /// the EventStream wire (`chunk` events carrying the family's frames).
     fn bedrock_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        if req.protocol == Protocol::AwsConverse {
+            return self.converse_reply(req);
+        }
         let reply = match req.protocol {
             Protocol::AwsAnthropic => self.anthropic_reply(req)?,
             Protocol::AwsCohere => self.cohere_reply(req)?,
@@ -485,6 +488,79 @@ impl MockTransport {
                 Ok(bytes::Bytes::from(wire))
             }))),
             headers: reply.headers,
+        })
+    }
+
+    /// Bedrock Converse: `{system, messages[{role, content[{text}]}], toolConfig}`
+    /// → `{output.message, stopReason, usage}`; a stream is the typed
+    /// EventStream sequence (messageStart … metadata).
+    fn converse_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let body = Self::parse(&req.body, "converse")?;
+        let model = req
+            .url
+            .rsplit("/model/")
+            .next()
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("mock");
+        let user = body["messages"]
+            .as_array()
+            .and_then(|ms| ms.iter().rev().find(|m| m["role"] == "user"))
+            .and_then(|m| m["content"][0]["text"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let sys = body["system"][0]["text"].as_str().unwrap_or_default();
+        let sys_note = if sys.is_empty() {
+            String::new()
+        } else {
+            format!("[sys:{sys}] ")
+        };
+        let reply = format!("[mock-converse:{model}] {sys_note}you said: {user}");
+        let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
+        if let Some(tool) = body["toolConfig"]["tools"][0]["toolSpec"]["name"].as_str() {
+            return Self::ok_json(json!({
+                "output": {"message": {"role": "assistant", "content": [
+                    {"toolUse": {"toolUseId": "tu-mock-1", "name": tool, "input": {"echo": user}}}]}},
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": it, "outputTokens": ot, "totalTokens": it + ot}
+            }));
+        }
+        if !req.stream {
+            return Self::ok_json(json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": reply}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": it, "outputTokens": ot, "totalTokens": it + ot}
+            }));
+        }
+        let (a, b) = Self::split_half(&reply);
+        let mut wire = Vec::new();
+        for (event_type, payload) in [
+            ("messageStart", json!({"role": "assistant"})),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0, "delta": {"text": a}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0, "delta": {"text": b}}),
+            ),
+            ("contentBlockStop", json!({"contentBlockIndex": 0})),
+            ("messageStop", json!({"stopReason": "end_turn"})),
+            (
+                "metadata",
+                json!({"usage": {"inputTokens": it, "outputTokens": ot, "totalTokens": it + ot}}),
+            ),
+        ] {
+            wire.extend(crate::eventstream::encode_event(
+                event_type,
+                payload.to_string().as_bytes(),
+            ));
+        }
+        Ok(UpstreamResponse {
+            status: 200,
+            body: UpstreamBody::SseStream(Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from(wire))
+            }))),
+            headers: HeaderMap::new(),
         })
     }
 
