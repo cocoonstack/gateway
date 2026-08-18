@@ -838,8 +838,7 @@ impl ResponsesEngine {
         self.base.model_name().unwrap_or_default().to_owned()
     }
 
-    /// The native body passes through with the DAG-selected model applied; a
-    /// request from another surface is built from the normalized messages.
+    /// The native body as sent, or one built from the normalized turns off the native surface.
     fn build_body(&mut self) -> GResult<Value> {
         let mut body = match self.base.take_raw() {
             Value::Object(raw) => raw,
@@ -852,8 +851,7 @@ impl ResponsesEngine {
         Ok(Value::Object(body))
     }
 
-    /// Chat/Messages-surface turns as Responses `input` items (tool calls and
-    /// results as `function_call` / `function_call_output`) plus the typed params.
+    /// A Responses body from the chat/messages turns and the typed params.
     fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) {
         let system = self.base.system_text();
         if !system.is_empty() {
@@ -1148,8 +1146,7 @@ fn function_call_output(call_id: Value, output: String) -> Value {
     ])
 }
 
-/// A Responses object's `status` (+ `incomplete_details.reason`) in the shared
-/// finish vocabulary for the other surfaces.
+/// A Responses `status`/`incomplete_details.reason` in the shared finish vocabulary.
 fn responses_finish(response: &Value, tool_calls: bool) -> String {
     let status = response["status"].as_str().unwrap_or("completed");
     match (status, response["incomplete_details"]["reason"].as_str()) {
@@ -1162,7 +1159,6 @@ fn responses_finish(response: &Value, tool_calls: bool) -> String {
     .to_owned()
 }
 
-/// A Responses `function_call` item as a chat-wire tool call.
 fn function_call_to_tool_call(mut item: Value) -> Value {
     object([
         ("id", item["call_id"].take()),
@@ -1193,8 +1189,7 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
     (input, output, Some(common))
 }
 
-/// Apply one Responses SSE frame: natively every frame moves out as a native
-/// event, elsewhere text/tool calls ride the plain chunk fields.
+/// Apply one Responses SSE frame: native events on the native surface, plain chunk fields elsewhere.
 fn responses_apply_frame(
     mut v: Value,
     status: u16,
