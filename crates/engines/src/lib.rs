@@ -6,6 +6,7 @@
 //! the SSE decoder, usage normalization, the dispatch factory, and the engine
 //! implementations.
 
+pub mod bedrock;
 pub mod bespoke;
 pub mod claude_engine;
 pub mod engine;
