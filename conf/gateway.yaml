@@ -139,9 +139,13 @@ models:
   - name: whisper-1 # audio stt family
     protocol: stt
     unit_price_micros: 100 # per audio second
-  - name: kling-video # video family, synchronous vendor shape
+  - name: kling-v1-6 # Kling text2video: {code, data.task_id} envelope, billed per second
     protocol: video
     provider: kling
+    unit_price_micros: 60000
+  - name: vidu-video # generic synchronous vendor shape (the video fallback wire)
+    protocol: video
+    provider: vidu
   - name: grok-imagine-video # async video: request_id + poll, billed per second on done
     protocol: video
     provider: xai
@@ -253,6 +257,10 @@ accounts:
     protocols: ["tts", "stt"]
   - name: mock-video-1
     provider: kling
+    priority: 1
+    protocols: ["video"]
+  - name: mock-vidu-1
+    provider: vidu
     priority: 1
     protocols: ["video"]
   - name: mock-xai-1 # e2e: the xAI host answers video with a request_id + poll

@@ -81,6 +81,7 @@ models:
   - {name: Wan-AI/Wan2.2-T2V-A14B, provider: siliconflow, protocol: video, unit_price_micros: 500000}
   - {name: wan2.2-t2v-plus, provider: dashscope, protocol: video, unit_price_micros: 120000}
   - {name: MiniMax-Hailuo-02, provider: minimax, protocol: video, unit_price_micros: 300000}
+  - {name: kling-v1-6, provider: kling, protocol: video, unit_price_micros: 60000}
   # realtime with real vendor usage (audio output at its own weight)
   - {name: gpt-realtime-mini, provider: openai, protocol: realtime, input_price_per_1k_micros: 600, output_price_per_1k_micros: 2400, token_rate: {audio_prompt: 16.0, audio_completion: 8.0}}
   # local ollama through the generic openai-compatible path
@@ -97,6 +98,11 @@ models:
   - {name: "us.meta.llama3-1-8b-instruct-v1:0", protocol: aws-llama, input_price_per_1k_micros: 220, output_price_per_1k_micros: 220}
 
 accounts:
+  - name: kling
+    provider: kling
+    endpoint: https://api-singapore.klingai.com
+    api_key_env: KLING_API_KEY
+    protocols: ["video"]
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
   - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama"], timeout_seconds: 120}

@@ -1458,7 +1458,7 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         .oneshot(post(
             "/v1/videos/generations",
             Some("ak-demo-123"),
-            r#"{"model":"kling-video","prompt":"a dog surfing"}"#,
+            r#"{"model":"vidu-video","prompt":"a dog surfing"}"#,
         ))
         .await
         .unwrap();
@@ -1612,6 +1612,13 @@ async fn dashscope_and_hailuo_dialects_bill_once_and_hailuo_serves_content() {
             false,
         ),
         (
+            r#"{"model":"kling-v1-6","prompt":"a lantern floating upriver","duration":5}"#,
+            "succeed",
+            5,
+            300_000,
+            false,
+        ),
+        (
             r#"{"model":"MiniMax-Hailuo-02","prompt":"a lantern floating upriver","duration":6}"#,
             "Success",
             1,
@@ -1626,11 +1633,7 @@ async fn dashscope_and_hailuo_dialects_bill_once_and_hailuo_serves_content() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp).await;
-        let id = j["output"]["task_id"]
-            .as_str()
-            .or_else(|| j["task_id"].as_str())
-            .unwrap()
-            .to_owned();
+        let id = gw_engines::families::video_handle(&j).unwrap().to_owned();
         assert!(
             id.contains("lantern"),
             "job keyed by the task id, not a trace id: {j}"
@@ -1646,6 +1649,7 @@ async fn dashscope_and_hailuo_dialects_bill_once_and_hailuo_serves_content() {
             assert_eq!(status, StatusCode::OK, "{poll}");
             let state = poll["output"]["task_status"]
                 .as_str()
+                .or_else(|| poll["data"]["task_status"].as_str())
                 .or_else(|| poll["status"].as_str())
                 .unwrap();
             assert_eq!(state, done, "{poll}");

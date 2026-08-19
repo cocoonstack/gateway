@@ -614,6 +614,8 @@ enum VideoDialect {
     DashScope,
     /// MiniMax Hailuo `/v1/video_generation` + `/v1/query/video_generation`.
     Minimax,
+    /// Kling `/v1/videos/text2video` + GET by task id; `{code, data}` envelope.
+    Kling,
 }
 
 fn video_dialect(provider: &str) -> VideoDialect {
@@ -622,6 +624,7 @@ fn video_dialect(provider: &str) -> VideoDialect {
         "siliconflow" => VideoDialect::SiliconFlow,
         "alibaba" | "dashscope" => VideoDialect::DashScope,
         "minimax" => VideoDialect::Minimax,
+        "kling" => VideoDialect::Kling,
         _ => VideoDialect::Generations,
     }
 }
@@ -629,10 +632,11 @@ fn video_dialect(provider: &str) -> VideoDialect {
 /// The vendor's async handle in a submit reply, whichever dialect answered;
 /// `None` for a synchronous reply that already carries the video.
 pub fn video_handle(v: &Value) -> Option<&str> {
-    // task ids before `request_id`: DashScope's reply carries both, and its
-    // top-level request_id is the HTTP call's trace id, not the job
+    // task ids before `request_id`: DashScope and Kling replies carry both, and
+    // their top-level request_id is the HTTP call's trace id, not the job
     v["output"]["task_id"]
         .as_str()
+        .or_else(|| v["data"]["task_id"].as_str())
         .or_else(|| v["requestId"].as_str())
         .or_else(|| v["task_id"].as_str().filter(|id| !id.is_empty()))
         .or_else(|| v["request_id"].as_str())
@@ -669,7 +673,17 @@ impl ModelEngine for VideoEngine {
         let dialect = video_dialect(self.base.provider());
         let model = self.base.model_name()?;
         let mut body = Map::new();
-        body.insert("model".into(), model.into());
+        // Kling names the field model_name and takes no inline image on this path
+        if dialect == VideoDialect::Kling {
+            if p.image.is_some() {
+                return Err(GatewayError::bad_request(
+                    "kling image-to-video is not wired; send a text prompt",
+                ));
+            }
+            body.insert("model_name".into(), model.into());
+        } else {
+            body.insert("model".into(), model.into());
+        }
         let (path, fields) = match dialect {
             VideoDialect::Sora => (
                 "videos",
@@ -723,21 +737,35 @@ impl ModelEngine for VideoEngine {
                     ("first_frame_image", p.image),
                 ],
             ),
+            VideoDialect::Kling => (
+                "videos/text2video",
+                vec![
+                    ("duration", p.duration_seconds.map(|d| d.to_string().into())),
+                    ("aspect_ratio", p.aspect_ratio.map(Value::from)),
+                    // Kling has quality modes, not resolutions: 1080p rides mode=pro
+                    (
+                        "mode",
+                        p.resolution.map(|r| {
+                            match r.as_str() {
+                                "1080p" | "pro" => "pro",
+                                _ => "std",
+                            }
+                            .into()
+                        }),
+                    ),
+                ],
+            ),
             VideoDialect::Generations => (
                 "videos/generations",
                 vec![
                     ("duration", p.duration_seconds.map(Value::from)),
                     ("resolution", p.resolution.map(Value::from)),
+                    ("aspect_ratio", p.aspect_ratio.map(Value::from)),
                     ("image", p.image),
                 ],
             ),
         };
         body.insert("prompt".into(), p.prompt.into());
-        if dialect == VideoDialect::Generations
-            && let Some(ar) = p.aspect_ratio
-        {
-            body.insert("aspect_ratio".into(), ar.into());
-        }
         for (k, v) in fields {
             if let Some(v) = v {
                 body.insert(k.into(), v);
@@ -747,10 +775,28 @@ impl ModelEngine for VideoEngine {
             .base
             .round_trip(&self.base.vendor_url(path), body.into())
             .await?;
-        if dialect == VideoDialect::Minimax {
-            reject_minimax_error(&v)?;
-        }
+        reject_envelope_error(dialect, &v)?;
         Ok(video_outcome(model, v, status))
+    }
+}
+
+/// Vendors whose business errors ride an HTTP 200: MiniMax's `base_resp`,
+/// Kling's `{code, message}` envelope.
+fn reject_envelope_error(dialect: VideoDialect, v: &Value) -> GResult<()> {
+    match dialect {
+        VideoDialect::Minimax => reject_minimax_error(v),
+        VideoDialect::Kling => {
+            let code = v["code"].as_i64().unwrap_or(0);
+            if code == 0 {
+                return Ok(());
+            }
+            Err(GatewayError::new(
+                gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+                502,
+                format!("kling code {code}: {}", v["message"]),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -792,6 +838,11 @@ pub async fn video_poll(
             versioned_url(base, &format!("query/video_generation?task_id={id}")),
             Vec::new(),
         ),
+        VideoDialect::Kling => (
+            "GET",
+            versioned_url(base, &format!("videos/text2video/{id}")),
+            Vec::new(),
+        ),
         _ => (
             "GET",
             versioned_url(base, &format!("videos/{id}")),
@@ -799,9 +850,7 @@ pub async fn video_poll(
         ),
     };
     let (status, body) = video_send(transport, account, method, url, req_body).await?;
-    if dialect == VideoDialect::Minimax {
-        reject_minimax_error(&body)?;
-    }
+    reject_envelope_error(dialect, &body)?;
     Ok(normalize_video_poll(dialect, status, body))
 }
 
@@ -828,6 +877,15 @@ fn normalize_video_poll(dialect: VideoDialect, status: u16, body: Value) -> Vide
             !body["file_id"].as_str().unwrap_or_default().is_empty() as i64,
             None,
         ),
+        VideoDialect::Kling => {
+            let videos = &body["data"]["task_result"]["videos"];
+            (
+                body["data"]["task_status"] == "succeed",
+                whole_seconds(&videos[0]["duration"])
+                    .unwrap_or_else(|| videos.as_array().map_or(0, Vec::len) as i64),
+                None,
+            )
+        }
         VideoDialect::Generations => (
             body["status"] == "done",
             whole_seconds(&body["video"]["duration"]).unwrap_or(0),

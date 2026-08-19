@@ -774,6 +774,27 @@ impl MockTransport {
                 "seconds": body["seconds"], "size": body["size"]
             }));
         }
+        if req.url.contains("/videos/text2video/") {
+            let id = req.url.rsplit('/').next().unwrap_or_default();
+            return Self::ok_json(if id.contains("pending") {
+                json!({"code": 0, "request_id": "kling-trace",
+                       "data": {"task_id": id, "task_status": "processing"}})
+            } else {
+                json!({"code": 0, "request_id": "kling-trace",
+                       "data": {"task_id": id, "task_status": "succeed",
+                                 "task_result": {"videos": [{"id": "v1", "duration": "5",
+                                     "url": format!("mock://videos/{id}.mp4")}]}}})
+            });
+        }
+        if req.url.contains("/videos/text2video") {
+            let body = Self::parse(&req.body, "video")?;
+            if body["model_name"].is_null() {
+                return Self::ok_json(json!({"code": 1200, "message": "model_name is required"}));
+            }
+            return Self::ok_json(json!({"code": 0, "request_id": "kling-trace",
+                                        "data": {"task_id": format!("kl-{}", slug(&body)),
+                                                  "task_status": "submitted"}}));
+        }
         if req.url.contains("/video/submit") {
             let body = Self::parse(&req.body, "video")?;
             return Self::ok_json(json!({"requestId": format!("sf-{}", slug(&body))}));
