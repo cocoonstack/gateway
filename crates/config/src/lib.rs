@@ -669,7 +669,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "xai" => ProviderPreset {
             endpoint: "https://api.x.ai",
-            wires: &["openai-chat", "responses", "image"],
+            wires: &["openai-chat", "responses", "image", "realtime"],
             default_model_wire: "openai-chat",
         },
         "siliconflow" => ProviderPreset {

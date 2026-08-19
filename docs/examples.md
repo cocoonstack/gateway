@@ -186,7 +186,9 @@ models:
 ```
 
 The preset covers xAI's OpenAI-compatible surfaces (`/v1/chat/completions`,
-`/v1/responses`, `/v1/images/generations`). `reasoning_effort` passes through
+`/v1/responses`, `/v1/images/generations`) and its realtime voice socket
+(`protocol: realtime`, model `grok-voice-latest`, billed by the delivered
+output estimate since xAI reports no usage). `reasoning_effort` passes through
 verbatim — grok-4.6 takes `low`…`xhigh`, grok-4.3 also `none`, and a model
 answers 400 for a value it does not list — and the usage's `cached_tokens` /
 `reasoning_tokens` land in the ledger like any OpenAI-shaped vendor. Anthropic

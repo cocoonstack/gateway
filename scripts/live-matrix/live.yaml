@@ -71,6 +71,7 @@ models:
   - {name: grok-4.20-0309-non-reasoning, provider: xai, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.16}}
   - {name: grok-4.5, provider: xai, protocol: responses, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.15}}
   - {name: grok-imagine-image-2.0, provider: xai, protocol: image, unit_price_micros: 70000}
+  - {name: grok-voice-latest, provider: xai, protocol: realtime, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 4000}
   # rerank vendors
   - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
   - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
