@@ -90,7 +90,8 @@ some Wan models reject submit `parameters`, so the gateway forwards only what
 the caller sets), `minimax` → Hailuo, anything else the xAI/Kling-style
 `videos/generations` shape. Live-verified: sora-2 (4 s billed from the
 `seconds` string, content download through the gateway), Wan2.2-T2V-A14B on
-SiliconFlow and MiniMax-Hailuo-02 (one unit per delivered video), and
+SiliconFlow and MiniMax-Hailuo-02 (one unit per delivered video, file content
+proxied through the gateway), and
 wan2.2-t2v-plus on DashScope intl (5 s from `usage.video_duration`).
 
 ```yaml

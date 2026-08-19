@@ -1601,20 +1601,22 @@ async fn async_video_bills_once_on_the_first_done_poll() {
 }
 
 #[tokio::test]
-async fn dashscope_and_hailuo_dialects_key_the_job_by_task_id_and_bill_their_units() {
+async fn dashscope_and_hailuo_dialects_bill_once_and_hailuo_serves_content() {
     let app = app();
-    for (body, done, units, cost) in [
+    for (body, done, units, cost, has_content) in [
         (
             r#"{"model":"wan2.2-t2v-plus","prompt":"a lantern floating upriver"}"#,
             "SUCCEEDED",
             5,
             600_000,
+            false,
         ),
         (
             r#"{"model":"MiniMax-Hailuo-02","prompt":"a lantern floating upriver","duration":6}"#,
             "Success",
             1,
             300_000,
+            true,
         ),
     ] {
         let resp = app
@@ -1653,7 +1655,15 @@ async fn dashscope_and_hailuo_dialects_key_the_job_by_task_id_and_bill_their_uni
             .oneshot(get_authed(&format!("/v1/videos/{id}/content")))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "content is Sora-only");
+        if has_content {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], b"MOCK-MP4");
+        } else {
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
         let j = body_json(
             app.clone()
                 .oneshot(internal_get("/internal/ledger"))
@@ -1680,7 +1690,7 @@ async fn dashscope_and_hailuo_dialects_key_the_job_by_task_id_and_bill_their_uni
 }
 
 #[tokio::test]
-async fn sora_dialect_video_bills_the_seconds_string_and_serves_content() {
+async fn sora_content_settles_once_without_a_prior_status_poll() {
     let app = app();
     let resp = app
         .clone()
@@ -1701,6 +1711,18 @@ async fn sora_dialect_video_bills_the_seconds_string_and_serves_content() {
     for _ in 0..2 {
         let resp = app
             .clone()
+            .oneshot(get_authed(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"MOCK-MP4");
+    }
+    for _ in 0..2 {
+        let resp = app
+            .clone()
             .oneshot(get_authed(&format!("/v1/videos/{id}")))
             .await
             .unwrap();
@@ -1709,16 +1731,6 @@ async fn sora_dialect_video_bills_the_seconds_string_and_serves_content() {
         assert_eq!(j["status"], "completed");
         assert_eq!(j["seconds"], "4");
     }
-    let resp = app
-        .clone()
-        .oneshot(get_authed(&format!("/v1/videos/{id}/content")))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(&bytes[..], b"MOCK-MP4");
 
     let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
     let rows: Vec<&Value> = j["records"]

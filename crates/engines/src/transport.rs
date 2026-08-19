@@ -805,6 +805,13 @@ impl MockTransport {
                        "usage": {"video_duration": 5, "video_count": 1}})
             });
         }
+        if req.url.contains("/files/retrieve_content") {
+            return Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")),
+                headers: HeaderMap::new(),
+            });
+        }
         if req.url.contains("/query/video_generation") {
             let id = req.url.rsplit('=').next().unwrap_or_default();
             return Self::ok_json(if id.contains("pending") {

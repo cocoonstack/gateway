@@ -4004,49 +4004,23 @@ async fn videos_generations(
     terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
 }
 
-/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
-async fn videos_get(
-    State(s): State<AppState>,
-    Authed(ak): Authed,
-    Path(id): Path<String>,
-) -> Response {
+async fn poll_and_settle_video(
+    s: &AppState,
+    job: &VideoJob,
+    account: &gw_models::Account,
+    id: &str,
+) -> Result<gw_engines::families::VideoPoll, Response> {
     let state = s.handler.state();
     let cfg = s.handler.cfg();
-    let gov = state.governance.as_ref();
-    let admitted = async {
-        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
-        admission::check_ak_rate(gov, &ak).await?;
-        admission::check_product_qpm(gov, &cfg, &ak.product).await
-    };
-    if let Err(denied) = admitted.await {
-        return error_response(429, denied);
-    }
-    let found = state.store.video_job_get(&id).await;
-    let job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", &id) {
-        Ok(job) => job,
-        Err(resp) => return resp,
-    };
-    let Some(account) = state.pool.named(&job.account) else {
-        return error_response(
-            503,
-            format!(
-                "account {} of video {id} is no longer configured",
-                job.account
-            ),
-        );
-    };
-    let poll =
-        match gw_engines::families::video_poll(s.handler.transport.as_ref(), account, &id).await {
-            Ok(poll) => poll,
-            Err(e) => return gateway_error(e),
-        };
-    // fail closed: an unclaimable settle errors out so the client's re-poll retries the billing;
-    // a done without billable units leaves the claim for a later, complete poll
+    let poll = gw_engines::families::video_poll(s.handler.transport.as_ref(), account, id)
+        .await
+        .map_err(gateway_error)?;
     let claimed = if poll.done && (poll.units > 0 || poll.vendor_cost.is_some()) {
-        match state.store.video_job_settle(&id).await {
-            Ok(claimed) => claimed,
-            Err(e) => return gateway_error(e),
-        }
+        state
+            .store
+            .video_job_settle(id)
+            .await
+            .map_err(gateway_error)?
     } else {
         false
     };
@@ -4085,6 +4059,44 @@ async fn videos_get(
         )
         .await;
     }
+    Ok(poll)
+}
+
+/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
+async fn videos_get(
+    State(s): State<AppState>,
+    Authed(ak): Authed,
+    Path(id): Path<String>,
+) -> Response {
+    let state = s.handler.state();
+    let cfg = s.handler.cfg();
+    let gov = state.governance.as_ref();
+    let admitted = async {
+        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
+        admission::check_ak_rate(gov, &ak).await?;
+        admission::check_product_qpm(gov, &cfg, &ak.product).await
+    };
+    if let Err(denied) = admitted.await {
+        return error_response(429, denied);
+    }
+    let found = state.store.video_job_get(&id).await;
+    let job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", &id) {
+        Ok(job) => job,
+        Err(resp) => return resp,
+    };
+    let Some(account) = state.pool.named(&job.account) else {
+        return error_response(
+            503,
+            format!(
+                "account {} of video {id} is no longer configured",
+                job.account
+            ),
+        );
+    };
+    let poll = match poll_and_settle_video(&s, &job, account, &id).await {
+        Ok(poll) => poll,
+        Err(resp) => return resp,
+    };
     (
         StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
         Json(poll.body),
@@ -4093,7 +4105,7 @@ async fn videos_get(
 }
 
 /// GET /v1/videos/{id}/content — the finished clip's bytes, proxied for vendors
-/// that hand out no URL (Sora); the poll's rate spend and tenant gate apply.
+/// that hand out no URL (Sora and Hailuo); the poll's rate spend and tenant gate apply.
 async fn videos_content(
     State(s): State<AppState>,
     Authed(ak): Authed,
@@ -4121,7 +4133,21 @@ async fn videos_content(
             format!("account {} is no longer configured", job.account),
         );
     };
-    match gw_engines::families::video_content(s.handler.transport.as_ref(), account, &id).await {
+    let poll = match poll_and_settle_video(&s, &job, account, &id).await {
+        Ok(poll) => poll,
+        Err(resp) => return resp,
+    };
+    if !poll.done {
+        return error_response(409, "video is not completed");
+    }
+    match gw_engines::families::video_content(
+        s.handler.transport.as_ref(),
+        account,
+        &id,
+        &poll.body,
+    )
+    .await
+    {
         Ok((status, content_type, bytes)) => (
             StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
             [("content-type", content_type)],

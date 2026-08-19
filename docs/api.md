@@ -49,7 +49,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
 | POST | `/v1/videos/generations` | `{model, prompt, duration?, aspect_ratio?, resolution?, image?}`, mapped to the account's dialect; a synchronous vendor answers with the video, an async one with its handle |
 | GET | `/v1/videos/{id}` | the vendor's poll, proxied in its own dialect; see Video |
-| GET | `/v1/videos/{id}/content` | the finished clip's bytes, proxied (Sora) |
+| GET | `/v1/videos/{id}/content` | the finished clip's bytes, proxied (Sora and Hailuo) |
 | POST | `/v1/audio/speech` | TTS, returns audio bytes |
 | POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio |
 | POST | `/v1/audio/translations` | STT translated to English (same request shape) |
@@ -155,7 +155,7 @@ the serving account's provider name: `openai`/`azure` speak Sora's `/v1/videos`
 `GET /v1/videos/{id}/content`), `siliconflow` Wan's `video/submit` +
 `video/status`, `alibaba`/`dashscope` the DashScope task API (async header,
 `output.task_id`, poll `/api/v1/tasks/{id}`), `minimax` Hailuo's
-`video_generation` + `query/video_generation`, and anything else the
+`video_generation` + `query/video_generation` + file content, and anything else the
 xAI/Kling-style `videos/generations` shape. Each dialect forwards only the
 fields its vendor takes (`aspect_ratio` only on the generic shape; Wan takes no
 duration).
@@ -163,16 +163,17 @@ duration).
 When the reply is an async handle, the gateway remembers which key, model and
 account it belongs to; `GET /v1/videos/{id}` spends the polling key's rate
 limits like any request, then proxies the vendor's poll on that account (`404`
-for an unknown id or another tenant's). The first poll that reaches the
-dialect's done state bills the submitting key the clip's whole seconds when the
-vendor reports a duration (Sora's `seconds`, xAI's `video.duration`,
-DashScope's `usage.video_duration`), else one unit per delivered video (Wan,
-Hailuo) — at the `unit_price_micros` quoted at submit (a reprice or removal of
-the model while the clip renders does not change it), taking the vendor cost
-from xAI's `usage.cost_in_usd_ticks` (1 tick = 10⁻¹⁰ USD) when present; that
-ledger row's `request_id` is the video id. Later polls of the same id return
-the vendor's answer without billing again; failed and expired jobs bill nothing
-beyond the submit row. Jobs are kept 30 days.
+for an unknown id or another tenant's). The first poll, including the poll that
+precedes a content download, that reaches the dialect's done state bills the
+submitting key the clip's whole seconds when the vendor reports a duration
+(Sora's `seconds`, xAI's `video.duration`, DashScope's
+`usage.video_duration`), else one unit per delivered video (Wan, Hailuo) — at
+the `unit_price_micros` quoted at submit (a reprice or removal of the model
+while the clip renders does not change it), taking the vendor cost from xAI's
+`usage.cost_in_usd_ticks` (1 tick = 10⁻¹⁰ USD) when present; that ledger row's
+`request_id` is the video id. Later polls and downloads do not bill again;
+failed and expired jobs bill nothing beyond the submit row. Jobs are kept 30
+days.
 
 ## Batch & files
 

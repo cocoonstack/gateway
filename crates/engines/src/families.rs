@@ -9,7 +9,7 @@ use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 use crate::base::{Base, VENDOR_SENTINEL, base_engine, parse_json_reply, versioned_url};
-use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
+use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_error};
 use crate::multipart::{Form, audio_kind, image_kind};
 use crate::sse::SseDecoder;
 use crate::transport::{Headers, SharedTransport, Transport, UpstreamBody, UpstreamRequest};
@@ -747,6 +747,9 @@ impl ModelEngine for VideoEngine {
             .base
             .round_trip(&self.base.vendor_url(path), body.into())
             .await?;
+        if dialect == VideoDialect::Minimax {
+            reject_minimax_error(&v)?;
+        }
         Ok(video_outcome(model, v, status))
     }
 }
@@ -776,7 +779,8 @@ pub async fn video_poll(
     id: &str,
 ) -> GResult<VideoPoll> {
     let base = account.base_url(VENDOR_SENTINEL);
-    let (method, url, req_body) = match video_dialect(&account.provider) {
+    let dialect = video_dialect(&account.provider);
+    let (method, url, req_body) = match dialect {
         VideoDialect::SiliconFlow => (
             "POST",
             versioned_url(base, "video/status"),
@@ -795,6 +799,9 @@ pub async fn video_poll(
         ),
     };
     let (status, body) = video_send(transport, account, method, url, req_body).await?;
+    if dialect == VideoDialect::Minimax {
+        reject_minimax_error(&body)?;
+    }
     Ok(normalize_video_poll(&account.provider, status, body))
 }
 
@@ -839,24 +846,38 @@ fn normalize_video_poll(provider: &str, status: u16, body: Value) -> VideoPoll {
     }
 }
 
-/// The finished clip's bytes and content type, proxied — only Sora hands the
-/// clip out this way; other dialects answer 404 (their poll carries a URL).
+/// The finished clip's bytes and content type, proxied for Sora and MiniMax;
+/// other dialects answer 404 because their poll carries a URL.
 pub async fn video_content(
     transport: &dyn Transport,
     account: &gw_models::Account,
     id: &str,
+    poll: &Value,
 ) -> GResult<(u16, String, bytes::Bytes)> {
-    if video_dialect(&account.provider) != VideoDialect::Sora {
-        return Err(GatewayError::new(
-            gw_consts::ErrCode::BUILD_REQ,
-            404,
-            "this vendor serves the clip by URL in the poll, not by download",
-        ));
-    }
-    let url = versioned_url(
-        account.base_url(VENDOR_SENTINEL),
-        &format!("videos/{id}/content"),
-    );
+    let path = match video_dialect(&account.provider) {
+        VideoDialect::Sora => format!("videos/{id}/content"),
+        VideoDialect::Minimax => {
+            let file_id = poll["file_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    GatewayError::new(
+                        gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+                        502,
+                        "minimax completed without file_id",
+                    )
+                })?;
+            format!("files/retrieve_content?file_id={file_id}")
+        }
+        _ => {
+            return Err(GatewayError::new(
+                gw_consts::ErrCode::BUILD_REQ,
+                404,
+                "this vendor serves the clip by URL in the poll, not by download",
+            ));
+        }
+    };
+    let url = versioned_url(account.base_url(VENDOR_SENTINEL), &path);
     let reply = transport
         .send(video_request(account, "GET", url, Vec::new()))
         .await?
@@ -2012,6 +2033,41 @@ mod tests {
                 headers: Default::default(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn minimax_video_business_errors_surface_on_submit_and_poll() {
+        let account = Arc::new(gw_models::Account {
+            name: "minimax-1".into(),
+            provider: "minimax".into(),
+            endpoint: "https://api.minimax.io".into(),
+            ..Default::default()
+        });
+        let transport = Arc::new(BytesReply(
+            br#"{"base_resp":{"status_code":1008,"status_msg":"insufficient balance"}}"#,
+        ));
+        let mut request = req(
+            Protocol::Video,
+            "MiniMax-Hailuo-02",
+            Some(TypedParams::Video(VideoParams {
+                prompt: "a paper boat".into(),
+                ..Default::default()
+            })),
+        );
+        request.account = Some(Arc::clone(&account));
+        let submit = VideoEngine::new(request, transport.clone())
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(submit.http_status, 502);
+        assert!(submit.message.contains("minimax base_resp 1008"));
+
+        let poll = match video_poll(transport.as_ref(), account.as_ref(), "task-1").await {
+            Ok(_) => panic!("MiniMax business error accepted as a successful poll"),
+            Err(e) => e,
+        };
+        assert_eq!(poll.http_status, 502);
+        assert!(poll.message.contains("minimax base_resp 1008"));
     }
 
     #[tokio::test]
