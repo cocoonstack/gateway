@@ -273,22 +273,35 @@ impl Transport for DispatchTransport {
     }
 }
 
-/// The vendor's `Retry-After` seconds, capped; unparseable waits at least a
-/// second, absent falls back to the connect path's linear backoff.
+/// The vendor's retry delay, capped; standard `Retry-After` takes precedence,
+/// then seconds-until-reset, else the connect path's linear backoff.
 fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
     const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
     const MIN_HEADER_WAIT: Duration = Duration::from_secs(1);
-    match headers
+    if let Some(v) = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
     {
-        Some(v) => v
+        return v
             .trim()
             .parse::<u64>()
             .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
-            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT)),
-        None => RETRY_BACKOFF * attempt,
+            .unwrap_or_else(|_| (RETRY_BACKOFF * attempt).max(MIN_HEADER_WAIT));
     }
+    headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(',')
+                .filter_map(|secs| secs.trim().parse::<u64>().ok())
+                .min()
+        })
+        .map(|secs| {
+            Duration::from_secs(secs)
+                .max(MIN_HEADER_WAIT)
+                .min(MAX_RETRY_AFTER)
+        })
+        .unwrap_or(RETRY_BACKOFF * attempt)
 }
 
 /// A live SSE byte stream that yields one terminal error when no chunk arrives
@@ -473,5 +486,8 @@ mod tests {
             Duration::from_secs(1),
             "an unparsed header still waits at least a second"
         );
+        h.remove(reqwest::header::RETRY_AFTER);
+        h.insert("x-ratelimit-reset", "1, 1419704".parse().unwrap());
+        assert_eq!(status_backoff(&h, 1), Duration::from_secs(1));
     }
 }
