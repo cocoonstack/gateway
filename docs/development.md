@@ -97,5 +97,5 @@ python3 scripts/live-matrix/live_matrix.py               # or: ... anthropic bed
 
 Last full run (2026-08-18, `fix/live-wire-round`): 86/86 cases across Anthropic,
 OpenAI, Gemini, DeepSeek, MiniMax, Qwen/DashScope, Qianfan, Moonshot,
-SiliconFlow, OpenRouter, Cohere/Jina rerank and Bedrock (InvokeModel,
+SiliconFlow, OpenRouter, Cohere/Jina rerank, xAI Grok and Bedrock (InvokeModel,
 Converse, Llama) — every ledger row matched the oracle exactly.

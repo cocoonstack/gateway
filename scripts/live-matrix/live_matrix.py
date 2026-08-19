@@ -37,6 +37,7 @@ GROUPS = [
     "openrouter",
     "rerank",
     "bedrock",
+    "xai",
 ]
 MODELS: dict[str, dict[str, Any]] = {}
 RESULTS: list[tuple[str, bool, str]] = []
@@ -330,6 +331,33 @@ def case_embeddings(gw: Gateway, model: str) -> None:
     check_ledger(gw, name, model, wire, False, before, f"dims={len(j['data'][0]['embedding'])} n={len(j['data'])}")
 
 
+def case_image(gw: Gateway, model: str) -> None:
+    """One generated image bills one unit at the model's unit price (plus any token usage the vendor reports)."""
+    name = f"{model} image"
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/images/generations", {"model": model, "prompt": "a lighthouse at dusk, flat vector", "n": 1})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    j = json.loads(txt)
+    count, row = gw.ledger()
+    conf = MODELS[model]
+    usage = j.get("usage") or {}
+    tokens = oracle(
+        model,
+        {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0)},
+        False,
+    )
+    expected_cost = tokens[3] + conf["unit"] * len(j.get("data", []))
+    ok = count == before + 1 and row["billed_units"] == len(j.get("data", [])) and row["cost_micros"] == expected_cost
+    record(
+        name,
+        ok,
+        f"images={len(j.get('data', []))} ledger units/cost={row['billed_units']}/{row['cost_micros']} "
+        f"expected {len(j.get('data', []))}/{expected_cost} usage={json.dumps(usage)}",
+    )
+
+
 def case_rerank(gw: Gateway, model: str, unit_priced: bool = False) -> None:
     name = f"{model} rerank"
     before, _ = gw.ledger()
@@ -571,7 +599,16 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
         record(name, False, f"HTTP {st}: {txt[:300]}")
     else:
         usage = done[-1]["response"]["usage"]
-        wire = {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0)}
+        wire = {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "prompt_tokens_details": {
+                "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
+            },
+        }
         check_ledger(gw, name, model, wire, False, before, f"text={text[:30]!r}")
     case_chat(gw, model, "responses model", stream=True, prompt=prompt)
     case_messages(gw, model, "responses model", stream=True, prompt=prompt)
@@ -749,6 +786,26 @@ def run_group(gw: Gateway, group: str) -> None:
     elif group == "rerank":
         case_rerank(gw, "rerank-v3.5", unit_priced=True)
         case_rerank(gw, "jina-reranker-v3")
+    elif group == "xai":
+        case_chat(gw, "grok-4.3", expect_reasoning=True)
+        case_chat(gw, "grok-4.3", stream=True, prompt=prime, expect_reasoning=True)
+        case_chat(gw, "grok-4.20-0309-non-reasoning")
+        case_thinking_tiers(
+            gw, "grok-4.6", native=False, tiers=["low", "medium", "high", "xhigh"], expect_reasoning=False
+        )
+        case_chat(gw, "grok-4.3", "reasoning_effort none", prompt=prime, reasoning_effort="none")
+        case_messages(gw, "grok-4.3", "cross-protocol")
+        case_messages(
+            gw,
+            "grok-4.6",
+            "cross-protocol thinking→effort",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            prompt=prime,
+        )
+        case_prompt_cache(gw, "grok-4.3", words=400)
+        case_responses_surfaces(gw, "grok-4.5")
+        case_image(gw, "grok-imagine-image-2.0")
     elif group == "bedrock":
         haiku, sonnet = "us.anthropic.claude-haiku-4-5-20251001-v1:0", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
         case_messages(gw, haiku, "aws-anthropic")

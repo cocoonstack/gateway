@@ -26,6 +26,7 @@ providers:
   - {name: moonshot, kind: moonshot, api_key_env: MOONSHOT_API_KEY, timeout_seconds: 120}
   - {name: siliconflow, kind: siliconflow, api_key_env: SILICONFLOW_API_KEY, timeout_seconds: 120}
   - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_API_KEY, timeout_seconds: 120}
+  - {name: xai, kind: xai, api_key_env: XAI_API_KEY, timeout_seconds: 180}
 
 models:
   # anthropic: cache-priced, prompt_cache breakpoints, thinking
@@ -64,6 +65,12 @@ models:
   - {name: BAAI/bge-reranker-v2-m3, provider: siliconflow, protocol: rerank, input_price_per_1k_micros: 10}
   # openrouter
   - {name: openai/gpt-oss-20b:free, provider: openrouter, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # xai
+  - {name: grok-4.3, provider: xai, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.16}}
+  - {name: grok-4.6, provider: xai, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
+  - {name: grok-4.20-0309-non-reasoning, provider: xai, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.16}}
+  - {name: grok-4.5, provider: xai, protocol: responses, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.15}}
+  - {name: grok-imagine-image-2.0, provider: xai, protocol: image, unit_price_micros: 70000}
   # rerank vendors
   - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
   - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
