@@ -81,15 +81,15 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
 The factory also dispatches `video`, `search`, generic `audio`, and
-`passthrough` protocols (kling-video, grok-imagine-video, sora-2 and
+`passthrough` protocols (kling-v1-6, grok-imagine-video, sora-2 and
 brave-search ship example accounts in the default config). `protocol: video`
 picks its wire from the account's provider name — `openai`/`azure` → Sora,
 `siliconflow` → Wan submit/status, `alibaba`/`dashscope` → the DashScope task
 API (the account endpoint is the bare `https://dashscope-intl.aliyuncs.com`;
 some Wan models reject submit `parameters`, so the gateway forwards only what
-the caller sets), `minimax` → Hailuo, anything else the xAI/Kling-style
-`videos/generations` shape. Live-verified: sora-2 (4 s billed from the
-`seconds` string, content download through the gateway), Wan2.2-T2V-A14B on
+the caller sets), `minimax` → Hailuo, `kling` → Kling text2video, and
+anything else the generic `videos/generations` shape. Live-verified: sora-2
+(4 s billed from the `seconds` string, content download through the gateway), Wan2.2-T2V-A14B on
 SiliconFlow and MiniMax-Hailuo-02 (one unit per delivered video, file content
 proxied through the gateway), and
 wan2.2-t2v-plus on DashScope intl (5 s from `usage.video_duration`).

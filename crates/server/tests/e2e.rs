@@ -1612,7 +1612,7 @@ async fn dashscope_and_hailuo_dialects_bill_once_and_hailuo_serves_content() {
             false,
         ),
         (
-            r#"{"model":"kling-video","prompt":"a lantern floating upriver","duration":5}"#,
+            r#"{"model":"kling-v1-6","prompt":"a lantern floating upriver","duration":5}"#,
             "succeed",
             5,
             300_000,

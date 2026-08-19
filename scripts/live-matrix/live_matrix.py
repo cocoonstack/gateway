@@ -389,6 +389,14 @@ def video_state(j: dict[str, Any]) -> str:
     )
 
 
+def _video_duration(j: dict[str, Any]) -> float:
+    videos = ((j.get("data") or {}).get("task_result") or {}).get("videos") or []
+    duration = (j.get("video") or {}).get("duration")
+    if duration is None and videos:
+        duration = videos[0].get("duration")
+    return float(duration or 0)
+
+
 def case_video(
     gw: Gateway,
     model: str,
@@ -426,7 +434,7 @@ def case_video(
     gw.call(f"/v1/videos/{rid}")
     count, row = gw.ledger()
     ticks = (j.get("usage") or {}).get("cost_in_usd_ticks")
-    expected_units = units if units is not None else math.ceil((j.get("video") or {}).get("duration", 0))
+    expected_units = units if units is not None else math.ceil(_video_duration(j))
     expected_vendor = ticks // 10_000 if ticks else row["vendor_cost_micros"]
     ok = (
         count == before + 2
@@ -962,7 +970,7 @@ def run_group(gw: Gateway, group: str) -> None:
         # parameters (size/duration) silently kill the task into UNKNOWN on intl — submit bare
         case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
         case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1, content=True)
-        case_video(gw, "kling-v1-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed", units=5)
+        case_video(gw, "kling-v1-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed")
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
     elif group == "ollama":

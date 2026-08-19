@@ -139,7 +139,7 @@ models:
   - name: whisper-1 # audio stt family
     protocol: stt
     unit_price_micros: 100 # per audio second
-  - name: kling-video # Kling text2video: {code, data.task_id} envelope, billed per second
+  - name: kling-v1-6 # Kling text2video: {code, data.task_id} envelope, billed per second
     protocol: video
     provider: kling
     unit_price_micros: 60000
