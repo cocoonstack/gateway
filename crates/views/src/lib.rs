@@ -121,6 +121,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/videos/generations", post(videos_generations))
         .route("/v1/videos/{id}", get(videos_get))
+        .route("/v1/videos/{id}/content", get(videos_content))
         .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
         .route("/v1/audio/translations", post(audio_translations))
@@ -3971,9 +3972,12 @@ async fn videos_generations(
     };
     log_access("videos", &ctx, started);
     let outcome = ctx.outcome.take();
+    // async iff the reply carries a handle and no delivered video (a sync Kling
+    // reply has a task_id too, next to the finished video_url)
     let handle = outcome
         .as_ref()
-        .and_then(|o| o.response.response_v2.as_ref()?["request_id"].as_str());
+        .filter(|o| o.response.message.is_empty())
+        .and_then(|o| gw_engines::families::video_handle(o.response.response_v2.as_ref()?));
     if let Some(id) = handle {
         let param = ctx.request.model_param_v2.as_ref();
         let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
@@ -4000,57 +4004,49 @@ async fn videos_generations(
     terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
 }
 
-/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
-async fn videos_get(
-    State(s): State<AppState>,
-    Authed(ak): Authed,
-    Path(id): Path<String>,
-) -> Response {
+/// The shared head of both video read routes: spend the caller's rate limits,
+/// load the job under its tenant gate.
+async fn admit_video_job(
+    s: &AppState,
+    ak: &AkInfo,
+    id: &str,
+) -> Result<(Arc<GatewayState>, VideoJob), Response> {
     let state = s.handler.state();
     let cfg = s.handler.cfg();
     let gov = state.governance.as_ref();
     let admitted = async {
         admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
-        admission::check_ak_rate(gov, &ak).await?;
+        admission::check_ak_rate(gov, ak).await?;
         admission::check_product_qpm(gov, &cfg, &ak.product).await
     };
     if let Err(denied) = admitted.await {
-        return error_response(429, denied);
+        return Err(error_response(429, denied));
     }
-    let found = state.store.video_job_get(&id).await;
-    let job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", &id) {
-        Ok(job) => job,
-        Err(resp) => return resp,
-    };
-    let Some(account) = state.pool.named(&job.account) else {
-        return error_response(
-            503,
-            format!(
-                "account {} of video {id} is no longer configured",
-                job.account
-            ),
-        );
-    };
-    let (status, v) =
-        match gw_engines::families::video_poll(s.handler.transport.as_ref(), account, &id).await {
-            Ok(reply) => reply,
-            Err(e) => return gateway_error(e),
-        };
-    let units = gw_engines::families::whole_seconds(&v["video"]["duration"]).unwrap_or(0);
-    // 1 tick = 1e-10 USD; micros are 1e-6
-    let vendor_cost = v["usage"]["cost_in_usd_ticks"]
-        .as_f64()
-        .map(|t| (t / 1e4).round() as i64);
-    // fail closed: an unclaimable settle errors out so the client's re-poll retries the billing;
-    // a done without a duration leaves the claim for a later, complete poll
-    let claimed = match v["status"].as_str() {
-        Some("done") if units > 0 || vendor_cost.is_some() => {
-            match state.store.video_job_settle(&id).await {
-                Ok(claimed) => claimed,
-                Err(e) => return gateway_error(e),
-            }
-        }
-        _ => false,
+    let found = state.store.video_job_get(id).await;
+    let job = tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", id)?;
+    Ok((state, job))
+}
+
+async fn poll_and_settle_video(
+    s: &AppState,
+    job: &VideoJob,
+    account: &gw_models::Account,
+) -> Result<gw_engines::families::VideoPoll, Response> {
+    let state = s.handler.state();
+    let cfg = s.handler.cfg();
+    let poll = gw_engines::families::video_poll(s.handler.transport.as_ref(), account, &job.id)
+        .await
+        .map_err(gateway_error)?;
+    // fail closed: an unclaimable settle errors out so the client's retry re-attempts the
+    // billing; a done without billable units leaves the claim for a later, complete poll
+    let claimed = if poll.done && (poll.units > 0 || poll.vendor_cost.is_some()) {
+        state
+            .store
+            .video_job_settle(&job.id)
+            .await
+            .map_err(gateway_error)?
+    } else {
+        false
     };
     if claimed {
         admission::settle_and_bill(
@@ -4072,11 +4068,11 @@ async fn videos_get(
                     billable_prompt: 0,
                     billable_completion: 0,
                     total: 0,
-                    units,
+                    units: poll.units,
                     discount: 1.0,
                     ptu_spillover: false,
                     estimated: false,
-                    vendor_cost,
+                    vendor_cost: poll.vendor_cost,
                     unit_price: Some(job.unit_price_micros),
                 },
                 reserved: 0,
@@ -4087,11 +4083,76 @@ async fn videos_get(
         )
         .await;
     }
+    Ok(poll)
+}
+
+/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
+async fn videos_get(
+    State(s): State<AppState>,
+    Authed(ak): Authed,
+    Path(id): Path<String>,
+) -> Response {
+    let (state, job) = match admit_video_job(&s, &ak, &id).await {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
+    };
+    let Some(account) = state.pool.named(&job.account) else {
+        return error_response(
+            503,
+            format!("account {} is no longer configured", job.account),
+        );
+    };
+    let poll = match poll_and_settle_video(&s, &job, account).await {
+        Ok(poll) => poll,
+        Err(resp) => return resp,
+    };
     (
-        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-        Json(v),
+        StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
+        Json(poll.body),
     )
         .into_response()
+}
+
+/// GET /v1/videos/{id}/content — the finished clip's bytes, proxied for vendors
+/// that hand out no URL (Sora and Hailuo); the poll's rate spend and tenant gate apply.
+async fn videos_content(
+    State(s): State<AppState>,
+    Authed(ak): Authed,
+    Path(id): Path<String>,
+) -> Response {
+    let (state, job) = match admit_video_job(&s, &ak, &id).await {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
+    };
+    let Some(account) = state.pool.named(&job.account) else {
+        return error_response(
+            503,
+            format!("account {} is no longer configured", job.account),
+        );
+    };
+    let poll = match poll_and_settle_video(&s, &job, account).await {
+        Ok(poll) => poll,
+        Err(resp) => return resp,
+    };
+    if !poll.done {
+        return error_response(409, "video is not completed");
+    }
+    match gw_engines::families::video_content(
+        s.handler.transport.as_ref(),
+        account,
+        &job.id,
+        &poll.body,
+    )
+    .await
+    {
+        Ok((status, content_type, bytes)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            [("content-type", content_type)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => gateway_error(e),
+    }
 }
 
 /// POST /v1/audio/speech (TTS, returns audio bytes; OpenAI-compatible surface)

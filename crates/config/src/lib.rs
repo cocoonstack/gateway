@@ -30,6 +30,8 @@ pub enum ConfigError {
     UnknownProvider { model: String, provider: String },
     #[error("model `{model}` needs either protocol or provider")]
     ModelNeedsDispatch { model: String },
+    #[error("video model `{model}` must pin a provider (the video wire is provider-specific)")]
+    VideoModelNeedsProvider { model: String },
     #[error("duplicate {kind} name `{name}`")]
     DuplicateName { kind: &'static str, name: String },
     #[error("{kind} with an empty name")]
@@ -638,6 +640,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
                 "completions",
                 "realtime",
                 "moderations",
+                "video",
             ],
             default_model_wire: "openai-chat",
         },
@@ -674,7 +677,15 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "siliconflow" => ProviderPreset {
             endpoint: "https://api.siliconflow.cn",
-            wires: &["openai-chat", "embeddings", "rerank", "tts", "stt", "image"],
+            wires: &[
+                "openai-chat",
+                "embeddings",
+                "rerank",
+                "tts",
+                "stt",
+                "image",
+                "video",
+            ],
             default_model_wire: "openai-chat",
         },
         _ => return None,
@@ -841,6 +852,17 @@ impl GatewayConfig {
     /// Structural and value invariants checked before use: wire types, prices,
     /// token-rate weights, retry_status range, quota/variant shape.
     fn validate(&self) -> Result<(), ConfigError> {
+        // the video wire is provider-specific (dialect by provider name): an
+        // unpinned model would round-robin one vendor's body into another's API
+        if let Some(m) = self
+            .models
+            .iter()
+            .find(|m| m.protocol == "video" && m.provider.is_none())
+        {
+            return Err(ConfigError::VideoModelNeedsProvider {
+                model: m.name.clone(),
+            });
+        }
         if self.storage.shared_cache && self.storage.redis_url.is_empty() {
             return Err(ConfigError::SharedCacheNeedsRedis);
         }

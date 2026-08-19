@@ -131,6 +131,19 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     })
 }
 
+/// MiniMax reports business errors as `base_resp.status_code != 0` on an HTTP 200.
+pub(crate) fn reject_minimax_error(v: &Value) -> GResult<()> {
+    let code = v["base_resp"]["status_code"].as_i64().unwrap_or(0);
+    if code == 0 {
+        return Ok(());
+    }
+    Err(GatewayError::new(
+        ErrCode::FED_RESP_STATUS_NOT_ZERO,
+        502,
+        format!("minimax base_resp {code}: {}", v["base_resp"]["status_msg"]),
+    ))
+}
+
 /// Drop the empty object some vendors emit ahead of accumulated arguments
 /// (`{}{"command":…}`) and complete an empty no-argument string to `{}`; an
 /// unparseable string passes through untouched.

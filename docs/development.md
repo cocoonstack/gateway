@@ -96,9 +96,10 @@ GW_ADMIN_TOKEN=admin-live GW_CONFIG=scripts/live-matrix/live.yaml ./target/relea
 python3 scripts/live-matrix/live_matrix.py               # or: ... anthropic bedrock
 ```
 
-Last full run (2026-08-19, `feat/xai-cursor`): 129/134 cases across Anthropic,
-OpenAI, Gemini, DeepSeek, MiniMax, Qwen/DashScope, Qianfan, Moonshot,
-SiliconFlow, OpenRouter, Cohere/Jina rerank, xAI Grok (chat, Responses, image,
-video) and Bedrock (InvokeModel, Converse, Llama) — every ledger row matched the
-oracle exactly; the 5 failures were Gemini's free-tier quota (`429`) on the
-vendor side.
+Last full run (2026-08-19): all cases across Anthropic, OpenAI (incl.
+gpt-realtime-mini through `/v1/realtime` and sora-2 video), Gemini, DeepSeek,
+MiniMax (incl. Hailuo video), Qwen/DashScope (incl. wan2.2-t2v-plus video),
+Qianfan, Moonshot, SiliconFlow (incl. Wan2.2 video), OpenRouter, Cohere/Jina
+rerank, xAI Grok (chat, Responses, image, video), Bedrock (InvokeModel,
+Converse, Llama) and a local Ollama through the generic OpenAI-compatible path
+— every ledger row matched the oracle exactly.

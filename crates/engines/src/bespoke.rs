@@ -3,13 +3,13 @@
 //! response shape (the mock answers in the same shapes). AWS engines compute a
 //! real SigV4 Authorization header.
 
-use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_models::{GResult, GatewayResponse};
 use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 use crate::base::{Base, base_engine};
 use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
-use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
+use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_error};
 use crate::transport::Headers;
 
 base_engine!(ErnieEngine);
@@ -94,15 +94,7 @@ impl ModelEngine for MinimaxV1Engine {
             .base
             .post_json(&url, self.base.bearer_headers(), body)
             .await?;
-        // base_resp non-zero is an error (minimax's business error-code convention)
-        let code = v["base_resp"]["status_code"].as_i64().unwrap_or(0);
-        if code != 0 {
-            return Err(GatewayError::new(
-                gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
-                502,
-                format!("minimax base_resp {code}: {}", v["base_resp"]["status_msg"]),
-            ));
-        }
+        reject_minimax_error(&v)?;
         let total = crate::engine::tok(&v["usage"]["total_tokens"]);
         let resp = GatewayResponse {
             message: crate::engine::take_string(&mut v, "/reply").unwrap_or_default(),

@@ -876,6 +876,90 @@ async fn video_request_shape() {
 }
 
 #[tokio::test]
+async fn video_dialects_shape_the_submit_by_provider() {
+    use gw_models::Account;
+    let params = || {
+        TypedParams::Video(VideoParams {
+            prompt: "a dog surfing".into(),
+            duration_seconds: Some(4),
+            resolution: Some("720x1280".into()),
+            aspect_ratio: None,
+            image: Some(serde_json::json!("https://img/dog.png")),
+        })
+    };
+    let with_provider = |provider: &str| {
+        let mut req = typed_req(Protocol::Video, "m", params());
+        req.account = Some(std::sync::Arc::new(Account {
+            name: format!("{provider}-1"),
+            provider: provider.into(),
+            endpoint: format!("https://{provider}.example"),
+            ..Default::default()
+        }));
+        req
+    };
+
+    let t = RecordingTransport::new(r#"{"id":"video_1","object":"video","status":"queued"}"#);
+    let _ = VideoEngine::new(with_provider("openai"), t.clone())
+        .run()
+        .await
+        .unwrap();
+    let b = t.body_json();
+    assert_eq!(b["seconds"], "4", "sora seconds is a string: {b}");
+    assert_eq!(b["size"], "720x1280");
+    assert_eq!(b["input_reference"], "https://img/dog.png");
+    assert!(
+        b.get("duration").is_none() && b.get("resolution").is_none(),
+        "{b}"
+    );
+    assert!(t.url().ends_with("/v1/videos"), "url: {}", t.url());
+
+    let t = RecordingTransport::new(r#"{"requestId":"sf-1"}"#);
+    let _ = VideoEngine::new(with_provider("siliconflow"), t.clone())
+        .run()
+        .await
+        .unwrap();
+    let b = t.body_json();
+    assert_eq!(b["image_size"], "720x1280");
+    assert!(b.get("duration").is_none(), "wan takes no duration: {b}");
+    assert!(t.url().ends_with("/v1/video/submit"), "url: {}", t.url());
+
+    let t = RecordingTransport::new(
+        r#"{"output":{"task_id":"ds-1","task_status":"PENDING"},"request_id":"trace"}"#,
+    );
+    let _ = VideoEngine::new(with_provider("dashscope"), t.clone())
+        .run()
+        .await
+        .unwrap();
+    let b = t.body_json();
+    assert_eq!(b["input"]["prompt"], "a dog surfing");
+    assert_eq!(b["input"]["img_url"], "https://img/dog.png");
+    assert_eq!(b["parameters"]["duration"], 4);
+    assert_eq!(b["parameters"]["size"], "720x1280");
+    assert_eq!(t.header("X-DashScope-Async").as_deref(), Some("enable"));
+    assert!(
+        t.url()
+            .ends_with("/api/v1/services/aigc/video-generation/video-synthesis"),
+        "url: {}",
+        t.url()
+    );
+
+    let t = RecordingTransport::new(r#"{"task_id":"mm-1","base_resp":{"status_code":0}}"#);
+    let _ = VideoEngine::new(with_provider("minimax"), t.clone())
+        .run()
+        .await
+        .unwrap();
+    let b = t.body_json();
+    assert_eq!(b["duration"], 4);
+    assert_eq!(b["resolution"], "720x1280");
+    assert_eq!(b["first_frame_image"], "https://img/dog.png");
+    assert!(
+        t.url().ends_with("/v1/video_generation"),
+        "url: {}",
+        t.url()
+    );
+}
+
+#[tokio::test]
 async fn search_request_shape() {
     let t = RecordingTransport::new(
         r#"{"query":"q","results":[{"title":"t","url":"u","snippet":"s"}]}"#,
