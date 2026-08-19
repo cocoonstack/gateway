@@ -58,9 +58,15 @@ usage; a failed request refunds it. Charged price is the model's list price, or
 a tenant's `model_prices` override; when an account declares `cost_*_price` the
 ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
 Surfaces that meter no tokens bill per unit instead — TTS characters,
-transcription seconds, rerank search units, generated images — at the model's
-`unit_price_micros` (see [Configuration](configuration.md)); the unit count
-rides on the ledger row and the usage aggregates as `billed_units`. Audio
+transcription seconds, rerank search units, generated images, generated video
+seconds — at the model's `unit_price_micros` (see
+[Configuration](configuration.md)); the unit count rides on the ledger row and
+the usage aggregates as `billed_units`. An async video bills when its poll first
+sees `done`: the submit row carries 0 units, the completion row (its
+`request_id` is the video id) the clip's seconds at the price quoted at submit
+and, when the vendor reports
+one (xAI's `cost_in_usd_ticks`), the exact vendor cost instead of the account's
+unit price. Audio
 tokens and 1-hour cache writes take their own `token_rate` weights, a
 `long_context` tier re-prices calls past a prompt size, and `batch_discount`
 scales what `/v1/batches` items cost.

@@ -4,6 +4,7 @@
 //! events) are transcoded back into the Messages shapes the engine, the views
 //! and the native `/v1/messages` stream already understand.
 
+use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 /// A Messages body as a Converse body; Claude-only knobs and passthrough extras
@@ -12,7 +13,7 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
     let mut out = Map::with_capacity(6);
     if let Some(system) = body.remove("system") {
         let blocks = match system {
-            Value::String(text) => vec![json!({"text": text})],
+            Value::String(text) => vec![object([("text", text.into())])],
             Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
             _ => Vec::new(),
         };
@@ -81,16 +82,16 @@ pub(crate) fn reply(mut v: Value, model: &str) -> Value {
         _ => Vec::new(),
     };
     let usage = usage(&v["usage"]);
-    json!({
-        "id": "msg_converse",
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": stop_reason(v["stopReason"].as_str()),
-        "stop_sequence": null,
-        "usage": usage,
-    })
+    object([
+        ("id", "msg_converse".into()),
+        ("type", "message".into()),
+        ("role", "assistant".into()),
+        ("model", model.into()),
+        ("content", Value::Array(content)),
+        ("stop_reason", stop_reason(v["stopReason"].as_str()).into()),
+        ("stop_sequence", Value::Null),
+        ("usage", usage),
+    ])
 }
 
 /// Converse stream events as the Anthropic sequence: implicit text/reasoning
@@ -122,13 +123,22 @@ impl Events {
             "contentBlockStart" => {
                 let mut start = ev["start"].take();
                 let block = if let Some(tool) = start.get_mut("toolUse") {
-                    json!({"type": "tool_use", "id": tool["toolUseId"].take(),
-                           "name": tool["name"].take(), "input": {}})
+                    object([
+                        ("type", "tool_use".into()),
+                        ("id", tool["toolUseId"].take()),
+                        ("name", tool["name"].take()),
+                        ("input", json!({})),
+                    ])
                 } else {
                     json!({"type": "text", "text": ""})
                 };
                 self.open.push(index);
-                vec![json!({"type": "content_block_start", "index": index, "content_block": block})]
+                vec![block_event(
+                    "content_block_start",
+                    index,
+                    "content_block",
+                    block,
+                )]
             }
             "contentBlockDelta" => {
                 let mut delta = ev["delta"].take();
@@ -136,28 +146,32 @@ impl Events {
                 let (start_block, anthropic_delta) = if let Some(text) = delta.get_mut("text") {
                     (
                         json!({"type": "text", "text": ""}),
-                        json!({"type": "text_delta", "text": text.take()}),
+                        typed("text_delta", "text", text.take()),
                     )
                 } else if let Some(input) = delta["toolUse"].get_mut("input") {
                     (
                         Value::Null,
-                        json!({"type": "input_json_delta", "partial_json": input.take()}),
+                        typed("input_json_delta", "partial_json", input.take()),
                     )
                 } else if let Some(reasoning) = delta.get_mut("reasoningContent") {
                     if let Some(sig) = reasoning.get_mut("signature") {
                         (
                             json!({"type": "thinking", "thinking": ""}),
-                            json!({"type": "signature_delta", "signature": sig.take()}),
+                            typed("signature_delta", "signature", sig.take()),
                         )
                     } else if let Some(data) = reasoning.get_mut("redactedContent") {
                         self.open.push(index);
-                        return vec![json!({"type": "content_block_start", "index": index,
-                            "content_block": {"type": "redacted_thinking", "data": data.take()}})];
+                        let block = typed("redacted_thinking", "data", data.take());
+                        return vec![block_event(
+                            "content_block_start",
+                            index,
+                            "content_block",
+                            block,
+                        )];
                     } else {
                         (
                             json!({"type": "thinking", "thinking": ""}),
-                            json!({"type": "thinking_delta",
-                                   "thinking": reasoning["text"].take()}),
+                            typed("thinking_delta", "thinking", reasoning["text"].take()),
                         )
                     }
                 } else {
@@ -165,11 +179,19 @@ impl Events {
                 };
                 if !start_block.is_null() && !self.open.contains(&index) {
                     self.open.push(index);
-                    events.push(json!({"type": "content_block_start", "index": index,
-                                       "content_block": start_block}));
+                    events.push(block_event(
+                        "content_block_start",
+                        index,
+                        "content_block",
+                        start_block,
+                    ));
                 }
-                events.push(json!({"type": "content_block_delta", "index": index,
-                                   "delta": anthropic_delta}));
+                events.push(block_event(
+                    "content_block_delta",
+                    index,
+                    "delta",
+                    anthropic_delta,
+                ));
                 events
             }
             "contentBlockStop" => {
@@ -181,7 +203,11 @@ impl Events {
                 "delta": {"stop_reason": stop_reason(ev["stopReason"].as_str()), "stop_sequence": null}
             })],
             "metadata" => vec![
-                json!({"type": "message_delta", "delta": {}, "usage": usage(&ev["usage"])}),
+                object([
+                    ("type", "message_delta".into()),
+                    ("delta", json!({})),
+                    ("usage", usage(&ev["usage"])),
+                ]),
                 json!({"type": "message_stop"}),
             ],
             _ => Vec::new(),
@@ -189,13 +215,29 @@ impl Events {
     }
 }
 
+/// `{"type": <kind>, <key>: <value>}` — the shape of every Anthropic delta and block.
+fn typed(kind: &str, key: &str, value: Value) -> Value {
+    object([("type", kind.into()), (key, value)])
+}
+
+fn block_event(kind: &str, index: u64, key: &str, payload: Value) -> Value {
+    object([
+        ("type", kind.into()),
+        ("index", index.into()),
+        (key, payload),
+    ])
+}
+
 fn message(mut m: Value) -> Value {
     let content = match m["content"].take() {
-        Value::String(text) => vec![json!({"text": text})],
+        Value::String(text) => vec![object([("text", text.into())])],
         Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
         _ => Vec::new(),
     };
-    json!({"role": m["role"], "content": content})
+    object([
+        ("role", m["role"].take()),
+        ("content", Value::Array(content)),
+    ])
 }
 
 /// One Messages content block as Converse blocks; a `cache_control` marker
@@ -203,21 +245,30 @@ fn message(mut m: Value) -> Value {
 fn content_block(mut block: Value) -> Vec<Value> {
     let cache_control = block.get_mut("cache_control").map(Value::take);
     let mapped = match block["type"].as_str() {
-        Some("text") => json!({"text": block["text"].take()}),
+        Some("text") => object([("text", block["text"].take())]),
         Some("image") => {
             let mut source = block["source"].take();
             let format = source["media_type"]
                 .as_str()
                 .and_then(|m| m.strip_prefix("image/"))
-                .unwrap_or("png")
-                .to_owned();
-            json!({"image": {"format": format, "source": {"bytes": source["data"].take()}}})
+                .unwrap_or("png");
+            let image = object([
+                ("format", format.into()),
+                ("source", object([("bytes", source["data"].take())])),
+            ]);
+            object([("image", image)])
         }
-        Some("tool_use") => json!({"toolUse": {"toolUseId": block["id"].take(),
-            "name": block["name"].take(), "input": block["input"].take()}}),
+        Some("tool_use") => {
+            let tool = object([
+                ("toolUseId", block["id"].take()),
+                ("name", block["name"].take()),
+                ("input", block["input"].take()),
+            ]);
+            object([("toolUse", tool)])
+        }
         Some("tool_result") => {
-            let content = match block["content"].take() {
-                Value::String(text) => vec![json!({"text": text})],
+            let mut content = match block["content"].take() {
+                Value::String(text) => vec![object([("text", text.into())])],
                 Value::Array(blocks) => blocks
                     .into_iter()
                     .flat_map(content_block)
@@ -225,18 +276,29 @@ fn content_block(mut block: Value) -> Vec<Value> {
                     .collect(),
                 _ => Vec::new(),
             };
-            let mut result = json!({"toolUseId": block["tool_use_id"].take(),
-                "content": if content.is_empty() { vec![json!({"json": {}})] } else { content }});
+            if content.is_empty() {
+                content.push(json!({"json": {}}));
+            }
+            let mut result = object([
+                ("toolUseId", block["tool_use_id"].take()),
+                ("content", Value::Array(content)),
+            ]);
             if block["is_error"] == true {
                 result["status"] = "error".into();
             }
-            json!({"toolResult": result})
+            object([("toolResult", result)])
         }
-        Some("thinking") => json!({"reasoningContent": {"reasoningText": {
-            "text": block["thinking"].take(), "signature": block["signature"].take()}}}),
-        Some("redacted_thinking") => {
-            json!({"reasoningContent": {"redactedContent": block["data"].take()}})
+        Some("thinking") => {
+            let text = object([
+                ("text", block["thinking"].take()),
+                ("signature", block["signature"].take()),
+            ]);
+            object([("reasoningContent", object([("reasoningText", text)]))])
         }
+        Some("redacted_thinking") => object([(
+            "reasoningContent",
+            object([("redactedContent", block["data"].take())]),
+        )]),
         _ => return Vec::new(),
     };
     let mut blocks = vec![mapped];
@@ -255,17 +317,15 @@ fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
     if let Some(d) = tool.get_mut("description").filter(|d| !d.is_null()) {
         spec.insert("description".into(), d.take());
     }
-    spec.insert(
-        "inputSchema".into(),
-        json!({"json": match tool["input_schema"].take() {
-            Value::Null => json!({"type": "object", "properties": {}}),
-            schema => schema,
-        }}),
-    );
+    let schema = match tool["input_schema"].take() {
+        Value::Null => json!({"type": "object", "properties": {}}),
+        schema => schema,
+    };
+    spec.insert("inputSchema".into(), object([("json", schema)]));
     if claude && let Some(strict) = tool.get_mut("strict").filter(|strict| !strict.is_null()) {
         spec.insert("strict".into(), strict.take());
     }
-    let mut tools = vec![json!({"toolSpec": spec})];
+    let mut tools = vec![object([("toolSpec", Value::Object(spec))])];
     if let Some(control) = cache_control {
         tools.push(cache_point(control));
     }
@@ -278,7 +338,7 @@ fn cache_point(mut control: Value) -> Value {
     if let Some(ttl) = control.get_mut("ttl").filter(|ttl| !ttl.is_null()) {
         point.insert("ttl".into(), ttl.take());
     }
-    json!({"cachePoint": point})
+    object([("cachePoint", Value::Object(point))])
 }
 
 fn converse_tool_choice(choice: Value) -> (bool, Option<Value>) {
@@ -289,29 +349,36 @@ fn converse_tool_choice(choice: Value) -> (bool, Option<Value>) {
         Some("none") => (true, None),
         Some("any") => (false, Some(json!({"any": {}}))),
         Some("auto") => (false, Some(json!({"auto": {}}))),
-        Some("tool") => (
-            false,
-            Some(json!({"tool": {"name": fields.remove("name").unwrap_or(Value::Null)}})),
-        ),
+        Some("tool") => {
+            let name = fields.remove("name").unwrap_or(Value::Null);
+            (false, Some(object([("tool", object([("name", name)]))])))
+        }
         _ => (false, None),
     }
 }
 
 fn anthropic_block(mut block: Value) -> Option<Value> {
     if let Some(text) = block.get_mut("text") {
-        return Some(json!({"type": "text", "text": text.take()}));
+        return Some(typed("text", "text", text.take()));
     }
     if let Some(tool) = block.get_mut("toolUse") {
-        return Some(json!({"type": "tool_use", "id": tool["toolUseId"].take(),
-            "name": tool["name"].take(), "input": tool["input"].take()}));
+        return Some(object([
+            ("type", "tool_use".into()),
+            ("id", tool["toolUseId"].take()),
+            ("name", tool["name"].take()),
+            ("input", tool["input"].take()),
+        ]));
     }
     if let Some(reasoning) = block.get_mut("reasoningContent") {
         if let Some(text) = reasoning.get_mut("reasoningText") {
-            return Some(json!({"type": "thinking", "thinking": text["text"].take(),
-                "signature": text["signature"].take()}));
+            return Some(object([
+                ("type", "thinking".into()),
+                ("thinking", text["text"].take()),
+                ("signature", text["signature"].take()),
+            ]));
         }
         if let Some(data) = reasoning.get_mut("redactedContent") {
-            return Some(json!({"type": "redacted_thinking", "data": data.take()}));
+            return Some(typed("redacted_thinking", "data", data.take()));
         }
     }
     None

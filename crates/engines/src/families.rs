@@ -4,14 +4,15 @@
 //! deferred to a later fidelity pass.
 
 use base64::Engine as _;
-use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams};
-use serde_json::{Value, json};
+use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams, VideoParams};
+use gw_protocol::object;
+use serde_json::{Map, Value, json};
 
-use crate::base::{Base, base_engine};
+use crate::base::{Base, VENDOR_SENTINEL, base_engine, parse_json_reply, versioned_url};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::multipart::{Form, audio_kind, image_kind};
 use crate::sse::SseDecoder;
-use crate::transport::{Headers, SharedTransport, UpstreamBody};
+use crate::transport::{Headers, SharedTransport, Transport, UpstreamBody, UpstreamRequest};
 
 /// Gemini `parts` from a unified message: text and data-URI images (`inlineData`);
 /// remote image URLs cannot be inlined without a fetch and are skipped.
@@ -78,14 +79,18 @@ impl VertexEngine {
                 } else {
                     gw_consts::role::USER
                 };
-                json!({"role": role, "parts": gemini_parts(m)})
+                object([
+                    ("role", role.into()),
+                    ("parts", Value::Array(gemini_parts(m))),
+                ])
             })
             .collect();
         let mut body = json!({});
         body["contents"] = Value::Array(contents);
         let system = self.base.system_text();
         if !system.is_empty() {
-            body["systemInstruction"] = json!({"parts": [{"text": system}]});
+            let part = object([("text", system.into())]);
+            body["systemInstruction"] = object([("parts", Value::Array(vec![part]))]);
         }
         // sampling params → generationConfig — else Gemini silently uses defaults
         if let Some(p) = self.base.chat_params() {
@@ -493,7 +498,7 @@ impl ModelEngine for AudioEngine {
                 match reply.body {
                     UpstreamBody::Json(bytes) if status < 400 && !looks_like_json(&bytes) => {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        (status, json!({"audio_b64": b64}))
+                        (status, object([("audio_b64", b64.into())]))
                     }
                     body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
                         status,
@@ -577,7 +582,7 @@ impl ModelEngine for AudioEngine {
 }
 
 /// A vendor duration as whole billed seconds (fractions round up).
-fn whole_seconds(v: &Value) -> Option<i64> {
+pub fn whole_seconds(v: &Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_f64().map(|f| f.ceil() as i64))
         .filter(|s| *s > 0)
@@ -594,34 +599,68 @@ base_engine!(VideoEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for VideoEngine {
-    /// Merges the sora/veo/kling/runway/vidu/minimax_video engines (async-task
-    /// type; mock completes immediately).
+    /// The generations shape; a sync vendor answers with the video, an async one with a `request_id`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let prompt = match &param.typed {
-            Some(TypedParams::Video(p)) => p.prompt.as_str(),
-            _ => self.base.last_message_text(),
+        let p = match self.base.take_typed() {
+            Some(TypedParams::Video(p)) => p,
+            _ => VideoParams {
+                prompt: self.base.last_message_text().to_owned(),
+                ..Default::default()
+            },
         };
-        require_non_empty(prompt, "video prompt")?;
-        let mut body = json!({"model": param.model_name, "prompt": prompt});
-        if let Some(TypedParams::Video(p)) = &param.typed {
-            if let Some(d) = p.duration_seconds {
-                body["duration_seconds"] = json!(d);
-            }
-            if let Some(r) = &p.resolution {
-                body["resolution"] = json!(r);
+        require_non_empty(&p.prompt, "video prompt")?;
+        let model = self.base.model_name()?;
+        let mut body = Map::new();
+        body.insert("model".into(), model.into());
+        body.insert("prompt".into(), p.prompt.into());
+        for (k, v) in [
+            ("duration", p.duration_seconds.map(Value::from)),
+            ("resolution", p.resolution.map(Value::from)),
+            ("aspect_ratio", p.aspect_ratio.map(Value::from)),
+            ("image", p.image),
+        ] {
+            if let Some(v) = v {
+                body.insert(k.into(), v);
             }
         }
         let (status, v) = self
             .base
-            .round_trip(&self.base.vendor_url("videos/generations"), body)
+            .round_trip(&self.base.vendor_url("videos/generations"), body.into())
             .await?;
-        let message = v["video_url"].as_str().unwrap_or_default().to_owned();
+        let message = v["video"]["url"]
+            .as_str()
+            .or_else(|| v["video_url"].as_str())
+            .unwrap_or_default()
+            .to_owned();
         let step = v["status"].as_str().unwrap_or_default().to_owned();
-        let mut out = family_outcome(message, &param.model_name, v, status);
+        let units = whole_seconds(&v["video"]["duration"]).unwrap_or(0);
+        let mut out = family_outcome(message, model, v, status);
         out.response.step = step;
+        out.response.billed_units = units;
         Ok(out)
     }
+}
+
+/// Poll an async video generation where it was submitted: `GET {base}/v1/videos/{id}`.
+pub async fn video_poll(
+    transport: &dyn Transport,
+    account: &gw_models::Account,
+    id: &str,
+) -> GResult<(u16, Value)> {
+    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
+    let reply = transport
+        .send(UpstreamRequest {
+            protocol: gw_consts::Protocol::Video,
+            method: "GET",
+            url: versioned_url(account.base_url(VENDOR_SENTINEL), &format!("videos/{id}")),
+            headers: vec![("authorization", format!("Bearer {key}"))],
+            body: Vec::new(),
+            stream: false,
+            account: account.name.clone(),
+            replay_account: None,
+        })
+        .await?;
+    parse_json_reply(reply)
 }
 
 base_engine!(SearchEngine);
@@ -664,8 +703,7 @@ base_engine!(ModerationsEngine);
 impl ModelEngine for ModerationsEngine {
     /// OpenAI moderations shape: `{model, input: [..]}` → per-input verdicts.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let Some(TypedParams::Moderation(p)) = &param.typed else {
+        let Some(TypedParams::Moderation(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("moderations params are required"));
         };
         if p.input.is_empty() {
@@ -673,7 +711,9 @@ impl ModelEngine for ModerationsEngine {
                 "moderations input must not be empty",
             ));
         }
-        let body = json!({"model": param.model_name, "input": p.input});
+        let model = self.base.model_name()?;
+        let input = Value::Array(p.input.into_iter().map(Value::String).collect());
+        let body = object([("model", model.into()), ("input", input)]);
         let (status, v) = self
             .base
             .round_trip(
@@ -691,7 +731,7 @@ impl ModelEngine for ModerationsEngine {
             .unwrap_or(0);
         Ok(family_outcome(
             format!("{flagged} flagged"),
-            &param.model_name,
+            model,
             v,
             status,
         ))
@@ -1124,11 +1164,6 @@ fn responses_tool(mut tool: Value) -> Value {
     tool
 }
 
-/// A JSON object from moved values (`json!` would deep-copy each one).
-fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
-    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
-}
-
 fn function_call(call_id: Value, name: Value, arguments: Value) -> Value {
     object([
         ("type", "function_call".into()),
@@ -1534,8 +1569,7 @@ mod tests {
                 "kling-mock",
                 Some(TypedParams::Video(VideoParams {
                     prompt: "a dog surfing".into(),
-                    duration_seconds: None,
-                    resolution: None,
+                    ..Default::default()
                 })),
             ),
             t(),

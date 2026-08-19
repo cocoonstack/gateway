@@ -47,6 +47,8 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
+| POST | `/v1/videos/generations` | `{model, prompt, duration?, aspect_ratio?, resolution?, image?}`; a synchronous vendor answers with the video, an async one (xAI) with `{request_id}` |
+| GET | `/v1/videos/{id}` | the vendor's poll, proxied (`status` pending/done/failed/expired, `video.url`, `video.duration`); see Video |
 | POST | `/v1/audio/speech` | TTS, returns audio bytes |
 | POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio |
 | POST | `/v1/audio/translations` | STT translated to English (same request shape) |
@@ -142,6 +144,23 @@ expired anchors fail open. Disabling thinking on a continuation and stripping
 the blocks — as the Anthropic API requires — is accepted. Signed thinking
 whose prose the tenant's policy cannot serve (blocklist or DLP hits) is
 stripped from the response; the visible turn still serves.
+
+## Video
+
+`POST /v1/videos/generations` runs the pipeline like any family (auth, limits,
+routing, a ledger row) and returns the vendor's reply as is. When that reply is
+an async handle (`{request_id}`), the gateway remembers which key, model and
+account it belongs to; `GET /v1/videos/{id}` spends the polling key's rate
+limits like any request, then proxies the vendor's poll on that account (`404`
+for an unknown id or another tenant's). The first poll that sees `status: done`
+bills the submitting key `video.duration` seconds (rounded up) at the
+`unit_price_micros` quoted when it submitted (a reprice or removal of the model
+while the clip renders does not change it), taking the vendor cost from
+`usage.cost_in_usd_ticks`
+(1 tick = 10⁻¹⁰ USD) when present; that ledger row's `request_id` is the video
+id. Later polls of the same id return the vendor's answer without billing
+again; `failed` and `expired` jobs bill nothing beyond the submit row. Jobs are
+kept 30 days.
 
 ## Batch & files
 

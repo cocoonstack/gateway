@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::object;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
@@ -87,12 +89,14 @@ pub fn image_url_to_image(mut part: Value) -> Value {
         .strip_prefix("data:")
         .and_then(|rest| rest.split_once(";base64,"))
     {
-        Some((media_type, data)) => {
-            serde_json::json!({"type": "base64", "media_type": media_type, "data": data})
-        }
-        None => serde_json::json!({"type": "url", "url": url}),
+        Some((media_type, data)) => object([
+            ("type", "base64".into()),
+            ("media_type", media_type.into()),
+            ("data", data.into()),
+        ]),
+        None => object([("type", "url".into()), ("url", url.into())]),
     };
-    serde_json::json!({"type": "image", "source": source})
+    object([("type", "image".into()), ("source", source)])
 }
 
 /// Inverse of [`image_url_to_image`]: an Anthropic `image` block as an OpenAI
@@ -116,7 +120,10 @@ pub fn image_to_image_url(mut block: Value) -> Value {
             }
         },
     };
-    serde_json::json!({"type": "image_url", "image_url": {"url": url}})
+    object([
+        ("type", "image_url".into()),
+        ("image_url", object([("url", url.into())])),
+    ])
 }
 
 /// OpenAI-shaped tool calls as Anthropic `tool_use` blocks; the `arguments`
@@ -155,10 +162,13 @@ pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Valu
                 Value::Null => "{}".to_owned(),
                 input => input.to_string(),
             };
-            let call = serde_json::json!({
-                "index": *index, "id": b["id"].take(), "type": "function",
-                "function": {"name": b["name"].take(), "arguments": arguments}
-            });
+            let function = object([("name", b["name"].take()), ("arguments", arguments.into())]);
+            let call = object([
+                ("index", (*index).into()),
+                ("id", b["id"].take()),
+                ("type", "function".into()),
+                ("function", function),
+            ]);
             *index += 1;
             call
         })

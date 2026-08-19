@@ -173,3 +173,50 @@ curl -s localhost:8080/v1/chat/completions \
 The same request shapes as any other model: reasoning comes back as
 `reasoning_content` + signed `reasoning_details`, tools and thinking replay
 through the loop, and `/v1/messages` speaks to it natively.
+
+## Grok (xAI)
+
+```yaml
+providers:
+  - {name: xai, kind: xai, api_key_env: XAI_API_KEY}
+models:
+  - {name: grok-4.6, provider: xai,
+     input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
+  - {name: grok-imagine-image-2.0, provider: xai, protocol: image, unit_price_micros: 70000}
+  - {name: grok-imagine-video-1.5, provider: xai, protocol: video, unit_price_micros: 100000}
+```
+
+The preset covers xAI's OpenAI-compatible surfaces (`/v1/chat/completions`,
+`/v1/responses`, `/v1/images/generations`), its async video
+(`/v1/videos/generations` answers `{request_id}`; poll `GET /v1/videos/{id}`
+until `done` — the first `done` bills the clip's seconds at the unit price and
+records xAI's `cost_in_usd_ticks` as the vendor cost) and its realtime voice
+socket (`protocol: realtime`, model `grok-voice-latest`, billed by the delivered
+output estimate since xAI reports no usage). `reasoning_effort` passes through
+verbatim — grok-4.6 takes `low`…`xhigh`, grok-4.3 also `none`, and a model
+answers 400 for a value it does not list — and the usage's `cached_tokens` /
+`reasoning_tokens` land in the ledger like any OpenAI-shaped vendor. Anthropic
+clients reach Grok through `/v1/messages` (the gateway converts; xAI's own
+Anthropic-compatible endpoint is deprecated).
+
+## Cursor and other bring-your-own-key clients
+
+Cursor's *Models → API Keys* lets you point its OpenAI, Anthropic and Google
+keys at another base URL. Requests are relayed by Cursor's servers, so the
+gateway must be reachable from the internet over HTTPS (a public host or a
+tunnel — never `localhost`).
+
+- **OpenAI key + "Override OpenAI Base URL"** → `https://gw.example.com/v1`
+  (Cursor appends `/chat/completions`), key = a gateway access key. Add each
+  gateway model name under *Model Names* — any configured model, Claude and
+  Gemini included: the gateway serves them on the OpenAI wire with streaming
+  and tool calls, which is what Cursor's Agent/Ask modes send.
+- **Anthropic key + base URL** → `https://gw.example.com`; the access key rides
+  as `x-api-key`, and `/v1/messages` serves every model natively or by
+  conversion.
+
+Tab completion and inline edit stay on Cursor's own models regardless of keys,
+and Cursor shows only the final answer (reasoning prose is dropped client-side).
+Verified on the gateway side by the live matrix (streamed chat with tools,
+`x-api-key` auth, `/v1/models`); driving the Cursor client itself was not part
+of that run.

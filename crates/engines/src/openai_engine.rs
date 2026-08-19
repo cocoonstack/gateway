@@ -70,7 +70,7 @@ impl OpenAiEngine {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
                     if let Some(v) = $v {
-                        body.insert($k.into(), json!(v));
+                        body.insert($k.into(), v.into());
                     }
                 };
             }
@@ -218,7 +218,7 @@ fn apply_sse_event(
     }
     let mut chunks = Vec::new();
     if resp.model.is_empty() {
-        resp.model = v["model"].as_str().unwrap_or_default().to_owned();
+        resp.model = crate::engine::take_string(&mut v, "/model").unwrap_or_default();
     }
     let mut tool_calls = None;
     if let Some(delta) = v

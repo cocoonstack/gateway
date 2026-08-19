@@ -404,6 +404,13 @@ impl AccountPool {
         self.select_excluding(p, provider, &[])
     }
 
+    pub fn named(&self, name: &str) -> Option<&Account> {
+        self.accounts
+            .iter()
+            .find(|a| a.name == name)
+            .map(Arc::as_ref)
+    }
+
     /// [`Self::select_excluding`] plus a health filter: cooldown accounts are
     /// excluded. Only accounts that could actually be selected (protocol AND
     /// provider match) are health-checked — the others would waste lookups.

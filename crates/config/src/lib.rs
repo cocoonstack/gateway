@@ -23,7 +23,7 @@ pub enum ConfigError {
     #[error("model `{model}` references unknown protocol `{wire}`")]
     UnknownModelMapping { model: String, wire: String },
     #[error(
-        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter, moonshot, siliconflow)"
+        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter, moonshot, xai, siliconflow)"
     )]
     UnknownProviderKind { provider: String, kind: String },
     #[error("model `{model}` references unknown provider `{provider}`")]
@@ -598,7 +598,7 @@ pub struct RetentionConf {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConf {
     pub name: String,
-    /// openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
+    /// openai | anthropic | gemini | deepseek | openrouter | moonshot | xai | siliconflow
     pub kind: String,
     #[serde(default)]
     pub api_key_env: String,
@@ -665,6 +665,11 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         "moonshot" => ProviderPreset {
             endpoint: "https://api.moonshot.cn",
             wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "xai" => ProviderPreset {
+            endpoint: "https://api.x.ai",
+            wires: &["openai-chat", "responses", "image", "video", "realtime"],
             default_model_wire: "openai-chat",
         },
         "siliconflow" => ProviderPreset {
@@ -1289,10 +1294,13 @@ providers:
   - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_KEY}
   - {name: kimi, kind: moonshot, api_key_env: MOONSHOT_KEY}
   - {name: sf, kind: siliconflow, api_key_env: SF_KEY}
+  - {name: xai, kind: xai, api_key_env: XAI_KEY}
 models:
   - {name: deepseek-chat, provider: deepseek}
   - {name: some-model, provider: openrouter}
   - {name: kimi-k2, provider: kimi}
+  - {name: grok-4.6, provider: xai}
+  - {name: grok-imagine-image-2.0, provider: xai, protocol: image}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
         assert_eq!(
@@ -1319,6 +1327,16 @@ models:
             .find(|a| a.name == "openrouter")
             .unwrap();
         assert_eq!(orr.endpoint, "https://openrouter.ai/api");
+        let xai = cfg.accounts.iter().find(|a| a.name == "xai").unwrap();
+        assert_eq!(xai.endpoint, "https://api.x.ai");
+        assert_eq!(
+            cfg.find_model("grok-4.6").unwrap().protocol(),
+            Some(Protocol::OpenaiChat)
+        );
+        assert_eq!(
+            cfg.find_model("grok-imagine-image-2.0").unwrap().protocol(),
+            Some(Protocol::Image)
+        );
     }
 
     #[test]

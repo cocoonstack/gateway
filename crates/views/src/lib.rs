@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
+use std::mem::take;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -27,15 +28,16 @@ use gw_engines::realtime::{
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
-    ModelParamV2, ReasoningParam, SttParams, TtsParams, TypedParams,
+    ModelParamV2, ReasoningParam, SttParams, TtsParams, TypedParams, VideoParams,
 };
 use gw_protocol::anthropic::{AnthUsage, MessagesRequest, tool_use_to_tool_calls};
+use gw_protocol::object;
 use gw_protocol::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
 };
 use gw_state::admission;
 use gw_state::{
-    AkInfo, GatewayState, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture,
+    AkInfo, GatewayState, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture, VideoJob,
 };
 use serde_json::{Value, json};
 
@@ -117,6 +119,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
+        .route("/v1/videos/generations", post(videos_generations))
+        .route("/v1/videos/{id}", get(videos_get))
         .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
         .route("/v1/audio/translations", post(audio_translations))
@@ -182,12 +186,31 @@ async fn track_requests(
     metrics::counter!(
         "gateway_requests_total",
         "route" => route.clone(),
-        "status" => resp.status().as_u16().to_string(),
+        "status" => status_label(resp.status()),
     )
     .increment(1);
     metrics::histogram!("gateway_request_duration_seconds", "route" => route)
         .record(started.elapsed().as_secs_f64());
     resp
+}
+
+/// The status label without a per-request allocation for the codes this gateway emits.
+fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
+    match status.as_u16() {
+        200 => "200".into(),
+        201 => "201".into(),
+        202 => "202".into(),
+        400 => "400".into(),
+        401 => "401".into(),
+        403 => "403".into(),
+        404 => "404".into(),
+        405 => "405".into(),
+        429 => "429".into(),
+        500 => "500".into(),
+        502 => "502".into(),
+        503 => "503".into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// In-band realtime error event. Never terminal: the session
@@ -545,6 +568,8 @@ async fn bill_realtime_turn(
                 discount: 1.0,
                 ptu_spillover: false,
                 estimated,
+                vendor_cost: None,
+                unit_price: None,
             },
             reserved: admit.reserved,
             tpm_reserved: admit.tpm_reserved,
@@ -2470,9 +2495,22 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-local-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The wire default when an engine reported no finish reason.
-fn finish_or_stop(fr: &str) -> &str {
-    if fr.is_empty() { "stop" } else { fr }
+/// The response's finish reason, moved out; the wire default when the engine reported none.
+fn take_finish(resp: &mut gw_models::GatewayResponse) -> String {
+    if resp.finish_reason.is_empty() {
+        "stop".to_owned()
+    } else {
+        take(&mut resp.finish_reason)
+    }
+}
+
+/// An Anthropic `content_block_delta` frame from a moved delta payload.
+fn block_delta(index: usize, kind: &str, key: &str, text: String) -> Value {
+    object([
+        ("type", "content_block_delta".into()),
+        ("index", index.into()),
+        ("delta", object([("type", kind.into()), (key, text.into())])),
+    ])
 }
 
 /// Engine tool calls in OpenAI shape: the anthropic engine hands over native `tool_use` blocks.
@@ -3006,7 +3044,7 @@ fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::Stre
     }
     if !chunks.iter().any(|c| c.finish_reason.is_some()) {
         chunks.push(gw_engines::StreamChunk {
-            finish_reason: Some(finish_or_stop(&resp.finish_reason).to_owned()),
+            finish_reason: Some(take_finish(resp)),
             ..Default::default()
         });
     }
@@ -3030,7 +3068,7 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         });
     }
     chunks.push(gw_engines::StreamChunk {
-        finish_reason: Some(finish_or_stop(&resp.finish_reason).to_owned()),
+        finish_reason: Some(take_finish(resp)),
         ..Default::default()
     });
     chunks
@@ -3418,8 +3456,7 @@ fn messages_stream_response(
                         let idx = self.open_block(BlockKind::Thinking);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
-                            json!({"type":"content_block_delta","index":idx,
-                                   "delta":{"type":"thinking_delta","thinking":c.reasoning}}),
+                            block_delta(idx, "thinking_delta", "thinking", take(&mut c.reasoning)),
                         ));
                     }
                     if !c.delta.is_empty() {
@@ -3427,8 +3464,7 @@ fn messages_stream_response(
                         let idx = self.open_block(BlockKind::Text);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
-                            json!({"type":"content_block_delta","index":idx,
-                                   "delta":{"type":"text_delta","text":c.delta}}),
+                            block_delta(idx, "text_delta", "text", take(&mut c.delta)),
                         ));
                     }
                     if let Some(tc) = c.tool_calls.take() {
@@ -3605,21 +3641,26 @@ async fn completions(
         let response = error_response(500, "pipeline produced no outcome");
         return terminal_response(&ctx, response).await;
     };
-    let r = &outcome.response;
-    let finish = finish_or_stop(&r.finish_reason);
-    let resp = json!({
-        "id": next_id("cmpl"),
-        "object": "text_completion",
-        "created": gw_state::epoch_secs(),
-        "model": r.model,
-        "choices": [{"text": r.message, "index": 0, "finish_reason": finish}],
-        "usage": openai_usage(
-            r.prompt_tokens,
-            r.completion_tokens,
-            r.total_tokens,
-            r.common_usage
-        ),
-    });
+    let mut r = outcome.response;
+    let usage = openai_usage(
+        r.prompt_tokens,
+        r.completion_tokens,
+        r.total_tokens,
+        r.common_usage,
+    );
+    let choice = object([
+        ("text", take(&mut r.message).into()),
+        ("index", 0.into()),
+        ("finish_reason", take_finish(&mut r).into()),
+    ]);
+    let resp = object([
+        ("id", next_id("cmpl").into()),
+        ("object", "text_completion".into()),
+        ("created", gw_state::epoch_secs().into()),
+        ("model", r.model.into()),
+        ("choices", Value::Array(vec![choice])),
+        ("usage", json!(usage)),
+    ]);
     let response = (StatusCode::OK, Json(resp)).into_response();
     terminal_response(&ctx, response).await
 }
@@ -3743,8 +3784,11 @@ fn responses_stream_response(
                         self.seq += 1;
                         self.queue.push_back(
                             Event::default().event("response.output_text.delta").data(
-                                json!({"type":"response.output_text.delta","delta":c.delta})
-                                    .to_string(),
+                                object([
+                                    ("type", "response.output_text.delta".into()),
+                                    ("delta", take(&mut c.delta).into()),
+                                ])
+                                .to_string(),
                             ),
                         );
                     }
@@ -3890,6 +3934,166 @@ async fn images_edits(
     .await
 }
 
+/// POST /v1/videos/generations — a `request_id` reply is remembered for the poll to bill.
+async fn videos_generations(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Authed(ak): Authed,
+    ApiJson(mut body): ApiJson<Value>,
+) -> Response {
+    let started = Instant::now();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
+    let prompt = gw_engines::engine::take_string(&mut body, "/prompt").unwrap_or_default();
+    if model.is_empty() || prompt.is_empty() {
+        return error_response(400, "model and prompt are required");
+    }
+    let typed = TypedParams::Video(VideoParams {
+        prompt,
+        duration_seconds: body["duration"].as_i64(),
+        resolution: gw_engines::engine::take_string(&mut body, "/resolution"),
+        aspect_ratio: gw_engines::engine::take_string(&mut body, "/aspect_ratio"),
+        image: body.get_mut("image").map(Value::take),
+    });
+    let user = user_hint(&headers, &body["user"]);
+    let mut ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::Video,
+        typed,
+        vec![],
+        user,
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    log_access("videos", &ctx, started);
+    let outcome = ctx.outcome.take();
+    let handle = outcome
+        .as_ref()
+        .and_then(|o| o.response.response_v2.as_ref()?["request_id"].as_str());
+    if let Some(id) = handle {
+        let param = ctx.request.model_param_v2.as_ref();
+        let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+        let job = VideoJob {
+            id: id.to_owned(),
+            tenant: ctx.ak.tenant.clone(),
+            ak: ctx.ak.ak.clone(),
+            product: ctx.ak.product.clone(),
+            user_id: ctx.effective_user_id().to_owned(),
+            model: param
+                .and_then(|p| p.fallback_from.as_deref())
+                .unwrap_or(served)
+                .to_owned(),
+            served_model: served.to_owned(),
+            account: ctx.request.account_name().to_owned(),
+            unit_price_micros: ctx.cfg.unit_price_for_tenant(&ctx.ak.tenant, served),
+            created_at_epoch_secs: gw_state::epoch_secs(),
+        };
+        if let Err(e) = s.handler.state().store.video_job_put(job).await {
+            tracing::error!(error = %e, video = %id, "video job not stored; the vendor's clip is orphaned");
+            return gateway_error(e);
+        }
+    }
+    terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
+}
+
+/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
+async fn videos_get(
+    State(s): State<AppState>,
+    Authed(ak): Authed,
+    Path(id): Path<String>,
+) -> Response {
+    let state = s.handler.state();
+    let cfg = s.handler.cfg();
+    let gov = state.governance.as_ref();
+    let admitted = async {
+        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
+        admission::check_ak_rate(gov, &ak).await?;
+        admission::check_product_qpm(gov, &cfg, &ak.product).await
+    };
+    if let Err(denied) = admitted.await {
+        return error_response(429, denied);
+    }
+    let found = state.store.video_job_get(&id).await;
+    let job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", &id) {
+        Ok(job) => job,
+        Err(resp) => return resp,
+    };
+    let Some(account) = state.pool.named(&job.account) else {
+        return error_response(
+            503,
+            format!(
+                "account {} of video {id} is no longer configured",
+                job.account
+            ),
+        );
+    };
+    let (status, v) =
+        match gw_engines::families::video_poll(s.handler.transport.as_ref(), account, &id).await {
+            Ok(reply) => reply,
+            Err(e) => return gateway_error(e),
+        };
+    let units = gw_engines::families::whole_seconds(&v["video"]["duration"]).unwrap_or(0);
+    // 1 tick = 1e-10 USD; micros are 1e-6
+    let vendor_cost = v["usage"]["cost_in_usd_ticks"]
+        .as_f64()
+        .map(|t| (t / 1e4).round() as i64);
+    // fail closed: an unclaimable settle errors out so the client's re-poll retries the billing;
+    // a done without a duration leaves the claim for a later, complete poll
+    let claimed = match v["status"].as_str() {
+        Some("done") if units > 0 || vendor_cost.is_some() => {
+            match state.store.video_job_settle(&id).await {
+                Ok(claimed) => claimed,
+                Err(e) => return gateway_error(e),
+            }
+        }
+        _ => false,
+    };
+    if claimed {
+        admission::settle_and_bill(
+            &state,
+            &cfg,
+            admission::SettleInput {
+                billing: gw_state::BillingInput {
+                    ak: &job.ak,
+                    product: &job.product,
+                    tenant: &job.tenant,
+                    user_id: &job.user_id,
+                    request_id: &job.id,
+                    requested_model: &job.model,
+                    served_model: &job.served_model,
+                    protocol: gw_consts::Protocol::Video.as_str(),
+                    account: &job.account,
+                    prompt: 0,
+                    completion: 0,
+                    billable_prompt: 0,
+                    billable_completion: 0,
+                    total: 0,
+                    units,
+                    discount: 1.0,
+                    ptu_spillover: false,
+                    estimated: false,
+                    vendor_cost,
+                    unit_price: Some(job.unit_price_micros),
+                },
+                reserved: 0,
+                tpm_reserved: None,
+                reserved_at: gw_state::epoch_secs(),
+                model_quota_key: None,
+            },
+        )
+        .await;
+    }
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+        Json(v),
+    )
+        .into_response()
+}
+
 /// POST /v1/audio/speech (TTS, returns audio bytes; OpenAI-compatible surface)
 async fn audio_speech(
     State(s): State<AppState>,
@@ -4013,10 +4217,11 @@ async fn audio_transcribe(
         Some(o) if o.block.block => error_response(400, o.response.message),
         // the vendor body verbatim (text plus usage/segments/language when sent)
         Some(o) => {
-            let body = o
-                .response
+            let mut r = o.response;
+            let body = r
                 .response_v2
-                .unwrap_or_else(|| json!({ "text": o.response.message }));
+                .take()
+                .unwrap_or_else(|| object([("text", take(&mut r.message).into())]));
             (StatusCode::OK, Json(body)).into_response()
         }
         None => error_response(500, "stt engine returned no outcome"),

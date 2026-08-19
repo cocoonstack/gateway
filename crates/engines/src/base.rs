@@ -9,6 +9,9 @@ use serde_json::Value;
 
 use crate::transport::{Headers, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
+/// The offline base of the generic vendor families (search, rerank, video, passthrough).
+pub const VENDOR_SENTINEL: &str = "mock://api.vendor.com";
+
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
     pub transport: SharedTransport,
@@ -49,27 +52,15 @@ impl Base {
             .map_or(mock_sentinel, |a| a.base_url(mock_sentinel))
     }
 
-    /// An OpenAI-family endpoint URL: `{base}/v1/{path}`, or `{base}/{path}`
-    /// when the configured base already names its API version (Qianfan's
-    /// `/v2`, a relay's `/compatible-mode/v1`).
+    /// [`versioned_url`] on the account's endpoint (or the mock sentinel).
     pub fn openai_url(&self, mock_sentinel: &str, path: &str) -> String {
-        let base = self.base_url(mock_sentinel);
-        let versioned = base.rsplit('/').next().is_some_and(|segment| {
-            segment.len() > 1
-                && segment.starts_with('v')
-                && segment[1..].bytes().all(|b| b.is_ascii_digit())
-        });
-        if versioned {
-            format!("{base}/{path}")
-        } else {
-            format!("{base}/v1/{path}")
-        }
+        versioned_url(self.base_url(mock_sentinel), path)
     }
 
     /// `{base}/v1/{path}` for the generic vendor families (search, rerank,
     /// video, passthrough) — the mock sentinel is theirs to share.
     pub fn vendor_url(&self, path: &str) -> String {
-        self.openai_url("mock://api.vendor.com", path)
+        self.openai_url(VENDOR_SENTINEL, path)
     }
 
     /// The account's API key (read from its env var at call time when live),
@@ -284,6 +275,20 @@ pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, 
         for (k, v) in extra {
             body.entry(k).or_insert(v);
         }
+    }
+}
+
+/// `{base}/v1/{path}`, or `{base}/{path}` when the base already names its version (`/v2`, `/compatible-mode/v1`).
+pub fn versioned_url(base: &str, path: &str) -> String {
+    let versioned = base.rsplit('/').next().is_some_and(|segment| {
+        segment.len() > 1
+            && segment.starts_with('v')
+            && segment[1..].bytes().all(|b| b.is_ascii_digit())
+    });
+    if versioned {
+        format!("{base}/{path}")
+    } else {
+        format!("{base}/v1/{path}")
     }
 }
 

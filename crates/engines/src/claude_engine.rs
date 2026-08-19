@@ -3,6 +3,7 @@
 //! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_protocol::object;
 use gw_protocol::reasoning::{ThinkingDialect, is_thinking_block};
 use serde_json::{Map, Value, json};
 
@@ -412,10 +413,14 @@ impl<'a> SseState<'a> {
         let mut native_chunk = StreamChunk::default();
         match v["type"].as_str().unwrap_or_default() {
             "message_start" => {
-                resp.model = v["message"]["model"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
+                resp.model = if self.preserve_native {
+                    v["message"]["model"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                } else {
+                    crate::engine::take_string(&mut v, "/message/model").unwrap_or_default()
+                };
                 self.input = v["message"]["usage"]["input_tokens"].as_i64().unwrap_or(0);
                 let usage = v.get_mut("message").and_then(|m| m.get_mut("usage"));
                 self.overlay_usage(usage);
@@ -635,10 +640,10 @@ pub fn anthropic_native_chunks(
                         object.insert("input".to_owned(), json!({}));
                     }
                     if let Some(input) = block.get("input") {
-                        deltas.push(json!({
-                            "type":"input_json_delta",
-                            "partial_json":input.to_string()
-                        }));
+                        deltas.push(object([
+                            ("type", "input_json_delta".into()),
+                            ("partial_json", input.to_string().into()),
+                        ]));
                     }
                 }
                 _ => {}
@@ -822,7 +827,7 @@ fn normalize_tool_choice_anthropic(mut choice: Value) -> Value {
         },
         Value::Object(ref mut fields) if fields["type"] == "function" => {
             let name = fields["function"]["name"].take();
-            json!({"type": "tool", "name": name})
+            object([("type", "tool".into()), ("name", name)])
         }
         _ => choice,
     }

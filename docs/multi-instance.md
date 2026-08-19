@@ -11,7 +11,7 @@ shared, what stays local, and what the LB needs to do.
 | Account health / cooldown (`HealthStore`) | Redis (`storage.redis_url`) | ✅ when Redis is set — one instance's cooldown benches the account for all |
 | Config: keys/models/providers/tenants (`ConfigStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — versioned documents + a change feed |
 | Access-key table (`KeyStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — admin key CRUD is fleet-wide within ~2s and survives restarts |
-| Billing ledger / files / batches (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres; SQLite stays per-node |
+| Billing ledger / files / batches / video jobs (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres (a video poll may land on any instance; the settle claim is one atomic row update); SQLite stays per-node |
 | Request cache | in-process (moka), or Redis with `shared_cache: true` | ⚠️ per-instance by default; fleet-shared when `shared_cache` is set |
 | Thinking-signature audit | in-process only | ⚠️ per-instance; a continuation landing on another instance finds no anchor and fails open (forwarded, not rejected) |
 

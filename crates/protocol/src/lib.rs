@@ -3,5 +3,8 @@
 //! Layer L1: pure serde types, no I/O.
 
 pub mod anthropic;
+pub mod json;
 pub mod openai;
 pub mod reasoning;
+
+pub use json::object;
