@@ -39,6 +39,7 @@ GROUPS = [
     "bedrock",
     "xai",
     "video",
+    "search",
     "openai-rt",
     "ollama",
 ]
@@ -452,6 +453,26 @@ def case_video(
         ok = st == 200 and len(blob) > 10_000
         detail += f" content={len(blob)}B"
     record(name, ok, detail)
+
+
+def case_search(gw: Gateway, model: str) -> None:
+    """One web search bills one unit at the model's unit price; results pass through."""
+    name = f"{model} search"
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/search", {"model": model, "query": "what is an api gateway", "count": 3})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    j = json.loads(txt)
+    results = (j.get("web") or {}).get("results") or j.get("results") or []
+    count, row = gw.ledger()
+    ok = (
+        count == before + 1
+        and len(results) > 0
+        and row["billed_units"] == 1
+        and row["cost_micros"] == MODELS[model]["unit"]
+    )
+    record(name, ok, f"results={len(results)} ledger units/cost={row['billed_units']}/{row['cost_micros']}")
 
 
 def case_realtime(gw: Gateway, model: str) -> None:
@@ -971,6 +992,8 @@ def run_group(gw: Gateway, group: str) -> None:
         case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
         case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1, content=True)
         case_video(gw, "kling-v1-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed")
+    elif group == "search":
+        case_search(gw, "brave-search")
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
     elif group == "ollama":

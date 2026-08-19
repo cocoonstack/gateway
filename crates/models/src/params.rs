@@ -19,9 +19,9 @@ pub enum TypedParams {
     AudioTts(TtsParams),
     /// whisper / azure / google / ... (speech-to-text)
     AudioStt(SttParams),
-    /// sora / veo / kling / runway / vidu / minimax (video generation)
+    /// Video generation (Sora / Wan / DashScope / Hailuo / Kling dialects + a generic shape).
     Video(VideoParams),
-    /// bing / brave / serp / google custom search
+    /// Web search (Brave dialect + a generic shape).
     Search(SearchParams),
     /// content moderation (openai moderations shape)
     Moderation(ModerationParams),

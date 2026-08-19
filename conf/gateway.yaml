@@ -143,9 +143,9 @@ models:
     protocol: video
     provider: kling
     unit_price_micros: 60000
-  - name: vidu-video # generic synchronous vendor shape (the video fallback wire)
+  - name: demo-video # generic synchronous vendor shape (the video fallback wire; no real vendor speaks it)
     protocol: video
-    provider: vidu
+    provider: demo-video
   - name: grok-imagine-video # async video: request_id + poll, billed per second on done
     protocol: video
     provider: xai
@@ -164,6 +164,8 @@ models:
     unit_price_micros: 300000
   - name: brave-search # search family
     protocol: search
+    provider: brave
+    unit_price_micros: 5000
   - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
     protocol: openai-chat
     provider: tencent
@@ -259,8 +261,8 @@ accounts:
     provider: kling
     priority: 1
     protocols: ["video"]
-  - name: mock-vidu-1
-    provider: vidu
+  - name: mock-generic-video-1
+    provider: demo-video
     priority: 1
     protocols: ["video"]
   - name: mock-xai-1 # e2e: the xAI host answers video with a request_id + poll

@@ -878,6 +878,35 @@ impl MockTransport {
     }
 
     fn search_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        if req.url.contains("/res/v1/web/search") {
+            let params = req.url.split_once('?').map_or("", |(_, params)| params);
+            let param = |name| {
+                params.split('&').find_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    (key == name).then_some(value)
+                })
+            };
+            let q = param("q")
+                .map(|q| {
+                    percent_encoding::percent_decode_str(q)
+                        .decode_utf8_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default();
+            let count = param("count")
+                .and_then(|count| count.parse::<i64>().ok())
+                .unwrap_or(3)
+                .clamp(1, 20);
+            let results: Vec<Value> = (0..count)
+                .map(|i| {
+                    json!({"title": format!("brave result {} for {q}", i + 1),
+                           "url": format!("mock://brave/{}", i + 1),
+                           "description": format!("[mock-brave] about {q}")})
+                })
+                .collect();
+            return Self::ok_json(json!({"query": {"original": q},
+                                        "web": {"results": results}}));
+        }
         let body = Self::parse(&req.body, "search")?;
         let q = body["query"].as_str().unwrap_or("");
         let n = body["count"].as_i64().unwrap_or(3).clamp(1, 10);
@@ -994,6 +1023,9 @@ impl Transport for MockTransport {
         if req.protocol == Protocol::Video {
             return self.video_reply(&req);
         }
+        if req.protocol == Protocol::Search {
+            return self.search_reply(&req);
+        }
         let u = req.url.as_str();
         if u.contains("/model/") {
             self.bedrock_reply(&req)
@@ -1021,8 +1053,6 @@ impl Transport for MockTransport {
             self.moderations_reply(&req)
         } else if u.contains("/rerank") {
             self.rerank_reply(&req)
-        } else if u.contains("/search") {
-            self.search_reply(&req)
         } else if u.contains("/responses") {
             self.responses_reply(&req)
         } else if u.contains("/v1/completions") {

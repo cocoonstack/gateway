@@ -1458,7 +1458,7 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         .oneshot(post(
             "/v1/videos/generations",
             Some("ak-demo-123"),
-            r#"{"model":"vidu-video","prompt":"a dog surfing"}"#,
+            r#"{"model":"demo-video","prompt":"a dog surfing"}"#,
         ))
         .await
         .unwrap();
@@ -1769,6 +1769,34 @@ async fn sora_content_settles_once_without_a_prior_status_poll() {
     let settled = rows.iter().find(|r| r["billed_units"] == 4).unwrap();
     assert_eq!(settled["cost_micros"], 400_000, "4 s at 100000 micros/s");
     assert_eq!(settled["request_id"].as_str().unwrap(), id);
+}
+
+#[tokio::test]
+async fn search_routes_brave_and_bills_one_unit() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/search",
+            Some("ak-demo-123"),
+            r#"{"model":"brave-search","query":"api gateway","count":1}"#,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let j = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["query"]["original"], "api gateway", "{j}");
+    assert_eq!(j["web"]["results"].as_array().map(Vec::len), Some(1), "{j}");
+    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+    let row = j["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["served_model"] == "brave-search")
+        .unwrap();
+    assert_eq!(row["billed_units"], 1);
+    assert_eq!(row["cost_micros"], 5000);
 }
 
 #[tokio::test]
