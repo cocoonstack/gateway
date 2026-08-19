@@ -955,7 +955,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_video(gw, "Wan-AI/Wan2.2-T2V-A14B", {"resolution": "1280x720"}, done="Succeed", units=1)
         # parameters (size/duration) silently kill the task into UNKNOWN on intl — submit bare
         case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
-        case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1)
+        case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1, content=True)
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
     elif group == "ollama":

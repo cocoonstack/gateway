@@ -1732,6 +1732,30 @@ async fn sora_content_settles_once_without_a_prior_status_poll() {
         assert_eq!(j["seconds"], "4");
     }
 
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/videos/generations",
+            Some("ak-demo-123"),
+            r#"{"model":"MiniMax-Hailuo-02","prompt":"pending clip","duration":6}"#,
+        ))
+        .await
+        .unwrap();
+    let pending = body_json(resp).await["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let resp = app
+        .clone()
+        .oneshot(get_authed(&format!("/v1/videos/{pending}/content")))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "content before done answers 409"
+    );
+
     let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
     let rows: Vec<&Value> = j["records"]
         .as_array()

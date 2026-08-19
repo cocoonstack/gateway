@@ -805,7 +805,15 @@ impl MockTransport {
                        "usage": {"video_duration": 5, "video_count": 1}})
             });
         }
-        if req.url.contains("/files/retrieve_content") {
+        if req.url.contains("/files/retrieve") {
+            let id = req.url.rsplit('=').next().unwrap_or_default();
+            return Self::ok_json(json!({
+                "file": {"file_id": id, "purpose": "video_generation",
+                          "download_url": format!("mock://video-cdn.minimax.io/{id}.mp4")},
+                "base_resp": {"status_code": 0}
+            }));
+        }
+        if req.url.contains("video-cdn") {
             return Ok(UpstreamResponse {
                 status: 200,
                 body: UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")),

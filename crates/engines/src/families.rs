@@ -854,20 +854,44 @@ pub async fn video_content(
     id: &str,
     poll: &Value,
 ) -> GResult<(u16, String, bytes::Bytes)> {
-    let path = match video_dialect(&account.provider) {
-        VideoDialect::Sora => format!("videos/{id}/content"),
+    let base = account.base_url(VENDOR_SENTINEL);
+    let request = match video_dialect(&account.provider) {
+        VideoDialect::Sora => video_request(
+            account,
+            "GET",
+            versioned_url(base, &format!("videos/{id}/content")),
+            Vec::new(),
+        ),
         VideoDialect::Minimax => {
+            // the clip lives on a CDN: files/retrieve resolves the file_id to a
+            // signed download_url (retrieve_content rejects video_generation files)
             let file_id = poll["file_id"]
                 .as_str()
                 .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    GatewayError::new(
-                        gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
-                        502,
-                        "minimax completed without file_id",
-                    )
-                })?;
-            format!("files/retrieve_content?file_id={file_id}")
+                .ok_or_else(|| minimax_content_gap("minimax completed without file_id"))?;
+            let (_, meta) = video_send(
+                transport,
+                account,
+                "GET",
+                versioned_url(base, &format!("files/retrieve?file_id={file_id}")),
+                Vec::new(),
+            )
+            .await?;
+            reject_minimax_error(&meta)?;
+            let url = meta["file"]["download_url"]
+                .as_str()
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| minimax_content_gap("minimax file without download_url"))?;
+            UpstreamRequest {
+                protocol: gw_consts::Protocol::Video,
+                method: "GET",
+                url: url.to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                stream: false,
+                account: account.name.clone(),
+                replay_account: None,
+            }
         }
         _ => {
             return Err(GatewayError::new(
@@ -877,12 +901,7 @@ pub async fn video_content(
             ));
         }
     };
-    let url = versioned_url(account.base_url(VENDOR_SENTINEL), &path);
-    let reply = transport
-        .send(video_request(account, "GET", url, Vec::new()))
-        .await?
-        .buffered()
-        .await?;
+    let reply = transport.send(request).await?.buffered().await?;
     let content_type = reply
         .headers
         .get("content-type")
@@ -895,6 +914,10 @@ pub async fn video_content(
         UpstreamBody::SseStream(_) => bytes::Bytes::new(),
     };
     Ok((reply.status, content_type, bytes))
+}
+
+fn minimax_content_gap(message: &'static str) -> GatewayError {
+    GatewayError::new(gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO, 502, message)
 }
 
 fn video_request(
