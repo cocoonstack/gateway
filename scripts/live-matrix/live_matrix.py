@@ -372,6 +372,7 @@ def video_handle(j: dict[str, Any]) -> str | None:
     """The async handle, whichever dialect answered (mirrors the gateway's extraction)."""
     return (
         (j.get("output") or {}).get("task_id")
+        or (j.get("data") or {}).get("task_id")
         or j.get("requestId")
         or j.get("task_id")
         or j.get("request_id")
@@ -380,7 +381,12 @@ def video_handle(j: dict[str, Any]) -> str | None:
 
 
 def video_state(j: dict[str, Any]) -> str:
-    return str(j.get("status") or (j.get("output") or {}).get("task_status") or "")
+    return str(
+        j.get("status")
+        or (j.get("output") or {}).get("task_status")
+        or (j.get("data") or {}).get("task_status")
+        or ""
+    )
 
 
 def case_video(
@@ -956,6 +962,7 @@ def run_group(gw: Gateway, group: str) -> None:
         # parameters (size/duration) silently kill the task into UNKNOWN on intl — submit bare
         case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
         case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1, content=True)
+        case_video(gw, "kling-v1-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed", units=5)
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
     elif group == "ollama":

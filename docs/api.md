@@ -155,9 +155,10 @@ the serving account's provider name: `openai`/`azure` speak Sora's `/v1/videos`
 `GET /v1/videos/{id}/content`), `siliconflow` Wan's `video/submit` +
 `video/status`, `alibaba`/`dashscope` the DashScope task API (async header,
 `output.task_id`, poll `/api/v1/tasks/{id}`), `minimax` Hailuo's
-`video_generation` + `query/video_generation` + file content, and anything else the
-xAI/Kling-style `videos/generations` shape. Each dialect forwards only the
-fields its vendor takes (`aspect_ratio` only on the generic shape; Wan takes no
+`video_generation` + `query/video_generation` + file content, `kling` Kling's
+`videos/text2video` (`model_name`, string durations, a `{code, data}` envelope),
+and anything else the generic `videos/generations` shape. Each dialect forwards
+only the fields its vendor takes (`resolution` never reaches Kling; Wan takes no
 duration).
 
 When the reply is an async handle, the gateway remembers which key, model and

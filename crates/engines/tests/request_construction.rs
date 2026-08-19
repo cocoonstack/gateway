@@ -957,6 +957,40 @@ async fn video_dialects_shape_the_submit_by_provider() {
         "url: {}",
         t.url()
     );
+
+    let t = RecordingTransport::new(
+        r#"{"code":0,"request_id":"trace","data":{"task_id":"kl-1","task_status":"submitted"}}"#,
+    );
+    let mut req = typed_req(
+        Protocol::Video,
+        "kling-v1-6",
+        TypedParams::Video(VideoParams {
+            prompt: "a dog surfing".into(),
+            duration_seconds: Some(5),
+            aspect_ratio: Some("16:9".into()),
+            ..Default::default()
+        }),
+    );
+    req.account = Some(std::sync::Arc::new(Account {
+        name: "kling-1".into(),
+        provider: "kling".into(),
+        endpoint: "https://api-singapore.klingai.com".into(),
+        ..Default::default()
+    }));
+    let _ = VideoEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["model_name"], "kling-v1-6",
+        "kling field is model_name: {b}"
+    );
+    assert!(b.get("model").is_none(), "{b}");
+    assert_eq!(b["duration"], "5", "kling duration is a string: {b}");
+    assert_eq!(b["aspect_ratio"], "16:9");
+    assert!(
+        t.url().ends_with("/v1/videos/text2video"),
+        "url: {}",
+        t.url()
+    );
 }
 
 #[tokio::test]
