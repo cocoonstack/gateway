@@ -229,12 +229,15 @@ boundary, the delivered text or audio is billed from an estimate; a turn that
 delivered nothing is refunded. An endpoint-less account serves a local mock
 session (OpenAI Realtime event shape) for offline development.
 
-The wire follows the account's provider: a `gemini` provider bridges Google's
-Live API socket (binary frames relayed as-is, the key on the query string) and
-admits each turn on `clientContent.turnComplete` — the dialect's own
-generation signal — settling the `usageMetadata` that rides the completed
-turn; every other provider speaks the OpenAI Realtime shape and admits on
-`response.create`.
+The wire follows the account's preset kind (else its provider label): a
+`gemini` account bridges Google's Live API socket (binary frames relayed
+as-is, the key on the query string, `setup.model` rewritten to the entitled
+served model) and admits each turn on `clientContent.turnComplete` — the
+dialect's own generation signal — settling the `usageMetadata` that rides the
+completed turn; `realtimeInput` audio turns and a second
+`clientContent` during an active generation answer an in-band error until they
+have an admission point. Every other account speaks the OpenAI Realtime shape
+and admits on `response.create`.
 
 ## Introspection
 

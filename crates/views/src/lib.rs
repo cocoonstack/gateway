@@ -831,12 +831,16 @@ async fn realtime_bridge(
                             setup.insert("model".into(), format!("models/{}", rtm.served).into());
                             forward = UMsg::text(frame.to_string());
                         }
-                        // audio-driven turns have no admission point yet: refuse loudly, keep the session
-                        if frame.get("realtimeInput").is_some() || frame.get("realtime_input").is_some() {
+                        // audio-driven turns and barge-in have no admission point yet: refuse
+                        // loudly, keep the session
+                        let ungoverned = frame.get("realtimeInput").is_some()
+                            || frame.get("realtime_input").is_some()
+                            || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
+                        if ungoverned {
                             if cl_tx
                                 .send(rt_error_frame(
                                     ErrClass::Validation,
-                                    "realtimeInput is not wired; send clientContent turns",
+                                    "one governed clientContent turn at a time; realtimeInput is not wired",
                                 ))
                                 .await
                                 .is_err()
