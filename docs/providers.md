@@ -28,6 +28,7 @@ models:
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
 | `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` (its `reasoning_details` shape is the one this gateway emits, so signed Anthropic reasoning round-trips through tool loops; verified live on free and paid models) |
 | `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` (Kimi K2 thinking: `reasoning_content` in and out, `thinking: {type: disabled}` passes through; the vendor's `/anthropic` base also works as `kind: anthropic` + `endpoint`) |
+| `xai` | `https://api.x.ai` | openai-chat, responses, image | `Bearer` (Grok: `reasoning_effort` per model — grok-4.6 `low`–`xhigh`, grok-4.3 also `none`, others reject values they don't list; usage carries `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`; xAI's own Anthropic-compatible surface is deprecated, so Anthropic clients reach Grok through this gateway's `/v1/messages` cross-protocol path; not yet exercised with a live key) |
 | `siliconflow` | `https://api.siliconflow.cn` | openai-chat, embeddings, rerank, tts, stt, image | `Bearer` (Qwen3 `enable_thinking`, DeepSeek/GLM/Kimi/MiniMax hosted models, bge/Qwen3 embeddings and rerankers, CosyVoice TTS, SenseVoice STT, Kolors images — all verified live) |
 
 Any other OpenAI-compatible vendor (Qwen, Ollama, vLLM, a relay) uses

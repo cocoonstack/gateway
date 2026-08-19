@@ -156,7 +156,7 @@ and pins it for the whole session.
 ```yaml
 providers:
   - name: openai
-    kind: openai              # openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
+    kind: openai              # openai | anthropic | gemini | deepseek | openrouter | moonshot | xai | siliconflow
     api_key_env: OPENAI_API_KEY
     # endpoint / timeout_seconds / connect_retries / retry_status / secret_key_env may be
     # set here too and are inherited by every account naming this provider
