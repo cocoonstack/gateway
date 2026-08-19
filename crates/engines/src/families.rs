@@ -802,11 +802,11 @@ pub async fn video_poll(
     if dialect == VideoDialect::Minimax {
         reject_minimax_error(&body)?;
     }
-    Ok(normalize_video_poll(&account.provider, status, body))
+    Ok(normalize_video_poll(dialect, status, body))
 }
 
-fn normalize_video_poll(provider: &str, status: u16, body: Value) -> VideoPoll {
-    let (done, units, vendor_cost) = match video_dialect(provider) {
+fn normalize_video_poll(dialect: VideoDialect, status: u16, body: Value) -> VideoPoll {
+    let (done, units, vendor_cost) = match dialect {
         VideoDialect::Sora => (
             body["status"] == "completed",
             whole_seconds(&body["seconds"]).unwrap_or(0),

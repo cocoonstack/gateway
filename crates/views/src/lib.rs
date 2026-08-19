@@ -4004,21 +4004,45 @@ async fn videos_generations(
     terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
 }
 
+/// The shared head of both video read routes: spend the caller's rate limits,
+/// load the job under its tenant gate.
+async fn admit_video_job(
+    s: &AppState,
+    ak: &AkInfo,
+    id: &str,
+) -> Result<(Arc<GatewayState>, VideoJob), Response> {
+    let state = s.handler.state();
+    let cfg = s.handler.cfg();
+    let gov = state.governance.as_ref();
+    let admitted = async {
+        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
+        admission::check_ak_rate(gov, ak).await?;
+        admission::check_product_qpm(gov, &cfg, &ak.product).await
+    };
+    if let Err(denied) = admitted.await {
+        return Err(error_response(429, denied));
+    }
+    let found = state.store.video_job_get(id).await;
+    let job = tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", id)?;
+    Ok((state, job))
+}
+
 async fn poll_and_settle_video(
     s: &AppState,
     job: &VideoJob,
     account: &gw_models::Account,
-    id: &str,
 ) -> Result<gw_engines::families::VideoPoll, Response> {
     let state = s.handler.state();
     let cfg = s.handler.cfg();
-    let poll = gw_engines::families::video_poll(s.handler.transport.as_ref(), account, id)
+    let poll = gw_engines::families::video_poll(s.handler.transport.as_ref(), account, &job.id)
         .await
         .map_err(gateway_error)?;
+    // fail closed: an unclaimable settle errors out so the client's retry re-attempts the
+    // billing; a done without billable units leaves the claim for a later, complete poll
     let claimed = if poll.done && (poll.units > 0 || poll.vendor_cost.is_some()) {
         state
             .store
-            .video_job_settle(id)
+            .video_job_settle(&job.id)
             .await
             .map_err(gateway_error)?
     } else {
@@ -4068,32 +4092,17 @@ async fn videos_get(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let state = s.handler.state();
-    let cfg = s.handler.cfg();
-    let gov = state.governance.as_ref();
-    let admitted = async {
-        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
-        admission::check_ak_rate(gov, &ak).await?;
-        admission::check_product_qpm(gov, &cfg, &ak.product).await
-    };
-    if let Err(denied) = admitted.await {
-        return error_response(429, denied);
-    }
-    let found = state.store.video_job_get(&id).await;
-    let job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", &id) {
-        Ok(job) => job,
+    let (state, job) = match admit_video_job(&s, &ak, &id).await {
+        Ok(admitted) => admitted,
         Err(resp) => return resp,
     };
     let Some(account) = state.pool.named(&job.account) else {
         return error_response(
             503,
-            format!(
-                "account {} of video {id} is no longer configured",
-                job.account
-            ),
+            format!("account {} is no longer configured", job.account),
         );
     };
-    let poll = match poll_and_settle_video(&s, &job, account, &id).await {
+    let poll = match poll_and_settle_video(&s, &job, account).await {
         Ok(poll) => poll,
         Err(resp) => return resp,
     };
@@ -4111,20 +4120,8 @@ async fn videos_content(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let state = s.handler.state();
-    let cfg = s.handler.cfg();
-    let gov = state.governance.as_ref();
-    let admitted = async {
-        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
-        admission::check_ak_rate(gov, &ak).await?;
-        admission::check_product_qpm(gov, &cfg, &ak.product).await
-    };
-    if let Err(denied) = admitted.await {
-        return error_response(429, denied);
-    }
-    let found = state.store.video_job_get(&id).await;
-    let job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", &id) {
-        Ok(job) => job,
+    let (state, job) = match admit_video_job(&s, &ak, &id).await {
+        Ok(admitted) => admitted,
         Err(resp) => return resp,
     };
     let Some(account) = state.pool.named(&job.account) else {
@@ -4133,7 +4130,7 @@ async fn videos_content(
             format!("account {} is no longer configured", job.account),
         );
     };
-    let poll = match poll_and_settle_video(&s, &job, account, &id).await {
+    let poll = match poll_and_settle_video(&s, &job, account).await {
         Ok(poll) => poll,
         Err(resp) => return resp,
     };
@@ -4143,7 +4140,7 @@ async fn videos_content(
     match gw_engines::families::video_content(
         s.handler.transport.as_ref(),
         account,
-        &id,
+        &job.id,
         &poll.body,
     )
     .await

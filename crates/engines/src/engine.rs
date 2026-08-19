@@ -131,6 +131,7 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     })
 }
 
+/// MiniMax reports business errors as `base_resp.status_code != 0` on an HTTP 200.
 pub(crate) fn reject_minimax_error(v: &Value) -> GResult<()> {
     let code = v["base_resp"]["status_code"].as_i64().unwrap_or(0);
     if code == 0 {
