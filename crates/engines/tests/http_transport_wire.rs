@@ -321,10 +321,13 @@ async fn per_account_policy_and_connect_retry() {
         "an account dropped from the reload falls back to the default"
     );
 
-    let closed = {
+    // re-draw if another process steals the freed port before we dial it (CI runners do)
+    let closed = std::iter::repeat_with(|| {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
-    };
+    })
+    .find(|addr| std::net::TcpStream::connect_timeout(addr, Duration::from_millis(50)).is_err())
+    .unwrap();
     let started = std::time::Instant::now();
     let err = transport
         .send(UpstreamRequest {
