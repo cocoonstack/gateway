@@ -855,7 +855,7 @@ async fn video_request_shape() {
     );
     let req = typed_req(
         Protocol::Video,
-        "vidu-video",
+        "demo-video",
         TypedParams::Video(VideoParams {
             prompt: "a dog surfing".into(),
             duration_seconds: Some(5),
@@ -866,7 +866,7 @@ async fn video_request_shape() {
     );
     let _ = VideoEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    assert_eq!(b["model"], "vidu-video");
+    assert_eq!(b["model"], "demo-video");
     assert_eq!(b["prompt"], "a dog surfing");
     assert_eq!(b["duration"], 5);
     assert_eq!(b["resolution"], "1080p");

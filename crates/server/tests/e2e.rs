@@ -1458,7 +1458,7 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         .oneshot(post(
             "/v1/videos/generations",
             Some("ak-demo-123"),
-            r#"{"model":"vidu-video","prompt":"a dog surfing"}"#,
+            r#"{"model":"demo-video","prompt":"a dog surfing"}"#,
         ))
         .await
         .unwrap();
@@ -1779,14 +1779,15 @@ async fn search_routes_brave_and_bills_one_unit() {
         .oneshot(post(
             "/v1/search",
             Some("ak-demo-123"),
-            r#"{"model":"brave-search","query":"api gateway","count":3}"#,
+            r#"{"model":"brave-search","query":"api gateway","count":1}"#,
         ))
         .await
         .unwrap();
     let status = resp.status();
     let j = body_json(resp).await;
     assert_eq!(status, StatusCode::OK, "{j}");
-    assert_eq!(j["web"]["results"].as_array().map(Vec::len), Some(3), "{j}");
+    assert_eq!(j["query"]["original"], "api gateway", "{j}");
+    assert_eq!(j["web"]["results"].as_array().map(Vec::len), Some(1), "{j}");
     let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
     let row = j["records"]
         .as_array()
