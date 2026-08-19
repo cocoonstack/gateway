@@ -198,6 +198,8 @@ async fn track_requests(
 fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
     match status.as_u16() {
         200 => "200".into(),
+        201 => "201".into(),
+        202 => "202".into(),
         400 => "400".into(),
         401 => "401".into(),
         403 => "403".into(),
