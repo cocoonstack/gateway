@@ -26,6 +26,14 @@ impl Base {
         self.request.account_name().to_owned()
     }
 
+    pub fn provider(&self) -> &str {
+        self.request
+            .account
+            .as_ref()
+            .map(|a| a.provider.as_str())
+            .unwrap_or_default()
+    }
+
     /// The client's requested name when a variant/fallback served the call;
     /// native events must not leak the served model.
     pub fn model_override(&self) -> Option<&str> {

@@ -1601,6 +1601,139 @@ async fn async_video_bills_once_on_the_first_done_poll() {
 }
 
 #[tokio::test]
+async fn dashscope_and_hailuo_dialects_key_the_job_by_task_id_and_bill_their_units() {
+    let app = app();
+    for (body, done, units, cost) in [
+        (
+            r#"{"model":"wan2.2-t2v-plus","prompt":"a lantern floating upriver"}"#,
+            "SUCCEEDED",
+            5,
+            600_000,
+        ),
+        (
+            r#"{"model":"MiniMax-Hailuo-02","prompt":"a lantern floating upriver","duration":6}"#,
+            "Success",
+            1,
+            300_000,
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/videos/generations", Some("ak-demo-123"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        let id = j["output"]["task_id"]
+            .as_str()
+            .or_else(|| j["task_id"].as_str())
+            .unwrap()
+            .to_owned();
+        assert!(
+            id.contains("lantern"),
+            "job keyed by the task id, not a trace id: {j}"
+        );
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(get_authed(&format!("/v1/videos/{id}")))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let poll = body_json(resp).await;
+            assert_eq!(status, StatusCode::OK, "{poll}");
+            let state = poll["output"]["task_status"]
+                .as_str()
+                .or_else(|| poll["status"].as_str())
+                .unwrap();
+            assert_eq!(state, done, "{poll}");
+        }
+        let resp = app
+            .clone()
+            .oneshot(get_authed(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "content is Sora-only");
+        let j = body_json(
+            app.clone()
+                .oneshot(internal_get("/internal/ledger"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let settled = j["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["request_id"] == id.as_str())
+            .count();
+        assert_eq!(settled, 1, "billed once under the task id");
+        let row = j["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["billed_units"], units);
+        assert_eq!(row["cost_micros"], cost);
+    }
+}
+
+#[tokio::test]
+async fn sora_dialect_video_bills_the_seconds_string_and_serves_content() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/videos/generations",
+            Some("ak-demo-123"),
+            r#"{"model":"sora-2","prompt":"a paper crane unfolding","duration":4,"resolution":"720x1280"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["object"], "video");
+    assert_eq!(j["status"], "queued");
+    let id = j["id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("video_a-paper-crane-unfolding"), "{id}");
+
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(get_authed(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["status"], "completed");
+        assert_eq!(j["seconds"], "4");
+    }
+    let resp = app
+        .clone()
+        .oneshot(get_authed(&format!("/v1/videos/{id}/content")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"MOCK-MP4");
+
+    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+    let rows: Vec<&Value> = j["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["served_model"] == "sora-2")
+        .collect();
+    assert_eq!(rows.len(), 2, "one submit + one settle: {rows:?}");
+    let settled = rows.iter().find(|r| r["billed_units"] == 4).unwrap();
+    assert_eq!(settled["cost_micros"], 400_000, "4 s at 100000 micros/s");
+    assert_eq!(settled["request_id"].as_str().unwrap(), id);
+}
+
+#[tokio::test]
 async fn unit_priced_surfaces_bill_characters_and_seconds() {
     let app = app();
     for body in [

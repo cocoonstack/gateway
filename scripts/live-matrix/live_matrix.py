@@ -38,6 +38,9 @@ GROUPS = [
     "rerank",
     "bedrock",
     "xai",
+    "video",
+    "openai-rt",
+    "ollama",
 ]
 MODELS: dict[str, dict[str, Any]] = {}
 RESULTS: list[tuple[str, bool, str]] = []
@@ -74,11 +77,18 @@ class Gateway:
         headers = {"content-type": "application/json", "Authorization": f"Bearer {self.admin if admin else self.ak}"}
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, headers=headers, method="POST" if data else "GET")
+        status, raw = self._open(req, timeout)
+        return status, raw.decode(errors="replace")
+
+    def call_raw(self, path: str) -> tuple[int, bytes]:
+        return self._open(urllib.request.Request(self.base + path, headers={"Authorization": f"Bearer {self.ak}"}), 300)
+
+    def _open(self, req: urllib.request.Request, timeout: int) -> tuple[int, bytes]:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, r.read().decode(errors="replace")
+                return r.status, r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode(errors="replace")
+            return e.code, e.read()
 
     def ledger(self) -> tuple[int, dict[str, Any]]:
         """(row count, newest row) — read after a short settle so the async ledger write has landed."""
@@ -358,48 +368,132 @@ def case_image(gw: Gateway, model: str) -> None:
     )
 
 
-def case_video(gw: Gateway, model: str) -> None:
-    """Async video: the submit lands a 0-unit row; the first done poll bills the clip's seconds at the unit price with the vendor's tick cost; a re-poll bills nothing."""
+def video_handle(j: dict[str, Any]) -> str | None:
+    """The async handle, whichever dialect answered (mirrors the gateway's extraction)."""
+    return (
+        (j.get("output") or {}).get("task_id")
+        or j.get("requestId")
+        or j.get("task_id")
+        or j.get("request_id")
+        or (j.get("id") if j.get("object") == "video" else None)
+    )
+
+
+def video_state(j: dict[str, Any]) -> str:
+    return str(j.get("status") or (j.get("output") or {}).get("task_status") or "")
+
+
+def case_video(
+    gw: Gateway,
+    model: str,
+    body: dict[str, Any] | None = None,
+    done: str = "done",
+    units: int | None = None,
+    content: bool = False,
+    timeout: int = 900,
+) -> None:
+    """Async video: submit lands a 0-unit row; the first terminal poll bills once at the quoted unit price; a re-poll adds nothing."""
     name = f"{model} video"
     before, _ = gw.ledger()
-    st, txt = gw.call(
-        "/v1/videos/generations",
-        {"model": model, "prompt": "a paper boat drifting on a pond, gentle ripples", "duration": 2, "resolution": "480p"},
-    )
+    req = {"model": model, "prompt": "a paper boat drifting on a pond, gentle ripples"}
+    req.update(body if body is not None else {"duration": 2, "resolution": "480p"})
+    st, txt = gw.call("/v1/videos/generations", req)
     if st != 200:
-        record(name, False, f"HTTP {st}: {txt[:200]}")
+        record(name, False, f"HTTP {st}: {txt[:300]}")
         return
-    rid = json.loads(txt).get("request_id")
+    rid = video_handle(json.loads(txt))
     if not rid:
-        record(name, False, f"no request_id: {txt[:200]}")
+        record(name, False, f"no async handle: {txt[:300]}")
         return
-    deadline = time.time() + 600
+    deadline = time.time() + timeout
     j: dict[str, Any] = {}
+    terminal = {done, "failed", "expired", "Failed", "Fail", "FAILED", "CANCELED"}
     while time.time() < deadline:
         st, txt = gw.call(f"/v1/videos/{rid}")
         j = json.loads(txt) if st == 200 else {}
-        if j.get("status") in ("done", "failed", "expired"):
+        if video_state(j) in terminal:
             break
         time.sleep(5)
-    if j.get("status") != "done":
-        record(name, False, f"status={j.get('status')} HTTP {st}: {txt[:200]}")
+    if video_state(j) != done:
+        record(name, False, f"state={video_state(j)} HTTP {st}: {txt[:300]}")
         return
     gw.call(f"/v1/videos/{rid}")
     count, row = gw.ledger()
-    seconds = math.ceil(j["video"]["duration"])
-    ticks = (j.get("usage") or {}).get("cost_in_usd_ticks", 0)
-    expected_cost = seconds * MODELS[model]["unit"]
+    ticks = (j.get("usage") or {}).get("cost_in_usd_ticks")
+    expected_units = units if units is not None else math.ceil((j.get("video") or {}).get("duration", 0))
+    expected_vendor = ticks // 10_000 if ticks else row["vendor_cost_micros"]
     ok = (
         count == before + 2
-        and row["billed_units"] == seconds
-        and row["cost_micros"] == expected_cost
-        and row["vendor_cost_micros"] == ticks // 10_000
+        and row["billed_units"] == expected_units
+        and row["cost_micros"] == expected_units * MODELS[model]["unit"]
+        and row["vendor_cost_micros"] == expected_vendor
+        and row["request_id"] == rid
+    )
+    detail = (
+        f"rows+{count - before} ledger units/cost/vendor={row['billed_units']}/{row['cost_micros']}/"
+        f"{row['vendor_cost_micros']} expected {expected_units}/{expected_units * MODELS[model]['unit']}/{expected_vendor}"
+    )
+    if content and ok:
+        st, blob = gw.call_raw(f"/v1/videos/{rid}/content")
+        ok = st == 200 and len(blob) > 10_000
+        detail += f" content={len(blob)}B"
+    record(name, ok, detail)
+
+
+def case_realtime(gw: Gateway, model: str) -> None:
+    """One gated realtime turn with audio output: the vendor's usage frame settles the ledger row (not the estimate)."""
+    name = f"{model} realtime"
+    try:
+        import websocket
+    except ImportError:
+        record(name, False, "websocket-client not installed")
+        return
+    before, _ = gw.ledger()
+    ws = websocket.create_connection(
+        gw.base.replace("http", "ws", 1) + f"/v1/realtime?model={model}",
+        header={"Authorization": f"Bearer {gw.ak}"},
+        timeout=90,
+    )
+    ws.send(json.dumps({"type": "session.update", "session": {"type": "realtime", "output_modalities": ["audio"]}}))
+    ws.send(json.dumps({"type": "conversation.item.create", "item": {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "Say the single word: pong"}]}}))
+    ws.send(json.dumps({"type": "response.create"}))
+    done: dict[str, Any] = {}
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        frame = json.loads(ws.recv())
+        if frame.get("type") == "response.done":
+            done = frame
+            break
+        if frame.get("type") == "error":
+            record(name, False, json.dumps(frame)[:300])
+            ws.close()
+            return
+    ws.close()
+    u = (done.get("response") or {}).get("usage") or {}
+    it, ot = u.get("input_tokens", 0), u.get("output_tokens", 0)
+    ap = (u.get("input_token_details") or {}).get("audio_tokens", 0)
+    ac = (u.get("output_token_details") or {}).get("audio_tokens", 0)
+    rate = MODELS[model]["rate"]
+    bp = rnd((it - ap) + ap * rate.get("audio_prompt", 1.0))
+    bc = rnd((ot - ac) + ac * rate.get("audio_completion", 1.0))
+    cost = (MODELS[model]["in"] * bp) // 1000 + (MODELS[model]["out"] * bc) // 1000
+    count, row = gw.ledger()
+    ok = (
+        count == before + 1
+        and (row["prompt_tokens"], row["completion_tokens"]) == (it, ot)
+        and row["total_tokens"] == bp + bc
+        and row["cost_micros"] == cost
+        and not row["estimated"]
+        and ac > 0
     )
     record(
         name,
         ok,
-        f"duration={j['video']['duration']} ticks={ticks} rows+{count - before} ledger units/cost/vendor="
-        f"{row['billed_units']}/{row['cost_micros']}/{row['vendor_cost_micros']} expected {seconds}/{expected_cost}/{ticks // 10_000}",
+        f"wire it/ot/ap/ac={it}/{ot}/{ap}/{ac} ledger p/c/t/cost/est="
+        f"({row['prompt_tokens']}, {row['completion_tokens']}, {row['total_tokens']}, {row['cost_micros']}, {row['estimated']}) "
+        f"oracle=({it}, {ot}, {bp + bc}, {cost})",
     )
 
 
@@ -743,10 +837,14 @@ def run_group(gw: Gateway, group: str) -> None:
         case_embeddings(gw, "text-embedding-3-small")
         case_responses_surfaces(gw, "gpt-4.1-nano")
     elif group == "gemini":
-        for model in ("gemini-3.6-flash", "gemini-3.7-flash"):
+        # free tier: 5 RPM per model, so pace the calls
+        for model in ("gemini-3.6-flash",):
             case_chat(gw, model)
+            time.sleep(13)
             case_chat(gw, model, stream=True)
+            time.sleep(13)
             case_chat(gw, model, "reasoning_effort low", prompt=prime, reasoning_effort="low")
+            time.sleep(13)
             case_messages(gw, model, "cross-protocol")
     elif group == "deepseek":
         case_chat(gw, "deepseek-chat")
@@ -852,6 +950,18 @@ def run_group(gw: Gateway, group: str) -> None:
         case_responses_surfaces(gw, "grok-4.5")
         case_image(gw, "grok-imagine-image-2.0")
         case_video(gw, "grok-imagine-video-1.5")
+    elif group == "video":
+        case_video(gw, "sora-2", {"duration": 4, "resolution": "720x1280"}, done="completed", units=4, content=True)
+        case_video(gw, "Wan-AI/Wan2.2-T2V-A14B", {"resolution": "1280x720"}, done="Succeed", units=1)
+        # parameters (size/duration) silently kill the task into UNKNOWN on intl — submit bare
+        case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
+        case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1)
+    elif group == "openai-rt":
+        case_realtime(gw, "gpt-realtime-mini")
+    elif group == "ollama":
+        case_chat(gw, "qwen2.5:0.5b")
+        case_chat(gw, "qwen2.5:0.5b", stream=True)
+        case_messages(gw, "qwen2.5:0.5b", "cross-protocol")
     elif group == "bedrock":
         haiku, sonnet = "us.anthropic.claude-haiku-4-5-20251001-v1:0", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
         case_messages(gw, haiku, "aws-anthropic")

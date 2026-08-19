@@ -736,8 +736,89 @@ impl MockTransport {
         }
     }
 
-    /// The xAI host answers async: `request_id` on POST; the poll's state is spelled by the id.
+    /// Async hosts answer a handle on submit; a poll's state is spelled by the
+    /// id (`…pending…`, `…failed…`, else done). One dialect per mock host.
     fn video_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let slug = |v: &Value| -> String {
+            let s: String = v["prompt"]
+                .as_str()
+                .or_else(|| v["input"]["prompt"].as_str())
+                .unwrap_or_default()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect();
+            format!("{s}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
+        };
+        if req.url.contains("openai.com") {
+            if req.url.ends_with("/content") {
+                return Ok(UpstreamResponse {
+                    status: 200,
+                    body: UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")),
+                    headers: HeaderMap::new(),
+                });
+            }
+            if req.method == "GET" {
+                let id = req.url.rsplit('/').next().unwrap_or_default();
+                return Self::ok_json(if id.contains("pending") {
+                    json!({"id": id, "object": "video", "status": "in_progress", "progress": 40})
+                } else {
+                    json!({"id": id, "object": "video", "status": "completed",
+                           "progress": 100, "seconds": "4", "size": "720x1280"})
+                });
+            }
+            let body = Self::parse(&req.body, "video")?;
+            return Self::ok_json(json!({
+                "id": format!("video_{}", slug(&body)), "object": "video",
+                "status": "queued", "progress": 0,
+                "seconds": body["seconds"], "size": body["size"]
+            }));
+        }
+        if req.url.contains("/video/submit") {
+            let body = Self::parse(&req.body, "video")?;
+            return Self::ok_json(json!({"requestId": format!("sf-{}", slug(&body))}));
+        }
+        if req.url.contains("/video/status") {
+            let body = Self::parse(&req.body, "video")?;
+            let id = body["requestId"].as_str().unwrap_or_default();
+            return Self::ok_json(if id.contains("pending") {
+                json!({"status": "InProgress"})
+            } else {
+                json!({"status": "Succeed",
+                       "results": {"videos": [{"url": format!("mock://videos/{id}.mp4")}],
+                                    "seed": 7}})
+            });
+        }
+        if req.url.contains("video-synthesis") {
+            let body = Self::parse(&req.body, "video")?;
+            return Self::ok_json(json!({"output": {
+                "task_id": format!("ds-{}", slug(&body)), "task_status": "PENDING"
+            }, "request_id": "mock-ds"}));
+        }
+        if req.url.contains("/api/v1/tasks/") {
+            let id = req.url.rsplit('/').next().unwrap_or_default();
+            return Self::ok_json(if id.contains("pending") {
+                json!({"output": {"task_id": id, "task_status": "RUNNING"}})
+            } else {
+                json!({"output": {"task_id": id, "task_status": "SUCCEEDED",
+                                   "video_url": format!("mock://videos/{id}.mp4")},
+                       "usage": {"video_duration": 5, "video_count": 1}})
+            });
+        }
+        if req.url.contains("/query/video_generation") {
+            let id = req.url.rsplit('=').next().unwrap_or_default();
+            return Self::ok_json(if id.contains("pending") {
+                json!({"task_id": id, "status": "Processing", "base_resp": {"status_code": 0}})
+            } else {
+                json!({"task_id": id, "status": "Success", "file_id": format!("file-{id}"),
+                       "base_resp": {"status_code": 0}})
+            });
+        }
+        if req.url.contains("/video_generation") {
+            let body = Self::parse(&req.body, "video")?;
+            return Self::ok_json(json!({"task_id": format!("mm-{}", slug(&body)),
+                                        "base_resp": {"status_code": 0}}));
+        }
         if req.method == "GET" {
             let id = req.url.rsplit('/').next().unwrap_or_default();
             return Self::ok_json(if id.contains("pending") {
@@ -752,15 +833,7 @@ impl MockTransport {
         }
         let body = Self::parse(&req.body, "video")?;
         if req.url.contains("x.ai") {
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let slug: String = body["prompt"]
-                .as_str()
-                .unwrap_or_default()
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '-' })
-                .collect();
-            let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            return Self::ok_json(json!({"request_id": format!("vid-{slug}-{n}")}));
+            return Self::ok_json(json!({"request_id": format!("vid-{}", slug(&body))}));
         }
         Self::ok_json(json!({
             "task_id": "video-task-mock", "status": "succeeded",
@@ -882,6 +955,9 @@ impl Transport for MockTransport {
                           "message": "mock vendor rejected the request"}
             }));
         }
+        if req.protocol == Protocol::Video {
+            return self.video_reply(&req);
+        }
         let u = req.url.as_str();
         if u.contains("/model/") {
             self.bedrock_reply(&req)
@@ -905,8 +981,6 @@ impl Transport for MockTransport {
             self.image_reply(&req)
         } else if u.contains("/audio/") {
             self.audio_reply(&req)
-        } else if u.contains("/videos") {
-            self.video_reply(&req)
         } else if u.contains("/moderations") {
             self.moderations_reply(&req)
         } else if u.contains("/rerank") {

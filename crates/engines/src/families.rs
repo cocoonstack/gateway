@@ -585,6 +585,11 @@ impl ModelEngine for AudioEngine {
 pub fn whole_seconds(v: &Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_f64().map(|f| f.ceil() as i64))
+        .or_else(|| {
+            v.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|f| f.ceil() as i64)
+        })
         .filter(|s| *s > 0)
 }
 
@@ -595,11 +600,63 @@ fn looks_like_json(bytes: &[u8]) -> bool {
     )
 }
 
+/// Which async-video wire an account speaks, by its provider name (the same
+/// keying the realtime bridge uses for its Gemini dialect).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VideoDialect {
+    /// xAI/Kling `videos/generations`: `request_id` or an inline `video_url`.
+    Generations,
+    /// OpenAI Sora `/v1/videos`: a video object, `seconds` as a string.
+    Sora,
+    /// SiliconFlow Wan `/v1/video/submit` + POST `/v1/video/status`.
+    SiliconFlow,
+    /// DashScope `/api/v1/services/aigc/video-generation/video-synthesis` + `/api/v1/tasks/{id}`.
+    DashScope,
+    /// MiniMax Hailuo `/v1/video_generation` + `/v1/query/video_generation`.
+    Minimax,
+}
+
+fn video_dialect(provider: &str) -> VideoDialect {
+    match provider {
+        "openai" => VideoDialect::Sora,
+        "siliconflow" => VideoDialect::SiliconFlow,
+        "alibaba" | "dashscope" => VideoDialect::DashScope,
+        "minimax" => VideoDialect::Minimax,
+        _ => VideoDialect::Generations,
+    }
+}
+
+/// The vendor's async handle in a submit reply, whichever dialect answered;
+/// `None` for a synchronous reply that already carries the video.
+pub fn video_handle(v: &Value) -> Option<&str> {
+    // task ids before `request_id`: DashScope's reply carries both, and its
+    // top-level request_id is the HTTP call's trace id, not the job
+    v["output"]["task_id"]
+        .as_str()
+        .or_else(|| v["requestId"].as_str())
+        .or_else(|| v["task_id"].as_str().filter(|id| !id.is_empty()))
+        .or_else(|| v["request_id"].as_str())
+        .or_else(|| v["id"].as_str().filter(|_| v["object"] == "video"))
+}
+
+/// One normalized poll of an async video job: the vendor body passes through,
+/// `done`/`failed`/`units`/`vendor_cost` drive the gateway's one-shot settle.
+pub struct VideoPoll {
+    pub status: u16,
+    pub body: Value,
+    pub done: bool,
+    /// Billable units on `done`: the clip's whole seconds when the vendor
+    /// reports a duration, else the number of delivered videos.
+    pub units: i64,
+    pub vendor_cost: Option<i64>,
+}
+
 base_engine!(VideoEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for VideoEngine {
-    /// The generations shape; a sync vendor answers with the video, an async one with a `request_id`.
+    /// A sync vendor answers with the video, an async one with a handle the
+    /// poll surface settles later; the body follows the account's dialect.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let p = match self.base.take_typed() {
             Some(TypedParams::Video(p)) => p,
@@ -609,56 +666,248 @@ impl ModelEngine for VideoEngine {
             },
         };
         require_non_empty(&p.prompt, "video prompt")?;
+        let dialect = video_dialect(self.base.provider());
         let model = self.base.model_name()?;
         let mut body = Map::new();
         body.insert("model".into(), model.into());
+        let (path, fields) = match dialect {
+            VideoDialect::Sora => (
+                "videos",
+                vec![
+                    ("seconds", p.duration_seconds.map(|d| d.to_string().into())),
+                    ("size", p.resolution.map(Value::from)),
+                    ("input_reference", p.image),
+                ],
+            ),
+            VideoDialect::SiliconFlow => (
+                "video/submit",
+                vec![
+                    ("image_size", p.resolution.map(Value::from)),
+                    ("image", p.image),
+                ],
+            ),
+            VideoDialect::DashScope => {
+                let mut input = Map::with_capacity(2);
+                input.insert("prompt".into(), p.prompt.into());
+                if let Some(image) = p.image {
+                    input.insert("img_url".into(), image);
+                }
+                let mut parameters = Map::with_capacity(2);
+                if let Some(d) = p.duration_seconds {
+                    parameters.insert("duration".into(), d.into());
+                }
+                if let Some(r) = p.resolution {
+                    parameters.insert("size".into(), r.into());
+                }
+                body.insert("input".into(), Value::Object(input));
+                if !parameters.is_empty() {
+                    body.insert("parameters".into(), Value::Object(parameters));
+                }
+                let url = format!(
+                    "{}/api/v1/services/aigc/video-generation/video-synthesis",
+                    self.base.base_url(VENDOR_SENTINEL)
+                );
+                let mut headers = self.base.bearer_headers();
+                headers.push(("X-DashScope-Async", "enable".into()));
+                let (status, v) = self
+                    .base
+                    .round_trip_with(&url, headers, body.into())
+                    .await?;
+                return Ok(video_outcome(model, v, status));
+            }
+            VideoDialect::Minimax => (
+                "video_generation",
+                vec![
+                    ("duration", p.duration_seconds.map(Value::from)),
+                    ("resolution", p.resolution.map(Value::from)),
+                    ("first_frame_image", p.image),
+                ],
+            ),
+            VideoDialect::Generations => (
+                "videos/generations",
+                vec![
+                    ("duration", p.duration_seconds.map(Value::from)),
+                    ("resolution", p.resolution.map(Value::from)),
+                    ("image", p.image),
+                ],
+            ),
+        };
         body.insert("prompt".into(), p.prompt.into());
-        for (k, v) in [
-            ("duration", p.duration_seconds.map(Value::from)),
-            ("resolution", p.resolution.map(Value::from)),
-            ("aspect_ratio", p.aspect_ratio.map(Value::from)),
-            ("image", p.image),
-        ] {
+        if dialect == VideoDialect::Generations
+            && let Some(ar) = p.aspect_ratio
+        {
+            body.insert("aspect_ratio".into(), ar.into());
+        }
+        for (k, v) in fields {
             if let Some(v) = v {
                 body.insert(k.into(), v);
             }
         }
         let (status, v) = self
             .base
-            .round_trip(&self.base.vendor_url("videos/generations"), body.into())
+            .round_trip(&self.base.vendor_url(path), body.into())
             .await?;
-        let message = v["video"]["url"]
-            .as_str()
-            .or_else(|| v["video_url"].as_str())
-            .unwrap_or_default()
-            .to_owned();
-        let step = v["status"].as_str().unwrap_or_default().to_owned();
-        let units = whole_seconds(&v["video"]["duration"]).unwrap_or(0);
-        let mut out = family_outcome(message, model, v, status);
-        out.response.step = step;
-        out.response.billed_units = units;
-        Ok(out)
+        Ok(video_outcome(model, v, status))
     }
 }
 
-/// Poll an async video generation where it was submitted: `GET {base}/v1/videos/{id}`.
+fn video_outcome(model: &str, v: Value, status: u16) -> EngineOutcome {
+    let message = v["video"]["url"]
+        .as_str()
+        .or_else(|| v["video_url"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let step = v["status"]
+        .as_str()
+        .or_else(|| v["output"]["task_status"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let units = whole_seconds(&v["video"]["duration"]).unwrap_or(0);
+    let mut out = family_outcome(message, model, v, status);
+    out.response.step = step;
+    out.response.billed_units = units;
+    out
+}
+
+/// Poll an async video generation where it was submitted, in the account's dialect.
 pub async fn video_poll(
     transport: &dyn Transport,
     account: &gw_models::Account,
     id: &str,
-) -> GResult<(u16, Value)> {
-    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
+) -> GResult<VideoPoll> {
+    let base = account.base_url(VENDOR_SENTINEL);
+    let (method, url, req_body) = match video_dialect(&account.provider) {
+        VideoDialect::SiliconFlow => (
+            "POST",
+            versioned_url(base, "video/status"),
+            serde_json::to_vec(&object([("requestId", id.into())])).unwrap_or_default(),
+        ),
+        VideoDialect::DashScope => ("GET", format!("{base}/api/v1/tasks/{id}"), Vec::new()),
+        VideoDialect::Minimax => (
+            "GET",
+            versioned_url(base, &format!("query/video_generation?task_id={id}")),
+            Vec::new(),
+        ),
+        _ => (
+            "GET",
+            versioned_url(base, &format!("videos/{id}")),
+            Vec::new(),
+        ),
+    };
+    let (status, body) = video_send(transport, account, method, url, req_body).await?;
+    Ok(normalize_video_poll(&account.provider, status, body))
+}
+
+fn normalize_video_poll(provider: &str, status: u16, body: Value) -> VideoPoll {
+    let (done, units, vendor_cost) = match video_dialect(provider) {
+        VideoDialect::Sora => (
+            body["status"] == "completed",
+            whole_seconds(&body["seconds"]).unwrap_or(0),
+            None,
+        ),
+        VideoDialect::SiliconFlow => (
+            body["status"] == "Succeed",
+            body["results"]["videos"].as_array().map_or(0, Vec::len) as i64,
+            None,
+        ),
+        VideoDialect::DashScope => (
+            body["output"]["task_status"] == "SUCCEEDED",
+            whole_seconds(&body["usage"]["video_duration"])
+                .unwrap_or_else(|| body["output"]["video_url"].is_string() as i64),
+            None,
+        ),
+        VideoDialect::Minimax => (
+            body["status"] == "Success",
+            !body["file_id"].as_str().unwrap_or_default().is_empty() as i64,
+            None,
+        ),
+        VideoDialect::Generations => (
+            body["status"] == "done",
+            whole_seconds(&body["video"]["duration"]).unwrap_or(0),
+            // 1 tick = 1e-10 USD; micros are 1e-6
+            body["usage"]["cost_in_usd_ticks"]
+                .as_f64()
+                .map(|t| (t / 1e4).round() as i64),
+        ),
+    };
+    VideoPoll {
+        status,
+        body,
+        done,
+        units,
+        vendor_cost,
+    }
+}
+
+/// The finished clip's bytes and content type, proxied — only Sora hands the
+/// clip out this way; other dialects answer 404 (their poll carries a URL).
+pub async fn video_content(
+    transport: &dyn Transport,
+    account: &gw_models::Account,
+    id: &str,
+) -> GResult<(u16, String, Vec<u8>)> {
+    if video_dialect(&account.provider) != VideoDialect::Sora {
+        return Err(GatewayError::new(
+            gw_consts::ErrCode::BUILD_REQ,
+            404,
+            "this vendor serves the clip by URL in the poll, not by download",
+        ));
+    }
+    let url = versioned_url(
+        account.base_url(VENDOR_SENTINEL),
+        &format!("videos/{id}/content"),
+    );
     let reply = transport
-        .send(UpstreamRequest {
-            protocol: gw_consts::Protocol::Video,
-            method: "GET",
-            url: versioned_url(account.base_url(VENDOR_SENTINEL), &format!("videos/{id}")),
-            headers: vec![("authorization", format!("Bearer {key}"))],
-            body: Vec::new(),
-            stream: false,
-            account: account.name.clone(),
-            replay_account: None,
-        })
+        .send(video_request(account, "GET", url, Vec::new()))
+        .await?
+        .buffered()
+        .await?;
+    let content_type = reply
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("video/mp4")
+        .to_owned();
+    let bytes = match reply.body {
+        UpstreamBody::Json(b) => b.to_vec(),
+        UpstreamBody::Sse(b) => b,
+        UpstreamBody::SseStream(_) => Vec::new(),
+    };
+    Ok((reply.status, content_type, bytes))
+}
+
+fn video_request(
+    account: &gw_models::Account,
+    method: &'static str,
+    url: String,
+    body: Vec<u8>,
+) -> UpstreamRequest {
+    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
+    let mut headers = vec![("authorization", format!("Bearer {key}"))];
+    if !body.is_empty() {
+        headers.push(("content-type", "application/json".into()));
+    }
+    UpstreamRequest {
+        protocol: gw_consts::Protocol::Video,
+        method,
+        url,
+        headers,
+        body,
+        stream: false,
+        account: account.name.clone(),
+        replay_account: None,
+    }
+}
+
+async fn video_send(
+    transport: &dyn Transport,
+    account: &gw_models::Account,
+    method: &'static str,
+    url: String,
+    body: Vec<u8>,
+) -> GResult<(u16, Value)> {
+    let reply = transport
+        .send(video_request(account, method, url, body))
         .await?;
     parse_json_reply(reply)
 }
@@ -1485,6 +1734,9 @@ mod tests {
         );
         assert_eq!(stt.run().await.unwrap().response.billed_units, 4);
         assert_eq!(whole_seconds(&json!(4.1)), Some(5));
+        assert_eq!(whole_seconds(&json!("4")), Some(4));
+        assert_eq!(whole_seconds(&json!("12.5")), Some(13));
+        assert_eq!(whole_seconds(&json!("clip")), None);
         assert_eq!(whole_seconds(&json!(0)), None);
 
         let mut tts = AudioEngine::new(
@@ -1558,6 +1810,32 @@ mod tests {
                 .response
                 .message
                 .contains("transcribed")
+        );
+    }
+
+    #[test]
+    fn video_handle_prefers_the_task_id_over_a_trace_request_id() {
+        for (reply, want) in [
+            (
+                json!({"request_id": "trace-1", "output": {"task_id": "ds-1", "task_status": "PENDING"}}),
+                "ds-1",
+            ),
+            (json!({"request_id": "vid-xai-1"}), "vid-xai-1"),
+            (json!({"requestId": "sf-1"}), "sf-1"),
+            (
+                json!({"task_id": "mm-1", "base_resp": {"status_code": 0}}),
+                "mm-1",
+            ),
+            (
+                json!({"id": "video_abc", "object": "video", "status": "queued"}),
+                "video_abc",
+            ),
+        ] {
+            assert_eq!(video_handle(&reply), Some(want), "{reply}");
+        }
+        assert_eq!(
+            video_handle(&json!({"task_id": "", "video_url": "u"})),
+            None
         );
     }
 

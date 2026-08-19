@@ -146,6 +146,18 @@ models:
     protocol: video
     provider: xai
     unit_price_micros: 100000
+  - name: sora-2 # async video, OpenAI dialect: video object + seconds string + content download
+    protocol: video
+    provider: openai
+    unit_price_micros: 100000
+  - name: wan2.2-t2v-plus # async video, DashScope task dialect
+    protocol: video
+    provider: dashscope
+    unit_price_micros: 120000
+  - name: MiniMax-Hailuo-02 # async video, Hailuo dialect (one unit per delivered video)
+    protocol: video
+    provider: minimax
+    unit_price_micros: 300000
   - name: brave-search # search family
     protocol: search
   - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
@@ -246,6 +258,21 @@ accounts:
   - name: mock-xai-1 # e2e: the xAI host answers video with a request_id + poll
     provider: xai
     endpoint: mock://api.x.ai
+    priority: 1
+    protocols: ["video"]
+  - name: mock-sora-1 # e2e: the OpenAI host answers the Sora video-object dialect
+    provider: openai
+    endpoint: mock://api.openai.com
+    priority: 1
+    protocols: ["video"]
+  - name: mock-wan-1 # e2e: the DashScope task dialect (trace request_id next to the task_id)
+    provider: dashscope
+    endpoint: mock://dashscope-intl.aliyuncs.com
+    priority: 1
+    protocols: ["video"]
+  - name: mock-hailuo-1 # e2e: the MiniMax Hailuo dialect
+    provider: minimax
+    endpoint: mock://api.minimax.io
     priority: 1
     protocols: ["video"]
   - name: mock-search-1
