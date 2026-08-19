@@ -5,6 +5,7 @@
 //! server default) live in `http_transport`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gw_consts::Protocol;
 use gw_models::{GResult, GatewayError, StreamError};
@@ -735,8 +736,32 @@ impl MockTransport {
         }
     }
 
+    /// The xAI host answers async: `request_id` on POST; the poll's state is spelled by the id.
     fn video_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        if req.method == "GET" {
+            let id = req.url.rsplit('/').next().unwrap_or_default();
+            return Self::ok_json(if id.contains("pending") {
+                json!({"status": "pending", "progress": 40})
+            } else if id.contains("failed") {
+                json!({"status": "failed", "error": "mock generation failed"})
+            } else {
+                json!({"status": "done", "progress": 100,
+                       "video": {"url": format!("mock://videos/{id}.mp4"), "duration": 2},
+                       "usage": {"cost_in_usd_ticks": 1_600_000_000}})
+            });
+        }
         let body = Self::parse(&req.body, "video")?;
+        if req.url.contains("x.ai") {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let slug: String = body["prompt"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect();
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            return Self::ok_json(json!({"request_id": format!("vid-{slug}-{n}")}));
+        }
         Self::ok_json(json!({
             "task_id": "video-task-mock", "status": "succeeded",
             "video_url": "mock://videos/out.mp4", "prompt": body["prompt"]

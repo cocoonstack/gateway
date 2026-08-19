@@ -148,6 +148,11 @@ pub struct VideoParams {
     pub duration_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    /// Image-to-video source, forwarded in the vendor's own shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

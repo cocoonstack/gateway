@@ -868,6 +868,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
                 discount,
                 ptu_spillover,
                 estimated,
+                vendor_cost: None,
             },
             reserved,
             tpm_reserved,

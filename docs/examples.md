@@ -183,11 +183,15 @@ models:
   - {name: grok-4.6, provider: xai,
      input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
   - {name: grok-imagine-image-2.0, provider: xai, protocol: image, unit_price_micros: 70000}
+  - {name: grok-imagine-video-1.5, provider: xai, protocol: video, unit_price_micros: 100000}
 ```
 
 The preset covers xAI's OpenAI-compatible surfaces (`/v1/chat/completions`,
-`/v1/responses`, `/v1/images/generations`) and its realtime voice socket
-(`protocol: realtime`, model `grok-voice-latest`, billed by the delivered
+`/v1/responses`, `/v1/images/generations`), its async video
+(`/v1/videos/generations` answers `{request_id}`; poll `GET /v1/videos/{id}`
+until `done` — the first `done` bills the clip's seconds at the unit price and
+records xAI's `cost_in_usd_ticks` as the vendor cost) and its realtime voice
+socket (`protocol: realtime`, model `grok-voice-latest`, billed by the delivered
 output estimate since xAI reports no usage). `reasoning_effort` passes through
 verbatim — grok-4.6 takes `low`…`xhigh`, grok-4.3 also `none`, and a model
 answers 400 for a value it does not list — and the usage's `cached_tokens` /

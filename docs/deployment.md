@@ -59,8 +59,9 @@ storage:
   # sqlite_path: /var/lib/gw/store.db  # single-node alternative to postgres_url
 ```
 
-- **Durable records** (ledger, files, batches): SQLite when `sqlite_path` is
-  set (survives restarts), otherwise in-memory. The single-node SQLite store
+- **Durable records** (ledger, files, batches, async video jobs — pruned 30
+  days after submit): SQLite when `sqlite_path` is set (survives restarts),
+  otherwise in-memory. The single-node SQLite store
   sweeps orphaned `pending`/`running` batch jobs to `failed` on startup; the
   Postgres store deliberately does not (another live instance may still be
   executing them — stale claims are requeued via the fleet drain instead).

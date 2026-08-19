@@ -83,7 +83,8 @@ and `token_rate` weights chosen so every billing dimension is visible;
 `/v1/messages` (native and cross-protocol), thinking (budget/adaptive/effort
 dialects, signed replay through a tool loop), prompt cache (Anthropic
 breakpoints, automatic prefix caching on OpenAI/DeepSeek/Qwen), the response
-cache, embeddings and rerank. For every call it recomputes the weighted total
+cache, embeddings, rerank, image and async video (submit, poll to `done`, one
+settle row). For every call it recomputes the weighted total
 and cost from the *wire* usage with the configured prices and compares them
 to the newest ledger row — an oracle independent of the gateway's own
 arithmetic — and asserts that reasoning content and cache reads/writes reached
@@ -95,7 +96,9 @@ GW_ADMIN_TOKEN=admin-live GW_CONFIG=scripts/live-matrix/live.yaml ./target/relea
 python3 scripts/live-matrix/live_matrix.py               # or: ... anthropic bedrock
 ```
 
-Last full run (2026-08-18, `fix/live-wire-round`): 86/86 cases across Anthropic,
+Last full run (2026-08-19, `feat/xai-cursor`): 129/134 cases across Anthropic,
 OpenAI, Gemini, DeepSeek, MiniMax, Qwen/DashScope, Qianfan, Moonshot,
-SiliconFlow, OpenRouter, Cohere/Jina rerank, xAI Grok and Bedrock (InvokeModel,
-Converse, Llama) — every ledger row matched the oracle exactly.
+SiliconFlow, OpenRouter, Cohere/Jina rerank, xAI Grok (chat, Responses, image,
+video) and Bedrock (InvokeModel, Converse, Llama) — every ledger row matched the
+oracle exactly; the 5 failures were Gemini's free-tier quota (`429`) on the
+vendor side.

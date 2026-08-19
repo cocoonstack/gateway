@@ -860,14 +860,18 @@ async fn video_request_shape() {
             prompt: "a dog surfing".into(),
             duration_seconds: Some(5),
             resolution: Some("1080p".into()),
+            aspect_ratio: Some("16:9".into()),
+            image: Some(serde_json::json!({"url": "https://img/dog.png"})),
         }),
     );
     let _ = VideoEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["model"], "kling-video");
     assert_eq!(b["prompt"], "a dog surfing");
-    assert_eq!(b["duration_seconds"], 5);
+    assert_eq!(b["duration"], 5);
     assert_eq!(b["resolution"], "1080p");
+    assert_eq!(b["aspect_ratio"], "16:9");
+    assert_eq!(b["image"]["url"], "https://img/dog.png");
     assert!(t.url().contains("/videos"), "url: {}", t.url());
 }
 

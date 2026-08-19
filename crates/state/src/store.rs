@@ -48,6 +48,9 @@ const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 /// starts. Valid in both SQL dialects.
 const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup";
 
+/// A put prunes async video jobs older than this (vendor results expire far sooner).
+const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BillingRecord {
@@ -165,6 +168,21 @@ pub struct StoredFile {
     pub content: String,
 }
 
+/// An async video generation awaiting its poll: whose it is and where it ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoJob {
+    /// The vendor's request id, also the client's poll handle.
+    pub id: String,
+    pub tenant: String,
+    pub ak: String,
+    pub product: String,
+    pub user_id: String,
+    pub model: String,
+    pub served_model: String,
+    pub account: String,
+    pub created_at_epoch_secs: i64,
+}
+
 /// Identity + token counts for one billed call, priced into a [`BillingRecord`].
 pub struct BillingInput<'a> {
     pub ak: &'a str,
@@ -194,6 +212,8 @@ pub struct BillingInput<'a> {
     pub ptu_spillover: bool,
     /// Counts are estimated (aborted stream), not vendor-reported.
     pub estimated: bool,
+    /// Vendor-reported cost in micros, overriding the account's price list.
+    pub vendor_cost: Option<i64>,
 }
 
 /// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
@@ -276,10 +296,12 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
             gw_models::cost_micros(billable_prompt, billable_completion, charged)
                 .saturating_add(unit_cost),
         ),
-        vendor_cost_micros: discounted(
-            gw_models::cost_micros(billable_prompt, billable_completion, vendor)
-                .saturating_add(units.saturating_mul(vendor_unit)),
-        ),
+        vendor_cost_micros: b.vendor_cost.unwrap_or_else(|| {
+            discounted(
+                gw_models::cost_micros(billable_prompt, billable_completion, vendor)
+                    .saturating_add(units.saturating_mul(vendor_unit)),
+            )
+        }),
         billed_units: units,
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
@@ -577,6 +599,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// check-then-delete window); whether it existed under that tenant.
     async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool>;
 
+    async fn video_job_put(&self, job: VideoJob) -> GResult<()>;
+    async fn video_job_get(&self, id: &str) -> GResult<Option<VideoJob>>;
+    /// Claim the job's one-time billing; false when an earlier poll already did.
+    async fn video_job_settle(&self, id: &str) -> GResult<bool>;
+
     async fn batch_create(
         &self,
         ak: &str,
@@ -730,6 +757,7 @@ pub struct MemoryStore {
     erasures: Mutex<std::collections::HashMap<(String, String), i64>>,
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
+    videos: DashMap<String, (VideoJob, bool)>,
     seq: AtomicUsize,
     /// oldest records beyond this are pruned on write; 0 = unlimited.
     ledger_max_rows: usize,
@@ -1098,6 +1126,26 @@ impl Store for MemoryStore {
             .is_some())
     }
 
+    async fn video_job_put(&self, job: VideoJob) -> GResult<()> {
+        let cutoff = job.created_at_epoch_secs - VIDEO_JOB_RETENTION_SECS;
+        self.videos
+            .retain(|_, (j, _)| j.created_at_epoch_secs >= cutoff);
+        self.videos.insert(job.id.clone(), (job, false));
+        Ok(())
+    }
+
+    async fn video_job_get(&self, id: &str) -> GResult<Option<VideoJob>> {
+        Ok(self.videos.get(id).map(|e| e.value().0.clone()))
+    }
+
+    async fn video_job_settle(&self, id: &str) -> GResult<bool> {
+        Ok(self.videos.get_mut(id).is_some_and(|mut e| {
+            let first = !e.value().1;
+            e.value_mut().1 = true;
+            first
+        }))
+    }
+
     async fn batch_create(
         &self,
         ak: &str,
@@ -1209,6 +1257,9 @@ row_mapper!(admin_audit_row -> AdminAudit {
     created_at_epoch_secs, actor, scope, action, target, summary, source_ip,
 });
 
+row_mapper!(video_job_row -> VideoJob {
+    id, tenant, ak, product, user_id, model, served_model, account, created_at_epoch_secs,
+});
 row_mapper!(content_row -> crate::ContentRecord {
     created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
     sealed, expires_at_epoch_secs,
@@ -1289,6 +1340,11 @@ impl SqliteStore {
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
                 purpose TEXT NOT NULL, bytes INTEGER NOT NULL, content TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS video_jobs (
+                id TEXT PRIMARY KEY, tenant TEXT NOT NULL, ak TEXT NOT NULL,
+                product TEXT NOT NULL, user_id TEXT NOT NULL, model TEXT NOT NULL,
+                served_model TEXT NOT NULL, account TEXT NOT NULL,
+                created_at_epoch_secs INTEGER NOT NULL, billed INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -1622,6 +1678,62 @@ macro_rules! sql_store_impl {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::sqlx_err("delete file", e))?;
+                Ok(r.rows_affected() > 0)
+            }
+
+            async fn video_job_put(&self, job: VideoJob) -> GResult<()> {
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "DELETE FROM video_jobs WHERE created_at_epoch_secs < ?"
+                ))
+                .bind(job.created_at_epoch_secs - VIDEO_JOB_RETENTION_SECS)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("prune video jobs", e))?;
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "INSERT INTO video_jobs (id, tenant, ak, product, user_id, model, served_model,
+                     account, created_at_epoch_secs)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .bind(&job.id)
+                .bind(&job.tenant)
+                .bind(&job.ak)
+                .bind(&job.product)
+                .bind(&job.user_id)
+                .bind(&job.model)
+                .bind(&job.served_model)
+                .bind(&job.account)
+                .bind(job.created_at_epoch_secs)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("insert video job", e))?;
+                Ok(())
+            }
+
+            async fn video_job_get(&self, id: &str) -> GResult<Option<VideoJob>> {
+                let row = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT id, tenant, ak, product, user_id, model, served_model, account,
+                     created_at_epoch_secs
+                     FROM video_jobs WHERE id = ?"
+                ))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read video job", e))?;
+                Ok(row.as_ref().map(video_job_row))
+            }
+
+            async fn video_job_settle(&self, id: &str) -> GResult<bool> {
+                let r = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "UPDATE video_jobs SET billed = 1 WHERE id = ? AND billed = 0"
+                ))
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("settle video job", e))?;
                 Ok(r.rows_affected() > 0)
             }
 
@@ -2120,6 +2232,11 @@ impl PostgresStore {
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default',
                 purpose TEXT NOT NULL, bytes BIGINT NOT NULL, content TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS video_jobs (
+                id TEXT PRIMARY KEY, tenant TEXT NOT NULL, ak TEXT NOT NULL,
+                product TEXT NOT NULL, user_id TEXT NOT NULL, model TEXT NOT NULL,
+                served_model TEXT NOT NULL, account TEXT NOT NULL,
+                created_at_epoch_secs BIGINT NOT NULL, billed INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -2826,6 +2943,7 @@ mod tests {
                 discount: 1.0,
                 ptu_spillover: false,
                 estimated: false,
+                vendor_cost: None,
             },
         );
         assert_eq!(rec.prompt_tokens, 1140);
@@ -2870,6 +2988,7 @@ mod tests {
             discount: 1.0,
             ptu_spillover: false,
             estimated: false,
+            vendor_cost: None,
         };
         let rec = billing_record(&cfg, &input("default"));
         assert_eq!(
@@ -2904,6 +3023,7 @@ mod tests {
                 discount: 1.0,
                 ptu_spillover: false,
                 estimated: false,
+                vendor_cost: None,
             },
         );
         assert_eq!(rec.prompt_tokens, MAX_METERED_TOKENS);
@@ -3012,6 +3132,53 @@ mod tests {
     #[tokio::test]
     async fn memory_store_roundtrip() {
         exercise(&MemoryStore::default()).await;
+    }
+
+    async fn exercise_video_jobs(store: &dyn Store) {
+        let job = VideoJob {
+            id: "vid-1".into(),
+            tenant: "t1".into(),
+            ak: "k1".into(),
+            product: "p".into(),
+            user_id: "alice".into(),
+            model: "grok-imagine-video".into(),
+            served_model: "grok-imagine-video".into(),
+            account: "xai".into(),
+            created_at_epoch_secs: 1_000,
+        };
+        store.video_job_put(job.clone()).await.unwrap();
+        assert_eq!(
+            store.video_job_get("vid-1").await.unwrap(),
+            Some(job.clone())
+        );
+        assert_eq!(store.video_job_get("vid-2").await.unwrap(), None);
+        assert!(store.video_job_settle("vid-1").await.unwrap());
+        assert!(
+            !store.video_job_settle("vid-1").await.unwrap(),
+            "billed once"
+        );
+        assert!(!store.video_job_settle("vid-2").await.unwrap());
+        let later = VideoJob {
+            id: "vid-2".into(),
+            created_at_epoch_secs: 1_001 + VIDEO_JOB_RETENTION_SECS,
+            ..job
+        };
+        store.video_job_put(later).await.unwrap();
+        assert_eq!(
+            store.video_job_get("vid-1").await.unwrap(),
+            None,
+            "a put prunes jobs past retention"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_jobs_settle_once_in_memory_and_sqlite() {
+        exercise_video_jobs(&MemoryStore::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("video.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_video_jobs(&store).await;
     }
 
     #[tokio::test]
@@ -3589,6 +3756,7 @@ mod tests {
         exercise_erase(&store, &ns).await;
         exercise_content_list(&store, &ns).await;
         exercise_terminal_idempotence(&store, &ns).await;
+        exercise_video_jobs(&store).await;
 
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
         let items = vec![

@@ -1448,6 +1448,129 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
 }
 
 #[tokio::test]
+async fn async_video_bills_once_on_the_first_done_poll() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/videos/generations",
+            Some("ak-demo-123"),
+            r#"{"model":"kling-video","prompt":"a dog surfing"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["video_url"], "mock://videos/out.mp4");
+
+    let mut ids = Vec::new();
+    for prompt in ["a cat on a skateboard", "pending clip", "failed clip"] {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/v1/videos/generations",
+                Some("ak-demo-123"),
+                &format!(
+                    r#"{{"model":"grok-imagine-video","prompt":"{prompt}","duration":2,"resolution":"480p"}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        ids.push(
+            j["request_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{j}"))
+                .to_owned(),
+        );
+    }
+    assert!(
+        ids[0].starts_with("vid-a-cat-on-a-skateboard-"),
+        "{}",
+        ids[0]
+    );
+    let poll = |id: String, ak: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .uri(format!("/v1/videos/{id}"))
+                .header("authorization", format!("Bearer {ak}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    for _ in 0..2 {
+        let (status, j) = poll(ids[0].clone(), "ak-demo-123").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(j["status"], "done");
+        assert_eq!(j["video"]["duration"], 2);
+    }
+    assert_eq!(
+        poll(ids[1].clone(), "ak-demo-123").await.1["status"],
+        "pending"
+    );
+    assert_eq!(
+        poll(ids[2].clone(), "ak-demo-123").await.1["status"],
+        "failed"
+    );
+    assert_eq!(
+        poll(ids[0].clone(), "ak-acme-1").await.0,
+        StatusCode::NOT_FOUND,
+        "another tenant cannot poll the job"
+    );
+    assert_eq!(
+        poll("vid-unknown".into(), "ak-demo-123").await.0,
+        StatusCode::NOT_FOUND
+    );
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/videos/generations",
+            Some("ak-limited"),
+            r#"{"model":"grok-imagine-video","prompt":"rate limited clip"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let limited = body_json(resp).await["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        poll(limited, "ak-limited").await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the poll spends the key's qps like any request"
+    );
+
+    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+    let rows: Vec<&Value> = j["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["protocol"] == "video")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        6,
+        "one sync + four submits + one settle: {rows:?}"
+    );
+    let settled: Vec<&&Value> = rows
+        .iter()
+        .filter(|r| r["billed_units"].as_i64().unwrap() > 0)
+        .collect();
+    assert_eq!(settled.len(), 1, "billed exactly once: {rows:?}");
+    let s = settled[0];
+    assert_eq!(s["model"], "grok-imagine-video");
+    assert_eq!(s["ak"], "ak-demo-123");
+    assert_eq!(s["billed_units"], 2);
+    assert_eq!(s["cost_micros"], 200_000, "2 s at 100000 micros/s");
+    assert_eq!(s["vendor_cost_micros"], 160_000, "1_600_000_000 ticks");
+    assert_eq!(s["estimated"], false);
+}
+
+#[tokio::test]
 async fn unit_priced_surfaces_bill_characters_and_seconds() {
     let app = app();
     for body in [

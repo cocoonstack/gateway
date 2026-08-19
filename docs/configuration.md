@@ -134,7 +134,8 @@ through `/v1/batches`. `unit_price_micros` prices what the surfaces
 without token usage meter — a `tts` model's input characters, an `stt`
 model's audio seconds (the vendor's `usage.seconds` / `duration`, else the
 uploaded WAV/MP3's own play length; fractions rounded up), a `rerank`
-model's `search_units`, an `image` model's images — and adds to `cost_micros` next to any token cost;
+model's `search_units`, an `image` model's images, a `video` model's
+generated seconds — and adds to `cost_micros` next to any token cost;
 the count lands in the ledger's `billed_units` and the `/admin/usage`
 aggregates. An account's `cost_unit_price_micros` is the vendor side of the
 same unit, for margin. `prompt_cache` (anthropic-messages models)

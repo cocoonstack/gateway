@@ -358,6 +358,51 @@ def case_image(gw: Gateway, model: str) -> None:
     )
 
 
+def case_video(gw: Gateway, model: str) -> None:
+    """Async video: the submit lands a 0-unit row; the first done poll bills the clip's seconds at the unit price with the vendor's tick cost; a re-poll bills nothing."""
+    name = f"{model} video"
+    before, _ = gw.ledger()
+    st, txt = gw.call(
+        "/v1/videos/generations",
+        {"model": model, "prompt": "a paper boat drifting on a pond, gentle ripples", "duration": 2, "resolution": "480p"},
+    )
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    rid = json.loads(txt).get("request_id")
+    if not rid:
+        record(name, False, f"no request_id: {txt[:200]}")
+        return
+    deadline = time.time() + 600
+    j: dict[str, Any] = {}
+    while time.time() < deadline:
+        st, txt = gw.call(f"/v1/videos/{rid}")
+        j = json.loads(txt) if st == 200 else {}
+        if j.get("status") in ("done", "failed", "expired"):
+            break
+        time.sleep(5)
+    if j.get("status") != "done":
+        record(name, False, f"status={j.get('status')} HTTP {st}: {txt[:200]}")
+        return
+    gw.call(f"/v1/videos/{rid}")
+    count, row = gw.ledger()
+    seconds = math.ceil(j["video"]["duration"])
+    ticks = (j.get("usage") or {}).get("cost_in_usd_ticks", 0)
+    expected_cost = seconds * MODELS[model]["unit"]
+    ok = (
+        count == before + 2
+        and row["billed_units"] == seconds
+        and row["cost_micros"] == expected_cost
+        and row["vendor_cost_micros"] == ticks // 10_000
+    )
+    record(
+        name,
+        ok,
+        f"duration={j['video']['duration']} ticks={ticks} rows+{count - before} ledger units/cost/vendor="
+        f"{row['billed_units']}/{row['cost_micros']}/{row['vendor_cost_micros']} expected {seconds}/{expected_cost}/{ticks // 10_000}",
+    )
+
+
 def case_rerank(gw: Gateway, model: str, unit_priced: bool = False) -> None:
     name = f"{model} rerank"
     before, _ = gw.ledger()
@@ -806,6 +851,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_prompt_cache(gw, "grok-4.3", words=400)
         case_responses_surfaces(gw, "grok-4.5")
         case_image(gw, "grok-imagine-image-2.0")
+        case_video(gw, "grok-imagine-video-1.5")
     elif group == "bedrock":
         haiku, sonnet = "us.anthropic.claude-haiku-4-5-20251001-v1:0", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
         case_messages(gw, haiku, "aws-anthropic")

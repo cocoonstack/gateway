@@ -139,8 +139,13 @@ models:
   - name: whisper-1 # audio stt family
     protocol: stt
     unit_price_micros: 100 # per audio second
-  - name: kling-video # video family
+  - name: kling-video # video family, synchronous vendor shape
     protocol: video
+    provider: kling
+  - name: grok-imagine-video # async video: request_id + poll, billed per second on done
+    protocol: video
+    provider: xai
+    unit_price_micros: 100000
   - name: brave-search # search family
     protocol: search
   - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
@@ -236,6 +241,11 @@ accounts:
     protocols: ["tts", "stt"]
   - name: mock-video-1
     provider: kling
+    priority: 1
+    protocols: ["video"]
+  - name: mock-xai-1 # e2e: the xAI host answers video with a request_id + poll
+    provider: xai
+    endpoint: mock://api.x.ai
     priority: 1
     protocols: ["video"]
   - name: mock-search-1
