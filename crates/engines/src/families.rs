@@ -863,8 +863,7 @@ pub async fn video_content(
             Vec::new(),
         ),
         VideoDialect::Minimax => {
-            // the clip lives on a CDN: files/retrieve resolves the file_id to a
-            // signed download_url (retrieve_content rejects video_generation files)
+            // files/retrieve resolves the CDN url; retrieve_content rejects video_generation files
             let file_id = poll["file_id"]
                 .as_str()
                 .filter(|id| !id.is_empty())
@@ -882,16 +881,8 @@ pub async fn video_content(
                 .as_str()
                 .filter(|u| !u.is_empty())
                 .ok_or_else(|| minimax_content_gap("minimax file without download_url"))?;
-            UpstreamRequest {
-                protocol: gw_consts::Protocol::Video,
-                method: "GET",
-                url: url.to_owned(),
-                headers: Vec::new(),
-                body: Vec::new(),
-                stream: false,
-                account: account.name.clone(),
-                replay_account: None,
-            }
+            // the signed CDN url authorizes itself: no Bearer to a third-party host
+            video_upstream(account, "GET", url.to_owned(), Headers::new(), Vec::new())
         }
         _ => {
             return Err(GatewayError::new(
@@ -931,6 +922,16 @@ fn video_request(
     if !body.is_empty() {
         headers.push(("content-type", "application/json".into()));
     }
+    video_upstream(account, method, url, headers, body)
+}
+
+fn video_upstream(
+    account: &gw_models::Account,
+    method: &'static str,
+    url: String,
+    headers: Headers,
+    body: Vec<u8>,
+) -> UpstreamRequest {
     UpstreamRequest {
         protocol: gw_consts::Protocol::Video,
         method,
