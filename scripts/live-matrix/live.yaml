@@ -87,6 +87,8 @@ models:
   # local ollama through the generic openai-compatible path
   - {name: "qwen2.5:0.5b", provider: ollama, input_price_per_1k_micros: 100, output_price_per_1k_micros: 100}
   - {name: grok-voice-latest, provider: xai, protocol: realtime, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 4000}
+  # web search
+  - {name: brave-search, provider: brave, protocol: search, unit_price_micros: 5000}
   # rerank vendors
   - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
   - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
@@ -103,6 +105,11 @@ accounts:
     endpoint: https://api-singapore.klingai.com
     api_key_env: KLING_API_KEY
     protocols: ["video"]
+  - name: brave
+    provider: brave
+    endpoint: https://api.search.brave.com
+    api_key_env: BRAVE_API_KEY
+    protocols: ["search"]
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
   - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama"], timeout_seconds: 120}

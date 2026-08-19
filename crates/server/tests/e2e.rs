@@ -1772,6 +1772,31 @@ async fn sora_content_settles_once_without_a_prior_status_poll() {
 }
 
 #[tokio::test]
+async fn search_routes_brave_and_bills_one_unit() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/search",
+            Some("ak-demo-123"),
+            r#"{"model":"brave-search","query":"api gateway","count":3}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["web"]["results"].as_array().map(Vec::len), Some(3), "{j}");
+    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+    let row = j["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["served_model"] == "brave-search")
+        .unwrap();
+    assert_eq!(row["billed_units"], 1);
+}
+
+#[tokio::test]
 async fn unit_priced_surfaces_bill_characters_and_seconds() {
     let app = app();
     for body in [

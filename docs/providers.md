@@ -80,9 +80,12 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id or inference profile (`meta.llama3-8b-instruct-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.meta.llama4-scout-17b-instruct-v1:0`); the conversation is rendered into the Llama 3 (or Llama 4) chat template; usage from the token-count headers / invocation metrics, else the body counts |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
-The factory also dispatches `video`, `search`, generic `audio`, and
-`passthrough` protocols (kling-v1-6, grok-imagine-video, sora-2 and
-brave-search ship example accounts in the default config). `protocol: video`
+`protocol: search` routes web search: a `brave` provider account speaks the
+Brave Search API (`X-Subscription-Token`, live-verified; one unit per query),
+anything else the generic mock shape. The factory also dispatches `video`,
+generic `audio`, and `passthrough` protocols (kling-v1-6, grok-imagine-video,
+sora-2 and brave-search ship example accounts in the default config).
+`protocol: video`
 picks its wire from the account's provider name — `openai`/`azure` → Sora,
 `siliconflow` → Wan submit/status, `alibaba`/`dashscope` → the DashScope task
 API (the account endpoint is the bare `https://dashscope-intl.aliyuncs.com`;

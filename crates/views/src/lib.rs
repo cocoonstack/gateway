@@ -126,6 +126,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
         .route("/v1/audio/translations", post(audio_translations))
         .route("/v1/moderations", post(moderations))
+        .route("/v1/search", post(search))
         .route("/v1/rerank", post(rerank))
         .route("/v1/batches", post(batches_submit))
         .route("/v1/batches/{id}", get(batches_get))
@@ -4314,6 +4315,37 @@ async fn moderations(
         user_hint(&headers, &body["user"]),
         "moderations",
         "moderations",
+        started,
+    )
+    .await
+}
+
+/// POST /v1/search — web search as a routed backend: `{model, query, count?}`.
+async fn search(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Authed(ak): Authed,
+    ApiJson(mut body): ApiJson<Value>,
+) -> Response {
+    let started = Instant::now();
+    let model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
+    let query = gw_engines::engine::take_string(&mut body, "/query").unwrap_or_default();
+    if model.is_empty() || query.is_empty() {
+        return error_response(400, "model and query are required");
+    }
+    let typed = TypedParams::Search(gw_models::SearchParams {
+        query,
+        count: body["count"].as_i64().unwrap_or(3).clamp(1, 20),
+    });
+    family_response(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::Search,
+        typed,
+        user_hint(&headers, &body["user"]),
+        "search",
+        "search",
         started,
     )
     .await

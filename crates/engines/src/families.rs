@@ -1019,7 +1019,7 @@ base_engine!(SearchEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for SearchEngine {
-    /// Merges the bingsearch/brave/serp/google_custom_search engines.
+    /// Brave web search on a `brave` provider, else the generic mock shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {
@@ -1027,25 +1027,53 @@ impl ModelEngine for SearchEngine {
             _ => (self.base.last_message_text(), 3),
         };
         require_non_empty(query, "search query")?;
-        let body = json!({"query": query, "count": count});
-        let (status, v) = self
-            .base
-            .round_trip(&self.base.vendor_url("search"), body)
-            .await?;
-        let titles: Vec<String> = v["results"]
-            .as_array()
+        let (status, v, results) = if self.base.provider() == "brave" {
+            let q =
+                percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
+            let url = format!(
+                "{}/res/v1/web/search?q={q}&count={count}",
+                self.base.base_url(VENDOR_SENTINEL)
+            );
+            let headers = vec![
+                ("accept", "application/json".into()),
+                ("x-subscription-token", self.base.api_key()),
+            ];
+            let reply = self
+                .base
+                .transport
+                .send(UpstreamRequest {
+                    protocol: gw_consts::Protocol::Search,
+                    method: "GET",
+                    url,
+                    headers,
+                    body: Vec::new(),
+                    stream: false,
+                    account: self.base.account(),
+                    replay_account: None,
+                })
+                .await?;
+            let (status, v) = parse_json_reply(reply)?;
+            (status, v, "/web/results")
+        } else {
+            let body = json!({"query": query, "count": count});
+            let (status, v) = self
+                .base
+                .round_trip(&self.base.vendor_url("search"), body)
+                .await?;
+            (status, v, "/results")
+        };
+        let titles: Vec<String> = v
+            .pointer(results)
+            .and_then(Value::as_array)
             .map(|rs| {
                 rs.iter()
                     .filter_map(|r| r["title"].as_str().map(str::to_owned))
                     .collect()
             })
             .unwrap_or_default();
-        Ok(family_outcome(
-            titles.join("; "),
-            &param.model_name,
-            v,
-            status,
-        ))
+        let mut out = family_outcome(titles.join("; "), &param.model_name, v, status);
+        out.response.billed_units = 1;
+        Ok(out)
     }
 }
 

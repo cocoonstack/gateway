@@ -62,6 +62,12 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/rerank` | Cohere/Jina-compatible: `{model, query, documents, top_n?}` → `{results: [{index, relevance_score}]}` |
 
+## Search
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}`; a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
+
 ### Chat completions
 
 ```bash

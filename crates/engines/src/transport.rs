@@ -878,6 +878,23 @@ impl MockTransport {
     }
 
     fn search_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        if req.url.contains("/res/v1/web/search") {
+            let q = req
+                .url
+                .split("q=")
+                .nth(1)
+                .and_then(|r| r.split('&').next())
+                .unwrap_or_default();
+            let results: Vec<Value> = (0..3)
+                .map(|i| {
+                    json!({"title": format!("brave result {} for {q}", i + 1),
+                           "url": format!("mock://brave/{}", i + 1),
+                           "description": format!("[mock-brave] about {q}")})
+                })
+                .collect();
+            return Self::ok_json(json!({"query": {"original": q},
+                                        "web": {"results": results}}));
+        }
         let body = Self::parse(&req.body, "search")?;
         let q = body["query"].as_str().unwrap_or("");
         let n = body["count"].as_i64().unwrap_or(3).clamp(1, 10);
