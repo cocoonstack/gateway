@@ -4031,7 +4031,7 @@ async fn admit_video_job(
 async fn poll_and_settle_video(
     s: &AppState,
     job: &VideoJob,
-    account: &gw_models::Account,
+    account: &Arc<gw_models::Account>,
 ) -> Result<gw_engines::families::VideoPoll, Response> {
     let state = s.handler.state();
     let cfg = s.handler.cfg();
@@ -4103,7 +4103,7 @@ async fn videos_get(
             format!("account {} is no longer configured", job.account),
         );
     };
-    let poll = match poll_and_settle_video(&s, &job, account).await {
+    let poll = match poll_and_settle_video(&s, &job, &account).await {
         Ok(poll) => poll,
         Err(resp) => return resp,
     };
@@ -4131,7 +4131,7 @@ async fn videos_content(
             format!("account {} is no longer configured", job.account),
         );
     };
-    let poll = match poll_and_settle_video(&s, &job, account).await {
+    let poll = match poll_and_settle_video(&s, &job, &account).await {
         Ok(poll) => poll,
         Err(resp) => return resp,
     };
@@ -4140,7 +4140,7 @@ async fn videos_content(
     }
     match gw_engines::families::video_content(
         s.handler.transport.as_ref(),
-        account,
+        &account,
         &job.id,
         &poll.body,
     )

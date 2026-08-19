@@ -3,6 +3,8 @@
 //! that boundary. The mock protocol flags byte-level vendor differences as
 //! deferred to a later fidelity pass.
 
+use std::sync::Arc;
+
 use base64::Engine as _;
 use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams, VideoParams};
 use gw_protocol::object;
@@ -821,7 +823,7 @@ fn video_outcome(model: &str, v: Value, status: u16) -> EngineOutcome {
 /// Poll an async video generation where it was submitted, in the account's dialect.
 pub async fn video_poll(
     transport: &dyn Transport,
-    account: &gw_models::Account,
+    account: &Arc<gw_models::Account>,
     id: &str,
 ) -> GResult<VideoPoll> {
     let base = account.base_url(VENDOR_SENTINEL);
@@ -908,7 +910,7 @@ fn normalize_video_poll(dialect: VideoDialect, status: u16, body: Value) -> Vide
 /// other dialects answer 404 because their poll carries a URL.
 pub async fn video_content(
     transport: &dyn Transport,
-    account: &gw_models::Account,
+    account: &Arc<gw_models::Account>,
     id: &str,
     poll: &Value,
 ) -> GResult<(u16, String, bytes::Bytes)> {
@@ -970,7 +972,7 @@ fn minimax_content_gap(message: &'static str) -> GatewayError {
 }
 
 fn video_request(
-    account: &gw_models::Account,
+    account: &Arc<gw_models::Account>,
     method: &'static str,
     url: String,
     body: Vec<u8>,
@@ -984,7 +986,7 @@ fn video_request(
 }
 
 fn video_upstream(
-    account: &gw_models::Account,
+    account: &Arc<gw_models::Account>,
     method: &'static str,
     url: String,
     headers: Headers,
@@ -998,13 +1000,13 @@ fn video_upstream(
         body,
         stream: false,
         account: account.name.clone(),
-        replay_account: None,
+        replay_account: Some(Arc::clone(account)),
     }
 }
 
 async fn video_send(
     transport: &dyn Transport,
-    account: &gw_models::Account,
+    account: &Arc<gw_models::Account>,
     method: &'static str,
     url: String,
     body: Vec<u8>,
@@ -1019,7 +1021,7 @@ base_engine!(SearchEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for SearchEngine {
-    /// Brave web search on a `brave` provider, else the generic mock shape.
+    /// Brave or Google CSE on their providers, else the generic mock shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {
@@ -1027,40 +1029,49 @@ impl ModelEngine for SearchEngine {
             _ => (self.base.last_message_text(), 3),
         };
         require_non_empty(query, "search query")?;
-        let (status, v, results) = if self.base.provider() == "brave" {
-            let q =
-                percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
-            let url = format!(
-                "{}/res/v1/web/search?q={q}&count={count}",
-                self.base.base_url(VENDOR_SENTINEL)
-            );
-            let headers = vec![
-                ("accept", "application/json".into()),
-                ("x-subscription-token", self.base.api_key()),
-            ];
-            let reply = self
-                .base
-                .transport
-                .send(UpstreamRequest {
-                    protocol: gw_consts::Protocol::Search,
-                    method: "GET",
-                    url,
-                    headers,
-                    body: Vec::new(),
-                    stream: false,
-                    account: self.base.account(),
-                    replay_account: None,
-                })
-                .await?;
-            let (status, v) = parse_json_reply(reply)?;
-            (status, v, "/web/results")
-        } else {
-            let body = json!({"query": query, "count": count});
-            let (status, v) = self
-                .base
-                .round_trip(&self.base.vendor_url("search"), body)
-                .await?;
-            (status, v, "/results")
+        let q = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
+        let (status, v, results) = match self.base.provider() {
+            "brave" => {
+                let url = format!(
+                    "{}/res/v1/web/search?q={q}&count={count}",
+                    self.base.base_url(VENDOR_SENTINEL)
+                );
+                let headers = vec![
+                    ("accept", "application/json".into()),
+                    ("x-subscription-token", self.base.api_key()),
+                ];
+                let (status, v) = self.search_get(url, headers).await?;
+                (status, v, "/web/results")
+            }
+            // Google CSE: the engine id (cx) rides secret_key_env, the key the query string
+            "google" | "cse" => {
+                let cx = self
+                    .base
+                    .request
+                    .account
+                    .as_ref()
+                    .and_then(|a| a.secret())
+                    .ok_or_else(|| {
+                        GatewayError::bad_request(
+                            "google search needs the engine id (cx) in secret_key_env",
+                        )
+                    })?;
+                let url = format!(
+                    "{}/customsearch/v1?key={}&cx={cx}&q={q}&num={count}",
+                    self.base.base_url(VENDOR_SENTINEL),
+                    self.base.api_key(),
+                );
+                let (status, v) = self.search_get(url, Vec::new()).await?;
+                (status, v, "/items")
+            }
+            _ => {
+                let body = json!({"query": query, "count": count});
+                let (status, v) = self
+                    .base
+                    .round_trip(&self.base.vendor_url("search"), body)
+                    .await?;
+                (status, v, "/results")
+            }
         };
         let titles: Vec<String> = v
             .pointer(results)
@@ -1074,6 +1085,26 @@ impl ModelEngine for SearchEngine {
         let mut out = family_outcome(titles.join("; "), &param.model_name, v, status);
         out.response.billed_units = 1;
         Ok(out)
+    }
+}
+
+impl SearchEngine {
+    async fn search_get(&self, url: String, headers: Headers) -> GResult<(u16, Value)> {
+        let reply = self
+            .base
+            .transport
+            .send(UpstreamRequest {
+                protocol: gw_consts::Protocol::Search,
+                method: "GET",
+                url,
+                headers,
+                body: Vec::new(),
+                stream: false,
+                account: self.base.account(),
+                replay_account: self.base.replay_account(),
+            })
+            .await?;
+        parse_json_reply(reply)
     }
 }
 
@@ -2172,7 +2203,7 @@ mod tests {
         assert_eq!(submit.http_status, 502);
         assert!(submit.message.contains("minimax base_resp 1008"));
 
-        let poll = match video_poll(transport.as_ref(), account.as_ref(), "task-1").await {
+        let poll = match video_poll(transport.as_ref(), &account, "task-1").await {
             Ok(_) => panic!("MiniMax business error accepted as a successful poll"),
             Err(e) => e,
         };

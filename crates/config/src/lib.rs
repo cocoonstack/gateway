@@ -30,7 +30,7 @@ pub enum ConfigError {
     UnknownProvider { model: String, provider: String },
     #[error("model `{model}` needs either protocol or provider")]
     ModelNeedsDispatch { model: String },
-    #[error("video model `{model}` must pin a provider (the video wire is provider-specific)")]
+    #[error("model `{model}` must pin a provider (its wire is provider-specific)")]
     VideoModelNeedsProvider { model: String },
     #[error("duplicate {kind} name `{name}`")]
     DuplicateName { kind: &'static str, name: String },
@@ -852,12 +852,12 @@ impl GatewayConfig {
     /// Structural and value invariants checked before use: wire types, prices,
     /// token-rate weights, retry_status range, quota/variant shape.
     fn validate(&self) -> Result<(), ConfigError> {
-        // the video wire is provider-specific (dialect by provider name): an
+        // video/search wires are provider-specific (dialect by provider name): an
         // unpinned model would round-robin one vendor's body into another's API
         if let Some(m) = self
             .models
             .iter()
-            .find(|m| m.protocol == "video" && m.provider.is_none())
+            .find(|m| matches!(m.protocol.as_str(), "video" | "search") && m.provider.is_none())
         {
             return Err(ConfigError::VideoModelNeedsProvider {
                 model: m.name.clone(),

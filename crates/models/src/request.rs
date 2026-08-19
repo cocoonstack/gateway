@@ -267,6 +267,14 @@ pub mod domain {
             std::env::var(&self.api_key_env).ok()
         }
 
+        /// The paired secret (AWS secret key, Google CSE cx) from its env var.
+        pub fn secret(&self) -> Option<String> {
+            if self.secret_key_env.is_empty() {
+                return None;
+            }
+            std::env::var(&self.secret_key_env).ok()
+        }
+
         /// AWS SigV4 credentials read from the two env vars at call time; `None`
         /// unless both resolve. Never stored or logged.
         pub fn aws_credentials(&self) -> Option<(String, String)> {

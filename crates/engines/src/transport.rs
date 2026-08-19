@@ -878,6 +878,22 @@ impl MockTransport {
     }
 
     fn search_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        if req.url.contains("/customsearch/v1") {
+            let q = req
+                .url
+                .split("q=")
+                .nth(1)
+                .and_then(|r| r.split('&').next())
+                .unwrap_or_default();
+            let items: Vec<Value> = (0..3)
+                .map(|i| {
+                    json!({"title": format!("cse result {} for {q}", i + 1),
+                           "link": format!("mock://cse/{}", i + 1),
+                           "snippet": format!("[mock-cse] about {q}")})
+                })
+                .collect();
+            return Self::ok_json(json!({"kind": "customsearch#search", "items": items}));
+        }
         if req.url.contains("/res/v1/web/search") {
             let q = req
                 .url
@@ -1011,6 +1027,9 @@ impl Transport for MockTransport {
         if req.protocol == Protocol::Video {
             return self.video_reply(&req);
         }
+        if req.protocol == Protocol::Search {
+            return self.search_reply(&req);
+        }
         let u = req.url.as_str();
         if u.contains("/model/") {
             self.bedrock_reply(&req)
@@ -1038,8 +1057,6 @@ impl Transport for MockTransport {
             self.moderations_reply(&req)
         } else if u.contains("/rerank") {
             self.rerank_reply(&req)
-        } else if u.contains("/search") {
-            self.search_reply(&req)
         } else if u.contains("/responses") {
             self.responses_reply(&req)
         } else if u.contains("/v1/completions") {

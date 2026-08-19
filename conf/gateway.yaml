@@ -164,6 +164,12 @@ models:
     unit_price_micros: 300000
   - name: brave-search # search family
     protocol: search
+    provider: brave
+    unit_price_micros: 5000
+  - name: google-search # Google CSE: key + cx (secret_key_env)
+    protocol: search
+    provider: google
+    unit_price_micros: 5000
   - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
     protocol: openai-chat
     provider: tencent
@@ -285,6 +291,11 @@ accounts:
     protocols: ["video"]
   - name: mock-search-1
     provider: brave
+    priority: 1
+    protocols: ["search"]
+  - name: mock-cse-1
+    provider: google
+    secret_key_env: GW_TEST_CSE_CX
     priority: 1
     protocols: ["search"]
   - name: mock-responses-1 # OpenAI Responses API surface
