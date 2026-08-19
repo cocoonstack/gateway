@@ -742,6 +742,17 @@ impl ModelEngine for VideoEngine {
                 vec![
                     ("duration", p.duration_seconds.map(|d| d.to_string().into())),
                     ("aspect_ratio", p.aspect_ratio.map(Value::from)),
+                    // Kling has quality modes, not resolutions: 1080p rides mode=pro
+                    (
+                        "mode",
+                        p.resolution.map(|r| {
+                            match r.as_str() {
+                                "1080p" | "pro" => "pro",
+                                _ => "std",
+                            }
+                            .into()
+                        }),
+                    ),
                 ],
             ),
             VideoDialect::Generations => (
