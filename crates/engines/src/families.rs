@@ -845,7 +845,7 @@ pub async fn video_content(
     transport: &dyn Transport,
     account: &gw_models::Account,
     id: &str,
-) -> GResult<(u16, String, Vec<u8>)> {
+) -> GResult<(u16, String, bytes::Bytes)> {
     if video_dialect(&account.provider) != VideoDialect::Sora {
         return Err(GatewayError::new(
             gw_consts::ErrCode::BUILD_REQ,
@@ -869,9 +869,9 @@ pub async fn video_content(
         .unwrap_or("video/mp4")
         .to_owned();
     let bytes = match reply.body {
-        UpstreamBody::Json(b) => b.to_vec(),
-        UpstreamBody::Sse(b) => b,
-        UpstreamBody::SseStream(_) => Vec::new(),
+        UpstreamBody::Json(b) => b,
+        UpstreamBody::Sse(b) => b.into(),
+        UpstreamBody::SseStream(_) => bytes::Bytes::new(),
     };
     Ok((reply.status, content_type, bytes))
 }
