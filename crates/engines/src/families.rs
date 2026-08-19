@@ -5,6 +5,7 @@
 
 use base64::Engine as _;
 use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, TypedParams, VideoParams};
+use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 use crate::base::{Base, VENDOR_SENTINEL, base_engine, parse_json_reply, versioned_url};
@@ -78,14 +79,18 @@ impl VertexEngine {
                 } else {
                     gw_consts::role::USER
                 };
-                json!({"role": role, "parts": gemini_parts(m)})
+                object([
+                    ("role", role.into()),
+                    ("parts", Value::Array(gemini_parts(m))),
+                ])
             })
             .collect();
         let mut body = json!({});
         body["contents"] = Value::Array(contents);
         let system = self.base.system_text();
         if !system.is_empty() {
-            body["systemInstruction"] = json!({"parts": [{"text": system}]});
+            let part = object([("text", system.into())]);
+            body["systemInstruction"] = object([("parts", Value::Array(vec![part]))]);
         }
         // sampling params → generationConfig — else Gemini silently uses defaults
         if let Some(p) = self.base.chat_params() {
@@ -493,7 +498,7 @@ impl ModelEngine for AudioEngine {
                 match reply.body {
                     UpstreamBody::Json(bytes) if status < 400 && !looks_like_json(&bytes) => {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        (status, json!({"audio_b64": b64}))
+                        (status, object([("audio_b64", b64.into())]))
                     }
                     body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
                         status,
@@ -698,8 +703,7 @@ base_engine!(ModerationsEngine);
 impl ModelEngine for ModerationsEngine {
     /// OpenAI moderations shape: `{model, input: [..]}` → per-input verdicts.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        let Some(TypedParams::Moderation(p)) = &param.typed else {
+        let Some(TypedParams::Moderation(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("moderations params are required"));
         };
         if p.input.is_empty() {
@@ -707,7 +711,9 @@ impl ModelEngine for ModerationsEngine {
                 "moderations input must not be empty",
             ));
         }
-        let body = json!({"model": param.model_name, "input": p.input});
+        let model = self.base.model_name()?;
+        let input = Value::Array(p.input.into_iter().map(Value::String).collect());
+        let body = object([("model", model.into()), ("input", input)]);
         let (status, v) = self
             .base
             .round_trip(
@@ -725,7 +731,7 @@ impl ModelEngine for ModerationsEngine {
             .unwrap_or(0);
         Ok(family_outcome(
             format!("{flagged} flagged"),
-            &param.model_name,
+            model,
             v,
             status,
         ))
@@ -1156,11 +1162,6 @@ fn responses_tool(mut tool: Value) -> Value {
         fields.insert("parameters".to_owned(), schema);
     }
     tool
-}
-
-/// A JSON object from moved values (`json!` would deep-copy each one).
-fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
-    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
 }
 
 fn function_call(call_id: Value, name: Value, arguments: Value) -> Value {

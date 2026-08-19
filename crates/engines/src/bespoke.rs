@@ -4,6 +4,7 @@
 //! real SigV4 Authorization header.
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 use crate::base::{Base, base_engine};
@@ -370,18 +371,18 @@ impl ModelEngine for LlamaEngine {
 base_engine!(DashScopeEngine);
 
 impl DashScopeEngine {
-    fn build_body(&self, stream: bool) -> GResult<Value> {
-        let model = self.base.model_name()?.to_owned();
-        let messages: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
+    fn build_body(&mut self, stream: bool) -> GResult<Value> {
+        let messages: Vec<Value> = std::mem::take(&mut self.base.request.message)
+            .into_iter()
             .map(|m| {
-                json!({"role": if m.role == gw_consts::role::AI {"assistant"}
-                                 else if m.role == gw_consts::role::SYSTEM {"system"}
-                                 else {"user"},
-                       "content": m.content})
+                let role = if m.role == gw_consts::role::AI {
+                    "assistant"
+                } else if m.role == gw_consts::role::SYSTEM {
+                    "system"
+                } else {
+                    "user"
+                };
+                object([("role", role.into()), ("content", m.content.into())])
             })
             .collect();
         let mut parameters = json!({"result_format": "message"});
@@ -400,10 +401,12 @@ impl DashScopeEngine {
                 parameters["max_tokens"] = json!(mt);
             }
         }
-        let mut body = json!({"model": model, "input": {}});
-        body["input"]["messages"] = Value::Array(messages);
-        body["parameters"] = parameters;
-        Ok(body)
+        let input = object([("messages", Value::Array(messages))]);
+        Ok(object([
+            ("model", self.base.model_name()?.into()),
+            ("input", input),
+            ("parameters", parameters),
+        ]))
     }
 
     fn url(&self) -> String {

@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
+use std::mem::take;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -30,6 +31,7 @@ use gw_models::{
     ModelParamV2, ReasoningParam, SttParams, TtsParams, TypedParams, VideoParams,
 };
 use gw_protocol::anthropic::{AnthUsage, MessagesRequest, tool_use_to_tool_calls};
+use gw_protocol::object;
 use gw_protocol::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
 };
@@ -184,12 +186,29 @@ async fn track_requests(
     metrics::counter!(
         "gateway_requests_total",
         "route" => route.clone(),
-        "status" => resp.status().as_u16().to_string(),
+        "status" => status_label(resp.status()),
     )
     .increment(1);
     metrics::histogram!("gateway_request_duration_seconds", "route" => route)
         .record(started.elapsed().as_secs_f64());
     resp
+}
+
+/// The status label without a per-request allocation for the codes this gateway emits.
+fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
+    match status.as_u16() {
+        200 => "200".into(),
+        400 => "400".into(),
+        401 => "401".into(),
+        403 => "403".into(),
+        404 => "404".into(),
+        405 => "405".into(),
+        429 => "429".into(),
+        500 => "500".into(),
+        502 => "502".into(),
+        503 => "503".into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// In-band realtime error event. Never terminal: the session
@@ -2474,9 +2493,22 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-local-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The wire default when an engine reported no finish reason.
-fn finish_or_stop(fr: &str) -> &str {
-    if fr.is_empty() { "stop" } else { fr }
+/// The response's finish reason, moved out; the wire default when the engine reported none.
+fn take_finish(resp: &mut gw_models::GatewayResponse) -> String {
+    if resp.finish_reason.is_empty() {
+        "stop".to_owned()
+    } else {
+        take(&mut resp.finish_reason)
+    }
+}
+
+/// An Anthropic `content_block_delta` frame from a moved delta payload.
+fn block_delta(index: usize, kind: &str, key: &str, text: String) -> Value {
+    object([
+        ("type", "content_block_delta".into()),
+        ("index", index.into()),
+        ("delta", object([("type", kind.into()), (key, text.into())])),
+    ])
 }
 
 /// Engine tool calls in OpenAI shape: the anthropic engine hands over native `tool_use` blocks.
@@ -3010,7 +3042,7 @@ fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::Stre
     }
     if !chunks.iter().any(|c| c.finish_reason.is_some()) {
         chunks.push(gw_engines::StreamChunk {
-            finish_reason: Some(finish_or_stop(&resp.finish_reason).to_owned()),
+            finish_reason: Some(take_finish(resp)),
             ..Default::default()
         });
     }
@@ -3034,7 +3066,7 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         });
     }
     chunks.push(gw_engines::StreamChunk {
-        finish_reason: Some(finish_or_stop(&resp.finish_reason).to_owned()),
+        finish_reason: Some(take_finish(resp)),
         ..Default::default()
     });
     chunks
@@ -3422,8 +3454,7 @@ fn messages_stream_response(
                         let idx = self.open_block(BlockKind::Thinking);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
-                            json!({"type":"content_block_delta","index":idx,
-                                   "delta":{"type":"thinking_delta","thinking":c.reasoning}}),
+                            block_delta(idx, "thinking_delta", "thinking", take(&mut c.reasoning)),
                         ));
                     }
                     if !c.delta.is_empty() {
@@ -3431,8 +3462,7 @@ fn messages_stream_response(
                         let idx = self.open_block(BlockKind::Text);
                         self.queue.push_back(St::ev(
                             "content_block_delta",
-                            json!({"type":"content_block_delta","index":idx,
-                                   "delta":{"type":"text_delta","text":c.delta}}),
+                            block_delta(idx, "text_delta", "text", take(&mut c.delta)),
                         ));
                     }
                     if let Some(tc) = c.tool_calls.take() {
@@ -3609,21 +3639,26 @@ async fn completions(
         let response = error_response(500, "pipeline produced no outcome");
         return terminal_response(&ctx, response).await;
     };
-    let r = &outcome.response;
-    let finish = finish_or_stop(&r.finish_reason);
-    let resp = json!({
-        "id": next_id("cmpl"),
-        "object": "text_completion",
-        "created": gw_state::epoch_secs(),
-        "model": r.model,
-        "choices": [{"text": r.message, "index": 0, "finish_reason": finish}],
-        "usage": openai_usage(
-            r.prompt_tokens,
-            r.completion_tokens,
-            r.total_tokens,
-            r.common_usage
-        ),
-    });
+    let mut r = outcome.response;
+    let usage = openai_usage(
+        r.prompt_tokens,
+        r.completion_tokens,
+        r.total_tokens,
+        r.common_usage,
+    );
+    let choice = object([
+        ("text", take(&mut r.message).into()),
+        ("index", 0.into()),
+        ("finish_reason", take_finish(&mut r).into()),
+    ]);
+    let resp = object([
+        ("id", next_id("cmpl").into()),
+        ("object", "text_completion".into()),
+        ("created", gw_state::epoch_secs().into()),
+        ("model", r.model.into()),
+        ("choices", Value::Array(vec![choice])),
+        ("usage", json!(usage)),
+    ]);
     let response = (StatusCode::OK, Json(resp)).into_response();
     terminal_response(&ctx, response).await
 }
@@ -3747,8 +3782,11 @@ fn responses_stream_response(
                         self.seq += 1;
                         self.queue.push_back(
                             Event::default().event("response.output_text.delta").data(
-                                json!({"type":"response.output_text.delta","delta":c.delta})
-                                    .to_string(),
+                                object([
+                                    ("type", "response.output_text.delta".into()),
+                                    ("delta", take(&mut c.delta).into()),
+                                ])
+                                .to_string(),
                             ),
                         );
                     }
@@ -4177,10 +4215,11 @@ async fn audio_transcribe(
         Some(o) if o.block.block => error_response(400, o.response.message),
         // the vendor body verbatim (text plus usage/segments/language when sent)
         Some(o) => {
-            let body = o
-                .response
+            let mut r = o.response;
+            let body = r
                 .response_v2
-                .unwrap_or_else(|| json!({ "text": o.response.message }));
+                .take()
+                .unwrap_or_else(|| object([("text", take(&mut r.message).into())]));
             (StatusCode::OK, Json(body)).into_response()
         }
         None => error_response(500, "stt engine returned no outcome"),

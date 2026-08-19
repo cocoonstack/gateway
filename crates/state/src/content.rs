@@ -57,7 +57,8 @@ pub fn open(sealed: &str) -> Option<String> {
 fn seal_with(cipher: &XChaCha20Poly1305, plaintext: &str) -> Option<String> {
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
     let ct = cipher.encrypt(&nonce, plaintext.as_bytes()).ok()?;
-    let mut out = nonce.to_vec();
+    let mut out = Vec::with_capacity(nonce.len() + ct.len());
+    out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
     Some(base64::engine::general_purpose::STANDARD.encode(out))
 }
