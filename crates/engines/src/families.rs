@@ -624,7 +624,7 @@ fn video_dialect(provider: &str) -> VideoDialect {
         "siliconflow" => VideoDialect::SiliconFlow,
         "alibaba" | "dashscope" => VideoDialect::DashScope,
         "minimax" => VideoDialect::Minimax,
-        "kling" | "klingai" => VideoDialect::Kling,
+        "kling" => VideoDialect::Kling,
         _ => VideoDialect::Generations,
     }
 }

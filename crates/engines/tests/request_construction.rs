@@ -991,6 +991,23 @@ async fn video_dialects_shape_the_submit_by_provider() {
         "url: {}",
         t.url()
     );
+
+    let mut req = typed_req(
+        Protocol::Video,
+        "kling-v1-6",
+        TypedParams::Video(VideoParams {
+            prompt: "a dog surfing".into(),
+            image: Some(serde_json::json!("https://img/dog.png")),
+            ..Default::default()
+        }),
+    );
+    req.account = Some(std::sync::Arc::new(Account {
+        name: "kling-1".into(),
+        provider: "kling".into(),
+        ..Default::default()
+    }));
+    let err = VideoEngine::new(req, t).run().await.unwrap_err();
+    assert_eq!(err.http_status, 400, "kling image-to-video is not wired");
 }
 
 #[tokio::test]

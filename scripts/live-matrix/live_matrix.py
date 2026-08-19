@@ -393,7 +393,7 @@ def _video_duration(j: dict[str, Any]) -> float:
     videos = ((j.get("data") or {}).get("task_result") or {}).get("videos") or []
     duration = (j.get("video") or {}).get("duration")
     if duration is None and videos:
-        duration = videos[0].get("duration")
+        duration = videos[0].get("duration") or len(videos)
     return float(duration or 0)
 
 
