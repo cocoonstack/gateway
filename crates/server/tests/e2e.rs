@@ -1772,47 +1772,30 @@ async fn sora_content_settles_once_without_a_prior_status_poll() {
 }
 
 #[tokio::test]
-async fn search_routes_brave_and_cse_and_bills_one_unit() {
-    // SAFETY: test-scoped var name; no concurrent reader outside this test
-    unsafe { std::env::set_var("GW_TEST_CSE_CX", "cx-e2e") };
+async fn search_routes_brave_and_bills_one_unit() {
     let app = app();
-    for (model, ptr) in [
-        ("brave-search", "/web/results"),
-        ("google-search", "/items"),
-    ] {
-        let resp = app
-            .clone()
-            .oneshot(post(
-                "/v1/search",
-                Some("ak-demo-123"),
-                &format!(r#"{{"model":"{model}","query":"api gateway","count":3}}"#),
-            ))
-            .await
-            .unwrap();
-        let status = resp.status();
-        let j = body_json(resp).await;
-        assert_eq!(status, StatusCode::OK, "{j}");
-        assert_eq!(
-            j.pointer(ptr).and_then(Value::as_array).map(Vec::len),
-            Some(3),
-            "{j}"
-        );
-        let j = body_json(
-            app.clone()
-                .oneshot(internal_get("/internal/ledger"))
-                .await
-                .unwrap(),
-        )
-        .await;
-        let row = j["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["served_model"] == model)
-            .unwrap();
-        assert_eq!(row["billed_units"], 1);
-        assert_eq!(row["cost_micros"], 5000);
-    }
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/search",
+            Some("ak-demo-123"),
+            r#"{"model":"brave-search","query":"api gateway","count":3}"#,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let j = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["web"]["results"].as_array().map(Vec::len), Some(3), "{j}");
+    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+    let row = j["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["served_model"] == "brave-search")
+        .unwrap();
+    assert_eq!(row["billed_units"], 1);
+    assert_eq!(row["cost_micros"], 5000);
 }
 
 #[tokio::test]

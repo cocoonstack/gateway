@@ -82,7 +82,9 @@ usage); the rest are marked non-streaming below and always answer buffered:
 
 `protocol: search` routes web search: a `brave` provider account speaks the
 Brave Search API (`X-Subscription-Token`, live-verified; one unit per query),
-anything else the generic mock shape. The factory also dispatches `video`,
+anything else the generic mock shape. Google's Custom Search JSON API is
+deliberately not wired — Google closed it to new customers (existing projects
+keep access until 2027-01-01), so no reachable configuration exists. The factory also dispatches `video`,
 generic `audio`, and `passthrough` protocols (kling-v1-6, grok-imagine-video,
 sora-2 and brave-search ship example accounts in the default config).
 `protocol: video`

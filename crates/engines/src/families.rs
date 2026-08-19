@@ -1043,27 +1043,6 @@ impl ModelEngine for SearchEngine {
                 let (status, v) = self.search_get(url, headers).await?;
                 (status, v, "/web/results")
             }
-            // Google CSE: the engine id (cx) rides secret_key_env, the key the query string
-            "google" | "cse" => {
-                let cx = self
-                    .base
-                    .request
-                    .account
-                    .as_ref()
-                    .and_then(|a| a.secret())
-                    .ok_or_else(|| {
-                        GatewayError::bad_request(
-                            "google search needs the engine id (cx) in secret_key_env",
-                        )
-                    })?;
-                let url = format!(
-                    "{}/customsearch/v1?key={}&cx={cx}&q={q}&num={count}",
-                    self.base.base_url(VENDOR_SENTINEL),
-                    self.base.api_key(),
-                );
-                let (status, v) = self.search_get(url, Vec::new()).await?;
-                (status, v, "/items")
-            }
             _ => {
                 let body = json!({"query": query, "count": count});
                 let (status, v) = self

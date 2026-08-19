@@ -464,7 +464,7 @@ def case_search(gw: Gateway, model: str) -> None:
         record(name, False, f"HTTP {st}: {txt[:200]}")
         return
     j = json.loads(txt)
-    results = (j.get("web") or {}).get("results") or j.get("items") or j.get("results") or []
+    results = (j.get("web") or {}).get("results") or j.get("results") or []
     count, row = gw.ledger()
     ok = (
         count == before + 1
@@ -994,7 +994,6 @@ def run_group(gw: Gateway, group: str) -> None:
         case_video(gw, "kling-v1-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed")
     elif group == "search":
         case_search(gw, "brave-search")
-        case_search(gw, "google-search")
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
     elif group == "ollama":
