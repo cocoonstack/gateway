@@ -247,6 +247,8 @@ fn weight_one() -> f64 {
 pub struct AccountConf {
     pub name: String,
     pub provider: String,
+    #[serde(skip)]
+    pub kind: String,
     #[serde(default = "default_priority")]
     pub priority: i32,
     /// "ptu" (provisioned throughput, preferred) or "paygo" (default).
@@ -800,6 +802,7 @@ impl GatewayConfig {
                 self.accounts.push(AccountConf {
                     name: p.name.clone(),
                     provider: p.name.clone(),
+                    kind: p.kind.clone(),
                     priority: 1,
                     tier: String::new(),
                     cost_input_price_per_1k_micros: 0,
@@ -816,6 +819,7 @@ impl GatewayConfig {
             }
             // an empty endpoint would answer from the mock transport with fabricated successes
             for a in self.accounts.iter_mut().filter(|a| a.provider == p.name) {
+                a.kind = p.kind.clone();
                 if a.endpoint.is_empty() {
                     a.endpoint = if p.endpoint.is_empty() {
                         preset.endpoint.to_owned()

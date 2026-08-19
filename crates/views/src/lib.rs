@@ -762,7 +762,7 @@ async fn realtime_bridge(
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
     let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
-    let gemini = gw_engines::realtime::is_gemini_realtime(&account.provider);
+    let gemini = gw_engines::realtime::is_gemini_realtime(account.wire_kind());
     // Gemini's Live socket is one bidi RPC authed by key; the model rides the setup frame
     let url = if gemini {
         format!(
@@ -825,6 +825,27 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 if let Some(mut frame) = frame {
+                    if gemini {
+                        // pin the entitled model: the socket carries no model, the setup frame does
+                        if let Some(setup) = frame.get_mut("setup").and_then(Value::as_object_mut) {
+                            setup.insert("model".into(), format!("models/{}", rtm.served).into());
+                            forward = UMsg::text(frame.to_string());
+                        }
+                        // audio-driven turns have no admission point yet: refuse loudly, keep the session
+                        if frame.get("realtimeInput").is_some() || frame.get("realtime_input").is_some() {
+                            if cl_tx
+                                .send(rt_error_frame(
+                                    ErrClass::Validation,
+                                    "realtimeInput is not wired; send clientContent turns",
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
                         Err(reason) => {
                             if cl_tx
@@ -846,7 +867,7 @@ async fn realtime_bridge(
                     // —
                     // upstream rejects the duplicate and a raced accept is caught by the
                     // response.created gate
-                    if is_client_turn(&account.provider, &frame) && pending.is_none() {
+                    if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
                                 pending = Some(RealtimeTurn::new(admit));
@@ -894,13 +915,13 @@ async fn realtime_bridge(
                     Some(mut v) => {
                         if suppress {
                             relay = false;
-                            if realtime_usage(&account.provider, &v).is_some() {
+                            if realtime_usage(account.wire_kind(), &v).is_some() {
                                 suppress = false;
                             }
                         }
                         // server-VAD auto-starts a turn with no client response.create — gate it
                         // like a manual one
-                        else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
+                        else if realtime_turn_started(account.wire_kind(), &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
                                 Err((class, denied)) => {
@@ -912,7 +933,7 @@ async fn realtime_bridge(
                                     relay = false;
                                 }
                             }
-                        } else if let Some((it, ot)) = realtime_usage(&account.provider, &v) {
+                        } else if let Some((it, ot)) = realtime_usage(account.wire_kind(), &v) {
                             // turn boundary: settle the admitted turn; one with no gated turn bills
                             // unreserved
                             match pending.take() {
@@ -925,7 +946,7 @@ async fn realtime_bridge(
                                         gw_models::TokenInput {
                                             prompt: it,
                                             completion: ot,
-                                            ..turn_audio(&account.provider, &v)
+                                            ..turn_audio(account.wire_kind(), &v)
                                         },
                                         false,
                                     )
@@ -961,7 +982,7 @@ async fn realtime_bridge(
                                         gw_models::TokenInput {
                                             prompt: it,
                                             completion: ot,
-                                            ..turn_audio(&account.provider, &v)
+                                            ..turn_audio(account.wire_kind(), &v)
                                         },
                                         false,
                                     )

@@ -827,7 +827,7 @@ pub async fn video_poll(
     id: &str,
 ) -> GResult<VideoPoll> {
     let base = account.base_url(VENDOR_SENTINEL);
-    let dialect = video_dialect(&account.provider);
+    let dialect = video_dialect(account.wire_kind());
     let (method, url, req_body) = match dialect {
         VideoDialect::SiliconFlow => (
             "POST",
@@ -915,7 +915,7 @@ pub async fn video_content(
     poll: &Value,
 ) -> GResult<(u16, String, bytes::Bytes)> {
     let base = account.base_url(VENDOR_SENTINEL);
-    let request = match video_dialect(&account.provider) {
+    let request = match video_dialect(account.wire_kind()) {
         VideoDialect::Sora => video_request(
             account,
             "GET",

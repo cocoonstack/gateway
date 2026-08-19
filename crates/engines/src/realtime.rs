@@ -88,6 +88,19 @@ pub fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
 /// Text and opaque payload units carried by one OpenAI-dialect output-delta
 /// frame. Opaque units count base64 quanta.
 pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
+    // Gemini Live: delivered output rides serverContent.modelTurn parts
+    if let Some(parts) = frame["serverContent"]["modelTurn"]["parts"].as_array() {
+        let opaque = parts
+            .iter()
+            .map(|p| {
+                p["inlineData"]["data"]
+                    .as_str()
+                    .map_or(0, |d| d.len().div_ceil(4))
+                    + p["text"].as_str().map_or(0, |t| t.len().div_ceil(4))
+            })
+            .sum();
+        return (None, opaque);
+    }
     let frame_type = frame["type"].as_str().unwrap_or_default();
     let Some(delta) = frame["delta"].as_str() else {
         return (None, 0);
@@ -342,6 +355,10 @@ mod tests {
         let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34,
             "input_token_details":{"text_tokens":2,"audio_tokens":10},
             "output_token_details":{"text_tokens":4,"audio_tokens":30}}}});
+        let gem_out = json!({"serverContent": {"modelTurn": {"parts": [
+            {"text": "pong"}, {"inlineData": {"mimeType": "audio/pcm", "data": "AAAAAAAAAAAA"}}
+        ]}}});
+        assert_eq!(realtime_output_delta(&gem_out), (None, 4));
         assert!(is_client_turn(
             "openai",
             &json!({"type": "response.create"})
