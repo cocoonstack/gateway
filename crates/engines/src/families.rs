@@ -1040,7 +1040,21 @@ impl ModelEngine for SearchEngine {
                     ("accept", "application/json".into()),
                     ("x-subscription-token", self.base.api_key()),
                 ];
-                let (status, v) = self.search_get(url, headers).await?;
+                let reply = self
+                    .base
+                    .transport
+                    .send(UpstreamRequest {
+                        protocol: gw_consts::Protocol::Search,
+                        method: "GET",
+                        url,
+                        headers,
+                        body: Vec::new(),
+                        stream: false,
+                        account: self.base.account(),
+                        replay_account: self.base.replay_account(),
+                    })
+                    .await?;
+                let (status, v) = parse_json_reply(reply)?;
                 (status, v, "/web/results")
             }
             _ => {
@@ -1064,26 +1078,6 @@ impl ModelEngine for SearchEngine {
         let mut out = family_outcome(titles.join("; "), &param.model_name, v, status);
         out.response.billed_units = 1;
         Ok(out)
-    }
-}
-
-impl SearchEngine {
-    async fn search_get(&self, url: String, headers: Headers) -> GResult<(u16, Value)> {
-        let reply = self
-            .base
-            .transport
-            .send(UpstreamRequest {
-                protocol: gw_consts::Protocol::Search,
-                method: "GET",
-                url,
-                headers,
-                body: Vec::new(),
-                stream: false,
-                account: self.base.account(),
-                replay_account: self.base.replay_account(),
-            })
-            .await?;
-        parse_json_reply(reply)
     }
 }
 
@@ -2153,6 +2147,43 @@ mod tests {
                 headers: Default::default(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn kling_envelope_errors_surface_as_502() {
+        let account = Arc::new(gw_models::Account {
+            name: "kling-1".into(),
+            provider: "kling".into(),
+            endpoint: "https://api-singapore.klingai.com".into(),
+            ..Default::default()
+        });
+        let transport = Arc::new(BytesReply(
+            br#"{"code":1102,"message":"Account balance not enough","request_id":"trace"}"#,
+        ));
+        let mut request = req(
+            Protocol::Video,
+            "kling-v1-6",
+            Some(TypedParams::Video(VideoParams {
+                prompt: "a paper boat".into(),
+                ..Default::default()
+            })),
+        );
+        request.account = Some(Arc::clone(&account));
+        let submit = VideoEngine::new(request, transport.clone())
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(submit.http_status, 502);
+        assert!(
+            submit.message.contains("kling code 1102"),
+            "{}",
+            submit.message
+        );
+        let poll = match video_poll(transport.as_ref(), &account, "task-1").await {
+            Ok(_) => panic!("kling envelope error accepted as a successful poll"),
+            Err(e) => e,
+        };
+        assert_eq!(poll.http_status, 502);
     }
 
     #[tokio::test]

@@ -1463,7 +1463,21 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["video_url"], "mock://videos/out.mp4");
+    let sync = body_json(resp).await;
+    assert_eq!(sync["video_url"], "mock://videos/out.mp4");
+    let resp = app
+        .clone()
+        .oneshot(get_authed(&format!(
+            "/v1/videos/{}",
+            sync["task_id"].as_str().unwrap()
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a delivered sync reply must not register its task_id as an async job"
+    );
 
     let mut ids = Vec::new();
     for prompt in [
@@ -2821,8 +2835,6 @@ models:
         .unwrap();
     req.headers_mut()
         .insert("authorization", "Bearer ak-rt".parse().unwrap());
-    // the dialect is governable (clientContent.turnComplete admits a turn), so
-    // the upgrade proceeds; the dead upstream then surfaces as an error frame
     let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
     assert_eq!(resp.status().as_u16(), 101);
     use futures::StreamExt;

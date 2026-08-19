@@ -4005,12 +4005,19 @@ async fn videos_generations(
 }
 
 /// The shared head of both video read routes: spend the caller's rate limits,
-/// load the job under its tenant gate.
+/// load the job under its tenant gate, poll the vendor and settle a first done.
 async fn admit_video_job(
     s: &AppState,
     ak: &AkInfo,
     id: &str,
-) -> Result<(Arc<GatewayState>, VideoJob), Response> {
+) -> Result<
+    (
+        VideoJob,
+        Arc<gw_models::Account>,
+        gw_engines::families::VideoPoll,
+    ),
+    Response,
+> {
     let state = s.handler.state();
     let cfg = s.handler.cfg();
     let gov = state.governance.as_ref();
@@ -4024,7 +4031,14 @@ async fn admit_video_job(
     }
     let found = state.store.video_job_get(id).await;
     let job = tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", id)?;
-    Ok((state, job))
+    let Some(account) = state.pool.named(&job.account) else {
+        return Err(error_response(
+            503,
+            format!("account {} is no longer configured", job.account),
+        ));
+    };
+    let poll = poll_and_settle_video(s, &job, &account).await?;
+    Ok((job, account, poll))
 }
 
 async fn poll_and_settle_video(
@@ -4092,25 +4106,14 @@ async fn videos_get(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let (state, job) = match admit_video_job(&s, &ak, &id).await {
-        Ok(admitted) => admitted,
-        Err(resp) => return resp,
-    };
-    let Some(account) = state.pool.named(&job.account) else {
-        return error_response(
-            503,
-            format!("account {} is no longer configured", job.account),
-        );
-    };
-    let poll = match poll_and_settle_video(&s, &job, &account).await {
-        Ok(poll) => poll,
-        Err(resp) => return resp,
-    };
-    (
-        StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
-        Json(poll.body),
-    )
-        .into_response()
+    match admit_video_job(&s, &ak, &id).await {
+        Ok((_, _, poll)) => (
+            StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
+            Json(poll.body),
+        )
+            .into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// GET /v1/videos/{id}/content — the finished clip's bytes, proxied for vendors
@@ -4120,18 +4123,8 @@ async fn videos_content(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let (state, job) = match admit_video_job(&s, &ak, &id).await {
+    let (job, account, poll) = match admit_video_job(&s, &ak, &id).await {
         Ok(admitted) => admitted,
-        Err(resp) => return resp,
-    };
-    let Some(account) = state.pool.named(&job.account) else {
-        return error_response(
-            503,
-            format!("account {} is no longer configured", job.account),
-        );
-    };
-    let poll = match poll_and_settle_video(&s, &job, &account).await {
-        Ok(poll) => poll,
         Err(resp) => return resp,
     };
     if !poll.done {

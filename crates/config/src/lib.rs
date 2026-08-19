@@ -1362,6 +1362,15 @@ models:
     }
 
     #[test]
+    fn provider_specific_wires_must_pin_a_provider() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: v, protocol: video}]\naccounts: [{name: a, provider: p, protocols: ['video']}]";
+        assert!(matches!(
+            GatewayConfig::from_yaml(yaml),
+            Err(ConfigError::VideoModelNeedsProvider { model }) if model == "v"
+        ));
+    }
+
+    #[test]
     fn provider_presets_expand_to_accounts_and_model_defaults() {
         let cfg = GatewayConfig::from_yaml(PROVIDER_YAML).unwrap();
         assert_eq!(
