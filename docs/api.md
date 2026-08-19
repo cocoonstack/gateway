@@ -153,8 +153,10 @@ an async handle (`{request_id}`), the gateway remembers which key, model and
 account it belongs to; `GET /v1/videos/{id}` spends the polling key's rate
 limits like any request, then proxies the vendor's poll on that account (`404`
 for an unknown id or another tenant's). The first poll that sees `status: done`
-bills the submitting key `video.duration` seconds (rounded up) at the model's
-`unit_price_micros`, taking the vendor cost from `usage.cost_in_usd_ticks`
+bills the submitting key `video.duration` seconds (rounded up) at the
+`unit_price_micros` quoted when it submitted (a reprice or removal of the model
+while the clip renders does not change it), taking the vendor cost from
+`usage.cost_in_usd_ticks`
 (1 tick = 10⁻¹⁰ USD) when present; that ledger row's `request_id` is the video
 id. Later polls of the same id return the vendor's answer without billing
 again; `failed` and `expired` jobs bill nothing beyond the submit row. Jobs are

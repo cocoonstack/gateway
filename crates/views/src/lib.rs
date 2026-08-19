@@ -548,6 +548,7 @@ async fn bill_realtime_turn(
                 ptu_spillover: false,
                 estimated,
                 vendor_cost: None,
+                unit_price: None,
             },
             reserved: admit.reserved,
             tpm_reserved: admit.tpm_reserved,
@@ -3948,6 +3949,7 @@ async fn videos_generations(
                 .to_owned(),
             served_model: served.to_owned(),
             account: ctx.request.account_name().to_owned(),
+            unit_price_micros: ctx.cfg.unit_price_for_tenant(&ctx.ak.tenant, served),
             created_at_epoch_secs: gw_state::epoch_secs(),
         };
         if let Err(e) = s.handler.state().store.video_job_put(job).await {
@@ -4035,6 +4037,7 @@ async fn videos_get(
                     ptu_spillover: false,
                     estimated: false,
                     vendor_cost,
+                    unit_price: Some(job.unit_price_micros),
                 },
                 reserved: 0,
                 tpm_reserved: None,

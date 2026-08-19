@@ -63,7 +63,8 @@ seconds — at the model's `unit_price_micros` (see
 [Configuration](configuration.md)); the unit count rides on the ledger row and
 the usage aggregates as `billed_units`. An async video bills when its poll first
 sees `done`: the submit row carries 0 units, the completion row (its
-`request_id` is the video id) the clip's seconds and, when the vendor reports
+`request_id` is the video id) the clip's seconds at the price quoted at submit
+and, when the vendor reports
 one (xAI's `cost_in_usd_ticks`), the exact vendor cost instead of the account's
 unit price. Audio
 tokens and 1-hour cache writes take their own `token_rate` weights, a

@@ -1449,7 +1449,10 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
 
 #[tokio::test]
 async fn async_video_bills_once_on_the_first_done_poll() {
-    let app = app();
+    let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let st = gw_views::AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+    let app = gw_views::app(st.clone());
     let resp = app
         .clone()
         .oneshot(post(
@@ -1463,7 +1466,13 @@ async fn async_video_bills_once_on_the_first_done_poll() {
     assert_eq!(body_json(resp).await["video_url"], "mock://videos/out.mp4");
 
     let mut ids = Vec::new();
-    for prompt in ["a cat on a skateboard", "pending clip", "failed clip"] {
+    for prompt in [
+        "a cat on a skateboard",
+        "pending clip",
+        "failed clip",
+        "quoted before a reprice",
+        "quoted before the model went",
+    ] {
         let resp = app
             .clone()
             .oneshot(post(
@@ -1543,6 +1552,23 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         StatusCode::TOO_MANY_REQUESTS,
         "the poll spends the key's qps like any request"
     );
+    let video_model = "  - name: grok-imagine-video # async video: request_id + poll, billed per second on done\n    protocol: video\n    provider: xai\n    unit_price_micros: 100000\n";
+    assert!(gw_config::DEFAULT_YAML.contains(video_model));
+    for (yaml, id) in [
+        (
+            gw_config::DEFAULT_YAML.replace("unit_price_micros: 100000", "unit_price_micros: 5"),
+            &ids[3],
+        ),
+        (gw_config::DEFAULT_YAML.replace(video_model, ""), &ids[4]),
+    ] {
+        st.handler
+            .reload(GatewayConfig::from_yaml(&yaml).unwrap())
+            .await
+            .unwrap();
+        let (status, j) = poll(id.clone(), "ak-demo-123").await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        assert_eq!(j["status"], "done");
+    }
 
     let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
     let rows: Vec<&Value> = j["records"]
@@ -1553,21 +1579,25 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         .collect();
     assert_eq!(
         rows.len(),
-        6,
-        "one sync + four submits + one settle: {rows:?}"
+        10,
+        "one sync + six submits + three settles: {rows:?}"
     );
     let settled: Vec<&&Value> = rows
         .iter()
         .filter(|r| r["billed_units"].as_i64().unwrap() > 0)
         .collect();
-    assert_eq!(settled.len(), 1, "billed exactly once: {rows:?}");
-    let s = settled[0];
-    assert_eq!(s["model"], "grok-imagine-video");
-    assert_eq!(s["ak"], "ak-demo-123");
-    assert_eq!(s["billed_units"], 2);
-    assert_eq!(s["cost_micros"], 200_000, "2 s at 100000 micros/s");
-    assert_eq!(s["vendor_cost_micros"], 160_000, "1_600_000_000 ticks");
-    assert_eq!(s["estimated"], false);
+    assert_eq!(settled.len(), 3, "each done job billed once: {rows:?}");
+    for s in settled {
+        assert_eq!(s["model"], "grok-imagine-video");
+        assert_eq!(s["ak"], "ak-demo-123");
+        assert_eq!(s["billed_units"], 2);
+        assert_eq!(
+            s["cost_micros"], 200_000,
+            "2 s at the quoted 100000 micros/s: {s}"
+        );
+        assert_eq!(s["vendor_cost_micros"], 160_000, "1_600_000_000 ticks");
+        assert_eq!(s["estimated"], false);
+    }
 }
 
 #[tokio::test]

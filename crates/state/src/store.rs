@@ -180,6 +180,8 @@ pub struct VideoJob {
     pub model: String,
     pub served_model: String,
     pub account: String,
+    /// Unit price at submit; a deferred settle bills what was quoted.
+    pub unit_price_micros: i64,
     pub created_at_epoch_secs: i64,
 }
 
@@ -214,6 +216,8 @@ pub struct BillingInput<'a> {
     pub estimated: bool,
     /// Vendor-reported cost in micros, overriding the account's price list.
     pub vendor_cost: Option<i64>,
+    /// Unit price quoted at submit for a deferred settle; `None` = the current price list.
+    pub unit_price: Option<i64>,
 }
 
 /// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
@@ -256,7 +260,10 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
     let units = clamp_tokens(b.units);
-    let unit_cost = units.saturating_mul(cfg.unit_price_for_tenant(b.tenant, b.served_model));
+    let unit_price = b
+        .unit_price
+        .unwrap_or_else(|| cfg.unit_price_for_tenant(b.tenant, b.served_model));
+    let unit_cost = units.saturating_mul(unit_price);
     let discounted = |cost: i64| {
         if b.discount == 1.0 {
             cost
@@ -1258,7 +1265,8 @@ row_mapper!(admin_audit_row -> AdminAudit {
 });
 
 row_mapper!(video_job_row -> VideoJob {
-    id, tenant, ak, product, user_id, model, served_model, account, created_at_epoch_secs,
+    id, tenant, ak, product, user_id, model, served_model, account, unit_price_micros,
+    created_at_epoch_secs,
 });
 row_mapper!(content_row -> crate::ContentRecord {
     created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
@@ -1344,7 +1352,8 @@ impl SqliteStore {
                 id TEXT PRIMARY KEY, tenant TEXT NOT NULL, ak TEXT NOT NULL,
                 product TEXT NOT NULL, user_id TEXT NOT NULL, model TEXT NOT NULL,
                 served_model TEXT NOT NULL, account TEXT NOT NULL,
-                created_at_epoch_secs INTEGER NOT NULL, billed INTEGER NOT NULL DEFAULT 0)",
+                unit_price_micros INTEGER NOT NULL, created_at_epoch_secs INTEGER NOT NULL,
+                billed INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -1693,8 +1702,8 @@ macro_rules! sql_store_impl {
                 sqlx::query(dialect_sql!(
                     $dialect,
                     "INSERT INTO video_jobs (id, tenant, ak, product, user_id, model, served_model,
-                     account, created_at_epoch_secs)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                     account, unit_price_micros, created_at_epoch_secs)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ))
                 .bind(&job.id)
                 .bind(&job.tenant)
@@ -1704,6 +1713,7 @@ macro_rules! sql_store_impl {
                 .bind(&job.model)
                 .bind(&job.served_model)
                 .bind(&job.account)
+                .bind(job.unit_price_micros)
                 .bind(job.created_at_epoch_secs)
                 .execute(&self.pool)
                 .await
@@ -1715,7 +1725,7 @@ macro_rules! sql_store_impl {
                 let row = sqlx::query(dialect_sql!(
                     $dialect,
                     "SELECT id, tenant, ak, product, user_id, model, served_model, account,
-                     created_at_epoch_secs
+                     unit_price_micros, created_at_epoch_secs
                      FROM video_jobs WHERE id = ?"
                 ))
                 .bind(id)
@@ -2236,7 +2246,8 @@ impl PostgresStore {
                 id TEXT PRIMARY KEY, tenant TEXT NOT NULL, ak TEXT NOT NULL,
                 product TEXT NOT NULL, user_id TEXT NOT NULL, model TEXT NOT NULL,
                 served_model TEXT NOT NULL, account TEXT NOT NULL,
-                created_at_epoch_secs BIGINT NOT NULL, billed INTEGER NOT NULL DEFAULT 0)",
+                unit_price_micros BIGINT NOT NULL, created_at_epoch_secs BIGINT NOT NULL,
+                billed INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -2944,6 +2955,7 @@ mod tests {
                 ptu_spillover: false,
                 estimated: false,
                 vendor_cost: None,
+                unit_price: None,
             },
         );
         assert_eq!(rec.prompt_tokens, 1140);
@@ -2989,6 +3001,7 @@ mod tests {
             ptu_spillover: false,
             estimated: false,
             vendor_cost: None,
+            unit_price: None,
         };
         let rec = billing_record(&cfg, &input("default"));
         assert_eq!(
@@ -3024,6 +3037,7 @@ mod tests {
                 ptu_spillover: false,
                 estimated: false,
                 vendor_cost: None,
+                unit_price: None,
             },
         );
         assert_eq!(rec.prompt_tokens, MAX_METERED_TOKENS);
@@ -3144,6 +3158,7 @@ mod tests {
             model: "grok-imagine-video".into(),
             served_model: "grok-imagine-video".into(),
             account: "xai".into(),
+            unit_price_micros: 100_000,
             created_at_epoch_secs: 1_000,
         };
         store.video_job_put(job.clone()).await.unwrap();
