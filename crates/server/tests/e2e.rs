@@ -2795,7 +2795,7 @@ models:
 }
 
 #[tokio::test]
-async fn realtime_refuses_ungovernable_provider() {
+async fn realtime_upgrades_the_gemini_dialect_and_gates_on_the_client_turn() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let yaml = r#"
@@ -2821,10 +2821,18 @@ models:
         .unwrap();
     req.headers_mut()
         .insert("authorization", "Bearer ak-rt".parse().unwrap());
-    assert!(
-        tokio_tungstenite::connect_async(req).await.is_err(),
-        "realtime must refuse a provider it cannot gate before generation"
-    );
+    // the dialect is governable (clientContent.turnComplete admits a turn), so
+    // the upgrade proceeds; the dead upstream then surfaces as an error frame
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 101);
+    use futures::StreamExt;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "error", "{v}");
 }
 
 #[tokio::test]

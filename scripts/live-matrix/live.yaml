@@ -87,6 +87,14 @@ models:
   # local ollama through the generic openai-compatible path
   - {name: "qwen2.5:0.5b", provider: ollama, input_price_per_1k_micros: 100, output_price_per_1k_micros: 100}
   - {name: grok-voice-latest, provider: xai, protocol: realtime, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 4000}
+  # moderations + audio unit pricing (openai)
+  - {name: omni-moderation-latest, provider: openai, protocol: moderations}
+  - {name: gpt-4o-mini-tts, provider: openai, protocol: tts, unit_price_micros: 20}
+  - {name: whisper-1, provider: openai, protocol: stt, unit_price_micros: 100}
+  # dashscope legacy native wire
+  - {name: qwen-turbo, provider: dashscope-native, protocol: dashscope, input_price_per_1k_micros: 50, output_price_per_1k_micros: 200}
+  # gemini live (realtime bridge, gemini dialect)
+  - {name: gemini-3.1-flash-live-preview, provider: gemini, protocol: realtime, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500}
   # web search
   - {name: brave-search, provider: brave, protocol: search, unit_price_micros: 5000}
   # rerank vendors
@@ -100,6 +108,11 @@ models:
   - {name: "us.meta.llama3-1-8b-instruct-v1:0", protocol: aws-llama, input_price_per_1k_micros: 220, output_price_per_1k_micros: 220}
 
 accounts:
+  - name: dashscope-native
+    provider: dashscope-native
+    endpoint: https://dashscope-intl.aliyuncs.com
+    api_key_env: DASHSCOPE_API_KEY
+    protocols: ["dashscope"]
   - name: kling
     provider: kling
     endpoint: https://api-singapore.klingai.com

@@ -651,7 +651,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "gemini" => ProviderPreset {
             endpoint: "https://generativelanguage.googleapis.com",
-            wires: &["gemini"],
+            wires: &["gemini", "realtime"],
             default_model_wire: "gemini",
         },
         // OpenAI-protocol vendors: same wire shape, different base URL.

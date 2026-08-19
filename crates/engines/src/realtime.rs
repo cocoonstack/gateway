@@ -9,6 +9,16 @@ pub fn is_response_create(frame: &Value) -> bool {
     frame["type"] == "response.create"
 }
 
+/// The client frame that starts a generation — the admission point. OpenAI
+/// signals it as `response.create`, Gemini Live as a completed client turn.
+pub fn is_client_turn(provider: &str, frame: &Value) -> bool {
+    if is_gemini_realtime(provider) {
+        return frame["clientContent"]["turnComplete"] == Value::Bool(true)
+            || frame["client_content"]["turn_complete"] == Value::Bool(true);
+    }
+    is_response_create(frame)
+}
+
 /// String values that never carry human text (base64 media, protocol ids);
 /// everything else is scanned, fail closed, and config objects still recurse.
 fn skip_scalar(k: &str, text_delta: bool) -> bool {
@@ -332,6 +342,27 @@ mod tests {
         let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34,
             "input_token_details":{"text_tokens":2,"audio_tokens":10},
             "output_token_details":{"text_tokens":4,"audio_tokens":30}}}});
+        assert!(is_client_turn(
+            "openai",
+            &json!({"type": "response.create"})
+        ));
+        assert!(!is_client_turn(
+            "openai",
+            &json!({"clientContent": {"turnComplete": true}})
+        ));
+        assert!(is_client_turn(
+            "gemini",
+            &json!({"clientContent": {"turnComplete": true}})
+        ));
+        assert!(is_client_turn(
+            "google",
+            &json!({"client_content": {"turn_complete": true}})
+        ));
+        assert!(!is_client_turn(
+            "gemini",
+            &json!({"clientContent": {"turnComplete": false}})
+        ));
+        assert!(!is_client_turn("gemini", &json!({"setup": {"model": "m"}})));
         assert_eq!(realtime_usage("openai", &done), Some((12, 34)));
         assert_eq!(realtime_usage("azure", &done), Some((12, 34)));
         assert_eq!(realtime_audio_tokens("openai", &done), (10, 30));

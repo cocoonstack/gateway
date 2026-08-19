@@ -22,7 +22,7 @@ use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{
-    is_response_create, realtime_audio_tokens, realtime_output_delta, realtime_turn_started,
+    is_client_turn, realtime_audio_tokens, realtime_output_delta, realtime_turn_started,
     realtime_usage,
 };
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
@@ -338,15 +338,6 @@ async fn realtime_ws(
         ws.on_upgrade(move |socket| {
             realtime_session(socket, s, ak, m, mt, account.name.clone(), hint)
         })
-    } else if gw_engines::realtime::is_gemini_realtime(&account.provider) {
-        // no pre-generation gate signal in this dialect — refuse rather than bill after the fact
-        error_response(
-            501,
-            format!(
-                "realtime is not supported for provider `{}`",
-                account.provider
-            ),
-        )
     } else {
         ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, m, mt, account, hint))
     }
@@ -770,7 +761,16 @@ async fn realtime_bridge(
     let ws_base = base
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    let url = format!("{ws_base}/v1/realtime?model={}", rtm.served);
+    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
+    let gemini = gw_engines::realtime::is_gemini_realtime(&account.provider);
+    // Gemini's Live socket is one bidi RPC authed by key; the model rides the setup frame
+    let url = if gemini {
+        format!(
+            "{ws_base}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={key}"
+        )
+    } else {
+        format!("{ws_base}/v1/realtime?model={}", rtm.served)
+    };
     let mut req = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => {
@@ -784,8 +784,7 @@ async fn realtime_bridge(
             return;
         }
     };
-    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
-    if let Ok(v) = format!("Bearer {key}").parse() {
+    if !gemini && let Ok(v) = format!("Bearer {key}").parse() {
         req.headers_mut().insert("authorization", v);
     }
     let upstream = match tokio_tungstenite::connect_async(req).await {
@@ -847,7 +846,7 @@ async fn realtime_bridge(
                     // —
                     // upstream rejects the duplicate and a raced accept is caught by the
                     // response.created gate
-                    if is_response_create(&frame) && pending.is_none() {
+                    if is_client_turn(&account.provider, &frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
                                 pending = Some(RealtimeTurn::new(admit));
