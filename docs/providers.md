@@ -76,7 +76,7 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
 | `aws-anthropic` | Anthropic Claude on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`anthropic.claude-…`, `us.anthropic.claude-…`); the full Messages engine (system, tools, thinking dialects by generation, prompt-cache breakpoints, signed reasoning) on the InvokeModel wire — `anthropic_version` in the body, model and streaming in the path; streams via InvokeModelWithResponseStream (EventStream frames decoded into the same event sequence) |
 | `aws-converse` | any model on AWS Bedrock via the Converse API | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API key (see below); model name = the Bedrock model id or inference profile (`eu.amazon.nova-micro-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `mistral.pixtral-large-2502-v1:0`, `anthropic.claude-…`); the Messages engine transcoded to Converse — system, tools + tool results, images, thinking replay, prompt-cache points — and back (buffered and `converse-stream`); Claude reasoning knobs ride in `additionalModelRequestFields`, other passthrough extras too |
-| `aws-cohere` | Cohere Command on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id; Command R (`{message, chat_history, preamble}` → `text`) and the legacy Command `generations[]` shape; usage from Bedrock's `x-amzn-bedrock-*-token-count` headers, or `amazon-bedrock-invocationMetrics` on a stream |
+| `aws-embed` | Titan / Cohere embeddings on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API-key Bearer (see below); model name = the Bedrock model id; Titan `{inputText}` → `{embedding, inputTextTokenCount}` takes exactly one input per call (a batch is refused with 400; `dimensions` forwarded when the client sends it), Cohere `{texts, input_type: search_document}` → `{embeddings}` in one call; answered in the OpenAI `/v1/embeddings` list shape, usage from Bedrock's `x-amzn-bedrock-*-token-count` headers |
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id or inference profile (`meta.llama3-8b-instruct-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.meta.llama4-scout-17b-instruct-v1:0`); the conversation is rendered into the Llama 3 (or Llama 4) chat template; usage from the token-count headers / invocation metrics, else the body counts |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
@@ -148,10 +148,10 @@ the native `/v1/messages` stream); the SigV4 path is verified up to an
 accepted signature. Vendor limits seen on that wire: Bedrock's Llama answers
 a tool request as JSON text rather than a `toolUse` block, Qwen rejects
 `stopSequences`, non-Claude models reject `strict` (the gateway forwards it
-only to Claude). Cohere Command R on Bedrock is verified against the
-[ministack](https://github.com/ministackorg/ministack) emulator's
-family-faithful InvokeModel replies, EventStream framing and token-count
-headers only — AWS marks Command R / R+ legacy and gates them per account.
+only to Claude). Cohere Command on Bedrock is not carried: AWS answered live
+probes with end-of-life for the legacy Command models and legacy-gates
+Command R per account, so the former `aws-cohere` chat protocol was removed.
+Titan v2 and Cohere v3 embeddings are live-verified through `aws-embed`.
 
 `GW_TRANSPORT` overrides transport routing: unset (or any value other than
 `mock`/`http`) routes `mock://` sentinel URLs in-process and real URLs over
@@ -191,7 +191,7 @@ console session it was minted in.
 accounts:
   - {name: bedrock, provider: aws, endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
      api_key_env: AWS_ACCESS_KEY_ID, secret_key_env: AWS_SECRET_ACCESS_KEY,
-     protocols: ["aws-anthropic", "aws-llama", "aws-cohere"]}
+     protocols: ["aws-anthropic", "aws-llama", "aws-embed"]}
   - {name: bedrock-eu, provider: aws, endpoint: "https://bedrock-runtime.eu-north-1.amazonaws.com",
      api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse"]}
 models:

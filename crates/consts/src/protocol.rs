@@ -45,8 +45,8 @@ pub enum Protocol {
     AwsAnthropic,
     /// Any Bedrock model through the Converse API (Messages engine, transcoded)
     AwsConverse,
-    /// Cohere Command on AWS Bedrock (SigV4)
-    AwsCohere,
+    /// Titan/Cohere embeddings on AWS Bedrock (InvokeModel)
+    AwsEmbed,
     /// Llama on AWS Bedrock (SigV4)
     AwsLlama,
     /// Alibaba DashScope native (input.messages/parameters/output.choices)
@@ -77,7 +77,7 @@ impl Protocol {
         Protocol::MinimaxV1,
         Protocol::AwsAnthropic,
         Protocol::AwsConverse,
-        Protocol::AwsCohere,
+        Protocol::AwsEmbed,
         Protocol::AwsLlama,
         Protocol::Dashscope,
         Protocol::Moderations,
@@ -104,7 +104,7 @@ impl Protocol {
             Protocol::MinimaxV1 => "minimax-v1",
             Protocol::AwsAnthropic => "aws-anthropic",
             Protocol::AwsConverse => "aws-converse",
-            Protocol::AwsCohere => "aws-cohere",
+            Protocol::AwsEmbed => "aws-embed",
             Protocol::AwsLlama => "aws-llama",
             Protocol::Dashscope => "dashscope",
             Protocol::Moderations => "moderations",

@@ -104,6 +104,9 @@ models:
   - {name: "us.anthropic.claude-haiku-4-5-20251001-v1:0", protocol: aws-anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
   - {name: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", protocol: aws-converse, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}, prompt_cache: true}
   - {name: "us.amazon.nova-lite-v1:0", protocol: aws-converse, input_price_per_1k_micros: 60, output_price_per_1k_micros: 240}
+  - {name: "mistral.mistral-large-2402-v1:0", protocol: aws-converse, input_price_per_1k_micros: 4000, output_price_per_1k_micros: 12000}
+  - {name: "amazon.titan-embed-text-v2:0", protocol: aws-embed, input_price_per_1k_micros: 20, output_price_per_1k_micros: 0}
+  - {name: "cohere.embed-english-v3", protocol: aws-embed, input_price_per_1k_micros: 100, output_price_per_1k_micros: 0}
   - {name: "us.deepseek.r1-v1:0", protocol: aws-converse, input_price_per_1k_micros: 1350, output_price_per_1k_micros: 5400}
   - {name: "us.meta.llama3-1-8b-instruct-v1:0", protocol: aws-llama, input_price_per_1k_micros: 220, output_price_per_1k_micros: 220}
 
@@ -125,7 +128,7 @@ accounts:
     protocols: ["search"]
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
-  - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama"], timeout_seconds: 120}
+  - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama", "aws-embed"], timeout_seconds: 120}
 
 security:
   dlp_redact: false

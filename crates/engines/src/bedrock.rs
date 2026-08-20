@@ -208,22 +208,29 @@ pub(crate) async fn bedrock_invoke(
     Ok((status, v, headers))
 }
 
+/// Billed input tokens, `fallback` when the header is absent — an embed reply
+/// carries the input header alone, so the pairwise form never matches it.
+pub(crate) fn bedrock_input_tokens(headers: &HeaderMap, fallback: i64) -> i64 {
+    token_header(headers, "x-amzn-bedrock-input-token-count").unwrap_or(fallback)
+}
+
 /// Bedrock stamps every InvokeModel reply with the billed counts while only some
 /// family bodies carry them, so the headers win when present.
 pub(crate) fn bedrock_header_usage(headers: &HeaderMap, body: (i64, i64)) -> (i64, i64) {
-    let count = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-    };
     match (
-        count("x-amzn-bedrock-input-token-count"),
-        count("x-amzn-bedrock-output-token-count"),
+        token_header(headers, "x-amzn-bedrock-input-token-count"),
+        token_header(headers, "x-amzn-bedrock-output-token-count"),
     ) {
         (Some(input), Some(output)) => (input, output),
         _ => body,
     }
+}
+
+fn token_header(headers: &HeaderMap, name: &str) -> Option<i64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
 }
 
 #[cfg(test)]

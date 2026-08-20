@@ -333,10 +333,11 @@ def case_messages(
         record(name + " [thinking present]", thinking_blocks > 0, note)
 
 
-def case_embeddings(gw: Gateway, model: str) -> None:
+def case_embeddings(gw: Gateway, model: str, inputs: list[str] | None = None) -> None:
+    """Titan takes exactly one input per invoke; every other embedder batches."""
     name = f"{model} embeddings"
     before, _ = gw.ledger()
-    st, txt = gw.call("/v1/embeddings", {"model": model, "input": ["gateway live test", "second input"]})
+    st, txt = gw.call("/v1/embeddings", {"model": model, "input": inputs or ["gateway live test", "second input"]})
     if st != 200:
         record(name, False, f"HTTP {st}: {txt[:200]}")
         return
@@ -1157,6 +1158,10 @@ def run_group(gw: Gateway, group: str) -> None:
         case_thinking_replay(gw, sonnet, native=True)
         case_chat(gw, "us.amazon.nova-lite-v1:0", "converse chat")
         case_chat(gw, "us.amazon.nova-lite-v1:0", "converse chat", stream=True)
+        case_chat(gw, "mistral.mistral-large-2402-v1:0", "converse chat")
+        case_chat(gw, "mistral.mistral-large-2402-v1:0", "converse chat", stream=True)
+        case_embeddings(gw, "amazon.titan-embed-text-v2:0", ["gateway live test"])
+        case_embeddings(gw, "cohere.embed-english-v3")
         case_chat(gw, "us.deepseek.r1-v1:0", "converse reasoning", prompt=prime, expect_reasoning=True)
         case_chat(gw, "us.meta.llama3-1-8b-instruct-v1:0", "aws-llama")
         case_chat(gw, "us.meta.llama3-1-8b-instruct-v1:0", "aws-llama", stream=True)
