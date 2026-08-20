@@ -80,6 +80,28 @@ pub fn is_gemini_realtime(provider: &str) -> bool {
     matches!(provider, "google" | "gemini" | "vertex")
 }
 
+/// Gemini may send `usageMetadata` on any server frame, not only the turn
+/// boundary: the latest snapshot settles a turnComplete that arrives bare.
+pub fn gemini_usage_update(provider: &str, frame: &Value) -> Option<Value> {
+    if !is_gemini_realtime(provider) {
+        return None;
+    }
+    frame
+        .get("usageMetadata")
+        .filter(|u| u.is_object())
+        .cloned()
+}
+
+/// (input, output) token counts of a Gemini `usageMetadata` object.
+pub fn gemini_tokens(u: &Value) -> (i64, i64) {
+    let it = u["promptTokenCount"].as_i64().unwrap_or(0);
+    let ot = u["responseTokenCount"]
+        .as_i64()
+        .or_else(|| u["candidatesTokenCount"].as_i64())
+        .unwrap_or(0);
+    (it, ot)
+}
+
 /// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate.
 pub fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
     !is_gemini_realtime(provider) && frame["type"] == "response.created"
@@ -122,13 +144,7 @@ pub fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
         if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
             return None;
         }
-        let u = &frame["usageMetadata"];
-        let it = u["promptTokenCount"].as_i64().unwrap_or(0);
-        let ot = u["responseTokenCount"]
-            .as_i64()
-            .or_else(|| u["candidatesTokenCount"].as_i64())
-            .unwrap_or(0);
-        (it, ot)
+        gemini_tokens(&frame["usageMetadata"])
     } else {
         // a turn ends on response.done, any status, possibly with zero usage
         if frame["type"] != "response.done" {
@@ -355,6 +371,20 @@ mod tests {
         let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34,
             "input_token_details":{"text_tokens":2,"audio_tokens":10},
             "output_token_details":{"text_tokens":4,"audio_tokens":30}}}});
+        let periodic = json!({"serverContent": {"modelTurn": {"parts": [{"text": "x"}]}},
+            "usageMetadata": {"promptTokenCount": 9, "responseTokenCount": 3}});
+        assert_eq!(
+            realtime_usage("gemini", &periodic),
+            None,
+            "off-boundary usage never settles"
+        );
+        assert_eq!(
+            gemini_usage_update("gemini", &periodic).map(|u| gemini_tokens(&u)),
+            Some((9, 3))
+        );
+        assert_eq!(gemini_usage_update("openai", &periodic), None);
+        let bare_done = json!({"serverContent": {"turnComplete": true}});
+        assert_eq!(realtime_usage("gemini", &bare_done), Some((0, 0)));
         let gem_out = json!({"serverContent": {"modelTurn": {"parts": [
             {"text": "pong"}, {"inlineData": {"mimeType": "audio/pcm", "data": "AAAAAAAAAAAA"}}
         ]}}});

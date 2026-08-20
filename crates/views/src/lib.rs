@@ -22,8 +22,8 @@ use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{
-    is_client_turn, realtime_audio_tokens, realtime_output_delta, realtime_turn_started,
-    realtime_usage,
+    gemini_tokens, gemini_usage_update, is_client_turn, realtime_audio_tokens,
+    realtime_output_delta, realtime_turn_started, realtime_usage,
 };
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
@@ -811,6 +811,8 @@ async fn realtime_bridge(
     let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
+    // Gemini sends cumulative usage on any server frame; the latest settles a bare turnComplete
+    let mut usage_snapshot: Option<Value> = None;
     // outbound DLP redactions summed within a turn, recorded once at its boundary
     let mut out_redacted = 0i64;
     loop {
@@ -917,6 +919,9 @@ async fn realtime_bridge(
                 let mut output_units = 0;
                 match frame {
                     Some(mut v) => {
+                        if let Some(u) = gemini_usage_update(account.wire_kind(), &v) {
+                            usage_snapshot = Some(u);
+                        }
                         if suppress {
                             relay = false;
                             if realtime_usage(account.wire_kind(), &v).is_some() {
@@ -937,7 +942,12 @@ async fn realtime_bridge(
                                     relay = false;
                                 }
                             }
-                        } else if let Some((it, ot)) = realtime_usage(account.wire_kind(), &v) {
+                        } else if let Some((mut it, mut ot)) = realtime_usage(account.wire_kind(), &v) {
+                            // every boundary consumes the snapshot so none leaks into the next turn
+                            if let (Some(u), true) = (usage_snapshot.take(), it + ot == 0) {
+                                (it, ot) = gemini_tokens(&u);
+                                v["usageMetadata"] = u;
+                            }
                             // turn boundary: settle the admitted turn; one with no gated turn bills
                             // unreserved
                             match pending.take() {
