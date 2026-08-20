@@ -85,8 +85,8 @@ pub fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
     !is_gemini_realtime(provider) && frame["type"] == "response.created"
 }
 
-/// Text and opaque payload units carried by one OpenAI-dialect output-delta
-/// frame. Opaque units count base64 quanta.
+/// Delivered output in one frame: OpenAI deltas yield text (or audio quanta),
+/// Gemini `modelTurn` parts count as byte-estimated opaque units.
 pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
     // Gemini Live: delivered output rides serverContent.modelTurn parts
     if let Some(parts) = frame["serverContent"]["modelTurn"]["parts"].as_array() {

@@ -156,7 +156,7 @@ stripped from the response; the visible turn still serves.
 
 `POST /v1/videos/generations` runs the pipeline like any family (auth, limits,
 routing, a ledger row) and returns the vendor's reply as is. The wire follows
-the serving account's provider name: `openai`/`azure` speak Sora's `/v1/videos`
+the serving account's preset kind (else its provider label): `openai` speaks Sora's `/v1/videos`
 (`seconds`, `size`, a video object back, the finished clip via
 `GET /v1/videos/{id}/content`), `siliconflow` Wan's `video/submit` +
 `video/status`, `alibaba`/`dashscope` the DashScope task API (async header,

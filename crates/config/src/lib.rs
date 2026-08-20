@@ -247,6 +247,7 @@ fn weight_one() -> f64 {
 pub struct AccountConf {
     pub name: String,
     pub provider: String,
+    /// Stamped from the provider preset in `normalize()`; never read from YAML.
     #[serde(skip)]
     pub kind: String,
     #[serde(default = "default_priority")]
@@ -802,7 +803,7 @@ impl GatewayConfig {
                 self.accounts.push(AccountConf {
                     name: p.name.clone(),
                     provider: p.name.clone(),
-                    kind: p.kind.clone(),
+                    kind: String::new(),
                     priority: 1,
                     tier: String::new(),
                     cost_input_price_per_1k_micros: 0,

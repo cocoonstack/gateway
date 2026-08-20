@@ -250,8 +250,6 @@ pub mod domain {
             self.tier == gw_consts::account_tier::PTU
         }
 
-        /// Base URL for building the upstream request: the account's endpoint if
-        /// set, else the given `mock://…` sentinel.
         /// The wire-dialect key: the preset kind when the account came from a
         /// `providers:` entry, else the operator's provider label.
         pub fn wire_kind(&self) -> &str {
@@ -262,6 +260,8 @@ pub mod domain {
             }
         }
 
+        /// Base URL for building the upstream request: the account's endpoint if
+        /// set, else the given `mock://…` sentinel.
         pub fn base_url<'a>(&'a self, mock_sentinel: &'a str) -> &'a str {
             if self.endpoint.is_empty() {
                 mock_sentinel

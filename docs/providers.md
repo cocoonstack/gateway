@@ -89,7 +89,7 @@ generic `audio`, and `passthrough` protocols (kling-v1-6, grok-imagine-video,
 sora-2 and brave-search ship example accounts in the default config).
 `protocol: video`
 picks its wire from the account's preset `kind` (falling back to the raw
-provider label for hand-written accounts) — `openai`/`azure` → Sora,
+provider label for hand-written accounts) — `openai` → Sora,
 `siliconflow` → Wan submit/status, `alibaba`/`dashscope` → the DashScope task
 API (the account endpoint is the bare `https://dashscope-intl.aliyuncs.com`;
 some Wan models reject submit `parameters`, so the gateway forwards only what
