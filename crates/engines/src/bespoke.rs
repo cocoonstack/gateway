@@ -8,9 +8,10 @@ use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 use crate::base::{Base, base_engine};
-use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
+use crate::bedrock::{
+    bedrock_header_usage, bedrock_input_tokens, bedrock_invoke, bedrock_stream, invocation_metrics,
+};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_error};
-use crate::transport::HeaderMap;
 use crate::transport::Headers;
 
 base_engine!(ErnieEngine);
@@ -114,10 +115,8 @@ base_engine!(AwsEmbedEngine);
 #[async_trait::async_trait]
 impl ModelEngine for AwsEmbedEngine {
     /// Bedrock embeddings over InvokeModel, answered in the OpenAI list shape:
-    /// Titan accepts exactly one `{inputText}` and returns
-    /// `{embedding, inputTextTokenCount}`; Cohere batches `{texts, input_type}`
-    /// into one call and returns `{embeddings}`;
-    /// usage from the `x-amzn-bedrock-*` headers, body counts as fallback.
+    /// Titan takes exactly one `{inputText}`, Cohere batches `{texts}`; usage
+    /// from the `x-amzn-bedrock-*` header, the body count as fallback.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let (texts, dimensions) = match self.base.take_typed() {
@@ -137,19 +136,20 @@ impl ModelEngine for AwsEmbedEngine {
             if let Value::Array(rows) = v["embeddings"].take() {
                 data.extend(rows.into_iter().enumerate().map(embedding_row));
             }
-            (st, embed_input_tokens(&headers, 0))
+            (st, bedrock_input_tokens(&headers, 0))
         } else {
             let [text] = <[String; 1]>::try_from(texts).map_err(|_| {
                 GatewayError::bad_request("titan embeddings require exactly one input")
             })?;
-            let mut body = json!({"inputText": text});
+            let mut body = json!({});
+            body["inputText"] = Value::String(text);
             if let Some(d) = dimensions {
                 body["dimensions"] = json!(d);
             }
             let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
             let body_count = crate::engine::tok(&v["inputTextTokenCount"]);
             data.push(embedding_row((0, v["embedding"].take())));
-            (st, embed_input_tokens(&headers, body_count))
+            (st, bedrock_input_tokens(&headers, body_count))
         };
         let mut v2 = json!({"object": "list", "model": model,
             "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}});
@@ -165,16 +165,6 @@ impl ModelEngine for AwsEmbedEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-}
-
-/// Embed replies carry only the input-count header (no output header), so the
-/// pairwise [`bedrock_header_usage`] contract never matches them.
-fn embed_input_tokens(headers: &HeaderMap, body_count: i64) -> i64 {
-    headers
-        .get("x-amzn-bedrock-input-token-count")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(body_count)
 }
 
 fn embedding_row((index, embedding): (usize, Value)) -> Value {
@@ -604,6 +594,12 @@ mod tests {
         assert_eq!(v["data"].as_array().unwrap().len(), 3);
         assert_eq!(out.response.prompt_tokens, 12);
         assert_eq!(v["usage"]["prompt_tokens"], 12);
+    }
+
+    #[tokio::test]
+    async fn titan_rejects_a_batch_the_vendor_cannot_serve() {
+        let r = embed_req("amazon.titan-embed-text-v2:0", &["one", "two"], None);
+        assert!(AwsEmbedEngine::new(r, t()).run().await.is_err());
     }
 
     #[tokio::test]
