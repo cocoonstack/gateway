@@ -93,6 +93,25 @@ pub fn gemini_usage_update(provider: &str, frame: &Value) -> Option<Value> {
 }
 
 /// (input, output) token counts of a Gemini `usageMetadata` object.
+/// The AUDIO-modality (input, output) token counts of a Gemini `usageMetadata` object.
+pub fn gemini_audio_tokens(u: &Value) -> (i64, i64) {
+    let modality = |details: &Value| {
+        details
+            .as_array()
+            .map(|ds| {
+                ds.iter()
+                    .filter(|d| d["modality"] == "AUDIO")
+                    .map(|d| d["tokenCount"].as_i64().unwrap_or(0).max(0))
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    (
+        modality(&u["promptTokensDetails"]),
+        modality(&u["responseTokensDetails"]),
+    )
+}
+
 pub fn gemini_tokens(u: &Value) -> (i64, i64) {
     let it = u["promptTokenCount"].as_i64().unwrap_or(0);
     let ot = u["responseTokenCount"]
@@ -164,22 +183,7 @@ pub fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
 /// audio apart from text; zero when the vendor reports no modality split.
 pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
     if is_gemini_realtime(provider) {
-        let modality = |details: &Value| {
-            details
-                .as_array()
-                .map(|ds| {
-                    ds.iter()
-                        .filter(|d| d["modality"] == "AUDIO")
-                        .map(|d| d["tokenCount"].as_i64().unwrap_or(0).max(0))
-                        .sum()
-                })
-                .unwrap_or(0)
-        };
-        let u = &frame["usageMetadata"];
-        return (
-            modality(&u["promptTokensDetails"]),
-            modality(&u["responseTokensDetails"]),
-        );
+        return gemini_audio_tokens(&frame["usageMetadata"]);
     }
     let u = &frame["response"]["usage"];
     (

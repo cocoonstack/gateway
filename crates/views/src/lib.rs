@@ -22,7 +22,7 @@ use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{
-    gemini_tokens, gemini_usage_update, is_client_turn, realtime_audio_tokens,
+    gemini_audio_tokens, gemini_tokens, gemini_usage_update, is_client_turn, realtime_audio_tokens,
     realtime_output_delta, realtime_turn_started, realtime_usage,
 };
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
@@ -741,8 +741,7 @@ fn upstream_text_to_client(
 }
 
 /// Bridge one realtime session to a real upstream: transparent relay plus auth,
-/// per-generation gates and per-turn billing; only the OpenAI dialect reaches
-/// here ([`realtime_ws`] refuses providers it cannot gate).
+/// per-generation gates and per-turn billing.
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -869,10 +868,7 @@ async fn realtime_bridge(
                             }
                         }
                     }
-                    // gate each generation trigger; with a turn already admitted it relays ungated
-                    // —
-                    // upstream rejects the duplicate and a raced accept is caught by the
-                    // response.created gate
+                    // dup triggers relay ungated: upstream rejects them, response.created gates a raced accept
                     if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
@@ -1069,7 +1065,26 @@ async fn realtime_bridge(
         }
     }
     if let Some(turn) = pending {
-        settle_realtime_abort(turn, &rtm, mt, &account.name).await;
+        if let Some(usage) = usage_snapshot {
+            let (prompt, reported_completion) = gemini_tokens(&usage);
+            // the snapshot may predate the last delivered parts; the byte estimate floors it
+            let completion = turn
+                .estimated_output_tokens()
+                .map_or(reported_completion, |delivered| {
+                    delivered.max(reported_completion)
+                });
+            let (audio_prompt, audio_completion) = gemini_audio_tokens(&usage);
+            let tokens = gw_models::TokenInput {
+                prompt,
+                completion,
+                audio_prompt,
+                audio_completion,
+                ..Default::default()
+            };
+            bill_realtime_turn(&turn.admit, &rtm, mt, &account.name, tokens, true).await;
+        } else {
+            settle_realtime_abort(turn, &rtm, mt, &account.name).await;
+        }
     }
     // a turn aborted before its boundary still redacted per frame — flush the count for the audit
     flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
