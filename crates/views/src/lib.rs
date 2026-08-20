@@ -1909,7 +1909,9 @@ async fn admin_config_get(State(s): State<AppState>, headers: HeaderMap) -> Resp
     };
     match store.load_latest().await {
         Ok(Some((version, yaml))) => {
-            Json(json!({ "version": version, "yaml": yaml })).into_response()
+            let mut out = json!({ "version": version });
+            out["yaml"] = Value::String(yaml);
+            Json(out).into_response()
         }
         Ok(None) => error_response(404, "config store is empty"),
         Err(e) => gateway_error(e),
@@ -2165,7 +2167,9 @@ async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Re
             })
         })
         .collect();
-    Json(json!({ "models": rows })).into_response()
+    let mut out = json!({});
+    out["models"] = Value::Array(rows);
+    Json(out).into_response()
 }
 
 /// GET /admin/usage — ledger rollup by (tenant, requested model). A tenant
@@ -2294,13 +2298,9 @@ async fn admin_usage_series(
             "vendor_cost_micros": if redact_vendor { 0 } else { totals.vendor_cost_micros },
         }));
     }
-    Json(json!({
-        "bucket": bucket_name,
-        "since": since,
-        "until": until,
-        "series": series,
-    }))
-    .into_response()
+    let mut out = json!({"bucket": bucket_name, "since": since, "until": until});
+    out["series"] = Value::Array(series);
+    Json(out).into_response()
 }
 
 /// A CSV field, RFC-4180 quoted and neutralized against spreadsheet formula

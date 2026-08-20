@@ -251,14 +251,14 @@ impl ModelEngine for LlamaEngine {
                 ..Default::default()
             };
             let mut full = String::new();
-            let (status, r) = bedrock_stream(&mut self.base, body, |v| {
+            let (status, r) = bedrock_stream(&mut self.base, body, |mut v| {
                 let mut chunks = Vec::new();
-                if let Some(t) = v["generation"].as_str()
+                if let Some(Value::String(t)) = v.get_mut("generation").map(Value::take)
                     && !t.is_empty()
                 {
-                    full.push_str(t);
+                    full.push_str(&t);
                     chunks.push(StreamChunk {
-                        delta: t.to_owned(),
+                        delta: t,
                         ..Default::default()
                     });
                 }
