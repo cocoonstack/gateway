@@ -6,7 +6,7 @@
 use gw_consts::{ErrCode, Protocol};
 use gw_models::{GResult, GatewayError, GatewayRequest};
 
-use crate::bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
+use crate::bespoke::{AwsEmbedEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
 use crate::claude_engine::ClaudeEngine;
 use crate::engine::ModelEngine;
 use crate::families::{
@@ -44,7 +44,7 @@ pub fn get_engine(
         Protocol::Passthrough => Box::new(PassthroughEngine::new(request, transport)),
         Protocol::Ernie => Box::new(ErnieEngine::new(request, transport)),
         Protocol::MinimaxV1 => Box::new(MinimaxV1Engine::new(request, transport)),
-        Protocol::AwsCohere => Box::new(CohereEngine::new(request, transport)),
+        Protocol::AwsEmbed => Box::new(AwsEmbedEngine::new(request, transport)),
         Protocol::AwsLlama => Box::new(LlamaEngine::new(request, transport)),
         Protocol::Dashscope => Box::new(DashScopeEngine::new(request, transport)),
         Protocol::Realtime => {

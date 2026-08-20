@@ -3,13 +3,14 @@
 //! response shape (the mock answers in the same shapes). AWS engines compute a
 //! real SigV4 Authorization header.
 
-use gw_models::{GResult, GatewayResponse};
+use gw_models::{GResult, GatewayError, GatewayResponse, TypedParams};
 use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
 use crate::base::{Base, base_engine};
 use crate::bedrock::{bedrock_header_usage, bedrock_invoke, bedrock_stream, invocation_metrics};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_error};
+use crate::transport::HeaderMap;
 use crate::transport::Headers;
 
 base_engine!(ErnieEngine);
@@ -108,107 +109,82 @@ impl ModelEngine for MinimaxV1Engine {
     }
 }
 
-base_engine!(CohereEngine);
-
-impl CohereEngine {
-    fn build_body(&mut self) -> Value {
-        // cohere's system slot is `preamble` (system turns are filtered above)
-        let system = self.base.system_text();
-        let mut history = simple_turns(&mut self.base, ("CHATBOT", "USER"), ("role", "message"));
-        let message = history
-            .pop()
-            .map(|mut last| last["message"].take())
-            .unwrap_or(Value::String(String::new()));
-        let mut body = json!({});
-        body["message"] = message;
-        body["chat_history"] = Value::Array(history);
-        if !system.is_empty() {
-            body["preamble"] = system.into();
-        }
-        if let Some(p) = self.base.chat_params()
-            && let Some(mt) = p.max_tokens
-        {
-            body["max_tokens"] = json!(mt);
-        }
-        body
-    }
-}
+base_engine!(AwsEmbedEngine);
 
 #[async_trait::async_trait]
-impl ModelEngine for CohereEngine {
-    /// Bedrock Cohere Command: `{message, chat_history}` → `{text, finish_reason}`
-    /// (legacy `generations[0]`), billed counts in the Bedrock headers.
+impl ModelEngine for AwsEmbedEngine {
+    /// Bedrock embeddings over InvokeModel, answered in the OpenAI list shape:
+    /// Titan `{inputText}` -> `{embedding, inputTextTokenCount}` one call per
+    /// input, Cohere `{texts, input_type}` -> `{embeddings}` in one call;
+    /// usage from the `x-amzn-bedrock-*` headers, body counts as fallback.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let body = self.build_body();
-        if self.base.request.stream {
-            let mut resp = GatewayResponse {
-                model,
-                is_messages_protocol: true,
-                ..Default::default()
-            };
-            let mut full = String::new();
-            let (status, r) = bedrock_stream(&mut self.base, body, |v| {
-                let mut chunks = Vec::new();
-                if let Some(t) = v["text"].as_str()
-                    && !t.is_empty()
-                    && v["event_type"] != "stream-end"
-                {
-                    full.push_str(t);
-                    chunks.push(StreamChunk {
-                        delta: t.to_owned(),
-                        ..Default::default()
-                    });
-                }
-                if let Some(fr) = v["finish_reason"].as_str() {
-                    resp.finish_reason = cohere_finish_reason(Some(fr));
-                    chunks.push(StreamChunk {
-                        finish_reason: Some(resp.finish_reason.clone()),
-                        ..Default::default()
-                    });
-                }
-                invocation_metrics(&v, &mut resp);
-                Ok(chunks)
-            })
-            .await?;
-            resp.message = full;
-            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
-            resp.raw_usage = Some(
-                json!({"input_tokens": resp.prompt_tokens, "output_tokens": resp.completion_tokens}),
-            );
-            return Ok(EngineOutcome::from_pump(resp, status, r));
-        }
-        let (status, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
-        let message = crate::engine::take_string(&mut v, "/text")
-            .or_else(|| crate::engine::take_string(&mut v, "/generations/0/text"))
-            .unwrap_or_default();
-        let finish_reason = cohere_finish_reason(
-            v["finish_reason"]
-                .as_str()
-                .or_else(|| v["generations"][0]["finish_reason"].as_str()),
-        );
-        let meta = &v["meta"];
-        let body_count = |key: &str| match crate::engine::tok(&meta["billed_units"][key]) {
-            0 => crate::engine::tok(&meta["tokens"][key]),
-            n => n,
+        let (texts, dimensions) = match self.base.take_typed() {
+            Some(TypedParams::Embeddings(p)) if !p.input.is_empty() => (p.input, p.dimensions),
+            _ => {
+                return Err(GatewayError::bad_request(
+                    "aws-embed serves embeddings input only",
+                ));
+            }
         };
-        let (input, output) = bedrock_header_usage(
-            &headers,
-            (body_count("input_tokens"), body_count("output_tokens")),
-        );
+        let mut data = Vec::with_capacity(texts.len());
+        let mut prompt_tokens = 0i64;
+        let mut status = 200;
+        if model.starts_with("cohere.") {
+            // bedrock's cohere embed requires an input_type; the gateway embeds for retrieval storage
+            let mut body = json!({"input_type": "search_document"});
+            body["texts"] = Value::Array(texts.into_iter().map(Value::String).collect());
+            let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
+            status = st;
+            if let Value::Array(rows) = v["embeddings"].take() {
+                data.extend(rows.into_iter().enumerate().map(embedding_row));
+            }
+            prompt_tokens = embed_input_tokens(&headers, 0);
+        } else {
+            for (i, text) in texts.into_iter().enumerate() {
+                let mut body = json!({});
+                body["inputText"] = Value::String(text);
+                if let Some(d) = dimensions {
+                    body["dimensions"] = json!(d);
+                }
+                let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
+                status = st;
+                let body_count = crate::engine::tok(&v["inputTextTokenCount"]);
+                prompt_tokens =
+                    prompt_tokens.saturating_add(embed_input_tokens(&headers, body_count));
+                data.push(embedding_row((i, v["embedding"].take())));
+            }
+        }
+        let mut v2 = json!({"object": "list", "model": model,
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}});
+        v2["data"] = Value::Array(data);
         let resp = GatewayResponse {
-            message,
             model,
-            finish_reason,
-            prompt_tokens: input,
-            completion_tokens: output,
-            total_tokens: input.saturating_add(output),
-            raw_usage: Some(json!({"input_tokens": input, "output_tokens": output})),
-            is_messages_protocol: true, // anthropic's usage fields align with cohere's input/output
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+            raw_usage: Some(v2["usage"].clone()),
+            response_v2: Some(v2),
+            finish_reason: "stop".to_owned(),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
+}
+
+/// Embed replies carry only the input-count header (no output header), so the
+/// pairwise [`bedrock_header_usage`] contract never matches them.
+fn embed_input_tokens(headers: &HeaderMap, body_count: i64) -> i64 {
+    headers
+        .get("x-amzn-bedrock-input-token-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(body_count)
+}
+
+fn embedding_row((index, embedding): (usize, Value)) -> Value {
+    let mut row = json!({"object": "embedding", "index": index});
+    row["embedding"] = embedding;
+    row
 }
 
 /// The non-system turns as `{role_key: ai|user, content_key: text}` objects,
@@ -262,14 +238,6 @@ fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
     prompt.push_str(end);
     prompt.push_str("\n\n");
     prompt
-}
-
-fn cohere_finish_reason(vendor: Option<&str>) -> String {
-    match vendor {
-        None | Some("COMPLETE") => "stop".to_owned(),
-        Some("MAX_TOKENS") => "length".to_owned(),
-        Some(other) => other.to_lowercase(),
-    }
 }
 
 base_engine!(LlamaEngine);
@@ -542,7 +510,7 @@ mod tests {
     use std::sync::Arc;
 
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
+    use gw_models::{ChatMsg, EmbeddingParams, GatewayRequest, ModelParamV2};
 
     use super::*;
     use crate::transport::{
@@ -610,48 +578,59 @@ mod tests {
         assert!(out.response.total_tokens > 0);
     }
 
-    #[tokio::test]
-    async fn cohere_wire_shape() {
-        let mut e = CohereEngine::new(req(Protocol::AwsCohere, "cohere.command-r-v1:0"), t());
-        let out = e.run().await.unwrap();
-        assert!(
-            out.response
-                .message
-                .contains("[mock-cohere] you said: hello bespoke")
-        );
-        assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
+    fn embed_req(model: &str, inputs: &[&str], dimensions: Option<i64>) -> GatewayRequest {
+        let mut r = req(Protocol::AwsEmbed, model);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Embeddings(EmbeddingParams {
+            input: inputs.iter().map(|s| (*s).to_owned()).collect(),
+            dimensions,
+        }));
+        r
     }
 
     #[tokio::test]
-    async fn bedrock_headers_bill_command_r_and_the_legacy_command_shape_parses() {
-        let mut e = CohereEngine::new(
-            req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
-            Arc::new(BedrockReply(
-                r#"{"response_id":"r","text":"hi there","finish_reason":"COMPLETE"}"#,
-                57,
-                9,
-            )),
+    async fn titan_embeddings_invoke_per_input_and_bill_the_body_counts() {
+        let r = embed_req(
+            "amazon.titan-embed-text-v2:0",
+            &["hello world", "second doc"],
+            Some(256),
         );
-        let out = e.run().await.unwrap();
-        assert_eq!(out.response.message, "hi there");
-        assert_eq!(out.response.finish_reason, "stop");
-        assert_eq!(
-            (out.response.prompt_tokens, out.response.completion_tokens),
-            (57, 9)
-        );
+        let out = AwsEmbedEngine::new(r, t()).run().await.unwrap();
+        let v = out.response.response_v2.unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 2);
+        assert_eq!(v["data"][1]["index"], 1);
+        assert!(v["data"][0]["embedding"].is_array());
+        assert_eq!(out.response.prompt_tokens, 4);
+        assert_eq!(out.response.completion_tokens, 0);
+        assert_eq!(v["usage"]["total_tokens"], 4);
+    }
 
-        let mut e = CohereEngine::new(
-            req(Protocol::AwsCohere, "cohere.command-text-v14"),
-            Arc::new(BedrockReply(
-                r#"{"generations":[{"id":"g","text":"legacy hi","finish_reason":"MAX_TOKENS"}],"prompt":""}"#,
-                12,
-                4,
-            )),
+    #[tokio::test]
+    async fn cohere_embeddings_batch_once_and_bill_the_bedrock_headers() {
+        let r = embed_req("cohere.embed-english-v3", &["a", "b", "c"], None);
+        let out = AwsEmbedEngine::new(r, t()).run().await.unwrap();
+        let v = out.response.response_v2.unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 3);
+        assert_eq!(out.response.prompt_tokens, 12);
+        assert_eq!(v["usage"]["prompt_tokens"], 12);
+    }
+
+    #[tokio::test]
+    async fn aws_embed_rejects_a_chat_request() {
+        let out = AwsEmbedEngine::new(req(Protocol::AwsEmbed, "amazon.titan-embed-text-v2:0"), t())
+            .run()
+            .await;
+        assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn bedrock_headers_bill_the_invoke() {
+        let mut e = AwsEmbedEngine::new(
+            embed_req("cohere.embed-english-v3", &["only text"], None),
+            Arc::new(BedrockReply(r#"{"embeddings":[[0.5,0.25]]}"#, 57, 0)),
         );
         let out = e.run().await.unwrap();
-        assert_eq!(out.response.message, "legacy hi");
-        assert_eq!(out.response.finish_reason, "length");
-        assert_eq!(out.response.total_tokens, 16);
+        assert_eq!(out.response.prompt_tokens, 57);
+        assert_eq!(out.response.total_tokens, 57);
 
         let mut e = LlamaEngine::new(
             req(Protocol::AwsLlama, "meta.llama3-1-8b-instruct-v1:0"),
@@ -681,19 +660,6 @@ mod tests {
         assert_eq!(out.response.finish_reason, "stop");
         assert!(out.chunks.iter().any(|c| c.finish_reason.is_some()));
         assert!(out.response.total_tokens > 0);
-
-        let mut r = req(Protocol::AwsCohere, "cohere.command-r-v1:0");
-        r.stream = true;
-        let out = CohereEngine::new(r, t()).run().await.unwrap();
-        assert!(
-            out.response
-                .message
-                .contains("[mock-cohere] you said: hello bespoke"),
-            "{:?}",
-            out.response
-        );
-        assert_eq!(out.response.finish_reason, "stop");
-        assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use gw_consts::Protocol;
 use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 use gw_engines::{
-    AudioEngine, AudioKind, ClaudeEngine, CohereEngine, CompletionsEngine, DashScopeEngine,
+    AudioEngine, AudioKind, AwsEmbedEngine, ClaudeEngine, CompletionsEngine, DashScopeEngine,
     EmbeddingsEngine, ErnieEngine, ImageEngine, LlamaEngine, MinimaxV1Engine, ModelEngine,
     OpenAiEngine, ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
 };
@@ -338,10 +338,12 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         std::env::set_var("GW_TEST_AWS_SK", "realsecretkeyvalue");
     }
 
-    let t = RecordingTransport::new(
-        r#"{"text":"ok","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
-    );
-    let mut req = chat_req(Protocol::AwsCohere, "cohere.command-r");
+    let t = RecordingTransport::new(r#"{"embeddings":[[0.5]]}"#);
+    let mut req = chat_req(Protocol::AwsEmbed, "cohere.embed-english-v3");
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Embeddings(EmbeddingParams {
+        input: vec!["hello".into()],
+        dimensions: None,
+    }));
     req.account = Some(std::sync::Arc::new(Account {
         name: "live-bedrock".into(),
         endpoint: "https://bedrock-runtime.eu-west-1.amazonaws.com".into(),
@@ -349,7 +351,7 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         secret_key_env: "GW_TEST_AWS_SK".into(),
         ..Default::default()
     }));
-    let _ = CohereEngine::new(req, t.clone()).run().await.unwrap();
+    let _ = AwsEmbedEngine::new(req, t.clone()).run().await.unwrap();
     assert!(
         t.url()
             .starts_with("https://bedrock-runtime.eu-west-1.amazonaws.com/model/"),
@@ -364,7 +366,7 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         "SigV4 must sign with the real access key in the endpoint's region, got: {auth}"
     );
     assert!(
-        t.url().ends_with("/model/cohere.command-r/invoke"),
+        t.url().ends_with("/model/cohere.embed-english-v3/invoke"),
         "url: {}",
         t.url()
     );
@@ -545,27 +547,6 @@ async fn system_prompt_reaches_every_bespoke_wire() {
             .all(|m| m["sender_type"] != "USER" || m["text"] != "be brief"),
         "system must not be downgraded to a USER turn: {mb}"
     );
-
-    let cohere = RecordingTransport::new(
-        r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
-    );
-    CohereEngine::new(
-        chat_req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
-        cohere.clone(),
-    )
-    .run()
-    .await
-    .unwrap();
-    let cb = cohere.body_json();
-    assert_eq!(cb["preamble"], "be brief", "cohere system slot");
-    assert!(
-        cb["chat_history"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|m| m["message"] != "be brief"),
-        "system must not leak into chat_history: {cb}"
-    );
 }
 
 #[tokio::test]
@@ -628,20 +609,17 @@ async fn minimax_v1_request_shape() {
 }
 
 #[tokio::test]
-async fn cohere_request_shape_with_sigv4() {
-    let t = RecordingTransport::new(
-        r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
-    );
-    let _ = CohereEngine::new(
-        chat_req(Protocol::AwsCohere, "cohere.command-r-v1:0"),
-        t.clone(),
-    )
-    .run()
-    .await
-    .unwrap();
+async fn embed_request_shape_with_sigv4() {
+    let t = RecordingTransport::new(r#"{"embeddings":[[0.5],[0.25]]}"#);
+    let mut req = chat_req(Protocol::AwsEmbed, "cohere.embed-english-v3");
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Embeddings(EmbeddingParams {
+        input: vec!["first".into(), "second".into()],
+        dimensions: None,
+    }));
+    let _ = AwsEmbedEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    assert_eq!(b["message"], "hello");
-    assert!(b["chat_history"].is_array());
+    assert_eq!(b["texts"], serde_json::json!(["first", "second"]));
+    assert_eq!(b["input_type"], "search_document");
     let auth = t.header("authorization").expect("SigV4 auth header");
     assert!(
         auth.starts_with("AWS4-HMAC-SHA256 Credential="),

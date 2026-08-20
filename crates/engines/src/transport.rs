@@ -425,7 +425,7 @@ impl MockTransport {
         }
         let reply = match req.protocol {
             Protocol::AwsAnthropic => self.anthropic_reply(req)?,
-            Protocol::AwsCohere => self.cohere_reply(req)?,
+            Protocol::AwsEmbed => self.embed_reply(req)?,
             Protocol::AwsLlama => self.llama_reply(req)?,
             _ => return Err(GatewayError::internal("mock bedrock protocol")),
         };
@@ -562,16 +562,20 @@ impl MockTransport {
         })
     }
 
-    fn cohere_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "cohere")?;
-        let user = body["message"].as_str().unwrap_or_default();
-        let reply = format!("[mock-cohere] you said: {user}");
-        Self::ok_json(json!({
-            "response_id": "cohere-mock", "generation_id": "gen-mock",
-            "text": reply, "finish_reason": "COMPLETE",
-            "meta": {"tokens": {"input_tokens": Self::tokens(user) + 3,
-                                  "output_tokens": Self::tokens(&reply)}}
-        }))
+    fn embed_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let body = Self::parse(&req.body, "embed")?;
+        if let Some(text) = body["inputText"].as_str() {
+            return Self::ok_json(json!({"embedding": [0.1, 0.2, 0.3],
+                "inputTextTokenCount": Self::tokens(text)}));
+        }
+        let n = body["texts"].as_array().map_or(0, Vec::len);
+        let mut reply = Self::ok_json(json!({"embeddings": vec![vec![0.1, 0.2, 0.3]; n]}))?;
+        // real embed replies carry ONLY the input-count header, never the output one
+        reply.headers.insert(
+            "x-amzn-bedrock-input-token-count",
+            reqwest::header::HeaderValue::from(n as u64 * 4),
+        );
+        Ok(reply)
     }
 
     fn llama_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
@@ -1035,8 +1039,6 @@ impl Transport for MockTransport {
             self.ernie_reply(&req)
         } else if u.contains("minimax") {
             self.minimax_reply(&req)
-        } else if u.contains("cohere") {
-            self.cohere_reply(&req)
         } else if u.contains("meta.llama") {
             self.llama_reply(&req)
         } else if u.contains("/messages") {
