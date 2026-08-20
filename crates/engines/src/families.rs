@@ -620,15 +620,22 @@ enum VideoDialect {
     Kling,
 }
 
-fn video_dialect(provider: &str) -> VideoDialect {
-    match provider {
-        "openai" => VideoDialect::Sora,
-        "siliconflow" => VideoDialect::SiliconFlow,
-        "alibaba" | "dashscope" => VideoDialect::DashScope,
-        "minimax" => VideoDialect::Minimax,
-        "kling" => VideoDialect::Kling,
-        _ => VideoDialect::Generations,
+/// The vendor label decides; `kind` only names an account's chat wire, so a
+/// `kind: openai` DashScope/MiniMax account must not read as Sora.
+fn video_dialect(vendor: &str, wire: &str) -> VideoDialect {
+    fn known(key: &str) -> Option<VideoDialect> {
+        Some(match key {
+            "openai" => VideoDialect::Sora,
+            "siliconflow" => VideoDialect::SiliconFlow,
+            "alibaba" | "dashscope" => VideoDialect::DashScope,
+            "minimax" => VideoDialect::Minimax,
+            "kling" => VideoDialect::Kling,
+            _ => return None,
+        })
     }
+    known(vendor)
+        .or_else(|| known(wire))
+        .unwrap_or(VideoDialect::Generations)
 }
 
 /// The vendor's async handle in a submit reply, whichever dialect answered;
@@ -672,7 +679,7 @@ impl ModelEngine for VideoEngine {
             },
         };
         require_non_empty(&p.prompt, "video prompt")?;
-        let dialect = video_dialect(self.base.provider());
+        let dialect = video_dialect(self.base.provider(), self.base.wire_kind());
         let model = self.base.model_name()?;
         let mut body = Map::new();
         // Kling names the field model_name and takes no inline image on this path
@@ -827,7 +834,7 @@ pub async fn video_poll(
     id: &str,
 ) -> GResult<VideoPoll> {
     let base = account.base_url(VENDOR_SENTINEL);
-    let dialect = video_dialect(account.wire_kind());
+    let dialect = video_dialect(&account.provider, account.wire_kind());
     let (method, url, req_body) = match dialect {
         VideoDialect::SiliconFlow => (
             "POST",
@@ -915,7 +922,7 @@ pub async fn video_content(
     poll: &Value,
 ) -> GResult<(u16, String, bytes::Bytes)> {
     let base = account.base_url(VENDOR_SENTINEL);
-    let request = match video_dialect(account.wire_kind()) {
+    let request = match video_dialect(&account.provider, account.wire_kind()) {
         VideoDialect::Sora => video_request(
             account,
             "GET",
@@ -1972,6 +1979,21 @@ mod tests {
             video_handle(&json!({"task_id": "", "video_url": "u"})),
             None
         );
+    }
+
+    #[test]
+    fn a_chat_wire_kind_never_overrides_the_video_vendor() {
+        assert_eq!(
+            video_dialect("dashscope", "openai"),
+            VideoDialect::DashScope
+        );
+        assert_eq!(video_dialect("minimax", "openai"), VideoDialect::Minimax);
+        assert_eq!(
+            video_dialect("my-sora-deploy", "openai"),
+            VideoDialect::Sora
+        );
+        assert_eq!(video_dialect("openai", "openai"), VideoDialect::Sora);
+        assert_eq!(video_dialect("xai", "xai"), VideoDialect::Generations);
     }
 
     #[tokio::test]

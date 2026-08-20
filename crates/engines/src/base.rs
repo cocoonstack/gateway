@@ -26,11 +26,19 @@ impl Base {
         self.request.account_name().to_owned()
     }
 
-    pub fn provider(&self) -> &str {
+    pub fn wire_kind(&self) -> &str {
         self.request
             .account
             .as_ref()
             .map(|a| a.wire_kind())
+            .unwrap_or_default()
+    }
+
+    pub fn provider(&self) -> &str {
+        self.request
+            .account
+            .as_ref()
+            .map(|a| a.provider.as_str())
             .unwrap_or_default()
     }
 
