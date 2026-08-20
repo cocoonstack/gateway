@@ -1463,7 +1463,21 @@ async fn async_video_bills_once_on_the_first_done_poll() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["video_url"], "mock://videos/out.mp4");
+    let sync = body_json(resp).await;
+    assert_eq!(sync["video_url"], "mock://videos/out.mp4");
+    let resp = app
+        .clone()
+        .oneshot(get_authed(&format!(
+            "/v1/videos/{}",
+            sync["task_id"].as_str().unwrap()
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a delivered sync reply must not register its task_id as an async job"
+    );
 
     let mut ids = Vec::new();
     for prompt in [
@@ -2795,7 +2809,7 @@ models:
 }
 
 #[tokio::test]
-async fn realtime_refuses_ungovernable_provider() {
+async fn realtime_upgrades_the_gemini_dialect_and_gates_on_the_client_turn() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let yaml = r#"
@@ -2821,10 +2835,16 @@ models:
         .unwrap();
     req.headers_mut()
         .insert("authorization", "Bearer ak-rt".parse().unwrap());
-    assert!(
-        tokio_tungstenite::connect_async(req).await.is_err(),
-        "realtime must refuse a provider it cannot gate before generation"
-    );
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 101);
+    use futures::StreamExt;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "error", "{v}");
 }
 
 #[tokio::test]

@@ -30,7 +30,7 @@ impl Base {
         self.request
             .account
             .as_ref()
-            .map(|a| a.provider.as_str())
+            .map(|a| a.wire_kind())
             .unwrap_or_default()
     }
 

@@ -9,6 +9,16 @@ pub fn is_response_create(frame: &Value) -> bool {
     frame["type"] == "response.create"
 }
 
+/// The client frame that starts a generation — the admission point. OpenAI
+/// signals it as `response.create`, Gemini Live as a completed client turn.
+pub fn is_client_turn(provider: &str, frame: &Value) -> bool {
+    if is_gemini_realtime(provider) {
+        return frame["clientContent"]["turnComplete"] == Value::Bool(true)
+            || frame["client_content"]["turn_complete"] == Value::Bool(true);
+    }
+    is_response_create(frame)
+}
+
 /// String values that never carry human text (base64 media, protocol ids);
 /// everything else is scanned, fail closed, and config objects still recurse.
 fn skip_scalar(k: &str, text_delta: bool) -> bool {
@@ -70,14 +80,68 @@ pub fn is_gemini_realtime(provider: &str) -> bool {
     matches!(provider, "google" | "gemini" | "vertex")
 }
 
+/// Gemini may send `usageMetadata` on any server frame, not only the turn
+/// boundary: the latest snapshot settles a turnComplete that arrives bare.
+pub fn gemini_usage_update(provider: &str, frame: &Value) -> Option<Value> {
+    if !is_gemini_realtime(provider) {
+        return None;
+    }
+    frame
+        .get("usageMetadata")
+        .filter(|u| u.is_object())
+        .cloned()
+}
+
+/// (input, output) token counts of a Gemini `usageMetadata` object.
+/// The AUDIO-modality (input, output) token counts of a Gemini `usageMetadata` object.
+pub fn gemini_audio_tokens(u: &Value) -> (i64, i64) {
+    let modality = |details: &Value| {
+        details
+            .as_array()
+            .map(|ds| {
+                ds.iter()
+                    .filter(|d| d["modality"] == "AUDIO")
+                    .map(|d| d["tokenCount"].as_i64().unwrap_or(0).max(0))
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    (
+        modality(&u["promptTokensDetails"]),
+        modality(&u["responseTokensDetails"]),
+    )
+}
+
+pub fn gemini_tokens(u: &Value) -> (i64, i64) {
+    let it = u["promptTokenCount"].as_i64().unwrap_or(0);
+    let ot = u["responseTokenCount"]
+        .as_i64()
+        .or_else(|| u["candidatesTokenCount"].as_i64())
+        .unwrap_or(0);
+    (it, ot)
+}
+
 /// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate.
 pub fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
     !is_gemini_realtime(provider) && frame["type"] == "response.created"
 }
 
-/// Text and opaque payload units carried by one OpenAI-dialect output-delta
-/// frame. Opaque units count base64 quanta.
+/// Delivered output in one frame: OpenAI deltas yield text (or audio quanta),
+/// Gemini `modelTurn` parts count as byte-estimated opaque units.
 pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
+    // Gemini Live: delivered output rides serverContent.modelTurn parts
+    if let Some(parts) = frame["serverContent"]["modelTurn"]["parts"].as_array() {
+        let opaque = parts
+            .iter()
+            .map(|p| {
+                p["inlineData"]["data"]
+                    .as_str()
+                    .map_or(0, |d| d.len().div_ceil(4))
+                    + p["text"].as_str().map_or(0, |t| t.len().div_ceil(4))
+            })
+            .sum();
+        return (None, opaque);
+    }
     let frame_type = frame["type"].as_str().unwrap_or_default();
     let Some(delta) = frame["delta"].as_str() else {
         return (None, 0);
@@ -99,13 +163,7 @@ pub fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
         if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
             return None;
         }
-        let u = &frame["usageMetadata"];
-        let it = u["promptTokenCount"].as_i64().unwrap_or(0);
-        let ot = u["responseTokenCount"]
-            .as_i64()
-            .or_else(|| u["candidatesTokenCount"].as_i64())
-            .unwrap_or(0);
-        (it, ot)
+        gemini_tokens(&frame["usageMetadata"])
     } else {
         // a turn ends on response.done, any status, possibly with zero usage
         if frame["type"] != "response.done" {
@@ -125,22 +183,7 @@ pub fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
 /// audio apart from text; zero when the vendor reports no modality split.
 pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
     if is_gemini_realtime(provider) {
-        let modality = |details: &Value| {
-            details
-                .as_array()
-                .map(|ds| {
-                    ds.iter()
-                        .filter(|d| d["modality"] == "AUDIO")
-                        .map(|d| d["tokenCount"].as_i64().unwrap_or(0).max(0))
-                        .sum()
-                })
-                .unwrap_or(0)
-        };
-        let u = &frame["usageMetadata"];
-        return (
-            modality(&u["promptTokensDetails"]),
-            modality(&u["responseTokensDetails"]),
-        );
+        return gemini_audio_tokens(&frame["usageMetadata"]);
     }
     let u = &frame["response"]["usage"];
     (
@@ -332,6 +375,45 @@ mod tests {
         let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34,
             "input_token_details":{"text_tokens":2,"audio_tokens":10},
             "output_token_details":{"text_tokens":4,"audio_tokens":30}}}});
+        let periodic = json!({"serverContent": {"modelTurn": {"parts": [{"text": "x"}]}},
+            "usageMetadata": {"promptTokenCount": 9, "responseTokenCount": 3}});
+        assert_eq!(
+            realtime_usage("gemini", &periodic),
+            None,
+            "off-boundary usage never settles"
+        );
+        assert_eq!(
+            gemini_usage_update("gemini", &periodic).map(|u| gemini_tokens(&u)),
+            Some((9, 3))
+        );
+        assert_eq!(gemini_usage_update("openai", &periodic), None);
+        let bare_done = json!({"serverContent": {"turnComplete": true}});
+        assert_eq!(realtime_usage("gemini", &bare_done), Some((0, 0)));
+        let gem_out = json!({"serverContent": {"modelTurn": {"parts": [
+            {"text": "pong"}, {"inlineData": {"mimeType": "audio/pcm", "data": "AAAAAAAAAAAA"}}
+        ]}}});
+        assert_eq!(realtime_output_delta(&gem_out), (None, 4));
+        assert!(is_client_turn(
+            "openai",
+            &json!({"type": "response.create"})
+        ));
+        assert!(!is_client_turn(
+            "openai",
+            &json!({"clientContent": {"turnComplete": true}})
+        ));
+        assert!(is_client_turn(
+            "gemini",
+            &json!({"clientContent": {"turnComplete": true}})
+        ));
+        assert!(is_client_turn(
+            "google",
+            &json!({"client_content": {"turn_complete": true}})
+        ));
+        assert!(!is_client_turn(
+            "gemini",
+            &json!({"clientContent": {"turnComplete": false}})
+        ));
+        assert!(!is_client_turn("gemini", &json!({"setup": {"model": "m"}})));
         assert_eq!(realtime_usage("openai", &done), Some((12, 34)));
         assert_eq!(realtime_usage("azure", &done), Some((12, 34)));
         assert_eq!(realtime_audio_tokens("openai", &done), (10, 30));

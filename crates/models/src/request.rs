@@ -222,6 +222,8 @@ pub mod domain {
     pub struct Account {
         pub name: String,
         pub provider: String,
+        /// The provider preset's kind when synthesized from `providers:`; empty on raw accounts.
+        pub kind: String,
         pub priority: i32,
         /// consts::account_tier::{PTU, PAYGO}; empty = paygo.
         pub tier: String,
@@ -246,6 +248,16 @@ pub mod domain {
     impl Account {
         pub fn is_ptu(&self) -> bool {
             self.tier == gw_consts::account_tier::PTU
+        }
+
+        /// The wire-dialect key: the preset kind when the account came from a
+        /// `providers:` entry, else the operator's provider label.
+        pub fn wire_kind(&self) -> &str {
+            if self.kind.is_empty() {
+                &self.provider
+            } else {
+                &self.kind
+            }
         }
 
         /// Base URL for building the upstream request: the account's endpoint if

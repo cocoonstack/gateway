@@ -377,6 +377,7 @@ impl AccountPool {
                 Arc::new(Account {
                     name: a.name.clone(),
                     provider: a.provider.clone(),
+                    kind: a.kind.clone(),
                     priority: a.priority,
                     tier: a.tier.clone(),
                     endpoint: a.endpoint.clone(),

@@ -40,6 +40,9 @@ GROUPS = [
     "xai",
     "video",
     "search",
+    "openai-aux",
+    "dashscope-native",
+    "gemini-rt",
     "openai-rt",
     "ollama",
 ]
@@ -453,6 +456,123 @@ def case_video(
         ok = st == 200 and len(blob) > 10_000
         detail += f" content={len(blob)}B"
     record(name, ok, detail)
+
+
+def case_moderations(gw: Gateway, model: str) -> None:
+    """Moderation verdicts pass through; the call lands one ledger row."""
+    name = f"{model} moderations"
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/moderations", {"model": model, "input": ["I want to hurt them badly", "good morning"]})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    j = json.loads(txt)
+    results = j.get("results", [])
+    count, _ = gw.ledger()
+    ok = count == before + 1 and len(results) == 2 and results[0].get("flagged") is True
+    record(name, ok, f"results={len(results)} flagged0={results and results[0].get('flagged')}")
+
+
+def case_tts(gw: Gateway, model: str, text: str = "Hello from the gateway, this is a voice check.") -> None:
+    """TTS bills one unit per input character."""
+    name = f"{model} tts"
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/audio/speech", {"model": model, "input": text, "voice": "alloy"})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    count, row = gw.ledger()
+    chars = len(text)
+    ok = (
+        count == before + 1
+        and row["billed_units"] == chars
+        and row["cost_micros"] == chars * MODELS[model]["unit"]
+        and len(txt) > 1000
+    )
+    record(name, ok, f"audio={len(txt)}B ledger units/cost={row['billed_units']}/{row['cost_micros']} expected {chars}/{chars * MODELS[model]['unit']}")
+
+
+def case_stt(gw: Gateway, model: str) -> None:
+    """STT bills whole seconds: the vendor's duration, else the upload's own play length."""
+    import base64
+    import io
+    import math as m
+    import struct
+    import wave
+
+    name = f"{model} stt"
+    seconds, rate = 2, 8000
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(12000 * m.sin(2 * m.pi * 440 * i / rate))) for i in range(rate * seconds)))
+    before, _ = gw.ledger()
+    st, txt = gw.call("/v1/audio/transcriptions", {"model": model, "audio_b64": base64.b64encode(buf.getvalue()).decode()})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:200]}")
+        return
+    count, row = gw.ledger()
+    ok = (
+        count == before + 1
+        and row["billed_units"] == seconds
+        and row["cost_micros"] == seconds * MODELS[model]["unit"]
+    )
+    record(name, ok, f"ledger units/cost={row['billed_units']}/{row['cost_micros']} expected {seconds}/{seconds * MODELS[model]['unit']} text={txt[:60]}")
+
+
+def case_realtime_gemini(gw: Gateway, model: str) -> None:
+    """One Live-API text turn through the bridge: usageMetadata settles the ledger row."""
+    name = f"{model} realtime"
+    try:
+        import websocket
+    except ImportError:
+        record(name, False, "websocket-client not installed")
+        return
+    before, _ = gw.ledger()
+    ws = websocket.create_connection(
+        gw.base.replace("http", "ws", 1) + f"/v1/realtime?model={model}",
+        header={"Authorization": f"Bearer {gw.ak}"},
+        timeout=90,
+    )
+    ws.send(json.dumps({"setup": {"model": f"models/{model}",
+                                   "generationConfig": {"responseModalities": ["AUDIO"]},
+                                   "outputAudioTranscription": {}}}))
+    setup = json.loads(ws.recv())
+    if "setupComplete" not in setup:
+        record(name, False, f"no setupComplete: {json.dumps(setup)[:200]}")
+        ws.close()
+        return
+    ws.send(json.dumps({"clientContent": {"turns": [{"role": "user", "parts": [{"text": "Reply with the single word: pong"}]}], "turnComplete": True}}))
+    usage: dict[str, Any] = {}
+    text = ""
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        frame = json.loads(ws.recv())
+        sc = frame.get("serverContent") or {}
+        text += (sc.get("outputTranscription") or {}).get("text", "")
+        if sc.get("turnComplete"):
+            usage = frame.get("usageMetadata") or {}
+            break
+    ws.close()
+    it = usage.get("promptTokenCount", 0)
+    ot = usage.get("responseTokenCount") or usage.get("candidatesTokenCount") or 0
+    cost = (MODELS[model]["in"] * it) // 1000 + (MODELS[model]["out"] * ot) // 1000
+    count, row = gw.ledger()
+    ok = (
+        count == before + 1
+        and (row["prompt_tokens"], row["completion_tokens"]) == (it, ot)
+        and row["cost_micros"] == cost
+        and not row["estimated"]
+        and "pong" in text.lower()
+    )
+    record(
+        name,
+        ok,
+        f"wire it/ot={it}/{ot} text='{text[:24]}' ledger p/c/cost/est=({row['prompt_tokens']}, {row['completion_tokens']}, "
+        f"{row['cost_micros']}, {row['estimated']}) oracle=({it}, {ot}, {cost})",
+    )
 
 
 def case_search(gw: Gateway, model: str) -> None:
@@ -996,6 +1116,14 @@ def run_group(gw: Gateway, group: str) -> None:
         case_search(gw, "brave-search")
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
+    elif group == "openai-aux":
+        case_moderations(gw, "omni-moderation-latest")
+        case_tts(gw, "gpt-4o-mini-tts")
+        case_stt(gw, "whisper-1")
+    elif group == "dashscope-native":
+        case_chat(gw, "qwen-turbo")
+    elif group == "gemini-rt":
+        case_realtime_gemini(gw, "gemini-3.1-flash-live-preview")
     elif group == "ollama":
         case_chat(gw, "qwen2.5:0.5b")
         case_chat(gw, "qwen2.5:0.5b", stream=True)

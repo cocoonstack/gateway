@@ -247,6 +247,9 @@ fn weight_one() -> f64 {
 pub struct AccountConf {
     pub name: String,
     pub provider: String,
+    /// Stamped from the provider preset in `normalize()`; never read from YAML.
+    #[serde(skip)]
+    pub kind: String,
     #[serde(default = "default_priority")]
     pub priority: i32,
     /// "ptu" (provisioned throughput, preferred) or "paygo" (default).
@@ -651,7 +654,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "gemini" => ProviderPreset {
             endpoint: "https://generativelanguage.googleapis.com",
-            wires: &["gemini"],
+            wires: &["gemini", "realtime"],
             default_model_wire: "gemini",
         },
         // OpenAI-protocol vendors: same wire shape, different base URL.
@@ -800,6 +803,7 @@ impl GatewayConfig {
                 self.accounts.push(AccountConf {
                     name: p.name.clone(),
                     provider: p.name.clone(),
+                    kind: String::new(),
                     priority: 1,
                     tier: String::new(),
                     cost_input_price_per_1k_micros: 0,
@@ -816,6 +820,7 @@ impl GatewayConfig {
             }
             // an empty endpoint would answer from the mock transport with fabricated successes
             for a in self.accounts.iter_mut().filter(|a| a.provider == p.name) {
+                a.kind = p.kind.clone();
                 if a.endpoint.is_empty() {
                     a.endpoint = if p.endpoint.is_empty() {
                         preset.endpoint.to_owned()
@@ -1359,6 +1364,15 @@ models:
             cfg.find_model("grok-imagine-image-2.0").unwrap().protocol(),
             Some(Protocol::Image)
         );
+    }
+
+    #[test]
+    fn provider_specific_wires_must_pin_a_provider() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: v, protocol: video}]\naccounts: [{name: a, provider: p, protocols: ['video']}]";
+        assert!(matches!(
+            GatewayConfig::from_yaml(yaml),
+            Err(ConfigError::VideoModelNeedsProvider { model }) if model == "v"
+        ));
     }
 
     #[test]

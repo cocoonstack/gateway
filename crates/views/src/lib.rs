@@ -22,8 +22,8 @@ use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{
-    is_response_create, realtime_audio_tokens, realtime_output_delta, realtime_turn_started,
-    realtime_usage,
+    gemini_audio_tokens, gemini_tokens, gemini_usage_update, is_client_turn, realtime_audio_tokens,
+    realtime_output_delta, realtime_turn_started, realtime_usage,
 };
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
@@ -338,15 +338,6 @@ async fn realtime_ws(
         ws.on_upgrade(move |socket| {
             realtime_session(socket, s, ak, m, mt, account.name.clone(), hint)
         })
-    } else if gw_engines::realtime::is_gemini_realtime(&account.provider) {
-        // no pre-generation gate signal in this dialect — refuse rather than bill after the fact
-        error_response(
-            501,
-            format!(
-                "realtime is not supported for provider `{}`",
-                account.provider
-            ),
-        )
     } else {
         ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, m, mt, account, hint))
     }
@@ -750,8 +741,7 @@ fn upstream_text_to_client(
 }
 
 /// Bridge one realtime session to a real upstream: transparent relay plus auth,
-/// per-generation gates and per-turn billing; only the OpenAI dialect reaches
-/// here ([`realtime_ws`] refuses providers it cannot gate).
+/// per-generation gates and per-turn billing.
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -770,7 +760,16 @@ async fn realtime_bridge(
     let ws_base = base
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    let url = format!("{ws_base}/v1/realtime?model={}", rtm.served);
+    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
+    let gemini = gw_engines::realtime::is_gemini_realtime(account.wire_kind());
+    // Gemini's Live socket is one bidi RPC authed by key; the model rides the setup frame
+    let url = if gemini {
+        format!(
+            "{ws_base}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={key}"
+        )
+    } else {
+        format!("{ws_base}/v1/realtime?model={}", rtm.served)
+    };
     let mut req = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => {
@@ -784,8 +783,7 @@ async fn realtime_bridge(
             return;
         }
     };
-    let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
-    if let Ok(v) = format!("Bearer {key}").parse() {
+    if !gemini && let Ok(v) = format!("Bearer {key}").parse() {
         req.headers_mut().insert("authorization", v);
     }
     let upstream = match tokio_tungstenite::connect_async(req).await {
@@ -812,6 +810,8 @@ async fn realtime_bridge(
     let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
+    // Gemini sends cumulative usage on any server frame; the latest settles a bare turnComplete
+    let mut usage_snapshot: Option<Value> = None;
     // outbound DLP redactions summed within a turn, recorded once at its boundary
     let mut out_redacted = 0i64;
     loop {
@@ -826,6 +826,31 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 if let Some(mut frame) = frame {
+                    if gemini {
+                        // pin the entitled model: the socket carries no model, the setup frame does
+                        if let Some(setup) = frame.get_mut("setup").and_then(Value::as_object_mut) {
+                            setup.insert("model".into(), format!("models/{}", rtm.served).into());
+                            forward = UMsg::text(frame.to_string());
+                        }
+                        // audio-driven turns and barge-in have no admission point yet: refuse
+                        // loudly, keep the session
+                        let ungoverned = frame.get("realtimeInput").is_some()
+                            || frame.get("realtime_input").is_some()
+                            || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
+                        if ungoverned {
+                            if cl_tx
+                                .send(rt_error_frame(
+                                    ErrClass::Validation,
+                                    "one governed clientContent turn at a time; realtimeInput is not wired",
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
                         Err(reason) => {
                             if cl_tx
@@ -843,11 +868,8 @@ async fn realtime_bridge(
                             }
                         }
                     }
-                    // gate each generation trigger; with a turn already admitted it relays ungated
-                    // —
-                    // upstream rejects the duplicate and a raced accept is caught by the
-                    // response.created gate
-                    if is_response_create(&frame) && pending.is_none() {
+                    // dup triggers relay ungated: upstream rejects them, response.created gates a raced accept
+                    if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
                         match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
                                 pending = Some(RealtimeTurn::new(admit));
@@ -893,15 +915,18 @@ async fn realtime_bridge(
                 let mut output_units = 0;
                 match frame {
                     Some(mut v) => {
+                        if let Some(u) = gemini_usage_update(account.wire_kind(), &v) {
+                            usage_snapshot = Some(u);
+                        }
                         if suppress {
                             relay = false;
-                            if realtime_usage(&account.provider, &v).is_some() {
+                            if realtime_usage(account.wire_kind(), &v).is_some() {
                                 suppress = false;
                             }
                         }
                         // server-VAD auto-starts a turn with no client response.create — gate it
                         // like a manual one
-                        else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
+                        else if realtime_turn_started(account.wire_kind(), &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
                                 Err((class, denied)) => {
@@ -913,7 +938,12 @@ async fn realtime_bridge(
                                     relay = false;
                                 }
                             }
-                        } else if let Some((it, ot)) = realtime_usage(&account.provider, &v) {
+                        } else if let Some((mut it, mut ot)) = realtime_usage(account.wire_kind(), &v) {
+                            // every boundary consumes the snapshot so none leaks into the next turn
+                            if let (Some(u), true) = (usage_snapshot.take(), it + ot == 0) {
+                                (it, ot) = gemini_tokens(&u);
+                                v["usageMetadata"] = u;
+                            }
                             // turn boundary: settle the admitted turn; one with no gated turn bills
                             // unreserved
                             match pending.take() {
@@ -926,7 +956,7 @@ async fn realtime_bridge(
                                         gw_models::TokenInput {
                                             prompt: it,
                                             completion: ot,
-                                            ..turn_audio(&account.provider, &v)
+                                            ..turn_audio(account.wire_kind(), &v)
                                         },
                                         false,
                                     )
@@ -962,7 +992,7 @@ async fn realtime_bridge(
                                         gw_models::TokenInput {
                                             prompt: it,
                                             completion: ot,
-                                            ..turn_audio(&account.provider, &v)
+                                            ..turn_audio(account.wire_kind(), &v)
                                         },
                                         false,
                                     )
@@ -1035,7 +1065,26 @@ async fn realtime_bridge(
         }
     }
     if let Some(turn) = pending {
-        settle_realtime_abort(turn, &rtm, mt, &account.name).await;
+        if let Some(usage) = usage_snapshot {
+            let (prompt, reported_completion) = gemini_tokens(&usage);
+            // the snapshot may predate the last delivered parts; the byte estimate floors it
+            let completion = turn
+                .estimated_output_tokens()
+                .map_or(reported_completion, |delivered| {
+                    delivered.max(reported_completion)
+                });
+            let (audio_prompt, audio_completion) = gemini_audio_tokens(&usage);
+            let tokens = gw_models::TokenInput {
+                prompt,
+                completion,
+                audio_prompt,
+                audio_completion,
+                ..Default::default()
+            };
+            bill_realtime_turn(&turn.admit, &rtm, mt, &account.name, tokens, true).await;
+        } else {
+            settle_realtime_abort(turn, &rtm, mt, &account.name).await;
+        }
     }
     // a turn aborted before its boundary still redacted per frame — flush the count for the audit
     flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
@@ -4006,12 +4055,19 @@ async fn videos_generations(
 }
 
 /// The shared head of both video read routes: spend the caller's rate limits,
-/// load the job under its tenant gate.
+/// load the job under its tenant gate, poll the vendor and settle a first done.
 async fn admit_video_job(
     s: &AppState,
     ak: &AkInfo,
     id: &str,
-) -> Result<(Arc<GatewayState>, VideoJob), Response> {
+) -> Result<
+    (
+        VideoJob,
+        Arc<gw_models::Account>,
+        gw_engines::families::VideoPoll,
+    ),
+    Response,
+> {
     let state = s.handler.state();
     let cfg = s.handler.cfg();
     let gov = state.governance.as_ref();
@@ -4025,7 +4081,14 @@ async fn admit_video_job(
     }
     let found = state.store.video_job_get(id).await;
     let job = tenant_owned(found, |j| &j.tenant, &ak.tenant, "video", id)?;
-    Ok((state, job))
+    let Some(account) = state.pool.named(&job.account) else {
+        return Err(error_response(
+            503,
+            format!("account {} is no longer configured", job.account),
+        ));
+    };
+    let poll = poll_and_settle_video(s, &job, &account).await?;
+    Ok((job, account, poll))
 }
 
 async fn poll_and_settle_video(
@@ -4093,25 +4156,14 @@ async fn videos_get(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let (state, job) = match admit_video_job(&s, &ak, &id).await {
-        Ok(admitted) => admitted,
-        Err(resp) => return resp,
-    };
-    let Some(account) = state.pool.named(&job.account) else {
-        return error_response(
-            503,
-            format!("account {} is no longer configured", job.account),
-        );
-    };
-    let poll = match poll_and_settle_video(&s, &job, &account).await {
-        Ok(poll) => poll,
-        Err(resp) => return resp,
-    };
-    (
-        StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
-        Json(poll.body),
-    )
-        .into_response()
+    match admit_video_job(&s, &ak, &id).await {
+        Ok((_, _, poll)) => (
+            StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
+            Json(poll.body),
+        )
+            .into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// GET /v1/videos/{id}/content — the finished clip's bytes, proxied for vendors
@@ -4121,18 +4173,8 @@ async fn videos_content(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let (state, job) = match admit_video_job(&s, &ak, &id).await {
+    let (job, account, poll) = match admit_video_job(&s, &ak, &id).await {
         Ok(admitted) => admitted,
-        Err(resp) => return resp,
-    };
-    let Some(account) = state.pool.named(&job.account) else {
-        return error_response(
-            503,
-            format!("account {} is no longer configured", job.account),
-        );
-    };
-    let poll = match poll_and_settle_video(&s, &job, &account).await {
-        Ok(poll) => poll,
         Err(resp) => return resp,
     };
     if !poll.done {

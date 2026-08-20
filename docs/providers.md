@@ -24,7 +24,7 @@ models:
 |------|----------|-----------|------|
 | `openai` | `https://api.openai.com` | openai-chat, embeddings, image, tts, stt, responses, completions, realtime, moderations, video | `Bearer` (realtime live-verified on gpt-realtime-mini — the bridge settles the vendor's `response.done` usage, audio output at its `token_rate.audio_completion` weight, `estimated: false`; video = Sora, see below) |
 | `anthropic` | `https://api.anthropic.com` | anthropic-messages | `x-api-key` + `anthropic-version` |
-| `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
+| `gemini` | `https://generativelanguage.googleapis.com` | gemini, realtime | `x-goog-api-key` (realtime = the Live API socket, live-verified: the bridge admits on `clientContent.turnComplete`, relays the binary frames, and settles `usageMetadata` — audio output tokens at their own weight) |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
 | `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` (its `reasoning_details` shape is the one this gateway emits, so signed Anthropic reasoning round-trips through tool loops; verified live on free and paid models) |
 | `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` (Kimi K2 thinking: `reasoning_content` in and out, `thinking: {type: disabled}` passes through; the vendor's `/anthropic` base also works as `kind: anthropic` + `endpoint`) |
@@ -88,7 +88,8 @@ keep access until 2027-01-01), so no reachable configuration exists. The factory
 generic `audio`, and `passthrough` protocols (kling-v1-6, grok-imagine-video,
 sora-2 and brave-search ship example accounts in the default config).
 `protocol: video`
-picks its wire from the account's provider name — `openai`/`azure` → Sora,
+picks its wire from the account's preset `kind` (falling back to the raw
+provider label for hand-written accounts) — `openai` → Sora,
 `siliconflow` → Wan submit/status, `alibaba`/`dashscope` → the DashScope task
 API (the account endpoint is the bare `https://dashscope-intl.aliyuncs.com`;
 some Wan models reject submit `parameters`, so the gateway forwards only what
