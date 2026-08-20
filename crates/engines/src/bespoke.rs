@@ -114,8 +114,9 @@ base_engine!(AwsEmbedEngine);
 #[async_trait::async_trait]
 impl ModelEngine for AwsEmbedEngine {
     /// Bedrock embeddings over InvokeModel, answered in the OpenAI list shape:
-    /// Titan `{inputText}` -> `{embedding, inputTextTokenCount}` one call per
-    /// input, Cohere `{texts, input_type}` -> `{embeddings}` in one call;
+    /// Titan accepts exactly one `{inputText}` and returns
+    /// `{embedding, inputTextTokenCount}`; Cohere batches `{texts, input_type}`
+    /// into one call and returns `{embeddings}`;
     /// usage from the `x-amzn-bedrock-*` headers, body counts as fallback.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
@@ -128,33 +129,28 @@ impl ModelEngine for AwsEmbedEngine {
             }
         };
         let mut data = Vec::with_capacity(texts.len());
-        let mut prompt_tokens = 0i64;
-        let mut status = 200;
-        if model.starts_with("cohere.") {
+        let (status, prompt_tokens) = if model.starts_with("cohere.") {
             // bedrock's cohere embed requires an input_type; the gateway embeds for retrieval storage
             let mut body = json!({"input_type": "search_document"});
             body["texts"] = Value::Array(texts.into_iter().map(Value::String).collect());
             let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
-            status = st;
             if let Value::Array(rows) = v["embeddings"].take() {
                 data.extend(rows.into_iter().enumerate().map(embedding_row));
             }
-            prompt_tokens = embed_input_tokens(&headers, 0);
+            (st, embed_input_tokens(&headers, 0))
         } else {
-            for (i, text) in texts.into_iter().enumerate() {
-                let mut body = json!({});
-                body["inputText"] = Value::String(text);
-                if let Some(d) = dimensions {
-                    body["dimensions"] = json!(d);
-                }
-                let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
-                status = st;
-                let body_count = crate::engine::tok(&v["inputTextTokenCount"]);
-                prompt_tokens =
-                    prompt_tokens.saturating_add(embed_input_tokens(&headers, body_count));
-                data.push(embedding_row((i, v["embedding"].take())));
+            let [text] = <[String; 1]>::try_from(texts).map_err(|_| {
+                GatewayError::bad_request("titan embeddings require exactly one input")
+            })?;
+            let mut body = json!({"inputText": text});
+            if let Some(d) = dimensions {
+                body["dimensions"] = json!(d);
             }
-        }
+            let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
+            let body_count = crate::engine::tok(&v["inputTextTokenCount"]);
+            data.push(embedding_row((0, v["embedding"].take())));
+            (st, embed_input_tokens(&headers, body_count))
+        };
         let mut v2 = json!({"object": "list", "model": model,
             "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}});
         v2["data"] = Value::Array(data);
@@ -588,20 +584,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn titan_embeddings_invoke_per_input_and_bill_the_body_counts() {
-        let r = embed_req(
-            "amazon.titan-embed-text-v2:0",
-            &["hello world", "second doc"],
-            Some(256),
-        );
+    async fn titan_embeddings_invoke_once_and_bill_the_body_count() {
+        let r = embed_req("amazon.titan-embed-text-v2:0", &["hello world"], Some(256));
         let out = AwsEmbedEngine::new(r, t()).run().await.unwrap();
         let v = out.response.response_v2.unwrap();
-        assert_eq!(v["data"].as_array().unwrap().len(), 2);
-        assert_eq!(v["data"][1]["index"], 1);
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"][0]["index"], 0);
         assert!(v["data"][0]["embedding"].is_array());
-        assert_eq!(out.response.prompt_tokens, 4);
+        assert_eq!(out.response.prompt_tokens, 2);
         assert_eq!(out.response.completion_tokens, 0);
-        assert_eq!(v["usage"]["total_tokens"], 4);
+        assert_eq!(v["usage"]["total_tokens"], 2);
     }
 
     #[tokio::test]
