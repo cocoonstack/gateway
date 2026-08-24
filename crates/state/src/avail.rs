@@ -183,8 +183,9 @@ impl AvailStore for RedisAvail {
                     return (0, 0);
                 }
             };
-        vals.chunks_exact(2).fold((0, 0), |(o, e), pair| {
-            (o + pair[0].unwrap_or(0), e + pair[1].unwrap_or(0))
+        let (pairs, _) = vals.as_chunks::<2>();
+        pairs.iter().fold((0, 0), |(o, e), [ok, err]| {
+            (o + ok.unwrap_or(0), e + err.unwrap_or(0))
         })
     }
 }

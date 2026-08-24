@@ -1288,6 +1288,7 @@ impl axum::extract::FromRequestParts<AppState> for Authed {
 
 /// The shared body behind [`ApiJson`]/[`AnthJson`]: `axum::Json` with the
 /// rejection rendered through the surface's own envelope.
+#[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn extract_json<T, S>(
     req: axum::extract::Request,
     state: &S,
@@ -1669,6 +1670,7 @@ fn require_config_store(s: &AppState) -> Result<&Arc<gw_state::PostgresConfigSto
 
 /// Key lookup under an admin scope: another tenant's key answers 404 (not
 /// 403), so a tenant admin can't probe which keys exist outside its scope.
+#[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn scoped_key(
     s: &AppState,
     scope: &AdminScope,
@@ -3568,6 +3570,7 @@ fn messages_stream_response(
 
 /// Run a non-chat family request through the pipeline. `mt` is only a
 /// placeholder protocol — the resolve_model DAG node maps the real one.
+#[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn run_family(
     s: &AppState,
     ak: AkInfo,
@@ -4056,6 +4059,7 @@ async fn videos_generations(
 
 /// The shared head of both video read routes: spend the caller's rate limits,
 /// load the job under its tenant gate, poll the vendor and settle a first done.
+#[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn admit_video_job(
     s: &AppState,
     ak: &AkInfo,
@@ -4091,6 +4095,7 @@ async fn admit_video_job(
     Ok((job, account, poll))
 }
 
+#[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn poll_and_settle_video(
     s: &AppState,
     job: &VideoJob,

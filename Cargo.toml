@@ -30,7 +30,7 @@ undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
 # --- async runtime ---
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "io-util"] }
 async-trait = "0.1"
 futures = "0.3"
 # --- web (server) ---
