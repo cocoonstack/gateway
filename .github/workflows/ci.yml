@@ -39,9 +39,6 @@ jobs:
       CP_TEST_GW_BIN: ${{ github.workspace }}/target/debug/gw
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -83,7 +80,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
       # Run cargo-deny directly (pinned) rather than the action, whose musl
       # container mis-resolves rust-toolchain.toml and tracks a floating CLI.
       - uses: taiki-e/install-action@v2
