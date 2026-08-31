@@ -20,7 +20,7 @@ version = "0.0.0" # the release tag is the version: release.yml stamps it before
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cocoonstack/gateway"
-rust-version = "1.88"
+rust-version = "1.98"
 publish = false
 
 [workspace.lints.clippy]

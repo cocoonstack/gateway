@@ -53,6 +53,7 @@ jobs:
       - name: Control-plane Go gates
         working-directory: control-plane
         run: |
+          make fmt-check
           GOWORK=off go vet ./...
           GOWORK=off go test ./...
           GOWORK=off go test -tags=integration -count=1 ./internal/integration

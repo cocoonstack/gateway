@@ -1,6 +1,31 @@
-.PHONY: test test-integration web web-test build
+.PHONY: test test-integration web web-test build fmt fmt-check gofumpt goimports
 
 RUST_CARGO ?= cargo
+
+LOCALBIN ?= $(shell pwd)/bin
+GOFUMPT_VERSION ?= v0.11.0
+GOFUMPT_ROOT := $(LOCALBIN)/gofumpt-$(GOFUMPT_VERSION)
+GOFMT := $(GOFUMPT_ROOT)/gofumpt
+GOIMPORTS_VERSION ?= v0.49.0
+GOIMPORTS_ROOT := $(LOCALBIN)/goimports-$(GOIMPORTS_VERSION)
+GOIMPORTS := $(GOIMPORTS_ROOT)/goimports
+GOIMPORTS_LOCAL_PREFIXES := github.com/cocoonstack/
+
+gofumpt: $(GOFMT)
+$(GOFMT):
+	GOBIN=$(GOFUMPT_ROOT) go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+
+goimports: $(GOIMPORTS)
+$(GOIMPORTS):
+	GOBIN=$(GOIMPORTS_ROOT) go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION)
+
+fmt: gofumpt goimports
+	$(GOFMT) -l -w .
+	$(GOIMPORTS) -l -w --local '$(GOIMPORTS_LOCAL_PREFIXES)' .
+
+fmt-check: gofumpt goimports
+	@test -z "$$($(GOFMT) -l .)" || { echo "Files need formatting (gofumpt):"; $(GOFMT) -l .; exit 1; }
+	@test -z "$$($(GOIMPORTS) -l .)" || { echo "Files need formatting (goimports):"; $(GOIMPORTS) -l .; exit 1; }
 
 test:
 	GOWORK=off go test ./...
