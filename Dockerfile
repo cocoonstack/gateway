@@ -1,11 +1,11 @@
 # Pinned: successive image builds must embed the same toolchain, not whatever
 # `rust:1` floats to on the day of the build.
-FROM rust:1 AS builder
+FROM rust:1.98.0@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8 AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p gw-server --locked
 
-FROM debian:trixie-slim
+FROM debian:13.6-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

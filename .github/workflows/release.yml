@@ -18,8 +18,8 @@ jobs:
           - {runner: macos-latest, os: darwin, arch: arm64}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Stamp the tag into the workspace version
         run: |
           perl -pi -e "s/^version = \"[^\"]*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
@@ -30,7 +30,7 @@ jobs:
           mkdir -p dist-gw
           tar -czf "dist-gw/gw_${GITHUB_REF_NAME#v}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" \
             -C target/release gw
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: gw-${{ matrix.os }}-${{ matrix.arch }}
           path: dist-gw/*.tar.gz
@@ -39,14 +39,14 @@ jobs:
     needs: gw
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: control-plane/go.mod
           cache-dependency-path: control-plane/go.sum
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -58,11 +58,11 @@ jobs:
           npm run build
           mkdir -p ../../dist-web
           tar -czf "../../dist-web/control-plane-web-dist_${GITHUB_REF_NAME#v}.tar.gz" -C . dist
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8.0.1
         with:
           path: dist-gw
           merge-multiple: true
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@v7.2.3
         with:
           version: v2.18.0
           args: release --clean

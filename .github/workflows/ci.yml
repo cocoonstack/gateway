@@ -38,15 +38,15 @@ jobs:
       # built by the cargo test step; drives the tenant-token full-chain E2E
       CP_TEST_GW_BIN: ${{ github.workspace }}/target/debug/gw
     steps:
-      - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: control-plane/go.mod
           cache-dependency-path: control-plane/go.sum
@@ -57,7 +57,7 @@ jobs:
           GOWORK=off go vet ./...
           GOWORK=off go test ./...
           GOWORK=off go test -tags=integration -count=1 ./internal/integration
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -80,11 +80,11 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       # Run cargo-deny directly (pinned) rather than the action, whose musl
       # container mis-resolves rust-toolchain.toml and tracks a floating CLI.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.87.2
         with:
           tool: cargo-deny@0.20.2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo deny check
