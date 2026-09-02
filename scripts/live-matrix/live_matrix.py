@@ -977,7 +977,6 @@ def run_group(gw: Gateway, group: str) -> None:
         case_thinking_tiers(gw, haiku, native=True, tiers=[1024, 4096, 16384], expect_reasoning=True)
         # adaptive thinking may skip reasoning at low effort on an easy prompt: presence is reported, not asserted
         case_thinking_tiers(gw, sonnet46, native=False, tiers=["low", "medium", "high", "max"], expect_reasoning=False)
-        # 4.7+ / 5 family: adaptive+summarized dialect, xhigh accepted, sampling knobs dropped by the gateway
         case_thinking_tiers(gw, opus5, native=False, tiers=["low", "medium", "high", "xhigh", "max"], expect_reasoning=False)
         case_chat(gw, opus5, "temperature dropped", prompt=prime, temperature=0.2, top_p=0.9)
         case_messages(
