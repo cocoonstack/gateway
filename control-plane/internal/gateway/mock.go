@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -121,7 +122,7 @@ func (m *MockClient) CreateKey(_ context.Context, actingTenant string, key Key) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if key.AK == "" || key.Product == "" || key.Tenant == "" {
-		return fmt.Errorf("ak, product and tenant are required")
+		return errors.New("ak, product and tenant are required")
 	}
 	// the real gateway answers an uncovered existing ak with 404 (scoped_key anti-probing), never 409
 	if existing, ok := m.keys[key.AK]; ok && actingTenant != "" && existing.Tenant != actingTenant {
@@ -187,7 +188,7 @@ func (m *MockClient) Config(context.Context) (ConfigDocument, error) {
 
 func (m *MockClient) ValidateConfig(_ context.Context, yaml string) (map[string]any, error) {
 	if !strings.Contains(yaml, "listen:") || !strings.Contains(yaml, "models:") {
-		return nil, fmt.Errorf("invalid config: listen and models are required")
+		return nil, errors.New("invalid config: listen and models are required")
 	}
 	return map[string]any{"valid": true, "models": strings.Count(yaml, "name:")}, nil
 }
@@ -211,7 +212,7 @@ func (m *MockClient) PublishConfig(ctx context.Context, yaml string, expectedVer
 func (m *MockClient) ConfigVersions(context.Context) ([]ConfigVersion, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]ConfigVersion(nil), m.versions...), nil
+	return slices.Clone(m.versions), nil
 }
 
 func (m *MockClient) RollbackConfig(_ context.Context, id int64) (int64, error) {
@@ -229,7 +230,7 @@ func (m *MockClient) RollbackConfig(_ context.Context, id int64) (int64, error) 
 func (m *MockClient) Audit(context.Context) ([]AuditEntry, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	entries := append([]AuditEntry(nil), m.audit...)
+	entries := slices.Clone(m.audit)
 	slices.SortFunc(entries, func(a, b AuditEntry) int { return cmp.Compare(b.CreatedAtEpochSecs, a.CreatedAtEpochSecs) })
 	return entries, nil
 }

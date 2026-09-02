@@ -1,11 +1,11 @@
-import { type FormEvent, useState } from "react";
+import { type FormEvent, type ReactElement, useState } from "react";
 import { api, jsonBody } from "../api";
 import { dateTime, roleLabel } from "../format";
 import { useAPI, useAction } from "../hooks";
 import type { Role, User } from "../types";
 import { Card, ErrorNotice, FormModal, Loading, PageHeader, Status } from "../components/UI";
 
-export default function UsersPage() {
+export default function UsersPage(): ReactElement {
   const { data, error, reload } = useAPI<{ users: User[] }>("/api/v1/admin/users");
   const [creating, setCreating] = useState(false);
   const action = useAction();

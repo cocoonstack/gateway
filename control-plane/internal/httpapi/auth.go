@@ -32,7 +32,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, maxJSONBody, &body) {
 		return
 	}
-	throttleKey := clientIP(r) + "|" + user.NormalizeEmail(body.Email)
+	throttleKey := s.clientIP(r) + "|" + user.NormalizeEmail(body.Email)
 	if !s.throttle.allow(throttleKey, time.Now()) {
 		writeError(w, http.StatusTooManyRequests, "too many login attempts; retry later")
 		return
@@ -50,12 +50,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.throttle.reset(throttleKey)
 	sessionID, err := auth.RandomToken(32)
 	if err != nil {
-		mapError(r.Context(), w, err)
+		loginError(r.Context(), w, err)
 		return
 	}
 	csrf, err := auth.RandomToken(24)
 	if err != nil {
-		mapError(r.Context(), w, err)
+		loginError(r.Context(), w, err)
 		return
 	}
 	now := time.Now()
@@ -64,7 +64,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		IssuedAt: now.Unix(), ExpiresAt: now.Add(s.sessionTTL).Unix(),
 	}
 	if err := s.sessions.Put(r.Context(), session); err != nil {
-		mapError(r.Context(), w, err)
+		loginError(r.Context(), w, err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{

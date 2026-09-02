@@ -1,10 +1,11 @@
+import type { ReactElement } from "react";
 import { useAuth } from "../App";
 import { compact, money } from "../format";
 import { useAPI } from "../hooks";
 import type { Overview } from "../types";
 import { Card, ErrorNotice, LineChart, Loading, Metric, PageHeader, Status } from "../components/UI";
 
-export default function OverviewPage() {
+export default function OverviewPage(): ReactElement {
   const { session } = useAuth();
   const { data, error } = useAPI<Overview>("/api/v1/overview?bucket=day");
   const isSystem = session.user.role === "system_admin";

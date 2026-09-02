@@ -1,11 +1,11 @@
-import { useMemo, useState } from "react";
+import { type ReactElement, useMemo, useState } from "react";
 import { useAuth } from "../App";
 import { compact, dateTime, money } from "../format";
 import { useAPI } from "../hooks";
 import type { UsageRow, UsageSeries } from "../types";
 import { Card, ErrorNotice, LineChart, Loading, PageHeader } from "../components/UI";
 
-export default function UsagePage() {
+export default function UsagePage(): ReactElement {
   const { session } = useAuth();
   const [days, setDays] = useState(30);
   const { since, until } = useMemo(() => {

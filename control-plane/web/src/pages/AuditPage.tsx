@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { type ReactElement, useState } from "react";
 import { Card, Empty, ErrorNotice, Loading, PageHeader, Status } from "../components/UI";
 import { dateTime } from "../format";
 import { useAPI } from "../hooks";
 import { useAuth } from "../App";
 import type { AuditEntry, SecurityEvent } from "../types";
 
-export default function AuditPage() {
+export default function AuditPage(): ReactElement {
   const { session } = useAuth();
   const system = session.user.role === "system_admin";
   const [kind, setKind] = useState<"ops" | "security">(system ? "ops" : "security");

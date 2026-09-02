@@ -276,7 +276,13 @@ func startControlPlane(t *testing.T, gwURL string) *httptest.Server {
 			t.Fatalf("seed user: %v", err)
 		}
 	}
-	server := httptest.NewServer(httpapi.New(store, kvmemory.New(), client, time.Hour, false, t.TempDir()).Handler())
+	server := httptest.NewServer(httpapi.New(httpapi.Options{
+		Users:      store,
+		Sessions:   kvmemory.New(),
+		Gateway:    client,
+		SessionTTL: time.Hour,
+		WebDir:     t.TempDir(),
+	}).Handler())
 	t.Cleanup(server.Close)
 	return server
 }

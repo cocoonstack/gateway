@@ -1,10 +1,11 @@
+import type { ReactElement } from "react";
 import { useAuth } from "../App";
 import { compact } from "../format";
 import { useAPI } from "../hooks";
 import type { Instance, ModelStatus } from "../types";
 import { Card, ErrorNotice, Loading, PageHeader, Status } from "../components/UI";
 
-export default function AvailabilityPage() {
+export default function AvailabilityPage(): ReactElement {
   const { session } = useAuth();
   const isSystem = session.user.role === "system_admin";
   const models = useAPI<{ models: ModelStatus[] }>("/api/v1/models/status");

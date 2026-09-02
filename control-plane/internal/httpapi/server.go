@@ -7,7 +7,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -37,31 +36,37 @@ type principal struct {
 
 type principalKey struct{}
 
+// Options configures a Server; with TrustedProxy set, X-Forwarded-For and X-Real-IP become the client IP.
+type Options struct {
+	Users        user.Store
+	Sessions     kv.Sessions
+	Gateway      gateway.Client
+	SessionTTL   time.Duration
+	CookieSecure bool
+	TrustedProxy bool
+	WebDir       string
+}
+
 type Server struct {
 	users        user.Store
 	sessions     kv.Sessions
 	gateway      gateway.Client
 	sessionTTL   time.Duration
 	cookieSecure bool
+	trustedProxy bool
 	webDir       string
 	throttle     *loginThrottle
 }
 
-func New(
-	users user.Store,
-	sessions kv.Sessions,
-	gw gateway.Client,
-	sessionTTL time.Duration,
-	cookieSecure bool,
-	webDir string,
-) *Server {
+func New(opts Options) *Server {
 	return &Server{
-		users:        users,
-		sessions:     sessions,
-		gateway:      gw,
-		sessionTTL:   sessionTTL,
-		cookieSecure: cookieSecure,
-		webDir:       webDir,
+		users:        opts.Users,
+		sessions:     opts.Sessions,
+		gateway:      opts.Gateway,
+		sessionTTL:   opts.SessionTTL,
+		cookieSecure: opts.CookieSecure,
+		trustedProxy: opts.TrustedProxy,
+		webDir:       opts.WebDir,
 		throttle:     newLoginThrottle(),
 	}
 }
@@ -108,7 +113,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		u, err := s.users.ByID(r.Context(), session.UserID)
-		if err != nil || u.Disabled || u.PasswordChangedAt > 0 && session.IssuedAt <= u.PasswordChangedAt {
+		if err != nil || u.Disabled || (u.PasswordChangedAt > 0 && session.IssuedAt <= u.PasswordChangedAt) {
 			_ = s.sessions.Delete(r.Context(), session.ID)
 			writeError(w, http.StatusUnauthorized, "authentication required")
 			return
@@ -178,6 +183,16 @@ func (s *Server) serveWeb(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, index)
 }
 
+// auditLog names the principal behind a mutating admin action; accessLog lines carry only the route.
+func (s *Server) auditLog(r *http.Request, action, target string) {
+	p := current(r)
+	log.WithFunc("httpapi.audit").Infof(
+		r.Context(),
+		"actor=%s role=%s action=%s target=%s ip=%s rid=%s",
+		p.User.Email, p.User.Role, action, target, s.clientIP(r), gateway.RequestIDFrom(r.Context()),
+	)
+}
+
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -187,6 +202,22 @@ func (w *statusWriter) WriteHeader(status int) {
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
+
+// ReadFrom keeps http.ServeFile on the sendfile path, which io.Copy reaches by type assertion.
+func (w *statusWriter) ReadFrom(src io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	return io.Copy(w.ResponseWriter, src)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func current(r *http.Request) principal {
 	value, _ := r.Context().Value(principalKey{}).(principal)
@@ -228,10 +259,10 @@ func period(r *http.Request) (int64, int64, string, error) {
 		bucket = "day"
 	}
 	if since < 0 || until < since {
-		return 0, 0, "", fmt.Errorf("since/until must be a valid non-negative range")
+		return 0, 0, "", errors.New("since/until must be a valid non-negative range")
 	}
 	if bucket != "hour" && bucket != "day" {
-		return 0, 0, "", fmt.Errorf("bucket must be hour or day")
+		return 0, 0, "", errors.New("bucket must be hour or day")
 	}
 	return since, until, bucket, nil
 }
@@ -297,16 +328,6 @@ func validRequestID(rid string) bool {
 	})
 }
 
-// auditLog names the principal behind a mutating admin action; accessLog lines carry only the route.
-func auditLog(r *http.Request, action, target string) {
-	p := current(r)
-	log.WithFunc("httpapi.audit").Infof(
-		r.Context(),
-		"actor=%s role=%s action=%s target=%s ip=%s rid=%s",
-		p.User.Email, p.User.Role, action, target, clientIP(r), gateway.RequestIDFrom(r.Context()),
-	)
-}
-
 func mapError(ctx context.Context, w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, user.ErrNotFound), errors.Is(err, gateway.ErrNotFound):
@@ -314,7 +335,12 @@ func mapError(ctx context.Context, w http.ResponseWriter, err error) {
 	case errors.Is(err, user.ErrConflict), errors.Is(err, gateway.ErrConflict):
 		writeError(w, http.StatusConflict, err.Error())
 	default:
-		log.WithFunc("httpapi.mapError").Error(ctx, err, "request failed")
+		log.WithFunc("httpapi.mapError").Errorf(ctx, err, "request failed rid=%s", gateway.RequestIDFrom(ctx))
 		writeError(w, http.StatusBadGateway, err.Error())
 	}
+}
+
+func loginError(ctx context.Context, w http.ResponseWriter, err error) {
+	log.WithFunc("httpapi.loginError").Errorf(ctx, err, "login failed rid=%s", gateway.RequestIDFrom(ctx))
+	writeError(w, http.StatusInternalServerError, "login is temporarily unavailable")
 }

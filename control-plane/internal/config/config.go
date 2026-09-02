@@ -3,7 +3,7 @@ package config
 
 import (
 	"cmp"
-	"fmt"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -23,6 +23,7 @@ type Config struct {
 	WebDir              string
 	SessionTTL          time.Duration
 	CookieSecure        bool
+	TrustedProxy        bool
 	DevSeed             bool
 	BootstrapEmail      string
 	BootstrapPassword   string
@@ -42,6 +43,7 @@ func Load() (Config, error) {
 		WebDir:            cmp.Or(os.Getenv("CP_WEB_DIR"), "web/dist"),
 		SessionTTL:        12 * time.Hour,
 		CookieSecure:      envBool("CP_COOKIE_SECURE", false),
+		TrustedProxy:      envBool("CP_TRUSTED_PROXY", false),
 		DevSeed:           envBool("CP_DEV_SEED", false),
 		BootstrapEmail:    os.Getenv("CP_BOOTSTRAP_ADMIN_EMAIL"),
 		BootstrapPassword: os.Getenv("CP_BOOTSTRAP_ADMIN_PASSWORD"),
@@ -50,27 +52,27 @@ func Load() (Config, error) {
 	if raw := os.Getenv("CP_SESSION_TTL"); raw != "" {
 		ttl, err := time.ParseDuration(raw)
 		if err != nil || ttl <= 0 {
-			return Config{}, fmt.Errorf("CP_SESSION_TTL must be a positive duration")
+			return Config{}, errors.New("CP_SESSION_TTL must be a positive duration")
 		}
 		cfg.SessionTTL = ttl
 	}
 	if cfg.StoreDriver != "memory" && cfg.StoreDriver != "postgres" {
-		return Config{}, fmt.Errorf("CP_STORE must be memory or postgres")
+		return Config{}, errors.New("CP_STORE must be memory or postgres")
 	}
 	if cfg.StoreDriver == "postgres" && cfg.DatabaseURL == "" {
-		return Config{}, fmt.Errorf("CP_DATABASE_URL is required for postgres")
+		return Config{}, errors.New("CP_DATABASE_URL is required for postgres")
 	}
 	if cfg.KVDriver != "memory" && cfg.KVDriver != "redis" {
-		return Config{}, fmt.Errorf("CP_KV must be memory or redis")
+		return Config{}, errors.New("CP_KV must be memory or redis")
 	}
 	if cfg.KVDriver == "redis" && cfg.RedisURL == "" {
-		return Config{}, fmt.Errorf("CP_REDIS_URL is required for redis")
+		return Config{}, errors.New("CP_REDIS_URL is required for redis")
 	}
 	if cfg.GatewayMode != "mock" && cfg.GatewayMode != "http" {
-		return Config{}, fmt.Errorf("CP_GATEWAY_MODE must be mock or http")
+		return Config{}, errors.New("CP_GATEWAY_MODE must be mock or http")
 	}
 	if cfg.GatewayMode == "http" && strings.TrimSpace(cfg.GatewayAdminToken) == "" {
-		return Config{}, fmt.Errorf("CP_GATEWAY_ADMIN_TOKEN is required for http gateway mode")
+		return Config{}, errors.New("CP_GATEWAY_ADMIN_TOKEN is required for http gateway mode")
 	}
 	tenantTokens, err := parseTenantTokens(os.Getenv("CP_GATEWAY_TENANT_TOKENS"))
 	if err != nil {
@@ -78,7 +80,7 @@ func Load() (Config, error) {
 	}
 	cfg.GatewayTenantTokens = tenantTokens
 	if (cfg.BootstrapEmail == "") != (cfg.BootstrapPassword == "") {
-		return Config{}, fmt.Errorf("bootstrap admin email and password must be set together")
+		return Config{}, errors.New("bootstrap admin email and password must be set together")
 	}
 	return cfg, nil
 }
@@ -92,7 +94,7 @@ func parseTenantTokens(raw string) (map[string]string, error) {
 		}
 		tenant, token, ok := strings.Cut(part, "=")
 		if !ok || tenant == "" || token == "" {
-			return nil, fmt.Errorf("CP_GATEWAY_TENANT_TOKENS entries must be tenant=token")
+			return nil, errors.New("CP_GATEWAY_TENANT_TOKENS entries must be tenant=token")
 		}
 		tokens[tenant] = token
 	}

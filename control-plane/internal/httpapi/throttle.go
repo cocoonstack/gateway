@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"cmp"
 	"maps"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,17 +24,19 @@ type window struct {
 type loginThrottle struct {
 	mu      sync.Mutex
 	windows map[string]window
+	sweepAt int
 }
 
 func newLoginThrottle() *loginThrottle {
-	return &loginThrottle{windows: make(map[string]window)}
+	return &loginThrottle{windows: make(map[string]window), sweepAt: throttleSweepAt}
 }
 
 func (t *loginThrottle) allow(key string, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.windows) > throttleSweepAt {
+	if len(t.windows) > t.sweepAt {
 		maps.DeleteFunc(t.windows, func(_ string, w window) bool { return now.Sub(w.start) >= loginWindow })
+		t.sweepAt = max(throttleSweepAt, 2*len(t.windows))
 	}
 	w := t.windows[key]
 	if now.Sub(w.start) >= loginWindow {
@@ -49,7 +53,13 @@ func (t *loginThrottle) reset(key string) {
 	delete(t.windows, key)
 }
 
-func clientIP(r *http.Request) string {
+func (s *Server) clientIP(r *http.Request) string {
+	if s.trustedProxy {
+		forwarded, _, _ := strings.Cut(r.Header.Get("X-Forwarded-For"), ",")
+		if ip := cmp.Or(strings.TrimSpace(forwarded), strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != "" {
+			return ip
+		}
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

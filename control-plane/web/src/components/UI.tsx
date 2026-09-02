@@ -1,5 +1,7 @@
-import type { FormEvent, ReactNode } from "react";
+import type { FormEvent, ReactElement, ReactNode } from "react";
 import { compact } from "../format";
+
+type NumericKey<T> = { [K in keyof T]: T[K] extends number ? K : never }[keyof T] & string;
 
 export function PageHeader({
   eyebrow,
@@ -11,7 +13,7 @@ export function PageHeader({
   title: string;
   description: string;
   actions?: ReactNode;
-}) {
+}): ReactElement {
   return (
     <header className="page-header">
       <div>
@@ -24,7 +26,7 @@ export function PageHeader({
   );
 }
 
-export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function Card({ children, className = "" }: { children: ReactNode; className?: string }): ReactElement {
   return <section className={`card ${className}`}>{children}</section>;
 }
 
@@ -38,7 +40,7 @@ export function Metric({
   value: string;
   detail: string;
   tone?: "neutral" | "positive" | "warning";
-}) {
+}): ReactElement {
   return (
     <Card className={`metric metric-${tone}`}>
       <p>{label}</p>
@@ -48,16 +50,16 @@ export function Metric({
   );
 }
 
-export function Status({ value }: { value: string }) {
+export function Status({ value }: { value: string }): ReactElement {
   return (
     <span className={`status status-${value}`}>
       <span aria-hidden="true" />
-      {value.replace("_", " ")}
+      {value.replaceAll("_", " ")}
     </span>
   );
 }
 
-export function Loading({ label = "Loading" }: { label?: string }) {
+export function Loading({ label = "Loading" }: { label?: string }): ReactElement {
   return (
     <div className="loading" role="status">
       <span />
@@ -66,11 +68,11 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-export function Empty({ children }: { children: ReactNode }) {
+export function Empty({ children }: { children: ReactNode }): ReactElement {
   return <div className="empty">{children}</div>;
 }
 
-export function ErrorNotice({ message }: { message: string }) {
+export function ErrorNotice({ message }: { message: string }): ReactElement {
   return <div className="notice notice-error">{message}</div>;
 }
 
@@ -94,7 +96,7 @@ export function FormModal({
   onClose: () => void;
   onSubmit: (event: FormEvent) => void;
   children: ReactNode;
-}) {
+}): ReactElement {
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="form-modal-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -124,14 +126,14 @@ export function LineChart<T extends { start: number }>({
   format = compact,
 }: {
   data: T[];
-  value: { [K in keyof T]: T[K] extends number ? K : never }[keyof T] & string;
+  value: NumericKey<T>;
   format?: (value: number) => string;
-}) {
+}): ReactElement {
   const width = 720;
   const height = 230;
   const padding = 18;
   const values = data.map((item) => item[value] as number);
-  const max = Math.max(...values, 1);
+  const max = values.reduce((highest, item) => Math.max(highest, item), 1);
   const points = values
     .map((item, index) => {
       const x = padding + (index / Math.max(values.length - 1, 1)) * (width - padding * 2);

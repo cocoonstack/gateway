@@ -25,6 +25,11 @@ import (
 	userpostgres "github.com/cocoonstack/gateway/control-plane/internal/user/postgres"
 )
 
+type userSeed struct {
+	id, email, displayName, password, tenant, gatewayUserID string
+	role                                                    user.Role
+}
+
 func main() {
 	ctx := context.Background()
 	cfg, err := config.Load()
@@ -63,7 +68,15 @@ func run(ctx context.Context, cfg config.Config) (err error) {
 		return err
 	}
 
-	api := httpapi.New(users, sessions, gw, cfg.SessionTTL, cfg.CookieSecure, cfg.WebDir)
+	api := httpapi.New(httpapi.Options{
+		Users:        users,
+		Sessions:     sessions,
+		Gateway:      gw,
+		SessionTTL:   cfg.SessionTTL,
+		CookieSecure: cfg.CookieSecure,
+		TrustedProxy: cfg.TrustedProxy,
+		WebDir:       cfg.WebDir,
+	})
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.Handler(),
@@ -112,11 +125,6 @@ func buildGateway(cfg config.Config) (gateway.Client, error) {
 		return gateway.NewMock(), nil
 	}
 	return gateway.NewHTTP(cfg.GatewayTargets, cfg.GatewayAdminToken, cfg.GatewayTenantTokens)
-}
-
-type userSeed struct {
-	id, email, displayName, password, tenant, gatewayUserID string
-	role                                                    user.Role
 }
 
 func seedUsers(ctx context.Context, store user.Store, cfg config.Config) error {

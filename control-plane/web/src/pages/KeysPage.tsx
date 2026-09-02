@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, type ReactElement, useEffect, useState } from "react";
 import { useAuth } from "../App";
 import { api, jsonBody } from "../api";
 import { compact, dateTime } from "../format";
@@ -6,7 +6,7 @@ import { useAPI, useAction } from "../hooks";
 import type { AccessKey } from "../types";
 import { Card, Empty, ErrorNotice, FormModal, Loading, PageHeader, Status } from "../components/UI";
 
-export default function KeysPage() {
+export default function KeysPage(): ReactElement {
   const { session } = useAuth();
   const [tenant, setTenant] = useState(session.user.role === "tenant_admin" ? session.user.tenant : "");
   const [filter, setFilter] = useState(tenant);

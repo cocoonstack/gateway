@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -177,6 +178,56 @@ func TestPasswordResetEvictsExistingSessions(t *testing.T) {
 	}
 }
 
+func TestClientIPHonoursForwardedHeadersOnlyWhenProxyIsTrusted(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		trustedProxy bool
+		forwardedFor string
+		realIP       string
+		want         string
+	}{
+		{"untrusted ignores forwarded", false, "203.0.113.7, 10.0.0.1", "203.0.113.9", "192.0.2.1"},
+		{"trusted takes first forwarded hop", true, "203.0.113.7, 10.0.0.1", "203.0.113.9", "203.0.113.7"},
+		{"trusted falls back to real ip", true, "", "203.0.113.9", "203.0.113.9"},
+		{"trusted falls back to remote addr", true, "", "", "192.0.2.1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServer(t, usermemory.New(), tt.trustedProxy)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+			req.RemoteAddr = "192.0.2.1:34567"
+			if tt.forwardedFor != "" {
+				req.Header.Set("X-Forwarded-For", tt.forwardedFor)
+			}
+			if tt.realIP != "" {
+				req.Header.Set("X-Real-IP", tt.realIP)
+			}
+			if got := s.clientIP(req); got != tt.want {
+				t.Errorf("clientIP = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoginThrottleSweepStaysAmortisedAndReclaimsExpired(t *testing.T) {
+	throttle := newLoginThrottle()
+	now := time.Now()
+	for i := range throttleSweepAt * 3 {
+		throttle.allow(strconv.Itoa(i), now)
+	}
+	if len(throttle.windows) != throttleSweepAt*3 {
+		t.Fatalf("live windows = %d, want %d", len(throttle.windows), throttleSweepAt*3)
+	}
+	if throttle.sweepAt <= throttleSweepAt {
+		t.Fatalf("sweepAt = %d, want it raised above %d so live windows do not force a scan per login", throttle.sweepAt, throttleSweepAt)
+	}
+	for i := range throttleSweepAt * 3 {
+		throttle.allow("fresh-"+strconv.Itoa(i), now.Add(2*loginWindow))
+	}
+	if _, ok := throttle.windows["0"]; ok {
+		t.Error("expired window survived every sweep")
+	}
+}
+
 type loginState struct {
 	cookie *http.Cookie
 	csrf   string
@@ -206,7 +257,19 @@ func testServer(t *testing.T) http.Handler {
 			t.Fatalf("seed user: %v", err)
 		}
 	}
-	return New(store, kvmemory.New(), gateway.NewMock(), time.Hour, false, t.TempDir()).Handler()
+	return newTestServer(t, store, false).Handler()
+}
+
+func newTestServer(t *testing.T, store user.Store, trustedProxy bool) *Server {
+	t.Helper()
+	return New(Options{
+		Users:        store,
+		Sessions:     kvmemory.New(),
+		Gateway:      gateway.NewMock(),
+		SessionTTL:   time.Hour,
+		TrustedProxy: trustedProxy,
+		WebDir:       t.TempDir(),
+	})
 }
 
 func loginAs(t *testing.T, handler http.Handler, email string) loginState {

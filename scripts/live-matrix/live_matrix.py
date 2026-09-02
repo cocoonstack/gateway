@@ -15,13 +15,19 @@ Groups: see GROUPS (default: all).
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
+import io
 import json
 import math
 import re
+import struct
 import sys
 import time
 import urllib.error
 import urllib.request
+import wave
+from pathlib import Path
 from typing import Any
 
 GROUPS = [
@@ -93,6 +99,8 @@ class Gateway:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
+        except OSError as e:
+            return 0, f"transport error: {e}".encode()
 
     def ledger(self) -> tuple[int, dict[str, Any]]:
         """(row count, newest row) — read after a short settle so the async ledger write has landed."""
@@ -104,7 +112,7 @@ class Gateway:
 
 def load_models(yaml_path: str) -> None:
     """Prices and weights per model from the flow-mapping lines of live.yaml (the oracle's inputs)."""
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding="utf-8") as f:
         lines = f.read().splitlines()
     for line in lines:
         m = re.match(r'- \{name: "?([^,"]+)"?, (.*)\}$', line.strip())
@@ -125,6 +133,8 @@ def load_models(yaml_path: str) -> None:
                 k, v = kv.split(":")
                 conf["rate"][k.strip()] = float(v)
         MODELS[name] = conf
+    if not MODELS:
+        raise SystemExit(f"no model prices parsed from {yaml_path}")
 
 
 def rnd(x: float) -> int:
@@ -133,7 +143,7 @@ def rnd(x: float) -> int:
 
 def oracle(model: str, wire: dict[str, Any], messages_protocol: bool) -> tuple[int, int, int, int]:
     """(prompt_total, completion_total, weighted_total, cost_micros) recomputed from the wire usage."""
-    conf = MODELS.get(model, {"in": 0, "out": 0, "unit": 0, "rate": {}})
+    conf = MODELS[model]
     rate = conf["rate"]
 
     def w(k: str, d: float = 1.0) -> float:
@@ -440,17 +450,18 @@ def case_video(
     count, row = gw.ledger()
     ticks = (j.get("usage") or {}).get("cost_in_usd_ticks")
     expected_units = units if units is not None else math.ceil(_video_duration(j))
-    expected_vendor = ticks // 10_000 if ticks else row["vendor_cost_micros"]
+    expected_vendor = ticks // 10_000 if ticks else None
     ok = (
         count == before + 2
         and row["billed_units"] == expected_units
         and row["cost_micros"] == expected_units * MODELS[model]["unit"]
-        and row["vendor_cost_micros"] == expected_vendor
+        and (expected_vendor is None or row["vendor_cost_micros"] == expected_vendor)
         and row["request_id"] == rid
     )
+    vendor_note = expected_vendor if expected_vendor is not None else "unchecked (vendor reported no ticks)"
     detail = (
         f"rows+{count - before} ledger units/cost/vendor={row['billed_units']}/{row['cost_micros']}/"
-        f"{row['vendor_cost_micros']} expected {expected_units}/{expected_units * MODELS[model]['unit']}/{expected_vendor}"
+        f"{row['vendor_cost_micros']} expected {expected_units}/{expected_units * MODELS[model]['unit']}/{vendor_note}"
     )
     if content and ok:
         st, blob = gw.call_raw(f"/v1/videos/{rid}/content")
@@ -495,12 +506,6 @@ def case_tts(gw: Gateway, model: str, text: str = "Hello from the gateway, this 
 
 def case_stt(gw: Gateway, model: str) -> None:
     """STT bills whole seconds: the vendor's duration, else the upload's own play length."""
-    import base64
-    import io
-    import math as m
-    import struct
-    import wave
-
     name = f"{model} stt"
     seconds, rate = 2, 8000
     buf = io.BytesIO()
@@ -508,7 +513,7 @@ def case_stt(gw: Gateway, model: str) -> None:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(rate)
-        w.writeframes(b"".join(struct.pack("<h", int(12000 * m.sin(2 * m.pi * 440 * i / rate))) for i in range(rate * seconds)))
+        w.writeframes(b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(rate * seconds)))
     before, _ = gw.ledger()
     st, txt = gw.call("/v1/audio/transcriptions", {"model": model, "audio_b64": base64.b64encode(buf.getvalue()).decode()})
     if st != 200:
@@ -537,26 +542,25 @@ def case_realtime_gemini(gw: Gateway, model: str) -> None:
         header={"Authorization": f"Bearer {gw.ak}"},
         timeout=90,
     )
-    ws.send(json.dumps({"setup": {"model": f"models/{model}",
-                                   "generationConfig": {"responseModalities": ["AUDIO"]},
-                                   "outputAudioTranscription": {}}}))
-    setup = json.loads(ws.recv())
-    if "setupComplete" not in setup:
-        record(name, False, f"no setupComplete: {json.dumps(setup)[:200]}")
-        ws.close()
-        return
-    ws.send(json.dumps({"clientContent": {"turns": [{"role": "user", "parts": [{"text": "Reply with the single word: pong"}]}], "turnComplete": True}}))
     usage: dict[str, Any] = {}
     text = ""
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        frame = json.loads(ws.recv())
-        sc = frame.get("serverContent") or {}
-        text += (sc.get("outputTranscription") or {}).get("text", "")
-        if sc.get("turnComplete"):
-            usage = frame.get("usageMetadata") or {}
-            break
-    ws.close()
+    with contextlib.closing(ws):
+        ws.send(json.dumps({"setup": {"model": f"models/{model}",
+                                       "generationConfig": {"responseModalities": ["AUDIO"]},
+                                       "outputAudioTranscription": {}}}))
+        setup = json.loads(ws.recv())
+        if "setupComplete" not in setup:
+            record(name, False, f"no setupComplete: {json.dumps(setup)[:200]}")
+            return
+        ws.send(json.dumps({"clientContent": {"turns": [{"role": "user", "parts": [{"text": "Reply with the single word: pong"}]}], "turnComplete": True}}))
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            frame = json.loads(ws.recv())
+            sc = frame.get("serverContent") or {}
+            text += (sc.get("outputTranscription") or {}).get("text", "")
+            if sc.get("turnComplete"):
+                usage = frame.get("usageMetadata") or {}
+                break
     it = usage.get("promptTokenCount", 0)
     ot = usage.get("responseTokenCount") or usage.get("candidatesTokenCount") or 0
     cost = (MODELS[model]["in"] * it) // 1000 + (MODELS[model]["out"] * ot) // 1000
@@ -610,23 +614,22 @@ def case_realtime(gw: Gateway, model: str) -> None:
         header={"Authorization": f"Bearer {gw.ak}"},
         timeout=90,
     )
-    ws.send(json.dumps({"type": "session.update", "session": {"type": "realtime", "output_modalities": ["audio"]}}))
-    ws.send(json.dumps({"type": "conversation.item.create", "item": {
-        "type": "message", "role": "user",
-        "content": [{"type": "input_text", "text": "Say the single word: pong"}]}}))
-    ws.send(json.dumps({"type": "response.create"}))
     done: dict[str, Any] = {}
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        frame = json.loads(ws.recv())
-        if frame.get("type") == "response.done":
-            done = frame
-            break
-        if frame.get("type") == "error":
-            record(name, False, json.dumps(frame)[:300])
-            ws.close()
-            return
-    ws.close()
+    with contextlib.closing(ws):
+        ws.send(json.dumps({"type": "session.update", "session": {"type": "realtime", "output_modalities": ["audio"]}}))
+        ws.send(json.dumps({"type": "conversation.item.create", "item": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "Say the single word: pong"}]}}))
+        ws.send(json.dumps({"type": "response.create"}))
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            frame = json.loads(ws.recv())
+            if frame.get("type") == "response.done":
+                done = frame
+                break
+            if frame.get("type") == "error":
+                record(name, False, json.dumps(frame)[:300])
+                return
     u = (done.get("response") or {}).get("usage") or {}
     it, ot = u.get("input_tokens", 0), u.get("output_tokens", 0)
     ap = (u.get("input_token_details") or {}).get("audio_tokens", 0)
@@ -1190,7 +1193,7 @@ def write_report(path: str) -> int:
     lines = [f"# Live matrix — {ok}/{len(RESULTS)} passed", "", "| result | case | detail |", "|---|---|---|"]
     for name, passed, detail in RESULTS:
         lines.append(f"| {'PASS' if passed else 'FAIL'} | {name} | {detail.replace('|', '/')} |")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\n{ok}/{len(RESULTS)} passed; report {path}")
     return 0 if ok == len(RESULTS) else 1
@@ -1204,15 +1207,22 @@ def main() -> int:
     ap.add_argument("--admin-token", default="admin-live")
     ap.add_argument(
         "--config",
-        default=__file__.rsplit("/", 1)[0] + "/live.yaml",
+        default=str(Path(__file__).parent / "live.yaml"),
         help="the gateway config the oracle reads prices from",
     )
     ap.add_argument("--report", default="live-matrix-report.md")
     args = ap.parse_args()
     load_models(args.config)
+    groups = args.groups or GROUPS
+    unknown = [g for g in groups if g not in GROUPS]
+    if unknown:
+        raise SystemExit(f"unknown groups: {', '.join(unknown)}")
     gw = Gateway(args.gateway, args.ak, args.admin_token)
-    for group in args.groups or GROUPS:
-        run_group(gw, group)
+    for group in groups:
+        try:
+            run_group(gw, group)
+        except Exception as e:
+            record(f"{group} group", False, f"aborted: {type(e).__name__}: {e}")
     return write_report(args.report)
 
 

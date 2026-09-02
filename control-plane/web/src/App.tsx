@@ -1,10 +1,10 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { api, APIError, setCSRF, setUnauthorizedHandler } from "./api";
 import { roleLabel } from "./format";
 import type { Role, Session } from "./types";
-import { Loading } from "./components/UI";
+import { ErrorNotice, Loading } from "./components/UI";
 import LoginPage from "./pages/LoginPage";
 import OverviewPage from "./pages/OverviewPage";
 import UsagePage from "./pages/UsagePage";
@@ -48,7 +48,7 @@ const navItems: NavItem[] = [
   { to: "/configuration", label: "Configuration", icon: "⌗", minRole: "system_admin", page: <ConfigPage /> },
 ];
 
-export default function App() {
+export default function App(): ReactElement {
   const [session, updateSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -92,6 +92,7 @@ export default function App() {
 
 function Shell() {
   const { session, logout } = useAuth();
+  const [signOutError, setSignOutError] = useState("");
   const role = session.user.role;
   const location = useLocation();
   const navigate = useNavigate();
@@ -121,8 +122,19 @@ function Shell() {
             <strong>{session.user.display_name}</strong>
             <span>{roleLabel(role)}</span>
           </div>
-          <button className="icon-button" aria-label="Sign out" title="Sign out" onClick={() => void logout().then(() => navigate("/"))}>↗</button>
+          <button
+            className="icon-button"
+            aria-label="Sign out"
+            title="Sign out"
+            onClick={() => {
+              setSignOutError("");
+              void logout()
+                .then(() => navigate("/"))
+                .catch(() => setSignOutError("Sign out failed. Try again."));
+            }}
+          >↗</button>
         </div>
+        {signOutError && <ErrorNotice message={signOutError} />}
       </aside>
       <main className="main-content">
         <Routes>

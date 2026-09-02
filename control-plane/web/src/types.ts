@@ -96,6 +96,7 @@ export interface AccessKey {
   daily_token_quota: number;
   tokens_per_minute?: number | null;
   expires_at_epoch_secs?: number | null;
+  model_quotas?: Record<string, number>;
   banned: boolean;
   suspended_until_epoch_secs?: number | null;
   status: "active" | "banned" | "expired" | "suspended";

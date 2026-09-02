@@ -210,12 +210,7 @@ components:
               expected_version: {type: integer, format: int64, description: "When >0, publish only if this is still the head version"}
     UserCreate:
       required: true
-      content:
-        application/json:
-          schema:
-            allOf:
-              - {$ref: "#/components/schemas/User"}
-              - {type: object, required: [password], properties: {password: {type: string, format: password}}}
+      content: {application/json: {schema: {$ref: "#/components/schemas/UserCreate"}}}
   responses:
     Session:
       description: Authenticated session
@@ -244,9 +239,19 @@ components:
         disabled: {type: boolean}
         created_at: {type: integer, format: int64}
         updated_at: {type: integer, format: int64}
+    UserCreate:
+      type: object
+      required: [email, password, role]
+      properties:
+        email: {type: string, format: email}
+        display_name: {type: string}
+        password: {type: string, format: password}
+        tenant: {type: string, description: "Required for member and tenant_admin; ignored for system_admin"}
+        gateway_user_id: {type: string}
+        role: {type: string, enum: [member, tenant_admin, system_admin]}
     AccessKey:
       type: object
-      required: [ak, product, tenant]
+      required: [ak, product]
       properties:
         ak: {type: string}
         product: {type: string}
