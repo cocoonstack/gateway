@@ -8,11 +8,10 @@ use sqlx::Row;
 /// The Postgres NOTIFY channel a publish fires on (payload = version id).
 pub const CONFIG_CHANNEL: &str = "gw_config";
 
-/// Superseded versions kept for operator inspection/rollback.
+// superseded versions kept for operator inspection and rollback
 const KEEP_VERSIONS: i64 = 20;
 
-/// Every publish serializes on this advisory lock: a `MAX(id)`-guarded insert
-/// is not atomic under READ COMMITTED.
+// a MAX(id)-guarded insert is not atomic under READ COMMITTED
 const PG_PUBLISH_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('gw_config_publish'))";
 
 /// Metadata for one retained config document, newest first in list responses.

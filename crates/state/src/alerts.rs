@@ -4,7 +4,7 @@
 
 use tokio::sync::mpsc;
 
-/// Bounded: a stuck dispatcher drops alerts instead of growing memory.
+// bounded: a stuck dispatcher drops alerts instead of growing memory
 const ALERT_QUEUE: usize = 256;
 
 /// One outbound alert.

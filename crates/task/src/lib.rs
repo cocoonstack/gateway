@@ -57,8 +57,9 @@ pub fn spawn_content_purge(
     })
 }
 
-/// Spawn the usage-rollup loop: folds completed ledger minutes into the
-/// durable per-user buckets. Returns the join handle (abort to stop).
+/// Spawn the usage-rollup loop: folds completed ledger minutes into the durable
+/// per-user buckets, then prunes the raw rows they now cover. Returns the join
+/// handle (abort to stop).
 pub fn spawn_usage_rollup(
     state: Arc<GatewayState>,
     period: Duration,
@@ -73,6 +74,11 @@ pub fn spawn_usage_rollup(
                 .await
             {
                 tracing::warn!(error = %e, "usage rollup failed");
+            }
+            match state.store.ledger_prune().await {
+                Ok(n) if n > 0 => tracing::info!(target: "task", pruned = n, "ledger prune"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "ledger prune failed"),
             }
         }
     })

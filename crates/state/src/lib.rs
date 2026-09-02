@@ -49,6 +49,8 @@ const FAILS_DECAY: Duration = Duration::from_secs(3_600);
 #[derive(Debug, Clone)]
 pub struct AkInfo {
     pub ak: String,
+    /// `ak`'s access-log fingerprint, stamped with the entry so no request re-hashes it.
+    pub ak_id: Arc<str>,
     pub product: String,
     /// Tenant this key belongs to (`gw_config::DEFAULT_TENANT` when undeclared).
     pub tenant: String,
@@ -66,7 +68,7 @@ pub struct AkInfo {
     /// Runtime state — a config reload must not clear it.
     pub suspended_until_epoch_secs: Option<i64>,
     /// Per-model daily token caps overriding the tenant defaults; empty = none.
-    /// Arc'd: `AkInfo` is cloned per request and the map is write-rare.
+    /// Arc'd: a patch copy-on-writes the whole `AkInfo` and the map is write-rare.
     pub model_quotas: Arc<std::collections::HashMap<String, i64>>,
 }
 
@@ -127,6 +129,7 @@ impl AkInfo {
 impl From<&gw_config::AkConf> for AkInfo {
     fn from(k: &gw_config::AkConf) -> Self {
         Self {
+            ak_id: access_key_fingerprint(&k.ak).into(),
             ak: k.ak.clone(),
             product: k.product.clone(),
             tenant: k.tenant.clone(),
@@ -176,12 +179,12 @@ pub enum KeySource {
 /// admin keys survive it (a preserved seam).
 #[derive(Debug, Default)]
 pub struct AkAuth {
-    keys: DashMap<String, (AkInfo, KeySource)>,
+    keys: DashMap<String, (Arc<AkInfo>, KeySource)>,
 }
 
 impl AkAuth {
-    pub fn authenticate(&self, ak: &str) -> Option<AkInfo> {
-        self.keys.get(ak).map(|e| e.value().0.clone())
+    pub fn authenticate(&self, ak: &str) -> Option<Arc<AkInfo>> {
+        self.keys.get(ak).map(|e| Arc::clone(&e.value().0))
     }
 
     /// Insert or replace a key. Config ownership is sticky: an admin write to a
@@ -201,10 +204,10 @@ impl AkAuth {
                 if info.suspended_until_epoch_secs.is_none() {
                     info.suspended_until_epoch_secs = e.get().0.suspended_until_epoch_secs;
                 }
-                e.insert((info, source));
+                e.insert((Arc::new(info), source));
             }
             Entry::Vacant(e) => {
-                e.insert((info, source));
+                e.insert((Arc::new(info), source));
             }
         }
     }
@@ -213,8 +216,8 @@ impl AkAuth {
     /// new view. `None` if the key doesn't exist.
     pub fn patch(&self, ak: &str, patch: &KeyPatch) -> Option<AkInfo> {
         let mut e = self.keys.get_mut(ak)?;
-        e.0.apply_patch(patch);
-        Some(e.0.clone())
+        Arc::make_mut(&mut e.0).apply_patch(patch);
+        Some(e.0.as_ref().clone())
     }
 
     /// A page of keys, sorted by ak (stable), optionally confined to `tenant`,
@@ -223,7 +226,7 @@ impl AkAuth {
         let mut keys: Vec<AkInfo> = self
             .keys
             .iter()
-            .map(|e| e.value().0.clone())
+            .map(|e| e.value().0.as_ref().clone())
             .filter(|k| tenant.is_none_or(|t| t == k.tenant))
             .collect();
         keys.sort_by(|a, b| a.ak.cmp(&b.ak));
@@ -250,7 +253,7 @@ impl AkAuth {
 
 #[async_trait::async_trait]
 impl KeyStore for AkAuth {
-    async fn authenticate(&self, ak: &str) -> Option<AkInfo> {
+    async fn authenticate(&self, ak: &str) -> Option<Arc<AkInfo>> {
         AkAuth::authenticate(self, ak)
     }
     async fn put(&self, info: AkInfo, source: KeySource) -> gw_models::GResult<()> {
@@ -775,7 +778,11 @@ impl GatewayState {
                 state.auth.put(AkInfo::from(k), KeySource::Config).await?;
             }
         } else {
-            let ks = PostgresKeyStore::connect(&cfg.storage.postgres_url).await?;
+            let ks = PostgresKeyStore::connect(
+                &cfg.storage.postgres_url,
+                cfg.storage.postgres_max_connections,
+            )
+            .await?;
             ks.reload_config_keys(&cfg.access_keys).await?;
             state.auth = Arc::new(ks);
             tracing::info!("key store = postgres (config keys seeded)");
@@ -783,6 +790,7 @@ impl GatewayState {
                 PostgresStore::connect_with_cap(
                     &cfg.storage.postgres_url,
                     cfg.storage.ledger_max_rows,
+                    cfg.storage.postgres_max_connections,
                 )
                 .await?,
             );
@@ -1012,6 +1020,7 @@ mod tests {
 
     fn ak_info(ak: &str) -> AkInfo {
         AkInfo {
+            ak_id: access_key_fingerprint(ak).into(),
             ak: ak.into(),
             product: "p".into(),
             tenant: "default".into(),

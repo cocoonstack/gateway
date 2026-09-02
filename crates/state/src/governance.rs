@@ -1,6 +1,7 @@
 //! Rate/quota governance behind a trait: [`MemoryGovernance`] (default,
-//! in-process counters) and [`RedisGovernance`] (multi-replica, same semantics
-//! via atomic server-side ops — INCR + EXPIRE windows, token-bucket Lua).
+//! in-process GCRA limiter and counters) and [`RedisGovernance`] (multi-replica,
+//! atomic server-side ops — INCR + PEXPIRE fixed windows, so a Redis rate limit
+//! admits up to 2x across a window boundary where the in-process one does not).
 
 use std::sync::LazyLock;
 use std::time::Duration;

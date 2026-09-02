@@ -29,6 +29,7 @@ storage:
   redis_url: redis://cache.internal:6379              # shared counters + health
   shared_cache: false                 # also share the response cache in Redis (needs redis_url)
   ledger_max_rows: 100000             # prune oldest billing rows past the cap; 0 = unlimited
+  postgres_max_connections: 10        # store and key-store connection-pool size; 0 = the built-in defaults (10 store, 5 key store)
 ```
 
 The billing ledger, uploaded files, and batch jobs live here. In-memory by

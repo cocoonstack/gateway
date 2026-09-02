@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
                 as gw_views::ConfigFuture
         }),
     };
-    let mut app_state = AppState::with_config(shared, transport, Some(loader));
+    let mut app_state = AppState::with_config(shared.clone(), transport, Some(loader));
     if let Some(store) = &config_store {
         app_state = app_state.with_config_store(store.clone());
     }
@@ -204,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    gw_state::admission::flush_billing(&shared.load().state).await;
     quota_task.abort();
     purge_task.abort();
     rollup_task.abort();

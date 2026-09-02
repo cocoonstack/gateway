@@ -56,6 +56,7 @@ storage:
   postgres_url: "postgres://gw:secret@db:5432/gw"  # fleet config + keys + ledger/files/batches
   redis_url: "redis://redis:6379"      # shared rate limits + quotas + account health
   ledger_max_rows: 1000000             # prune oldest billing rows past the cap
+  postgres_max_connections: 10         # store and key-store connection-pool size
   # sqlite_path: /var/lib/gw/store.db  # single-node alternative to postgres_url
 ```
 
@@ -65,6 +66,10 @@ storage:
   sweeps orphaned `pending`/`running` batch jobs to `failed` on startup; the
   Postgres store deliberately does not (another live instance may still be
   executing them — stale claims are requeued via the fleet drain instead).
+  Billing rows batch off the request path on the SQL backends: `SIGTERM`
+  flushes the queue before exit, so only a `SIGKILL` between a response and
+  the next flush loses rows, at most one batch. A full queue falls back to the
+  awaited write, so an accepted request never loses its row under overload.
 - **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
   namespaced under `gw:`, windows self-expire), otherwise in-process. Without
   Redis, each replica limits independently.
