@@ -92,7 +92,6 @@ pub fn gemini_usage_update(provider: &str, frame: &Value) -> Option<Value> {
         .cloned()
 }
 
-/// (input, output) token counts of a Gemini `usageMetadata` object.
 /// The AUDIO-modality (input, output) token counts of a Gemini `usageMetadata` object.
 pub fn gemini_audio_tokens(u: &Value) -> (i64, i64) {
     let modality = |details: &Value| {
@@ -112,6 +111,7 @@ pub fn gemini_audio_tokens(u: &Value) -> (i64, i64) {
     )
 }
 
+/// (input, output) token counts of a Gemini `usageMetadata` object.
 pub fn gemini_tokens(u: &Value) -> (i64, i64) {
     let it = u["promptTokenCount"].as_i64().unwrap_or(0);
     let ot = u["responseTokenCount"]

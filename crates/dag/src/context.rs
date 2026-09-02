@@ -16,7 +16,7 @@ pub struct DagContext {
     pub transport: SharedTransport,
 
     pub request: GatewayRequest,
-    pub ak: AkInfo,
+    pub ak: Arc<AkInfo>,
 
     /// engine result, set by the model_access layer.
     pub outcome: Option<EngineOutcome>,
@@ -51,7 +51,7 @@ impl DagContext {
         state: Arc<GatewayState>,
         transport: SharedTransport,
         request: GatewayRequest,
-        ak: AkInfo,
+        ak: Arc<AkInfo>,
     ) -> Self {
         Self {
             cfg,

@@ -48,6 +48,7 @@ const CONTENT_PAGE_DEFAULT: usize = 200;
 const CONTENT_PAGE_MAX: usize = 1_000;
 const USAGE_SERIES_MAX_POINTS: i64 = 400;
 const STREAM_CHANNEL_CAP: usize = 64;
+const NO_OUTCOME: &str = "pipeline produced no outcome";
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
 
@@ -182,7 +183,9 @@ async fn track_requests(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let route = matched.map(|m| m.as_str().to_owned()).unwrap_or_default();
+    let route: metrics::SharedString = matched
+        .map(|m| Arc::<str>::from(m.as_str()).into())
+        .unwrap_or_default();
     let started = Instant::now();
     let resp = next.run(req).await;
     metrics::counter!(
@@ -358,7 +361,7 @@ struct RtModel {
 /// the admission day (settle/refund land on the same bucket) and the admission
 /// snapshot (settlement must not drift when a reload lands mid-turn).
 struct RealtimeAdmit {
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     /// Effective attribution user for this turn: the key's owner if set, else
     /// the client's connect-time `x-gw-user` hint; empty for an ownerless key
     /// with no hint. Captured at admission so billing and budget agree.
@@ -622,7 +625,7 @@ async fn settle_realtime_abort(
 async fn realtime_session(
     mut socket: axum::extract::ws::WebSocket,
     s: AppState,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     rtm: RtModel,
     mt: gw_consts::Protocol,
     account: String,
@@ -745,7 +748,7 @@ fn upstream_text_to_client(
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     rtm: RtModel,
     mt: gw_consts::Protocol,
     account: Arc<gw_models::Account>,
@@ -1126,7 +1129,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
     let latency = started.elapsed();
     let user_id = ctx.effective_user_id();
     let decisions = ctx.decisions_line();
-    let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
+    let ak_id = &*ctx.ak.ak_id;
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
@@ -1232,7 +1235,10 @@ fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
 /// `(status, message)` so each surface can shape it to its own wire dialect.
-async fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'static str)> {
+async fn authenticate(
+    s: &AppState,
+    headers: &HeaderMap,
+) -> Result<Arc<AkInfo>, (u16, &'static str)> {
     let ak = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -1270,7 +1276,7 @@ fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
 
 /// [`authenticate`] as an extractor for the OpenAI-error surfaces; runs before
 /// the body extractor so an unauthenticated payload is never parsed.
-struct Authed(AkInfo);
+struct Authed(Arc<AkInfo>);
 
 impl axum::extract::FromRequestParts<AppState> for Authed {
     type Rejection = Response;
@@ -1675,7 +1681,7 @@ async fn scoped_key(
     s: &AppState,
     scope: &AdminScope,
     ak: &str,
-) -> Result<Option<AkInfo>, Response> {
+) -> Result<Option<Arc<AkInfo>>, Response> {
     match s.handler.state().auth.authenticate(ak).await {
         Some(existing) if !scope.covers(&existing.tenant) => {
             Err(error_response(404, format!("key {ak} not found")))
@@ -1794,6 +1800,7 @@ async fn admin_key_create(
         return r;
     }
     let info = AkInfo {
+        ak_id: gw_state::access_key_fingerprint(ak).into(),
         ak: ak.to_owned(),
         product: product.to_owned(),
         tenant: tenant.to_owned(),
@@ -2531,7 +2538,11 @@ fn anthropic_gateway_error(e: GatewayError) -> Response {
 
 /// Run the pipeline on its own task so a client disconnect can't cancel it
 /// mid-billing: once admitted, quota/ledger accounting runs to completion.
-async fn run_pipeline(s: &AppState, request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
+async fn run_pipeline(
+    s: &AppState,
+    request: GatewayRequest,
+    ak: Arc<AkInfo>,
+) -> GResult<DagContext> {
     let handler = s.handler.clone();
     match tokio::spawn(async move { handler.run(request, ak).await }).await {
         Ok(res) => res,
@@ -2756,7 +2767,7 @@ async fn chat_completions(
     };
     log_access("chat_completions", &ctx, started);
     let Some(mut outcome) = ctx.outcome.take() else {
-        let response = error_response(500, "pipeline produced no outcome");
+        let response = error_response(500, NO_OUTCOME);
         return terminal_response(&ctx, response).await;
     };
 
@@ -2816,7 +2827,7 @@ async fn chat_completions(
 fn spawn_stream_pipeline(
     s: &AppState,
     mut request: GatewayRequest,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     surface: &'static str,
     started: Instant,
 ) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
@@ -2883,6 +2894,28 @@ fn spawn_stream_pipeline(
                             }
                         }
                     }
+                } else {
+                    let _ = tx
+                        .send(gw_engines::StreamChunk {
+                            error: Some(Box::new(gw_models::StreamError {
+                                class: ErrClass::InternalServer,
+                                message: NO_OUTCOME.to_owned(),
+                                original_status: None,
+                            })),
+                            ..Default::default()
+                        })
+                        .await;
+                    if dlp {
+                        if let Err(e) = gw_handler::complete_buffered_stream(
+                            &mut ctx,
+                            gw_dag::StreamDelivery::None,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %e, "buffered stream settlement failed");
+                        }
+                        log_access(surface, &ctx, started);
+                    }
                 }
             }
             Err(e) => {
@@ -2944,7 +2977,7 @@ fn stream_error_body(err: gw_models::StreamError) -> Value {
 fn chat_stream_response(
     s: AppState,
     request: GatewayRequest,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     model: String,
     started: Instant,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
@@ -3087,7 +3120,10 @@ fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::Stre
     } else {
         std::mem::take(&mut outcome.chunks)
     };
-    if let Some(tc) = resp.tool_calls.take()
+    let native =
+        resp.anthropic_content.is_some() || chunks.iter().any(|c| c.native_event.is_some());
+    if !native
+        && let Some(tc) = resp.tool_calls.take()
         && !chunks.iter().any(|c| c.tool_calls.is_some())
     {
         chunks.push(gw_engines::StreamChunk {
@@ -3133,7 +3169,9 @@ fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
     if !chunk.reasoning.is_empty() {
         tokens = tokens.saturating_add(encoder.encode_len(&chunk.reasoning) as i64);
     }
-    if let Some(tool_calls) = &chunk.tool_calls {
+    if let Some(tool_calls) = &chunk.tool_calls
+        && chunk.native_event.is_none()
+    {
         tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
     }
     if let Some(event) = &chunk.native_event {
@@ -3258,7 +3296,7 @@ async fn messages(
     };
     log_access("messages", &ctx, started);
     let Some(mut outcome) = ctx.outcome.take() else {
-        let response = anthropic_error(500, "pipeline produced no outcome");
+        let response = anthropic_error(500, NO_OUTCOME);
         return terminal_response(&ctx, response).await;
     };
     let usage = anthropic_usage(
@@ -3327,7 +3365,7 @@ fn anthropic_tool_blocks(tool_calls: Option<Value>) -> Vec<Value> {
 fn messages_stream_response(
     s: AppState,
     request: GatewayRequest,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     model: String,
     started: Instant,
     thinking_audit: ThinkingSignatureAudit,
@@ -3573,7 +3611,7 @@ fn messages_stream_response(
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn run_family(
     s: &AppState,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     model: String,
     mt: gw_consts::Protocol,
     typed: TypedParams,
@@ -3600,7 +3638,7 @@ async fn run_family(
 #[allow(clippy::too_many_arguments)] // mirrors run_family; all call sites are literal
 async fn family_response(
     s: &AppState,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     model: String,
     mt: gw_consts::Protocol,
     typed: TypedParams,
@@ -3692,7 +3730,7 @@ async fn completions(
     };
     log_access("completions", &ctx, started);
     let Some(outcome) = ctx.outcome.take() else {
-        let response = error_response(500, "pipeline produced no outcome");
+        let response = error_response(500, NO_OUTCOME);
         return terminal_response(&ctx, response).await;
     };
     let mut r = outcome.response;
@@ -3767,7 +3805,7 @@ async fn responses(
 fn responses_stream_response(
     s: AppState,
     request: GatewayRequest,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     model: String,
     started: Instant,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
@@ -4287,7 +4325,7 @@ async fn audio_translations(
 async fn audio_transcribe(
     s: AppState,
     headers: HeaderMap,
-    ak: AkInfo,
+    ak: Arc<AkInfo>,
     mut body: Value,
     translate: bool,
 ) -> Response {
@@ -6058,6 +6096,28 @@ mod tests {
         assert!(stream_chunk_output_tokens(&tool) > 0);
         assert!(stream_chunk_output_tokens(&native) > 0);
         assert_eq!(stream_chunk_output_tokens(&Default::default()), 0);
+    }
+
+    #[test]
+    fn a_native_tool_frame_is_counted_once() {
+        let event = json!({
+            "type":"content_block_delta",
+            "delta":{"type":"input_json_delta","partial_json":"{\"city\":\"paris\"}"}
+        });
+        let native = gw_engines::StreamChunk {
+            native_event: Some(event.clone()),
+            ..Default::default()
+        };
+        let both = gw_engines::StreamChunk {
+            native_event: Some(event),
+            tool_calls: Some(json!([{"type":"tool_use","input":{"city":"paris"}}])),
+            ..Default::default()
+        };
+        assert_eq!(
+            stream_chunk_output_tokens(&both),
+            stream_chunk_output_tokens(&native),
+            "the native event already carries the tool arguments"
+        );
     }
 
     #[test]

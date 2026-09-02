@@ -22,7 +22,7 @@ pub(crate) const DEFAULT_CONNECT_RETRIES: u32 = 1;
 pub type Headers = Vec<(&'static str, String)>;
 
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UpstreamRequest {
     pub protocol: Protocol,
     pub method: &'static str,
@@ -66,16 +66,6 @@ impl StreamFault {
             message: format!("upstream stream failed: {}", self.message),
             original_status: None,
         }
-    }
-}
-
-/// The upstream-fault code: deadlines classify as ModelTimeout downstream,
-/// everything else as the generic RPC failure.
-pub(crate) fn upstream_fault_code(timeout: bool) -> gw_consts::ErrCode {
-    if timeout {
-        gw_consts::ErrCode::FED_RESP_TIMEOUT
-    } else {
-        gw_consts::ErrCode::FED_RESP_RPC_FAILED
     }
 }
 
@@ -146,3 +136,13 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 }
 
 pub type SharedTransport = Arc<dyn Transport>;
+
+/// The upstream-fault code: deadlines classify as ModelTimeout downstream,
+/// everything else as the generic RPC failure.
+pub(crate) fn upstream_fault_code(timeout: bool) -> gw_consts::ErrCode {
+    if timeout {
+        gw_consts::ErrCode::FED_RESP_TIMEOUT
+    } else {
+        gw_consts::ErrCode::FED_RESP_RPC_FAILED
+    }
+}

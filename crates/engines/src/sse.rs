@@ -25,8 +25,10 @@ impl SseDecoder {
         // decode only complete events: a chunk can end inside a multi-byte UTF-8 char
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        while let Some(end) = event_boundary(&self.buf, self.scanned) {
-            let event = String::from_utf8_lossy(&self.buf[..end]);
+        let mut consumed = 0;
+        let mut from = self.scanned;
+        while let Some(end) = event_boundary(&self.buf[consumed..], from) {
+            let event = String::from_utf8_lossy(&self.buf[consumed..consumed + end]);
             for line in event.lines() {
                 if let Some(data) = line.strip_prefix("data:") {
                     let data = data.strip_prefix(' ').unwrap_or(data);
@@ -37,9 +39,10 @@ impl SseDecoder {
                     }
                 }
             }
-            self.buf.drain(..end);
-            self.scanned = 0;
+            consumed += end;
+            from = 0;
         }
+        self.buf.drain(..consumed);
         // back up so a terminator split across the old/new join is still seen
         self.scanned = self.buf.len().saturating_sub(2);
         if self.buf.len() > MAX_EVENT_BYTES {
@@ -89,6 +92,20 @@ mod tests {
         let body = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n";
         let (events, done) = SseDecoder::decode_all(body).unwrap();
         assert_eq!(events, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+        assert!(done);
+    }
+
+    #[test]
+    fn many_events_in_one_chunk_decode_in_order() {
+        let mut body = Vec::new();
+        for i in 0..2000 {
+            body.extend_from_slice(format!("data: {{\"i\":{i}}}\n\n").as_bytes());
+        }
+        body.extend_from_slice(b"data: [DONE]\n\n");
+        let (events, done) = SseDecoder::decode_all(&body).unwrap();
+        assert_eq!(events.len(), 2000);
+        assert_eq!(events[0], r#"{"i":0}"#);
+        assert_eq!(events[1999], r#"{"i":1999}"#);
         assert!(done);
     }
 

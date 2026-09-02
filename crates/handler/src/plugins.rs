@@ -953,29 +953,30 @@ fn has_pii_candidate(b: &[u8]) -> bool {
 /// Hand-rolled scanner for `local@domain.tld` and 11-digit CN-mobile runs;
 /// `None` when nothing matched keeps the common case allocation-free.
 fn redact(text: &str) -> Option<(String, usize)> {
-    if !has_pii_candidate(text.as_bytes()) {
+    let b = text.as_bytes();
+    if !has_pii_candidate(b) {
         return None;
     }
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+    // every word byte is ASCII, so a span boundary is always a char boundary
+    let n = b.len();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-';
 
     let mut spans: Vec<(usize, usize, &str)> = Vec::new();
 
-    for (i, &c) in chars.iter().enumerate() {
-        if c != '@' {
+    for (i, &c) in b.iter().enumerate() {
+        if c != b'@' {
             continue;
         }
         let mut start = i;
-        while start > 0 && is_word(chars[start - 1]) {
+        while start > 0 && is_word(b[start - 1]) {
             start -= 1;
         }
         let mut end = i + 1;
-        while end < n && is_word(chars[end]) {
+        while end < n && is_word(b[end]) {
             end += 1;
         }
         let has_local = start < i;
-        let domain_has_dot = chars[i + 1..end].contains(&'.');
+        let domain_has_dot = b[i + 1..end].contains(&b'.');
         if has_local && domain_has_dot {
             spans.push((start, end, "[REDACTED_EMAIL]"));
         }
@@ -985,11 +986,11 @@ fn redact(text: &str) -> Option<(String, usize)> {
         |i: usize, spans: &[(usize, usize, &str)]| spans.iter().any(|&(s, e, _)| i >= s && i < e);
     let mut i = 0;
     while i + 10 < n {
-        if chars[i] == '1'
-            && matches!(chars[i + 1], '3'..='9')
-            && chars[i..i + 11].iter().all(|c| c.is_ascii_digit())
-            && (i == 0 || !chars[i - 1].is_ascii_digit())
-            && (i + 11 >= n || !chars[i + 11].is_ascii_digit())
+        if b[i] == b'1'
+            && matches!(b[i + 1], b'3'..=b'9')
+            && b[i..i + 11].iter().all(u8::is_ascii_digit)
+            && (i == 0 || !b[i - 1].is_ascii_digit())
+            && (i + 11 >= n || !b[i + 11].is_ascii_digit())
             && !in_span(i, &spans)
         {
             spans.push((i, i + 11, "[REDACTED_PHONE]"));
@@ -1008,13 +1009,13 @@ fn redact(text: &str) -> Option<(String, usize)> {
     let mut cursor = 0;
     for (s, e, rep) in spans {
         if s > cursor {
-            out.extend(&chars[cursor..s]);
+            out.push_str(&text[cursor..s]);
         }
         out.push_str(rep);
         cursor = e;
     }
     if cursor < n {
-        out.extend(&chars[cursor..]);
+        out.push_str(&text[cursor..]);
     }
     Some((out, hits))
 }
@@ -1474,6 +1475,20 @@ mod tests {
         assert!(r.contains("[REDACTED_EMAIL]"), "{r}");
         assert!(r.contains("[REDACTED_PHONE]"), "{r}");
         assert!(!r.contains("example.com") && !r.contains("13812345678"));
+    }
+
+    #[test]
+    fn redacts_across_multibyte_text_without_touching_it() {
+        let (r, n) =
+            redact("联系 邮箱 li.wei@例子.com and jane@corp.com 手机 13912345678 谢谢").unwrap();
+        assert_eq!(n, 2, "{r}");
+        assert!(r.starts_with("联系 邮箱 li.wei@例子.com and "), "{r}");
+        assert!(r.ends_with(" 谢谢"), "{r}");
+        assert!(
+            r.contains("[REDACTED_EMAIL]") && r.contains("[REDACTED_PHONE]"),
+            "{r}"
+        );
+        assert!(!r.contains("jane@corp.com") && !r.contains("13912345678"));
     }
 
     #[test]

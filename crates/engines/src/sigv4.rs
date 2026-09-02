@@ -50,11 +50,13 @@ pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec
 pub fn sign(p: &SigV4Params) -> (String, String) {
     let signed_headers: Vec<&str> = p.headers.iter().map(|(n, _)| *n).collect();
     let signed_headers = signed_headers.join(";");
-    let canonical_headers: String = p
-        .headers
-        .iter()
-        .map(|(n, v)| format!("{n}:{v}\n"))
-        .collect();
+    let mut canonical_headers = String::new();
+    for (n, v) in p.headers {
+        canonical_headers.push_str(n);
+        canonical_headers.push(':');
+        canonical_headers.push_str(v);
+        canonical_headers.push('\n');
+    }
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         p.method,
