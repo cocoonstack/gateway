@@ -9,7 +9,6 @@ pub mod error;
 pub mod params;
 pub mod request;
 pub mod response;
-pub mod token_estimate;
 pub mod usage;
 
 pub use block::Block;
@@ -26,5 +25,4 @@ pub use request::domain::{Account, ChatMsg};
 pub use request::{BatchItem, GatewayRequest, ModelParamV2};
 pub use response::GatewayResponse;
 pub use response::{StreamChunk, StreamError};
-pub use token_estimate::{HeuristicEncoder, TokenEncoder, estimate_prompt_tokens};
 pub use usage::CommonUsage;

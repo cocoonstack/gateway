@@ -736,7 +736,7 @@ async fn bill_aborted_stream(
         .as_ref()
         .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
         .response;
-    let enc = gw_models::token_estimate::default_encoder();
+    let enc = crate::token_estimate::default_encoder();
     let param = ctx.request.model_param_v2.as_ref();
     let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
         gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
@@ -746,7 +746,7 @@ async fn bill_aborted_stream(
     let prompt = if response.prompt_tokens > 0 {
         response.prompt_tokens
     } else {
-        gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
+        crate::token_estimate::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
     };
     let completion = delivered_completion
         .unwrap_or_else(|| enc.encode_len(&response.message) as i64)

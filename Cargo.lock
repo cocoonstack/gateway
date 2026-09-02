@@ -888,6 +888,7 @@ dependencies = [
  "metrics",
  "serde_json",
  "sha2 0.10.9",
+ "tiktoken-rs",
  "tokio",
  "tracing",
 ]
@@ -944,7 +945,6 @@ dependencies = [
  "gw-consts",
  "serde",
  "serde_json",
- "tiktoken-rs",
  "tokio",
 ]
 
