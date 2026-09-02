@@ -885,10 +885,10 @@ mod tests {
         );
     }
 
-    fn chat_req(model: &str, typed: gw_models::ChatParams, raw: Value) -> GatewayRequest {
+    fn chat_req(model: &str, typed: ChatParams, raw: Value) -> GatewayRequest {
         let mut r = base_req();
         let mut param = ModelParamV2::with_name(Protocol::AnthropicMessages, model);
-        param.typed = Some(gw_models::TypedParams::Chat(typed));
+        param.typed = Some(TypedParams::Chat(typed));
         param.raw = raw;
         r.model_param_v2 = Some(param);
         r
@@ -896,7 +896,7 @@ mod tests {
 
     #[test]
     fn sampling_knobs_follow_the_model_generation() {
-        let knobs = || gw_models::ChatParams {
+        let knobs = || ChatParams {
             temperature: Some(0.2),
             top_p: Some(0.9),
             ..Default::default()
