@@ -86,8 +86,9 @@ impl ClaudeEngine {
         }
         body.insert("messages".into(), Value::Array(messages));
         let mut max_tokens = 1024;
-        // only gateway-mapped thinking drops the sampling knobs Anthropic rejects
-        let mut mapped = false;
+        let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
+        // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
+        let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
@@ -99,7 +100,7 @@ impl ClaudeEngine {
                 if reasoning.thinking.is_none()
                     && param.raw.get("thinking").is_none()
                     && let Some((thinking, output_config, budget)) = map_thinking(
-                        gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name),
+                        dialect,
                         reasoning.effort.as_deref(),
                         reasoning.budget_tokens,
                     )
@@ -112,7 +113,7 @@ impl ClaudeEngine {
                     if max_tokens <= budget {
                         max_tokens = budget.saturating_add(max_tokens);
                     }
-                    mapped = true;
+                    sampling_rejected = true;
                 }
                 if let Some(thinking) = reasoning.thinking {
                     body.insert("thinking".into(), thinking);
@@ -121,7 +122,7 @@ impl ClaudeEngine {
                     body.insert("output_config".into(), output_config);
                 }
             }
-            if !mapped {
+            if !sampling_rejected {
                 if let Some(t) = p.temperature {
                     body.insert("temperature".into(), json!(t));
                 }
@@ -162,7 +163,7 @@ impl ClaudeEngine {
             body.insert("system".into(), system);
         }
         if let Some(extra) = raw.as_object_mut() {
-            if mapped {
+            if sampling_rejected {
                 extra.remove("top_k");
             }
             if bedrock {
@@ -713,6 +714,11 @@ fn map_thinking(
         Some("minimal") | None => budget_effort(budget),
         Some(effort) => effort,
     };
+    let effort = if dialect == ThinkingDialect::Adaptive && effort == "xhigh" {
+        "high"
+    } else {
+        effort
+    };
     Some((thinking, Some(json!({"effort": effort})), budget))
 }
 
@@ -877,6 +883,57 @@ mod tests {
                 {"name":"echo","input_schema":{"type":"object","properties":{"s":{"type":"string"}}}}
             ])
         );
+    }
+
+    fn chat_req(model: &str, typed: gw_models::ChatParams, raw: Value) -> GatewayRequest {
+        let mut r = base_req();
+        let mut param = ModelParamV2::with_name(Protocol::AnthropicMessages, model);
+        param.typed = Some(gw_models::TypedParams::Chat(typed));
+        param.raw = raw;
+        r.model_param_v2 = Some(param);
+        r
+    }
+
+    #[test]
+    fn sampling_knobs_follow_the_model_generation() {
+        let knobs = || gw_models::ChatParams {
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        for (model, kept) in [
+            ("claude-sonnet-4-5-20250929", true),
+            ("claude-sonnet-4-6", true),
+            ("claude-opus-5", false),
+            ("claude-fable-5-1", false),
+        ] {
+            let mut e = ClaudeEngine::new(
+                chat_req(model, knobs(), json!({"top_k": 5})),
+                Arc::new(MockTransport),
+            );
+            let body = e.build_body().unwrap();
+            for knob in ["temperature", "top_p", "top_k"] {
+                assert_eq!(body.contains_key(knob), kept, "{model} {knob}");
+            }
+        }
+    }
+
+    #[test]
+    fn xhigh_clamps_to_high_on_claude_4_6_only() {
+        use gw_protocol::reasoning::ThinkingDialect::*;
+        for (dialect, effort, budget, want) in [
+            (Adaptive, Some("xhigh"), None, "high"),
+            (Adaptive, None, Some(24576), "high"),
+            (Adaptive, Some("max"), None, "max"),
+            (AdaptiveSummarized, Some("xhigh"), None, "xhigh"),
+        ] {
+            let (_, output_config, _) = map_thinking(dialect, effort, budget).unwrap();
+            assert_eq!(
+                output_config.unwrap()["effort"],
+                want,
+                "{dialect:?} {effort:?} {budget:?}"
+            );
+        }
     }
 
     #[test]

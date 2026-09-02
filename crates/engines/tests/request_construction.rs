@@ -1228,8 +1228,10 @@ async fn anthropic_effort_maps_by_model_generation_and_owns_the_conflicting_knob
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert!(b.get("thinking").is_none() && b.get("output_config").is_none());
-    assert_eq!(b["temperature"], 0.2);
-    assert_eq!(b["top_k"], 5);
+    assert!(
+        b.get("temperature").is_none() && b.get("top_k").is_none(),
+        "4.7+ rejects sampling knobs"
+    );
 }
 
 #[tokio::test]
@@ -1281,7 +1283,10 @@ async fn anthropic_budget_and_client_thinking_precedence() {
     let b = t.body_json();
     assert_eq!(b["thinking"]["display"], "summarized");
     assert_eq!(b["output_config"]["effort"], "max");
-    assert_eq!(b["temperature"], 0.2);
+    assert!(
+        b.get("temperature").is_none(),
+        "4.7+ rejects sampling knobs"
+    );
 }
 
 #[tokio::test]

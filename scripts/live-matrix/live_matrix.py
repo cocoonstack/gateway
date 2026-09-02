@@ -939,7 +939,12 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
 def run_group(gw: Gateway, group: str) -> None:
     prime = "Is 17 prime? One word."
     if group == "anthropic":
-        haiku, sonnet45, sonnet46 = "claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-sonnet-4-6"
+        haiku, sonnet45, sonnet46, opus5 = (
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-6",
+            "claude-opus-5",
+        )
         case_chat(gw, haiku)
         case_chat(gw, haiku, stream=True)
         case_messages(gw, haiku)
@@ -972,6 +977,18 @@ def run_group(gw: Gateway, group: str) -> None:
         case_thinking_tiers(gw, haiku, native=True, tiers=[1024, 4096, 16384], expect_reasoning=True)
         # adaptive thinking may skip reasoning at low effort on an easy prompt: presence is reported, not asserted
         case_thinking_tiers(gw, sonnet46, native=False, tiers=["low", "medium", "high", "max"], expect_reasoning=False)
+        # 4.7+ / 5 family: adaptive+summarized dialect, xhigh accepted, sampling knobs dropped by the gateway
+        case_thinking_tiers(gw, opus5, native=False, tiers=["low", "medium", "high", "xhigh", "max"], expect_reasoning=False)
+        case_chat(gw, opus5, "temperature dropped", prompt=prime, temperature=0.2, top_p=0.9)
+        case_messages(
+            gw,
+            opus5,
+            "thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt="Solve 23*47 step by step briefly.",
+            expect_thinking=True,
+        )
     elif group == "openai":
         case_chat(gw, "gpt-4o-mini")
         case_chat(gw, "gpt-4o-mini", stream=True)
