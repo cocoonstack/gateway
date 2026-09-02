@@ -36,6 +36,7 @@ models:
   - {name: claude-haiku-4-5-20251001, provider: anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25, write_cache_1h: 2.0}, prompt_cache: true}
   - {name: claude-sonnet-4-5-20250929, provider: anthropic, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25, write_cache_1h: 2.0}, prompt_cache: true}
   - {name: claude-sonnet-4-6, provider: anthropic, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
+  - {name: claude-opus-5, provider: anthropic, input_price_per_1k_micros: 5000, output_price_per_1k_micros: 25000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
   # openai
   - {name: gpt-4o-mini, provider: openai, input_price_per_1k_micros: 150, output_price_per_1k_micros: 600, token_rate: {read_cache: 0.5}, cache_ttl_seconds: 120}
   - {name: gpt-4.1-mini, provider: openai, input_price_per_1k_micros: 400, output_price_per_1k_micros: 1600, token_rate: {read_cache: 0.25}}
