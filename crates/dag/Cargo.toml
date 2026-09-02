@@ -9,6 +9,7 @@ description = "Layered DAG execution: 4 fixed layers, topo-ordered nodes."
 [dependencies]
 gw-consts = { workspace = true }
 gw-models = { workspace = true }
+tiktoken-rs = { workspace = true }
 gw-config = { workspace = true }
 gw-state = { workspace = true }
 gw-engines = { workspace = true }

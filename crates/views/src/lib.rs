@@ -397,7 +397,7 @@ impl RealtimeTurn {
     }
 
     fn record_text(&mut self, text: &str) {
-        let tokens = gw_models::token_estimate::default_encoder().encode_len(text);
+        let tokens = gw_dag::token_estimate::default_encoder().encode_len(text);
         self.record_units(tokens as i64);
     }
 
@@ -1016,7 +1016,7 @@ async fn realtime_bridge(
                         if relay {
                             let (text, opaque) = realtime_output_delta(&v);
                             output_units = text.map_or(0, |text| {
-                                let tokens = gw_models::token_estimate::default_encoder()
+                                let tokens = gw_dag::token_estimate::default_encoder()
                                     .encode_len(text);
                                 tokens as i64
                             });
@@ -3128,7 +3128,7 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
 }
 
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
-    let encoder = gw_models::token_estimate::default_encoder();
+    let encoder = gw_dag::token_estimate::default_encoder();
     let mut tokens = encoder.encode_len(&chunk.delta) as i64;
     if !chunk.reasoning.is_empty() {
         tokens = tokens.saturating_add(encoder.encode_len(&chunk.reasoning) as i64);

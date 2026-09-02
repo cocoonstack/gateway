@@ -8,6 +8,7 @@
 pub mod context;
 pub mod executor;
 pub mod nodes;
+pub mod token_estimate;
 
 pub use context::DagContext;
 pub use executor::{DagNode, Layer, Plan, run};

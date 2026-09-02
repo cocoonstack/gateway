@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 
-use crate::request::domain::ChatMsg;
+use gw_models::ChatMsg;
 
 /// Encodes text to an (estimated) token count. The BPE seam — see module docs.
 pub trait TokenEncoder: Send + Sync {
