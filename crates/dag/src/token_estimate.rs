@@ -1,17 +1,10 @@
-//! Prompt-token estimation — the up-front estimate only; the authoritative
-//! count always comes back in the vendor's usage payload.
-//!
-//! Intended to feed PTU account selection (NOT the TPM limiter); wiring it into
-//! a token-aware selector is deferred. The structural accounting follows the
-//! standard OpenAI chat-token formula exactly; the text→token encoding sits
-//! behind the [`TokenEncoder`] seam — real tiktoken `cl100k_base` by default,
-//! [`HeuristicEncoder`] as the zero-dependency fallback.
+//! Up-front prompt-token estimate for admission; the vendor usage payload is
+//! the authoritative count. The encoding sits behind the [`TokenEncoder`] seam.
 
 use std::sync::LazyLock;
 
-use serde_json::Value;
-
 use gw_models::ChatMsg;
+use serde_json::Value;
 
 /// Encodes text to an (estimated) token count. The BPE seam — see module docs.
 pub trait TokenEncoder: Send + Sync {
