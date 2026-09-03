@@ -404,10 +404,6 @@ impl AccountPool {
         }
     }
 
-    pub fn select(&self, p: Protocol, provider: Option<&str>) -> Option<Arc<Account>> {
-        self.select_excluding(p, provider, &[])
-    }
-
     pub fn named(&self, name: &str) -> Option<Arc<Account>> {
         self.accounts
             .iter()
@@ -415,9 +411,10 @@ impl AccountPool {
             .map(Arc::clone)
     }
 
-    /// [`Self::select_excluding`] plus a health filter: cooldown accounts are
-    /// excluded. Only accounts that could actually be selected (protocol AND
-    /// provider match) are health-checked — the others would waste lookups.
+    /// PTU accounts are preferred over paygo; `excluded` (failed-over) and
+    /// cooldown accounts are skipped; within a tier, pick by priority then
+    /// round-robin. A model bound to a `provider` only uses that provider's
+    /// accounts, and only those are health-checked.
     pub async fn select_healthy(
         &self,
         p: Protocol,
@@ -441,18 +438,6 @@ impl AccountPool {
         self.select_with(p, provider, |name| {
             excluded.iter().any(|e| e == name) || unhealthy.contains(&name)
         })
-    }
-
-    /// PTU accounts are preferred over paygo; `excluded` (failed-over) accounts
-    /// are skipped; within a tier, pick by priority then round-robin. A model
-    /// bound to a `provider` only uses that provider's accounts.
-    pub fn select_excluding(
-        &self,
-        p: Protocol,
-        provider: Option<&str>,
-        excluded: &[String],
-    ) -> Option<Arc<Account>> {
-        self.select_with(p, provider, |name| excluded.iter().any(|e| e == name))
     }
 
     pub fn len(&self) -> usize {
@@ -1321,23 +1306,34 @@ mod tests {
         assert!(!s.governance.quota_check("a", 10).await);
     }
 
-    #[test]
-    fn pool_prefers_priority_then_round_robins() {
+    #[tokio::test]
+    async fn pool_prefers_priority_then_round_robins() {
         let s = state();
-        let a = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
-        let b = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
+        let h = s.health.as_ref();
+        let a = s
+            .pool
+            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h)
+            .await
+            .unwrap();
+        let b = s
+            .pool
+            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h)
+            .await
+            .unwrap();
         assert_eq!(a.name, "mock-openai-1");
         assert_eq!(b.name, "mock-openai-1");
         assert_eq!(
             s.pool
-                .select(Protocol::AnthropicMessages, None)
+                .select_healthy(Protocol::AnthropicMessages, None, &[], h)
+                .await
                 .unwrap()
                 .name,
             "mock-anthropic-1"
         );
         assert!(
             s.pool
-                .select(Protocol::Video, Some("nonexistent"))
+                .select_healthy(Protocol::Video, Some("nonexistent"), &[], h)
+                .await
                 .is_none()
         );
     }
@@ -1370,22 +1366,26 @@ mod tests {
         assert!(h.available("acc"));
     }
 
-    #[test]
-    fn pool_prefers_ptu_then_excludes_failed() {
+    #[tokio::test]
+    async fn pool_prefers_ptu_then_excludes_failed() {
         let s = state();
+        let h = s.health.as_ref();
         let first = s
             .pool
-            .select(Protocol::OpenaiChat, Some("tencent"))
+            .select_healthy(Protocol::OpenaiChat, Some("tencent"), &[], h)
+            .await
             .unwrap();
         assert_eq!(first.name, "mock-hunyuan-ptu-down");
         assert!(first.is_ptu());
         let next = s
             .pool
-            .select_excluding(
+            .select_healthy(
                 Protocol::OpenaiChat,
                 Some("tencent"),
                 &["mock-hunyuan-ptu-down".into()],
+                h,
             )
+            .await
             .unwrap();
         assert_eq!(next.name, "mock-hunyuan-paygo");
         assert!(!next.is_ptu());
