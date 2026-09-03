@@ -22,16 +22,6 @@ pub struct ScanOutcome {
     pub hits: Vec<RuleHit>,
 }
 
-/// Blocklist + regex scan over every string leaf, opaque signed-thinking fields included.
-pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanOutcome {
-    if sec.blocklist.is_empty() && sec.regexes.is_empty() {
-        return ScanOutcome::default();
-    }
-    let mut counts = ScanCounts::new(sec);
-    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| counts.visit(s));
-    counts.outcome()
-}
-
 /// Per-rule hit counters shared by the REST and realtime scans, so their semantics cannot drift.
 struct ScanCounts<'a> {
     sec: &'a SecurityConf,
@@ -81,63 +71,6 @@ impl<'a> ScanCounts<'a> {
             .then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32));
         ScanOutcome { block, hits }
     }
-}
-
-/// The text moderation reviews and retention records: signed-thinking prose in, opaque proof out.
-pub fn inbound_text(request: &mut GatewayRequest) -> String {
-    let mut out = String::new();
-    for_each_request_text(request, SignedThinking::Prose, &mut |s, _| {
-        push_text(&mut out, s);
-        0
-    });
-    out
-}
-
-fn push_text(out: &mut String, s: &str) {
-    if !s.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(s);
-    }
-}
-
-/// Apply mask spans over [`inbound_text`]; `Err(n)` means n spans hit signed thinking and nothing changed.
-pub fn apply_moderation_mask(
-    request: &mut GatewayRequest,
-    spans: &[std::ops::Range<usize>],
-) -> Result<usize, usize> {
-    let mut dry = SpanMasker::new(spans);
-    let mut protected = 0;
-    for_each_request_text(request, SignedThinking::Prose, &mut |text, prose| {
-        let overlaps = dry.probe(text);
-        if prose {
-            protected += overlaps;
-        }
-        0
-    });
-    if protected > 0 {
-        return Err(protected);
-    }
-    let mut masker = SpanMasker::new(spans);
-    for_each_request_text(request, SignedThinking::Prose, &mut |text, prose| {
-        // protected prose still advances the cursor; the probe proved no span lands in it
-        if prose {
-            masker.probe(text)
-        } else {
-            masker.apply(text)
-        }
-    });
-    Ok(masker.hits)
-}
-
-/// Moderator mask spans applied to one realtime frame, addressing its collected text.
-pub fn apply_mask_spans_frame(
-    frame: &mut serde_json::Value,
-    spans: &[std::ops::Range<usize>],
-) -> usize {
-    let mut masker = SpanMasker::new(spans);
-    gw_engines::realtime::visit_frame_text(frame, &mut |s| masker.apply(s))
 }
 
 /// Replays the `push_text` walk to map global byte spans onto slots, snapped to char boundaries.
@@ -212,6 +145,120 @@ impl SpanMasker {
     }
 }
 
+/// How a walk treats a native assistant turn's signed thinking; elsewhere every policy is `Visit`.
+#[derive(Clone, Copy, PartialEq)]
+enum SignedThinking {
+    /// Every string leaf, opaque proof included: no field choice may dodge the scanner.
+    Visit,
+    /// Skip the whole block — a rewrite would invalidate the signature.
+    Skip,
+    /// Prose without the opaque proof: the moderation view the mask offsets must match.
+    Prose,
+}
+
+#[derive(Default)]
+struct EventFragments {
+    /// output item index → delta path → accumulated text
+    values: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
+    fields: usize,
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl EventFragments {
+    fn append(&mut self, index: u64, path: &str, text: &str) {
+        if self.overflowed {
+            return;
+        }
+        let item = self.values.entry(index).or_default();
+        let new_key = !item.contains_key(path);
+        let added = text
+            .len()
+            .saturating_add(if new_key { path.len() } else { 0 });
+        if self.bytes.saturating_add(added) > MAX_NATIVE_EVENT_SCAN_BYTES
+            || (new_key && self.fields >= MAX_NATIVE_EVENT_SCAN_FIELDS)
+        {
+            self.overflowed = true;
+            self.values.clear();
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(added);
+        if new_key {
+            self.fields += 1;
+            item.insert(path.to_owned(), text.to_owned());
+        } else if let Some(buf) = item.get_mut(path) {
+            buf.push_str(text);
+        }
+    }
+}
+
+/// Blocklist + regex scan over every string leaf, opaque signed-thinking fields included.
+pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanOutcome {
+    if sec.blocklist.is_empty() && sec.regexes.is_empty() {
+        return ScanOutcome::default();
+    }
+    let mut counts = ScanCounts::new(sec);
+    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| counts.visit(s));
+    counts.outcome()
+}
+
+/// The text moderation reviews and retention records: signed-thinking prose in, opaque proof out.
+pub fn inbound_text(request: &mut GatewayRequest) -> String {
+    let mut out = String::new();
+    for_each_request_text(request, SignedThinking::Prose, &mut |s, _| {
+        push_text(&mut out, s);
+        0
+    });
+    out
+}
+
+fn push_text(out: &mut String, s: &str) {
+    if !s.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(s);
+    }
+}
+
+/// Apply mask spans over [`inbound_text`]; `Err(n)` means n spans hit signed thinking and nothing changed.
+pub fn apply_moderation_mask(
+    request: &mut GatewayRequest,
+    spans: &[std::ops::Range<usize>],
+) -> Result<usize, usize> {
+    let mut dry = SpanMasker::new(spans);
+    let mut protected = 0;
+    for_each_request_text(request, SignedThinking::Prose, &mut |text, prose| {
+        let overlaps = dry.probe(text);
+        if prose {
+            protected += overlaps;
+        }
+        0
+    });
+    if protected > 0 {
+        return Err(protected);
+    }
+    let mut masker = SpanMasker::new(spans);
+    for_each_request_text(request, SignedThinking::Prose, &mut |text, prose| {
+        // protected prose still advances the cursor; the probe proved no span lands in it
+        if prose {
+            masker.probe(text)
+        } else {
+            masker.apply(text)
+        }
+    });
+    Ok(masker.hits)
+}
+
+/// Moderator mask spans applied to one realtime frame, addressing its collected text.
+pub fn apply_mask_spans_frame(
+    frame: &mut serde_json::Value,
+    spans: &[std::ops::Range<usize>],
+) -> usize {
+    let mut masker = SpanMasker::new(spans);
+    gw_engines::realtime::visit_frame_text(frame, &mut |s| masker.apply(s))
+}
+
 fn snap_floor(s: &str, mut i: usize) -> usize {
     i = i.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -256,17 +303,6 @@ fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) 
         serde_json::Value::Object(o) => o.values_mut().map(|x| walk_json_strings(x, f)).sum(),
         _ => 0,
     }
-}
-
-/// How a walk treats a native assistant turn's signed thinking; elsewhere every policy is `Visit`.
-#[derive(Clone, Copy, PartialEq)]
-enum SignedThinking {
-    /// Every string leaf, opaque proof included: no field choice may dodge the scanner.
-    Visit,
-    /// Skip the whole block — a rewrite would invalidate the signature.
-    Skip,
-    /// Prose without the opaque proof: the moderation view the mask offsets must match.
-    Prose,
 }
 
 /// The ONE per-request text walk shared by scan, masking and DLP; the second visitor argument marks signed prose.
@@ -625,42 +661,6 @@ pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::Stream
         .map(|text| redaction_hits(text, pii, secrets))
         .sum::<usize>();
     hits
-}
-
-#[derive(Default)]
-struct EventFragments {
-    /// output item index → delta path → accumulated text
-    values: std::collections::HashMap<u64, std::collections::HashMap<String, String>>,
-    fields: usize,
-    bytes: usize,
-    overflowed: bool,
-}
-
-impl EventFragments {
-    fn append(&mut self, index: u64, path: &str, text: &str) {
-        if self.overflowed {
-            return;
-        }
-        let item = self.values.entry(index).or_default();
-        let new_key = !item.contains_key(path);
-        let added = text
-            .len()
-            .saturating_add(if new_key { path.len() } else { 0 });
-        if self.bytes.saturating_add(added) > MAX_NATIVE_EVENT_SCAN_BYTES
-            || (new_key && self.fields >= MAX_NATIVE_EVENT_SCAN_FIELDS)
-        {
-            self.overflowed = true;
-            self.values.clear();
-            return;
-        }
-        self.bytes = self.bytes.saturating_add(added);
-        if new_key {
-            self.fields += 1;
-            item.insert(path.to_owned(), text.to_owned());
-        } else if let Some(buf) = item.get_mut(path) {
-            buf.push_str(text);
-        }
-    }
 }
 
 fn walk_native_event(
