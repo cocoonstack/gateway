@@ -223,14 +223,18 @@ impl AkAuth {
     /// A page of keys, sorted by ak (stable), optionally confined to `tenant`,
     /// `offset..offset+limit` — the filter applies before paging.
     pub fn list(&self, tenant: Option<&str>, offset: usize, limit: usize) -> Vec<AkInfo> {
-        let mut keys: Vec<AkInfo> = self
+        let mut keys: Vec<Arc<AkInfo>> = self
             .keys
             .iter()
-            .map(|e| e.value().0.as_ref().clone())
-            .filter(|k| tenant.is_none_or(|t| t == k.tenant))
+            .filter(|e| tenant.is_none_or(|t| t == e.value().0.tenant))
+            .map(|e| Arc::clone(&e.value().0))
             .collect();
         keys.sort_by(|a, b| a.ak.cmp(&b.ak));
-        keys.into_iter().skip(offset).take(limit).collect()
+        keys.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|k| k.as_ref().clone())
+            .collect()
     }
 
     /// Remove a key regardless of source; returns whether it existed.

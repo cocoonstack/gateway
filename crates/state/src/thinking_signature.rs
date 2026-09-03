@@ -221,14 +221,11 @@ impl ThinkingSignatureAudit {
     ) -> ReviewVerdict {
         let anchor = self.anchor_digest(context, tool_id);
         let now = Instant::now();
-        let Ok(mut cache) = self.inner.cache.lock() else {
-            metrics::counter!(
-                "gateway_thinking_signature_cache_events_total",
-                "event" => "lock_error",
-            )
-            .increment(1);
-            return ReviewVerdict::Miss;
-        };
+        let mut cache = self
+            .inner
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(entry) = cache.entries.get(&anchor) else {
             return ReviewVerdict::Miss;
         };
@@ -262,22 +259,11 @@ impl ThinkingSignatureAudit {
             .iter()
             .map(|tool_id| self.anchor_digest(context, tool_id))
             .collect::<HashSet<_>>();
-        if anchors.len() > self.inner.max_entries {
-            metrics::counter!(
-                "gateway_thinking_signature_cache_events_total",
-                "event" => "capacity_drop",
-            )
-            .increment(1);
-            return;
-        }
-        let Ok(mut cache) = self.inner.cache.lock() else {
-            metrics::counter!(
-                "gateway_thinking_signature_cache_events_total",
-                "event" => "lock_error",
-            )
-            .increment(1);
-            return;
-        };
+        let mut cache = self
+            .inner
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let additional = |cache: &AuditCache| {
             anchors
                 .iter()

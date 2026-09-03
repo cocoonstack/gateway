@@ -135,8 +135,8 @@ impl SpanMasker {
             if span.start >= end || span.end <= start {
                 continue;
             }
-            let lo = snap_floor(s, span.start.saturating_sub(start));
-            let hi = snap_ceil(s, span.end.saturating_sub(start).min(s.len()));
+            let lo = s.floor_char_boundary(span.start.saturating_sub(start));
+            let hi = s.ceil_char_boundary(span.end.saturating_sub(start));
             s.replace_range(lo..hi, "[MASKED]");
             replaced += 1;
         }
@@ -257,22 +257,6 @@ pub fn apply_mask_spans_frame(
 ) -> usize {
     let mut masker = SpanMasker::new(spans);
     gw_engines::realtime::visit_frame_text(frame, &mut |s| masker.apply(s))
-}
-
-fn snap_floor(s: &str, mut i: usize) -> usize {
-    i = i.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn snap_ceil(s: &str, mut i: usize) -> usize {
-    i = i.min(s.len());
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 /// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.

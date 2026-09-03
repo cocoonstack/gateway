@@ -201,12 +201,12 @@ impl DagNode for CacheLookup {
             return Ok(());
         };
         // batch items bypass: a free (unbilled) hit would break their per-item billing
-        let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
-            return Ok(());
-        };
         if !ctx.request.buffered_online() {
             return Ok(());
         }
+        let Some(ttl) = cache_ttl_seconds(&ctx.cfg, &param.model_name) else {
+            return Ok(());
+        };
         let Some(key) = cache_key_of(ctx) else {
             return Ok(());
         };
