@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Layered DAG execution: 4 fixed layers, topo-ordered nodes."
+description = "Layered DAG execution: 4 fixed layers of sequential nodes."
 
 [dependencies]
 gw-consts = { workspace = true }

@@ -39,8 +39,8 @@ quota and ledger accounting run to completion even if the caller goes
 away. Spawned background work (offline batches) likewise outlives the
 submitting request.
 
-The DAG executes four fixed layers; nodes within a layer are
-topologically ordered by declared dependencies. `account_select` and
+The DAG executes four fixed layers; nodes within a layer run
+sequentially in declaration order. `account_select` and
 `model_access` form a retry loop: an upstream 5xx excludes the failed
 account and reselects once; a PTU→paygo switch is recorded as
 `ptu_spillover` in the ledger.
