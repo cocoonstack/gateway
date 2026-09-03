@@ -22,6 +22,10 @@ make release            # target/release/gw, built --locked
 GW_CONFIG=/etc/gateway.yaml ./target/release/gw
 ```
 
+The release profile is fat LTO with one codegen unit, functions aligned to
+64 bytes and branch targets to 32 bytes (`.cargo/config.toml`), and `gw` runs
+on jemalloc as its global allocator.
+
 ### Environment
 
 | Variable | Effect |

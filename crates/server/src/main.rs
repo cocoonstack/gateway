@@ -19,6 +19,9 @@ const BATCH_STALE_SECS: i64 = 120;
 const BATCH_POLL: Duration = Duration::from_secs(2);
 const CONFIG_FEED_RETRY: Duration = Duration::from_secs(5);
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
