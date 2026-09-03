@@ -83,7 +83,9 @@ impl BillingLedger {
                     dropped += unacked;
                 }
                 for tx in row_acks.drain(..) {
-                    let _ = tx.send(committed);
+                    if tx.send(committed).is_err() && !committed {
+                        dropped += 1;
+                    }
                 }
                 if let Some(tx) = ack.take() {
                     let _ = tx.send(std::mem::take(&mut dropped));
@@ -518,6 +520,25 @@ mod tests {
         let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows[0].request_id, "req-fallback");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canceled_attributed_write_is_reported_as_dropped() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(LEDGER_RETRY_ATTEMPTS);
+        let ledger = BillingLedger::repairing(store);
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+
+        ledger
+            .queue
+            .as_ref()
+            .unwrap()
+            .send(LedgerWrite::Row(record("req-canceled"), Some(tx)))
+            .await
+            .unwrap();
+
+        assert_eq!(ledger.flush().await, 1);
     }
 
     #[tokio::test]
