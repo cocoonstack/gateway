@@ -72,7 +72,6 @@ export interface Overview {
 export interface Account {
   name: string;
   provider: string;
-  priority: number;
   tier: string;
   health: string;
   protocols: string[];

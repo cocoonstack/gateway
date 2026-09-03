@@ -71,7 +71,6 @@ type Key struct {
 type Account struct {
 	Name      string   `json:"name"`
 	Provider  string   `json:"provider"`
-	Priority  int64    `json:"priority"`
 	Tier      string   `json:"tier"`
 	Health    string   `json:"health"`
 	Protocols []string `json:"protocols"`
