@@ -2,11 +2,17 @@
 
 ## Binary
 
-Install a tagged release (Linux/macOS, x86_64/arm64) with the generated script:
+Download a tagged release tarball (Linux/macOS, x86_64/arm64) and extract the
+`gw` binary:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/cocoonstack/gateway/releases/latest/download/gw-server-installer.sh | sh
+# substitute the release tag and target platform
+VERSION=v0.4.1
+OS=linux      # or darwin
+ARCH=amd64    # or arm64
+curl --proto '=https' --tlsv1.2 -LsSf -o gw.tar.gz \
+  "https://github.com/cocoonstack/gateway/releases/download/${VERSION}/gw_${VERSION#v}_${OS}_${ARCH}.tar.gz"
+tar -xzf gw.tar.gz gw
 ```
 
 Or build from source:
@@ -74,6 +80,15 @@ storage:
 - **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
   namespaced under `gw:`, windows self-expire), otherwise in-process. Without
   Redis, each replica limits independently.
+- `ledger_max_rows` is not a hard cap: pruning spares rows not yet folded
+  into the usage rollup, so the table can briefly exceed the cap under
+  rollup lag.
+- With Postgres + Redis, the batching billing writer shares the connection
+  pool with request-path reads; at the default `postgres_max_connections: 10`
+  a single-node bench showed the big-body lane going bimodal (p99 9 ms vs
+  22 ms) under load. Raising it to 40 (or higher) kept both arms stable and
+  5-8% faster — set `postgres_max_connections: 40` for fleet deployments;
+  the shipped `10` is a single-node value.
 
 ## Control plane
 

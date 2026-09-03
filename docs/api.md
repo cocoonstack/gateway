@@ -66,7 +66,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}`; a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
+| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}` (`count` defaults to 3, clamped to 1-20); a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
 
 ### Chat completions
 
@@ -245,7 +245,7 @@ and admits on `response.create`.
 |--------|------|-------|
 | GET | `/health` | liveness |
 | GET | `/metrics` | Prometheus registry (see [Observability](observability.md)) |
-| GET | `/internal/ledger` | billing records; `?limit=N` returns the N most recent (oldest-first within the page; `count` is the total); global admin token only |
+| GET | `/internal/ledger` | billing records; `?limit=N` returns the N most recent, default 100 (oldest-first within the page; `count` is the total); global admin token only |
 | GET | `/internal/accounts` | account pool view with health; global admin token only |
 
 `/internal/*` is an operator surface: it answers only to the global admin
@@ -268,7 +268,7 @@ regardless.
 | GET | `/admin/config` | current fleet config version and raw YAML (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/validate` | validate a config document without publishing it (global token) |
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed; `?expected_version=` publishes only while that is still the head — a moved head answers 409 (global token; needs `storage.postgres_url`) |
-| GET | `/admin/config/versions` | retained config versions, newest first (global token; needs `storage.postgres_url`) |
+| GET | `/admin/config/versions` | retained config versions, newest first; `?limit=` (default 20) (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/versions/{id}/rollback` | republish a retained document as a new head and reload (global token; needs `storage.postgres_url`) |
 | GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's); `?ak=` exact lookup answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
@@ -276,7 +276,7 @@ regardless.
 | DELETE | `/admin/keys/{ak}` | revoke a key |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 (operator-only margin basis) |
-| GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; tenant-scoped (vendor cost redacted like `/admin/usage/users`), maximum 400 points |
+| GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; `?tenant=` filter for the global token; tenant-scoped (vendor cost redacted like `/admin/usage/users`), maximum 400 points |
 | GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per billed turn and on session-fatal upstream errors; tenant-scoped |
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |

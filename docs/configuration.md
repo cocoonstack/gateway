@@ -41,7 +41,9 @@ distributed batch queue (any instance claims and runs submitted batches).
 `redis_url` shares rate/quota/TPM counters and account-health cooldowns across
 instances; `shared_cache: true` additionally moves the request cache into
 Redis so a hit on one instance serves the fleet (off = each instance caches
-in-process, a miss just recomputes).
+in-process, a miss just recomputes). `ledger_max_rows` is not a hard cap:
+pruning spares rows not yet folded into the usage rollup, so the table can
+briefly exceed the cap under rollup lag.
 
 ### `access_keys` — client authentication and per-key governance
 
@@ -114,7 +116,7 @@ models:
       audio_prompt: 16.67            #   audio input tokens (default = prompt weight)
       audio_completion: 8.33         #   audio output tokens (default = completion weight)
     long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
-    batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price
+    batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price; must be finite and in (0.0, 1.0]
     prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
@@ -229,7 +231,7 @@ security:                      # global default; a tenant may override it whole
 
 stability:
   failure_threshold: 3         # consecutive failures before an account cools down
-  cooldown_seconds: 300
+  cooldown_seconds: 30
   availability_window_minutes: 5   # /admin/models/status judgment window (max 60)
   unstable_error_rate: 0.1         # window error rate that reports `unstable`
   unavailable_error_rate: 0.5      # ... and `unavailable`
