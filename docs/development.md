@@ -39,7 +39,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 | `config` | YAML config, provider presets, name indices |
 | `state` | auth, account pool, health, cache; `Store` and `Governance` seams |
 | `engines` | per-protocol engines behind the `Transport` seam, SSE, SigV4 |
-| `dag` | the 4-layer request pipeline (precomputed plan) |
+| `dag` | the 4-layer request pipeline, nodes in declaration order |
 | `handler` | online/offline orchestration, DLP/blocklist plugins |
 | `task` | background tasks: quota reset, content purge, usage rollup, availability flush + alerts, alert dispatch |
 | `views` | axum HTTP/WebSocket handlers, streaming, metrics |
