@@ -17,7 +17,7 @@ gw-state = { workspace = true }
 gw-engines = { workspace = true }
 gw-views = { workspace = true }
 gw-task = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

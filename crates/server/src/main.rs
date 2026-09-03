@@ -5,13 +5,19 @@
 //! shutdown. Accounts with an `endpoint` egress to real vendors; the rest are
 //! served by the in-process mock; `GW_TRANSPORT=mock` forces zero egress.
 
+use std::borrow::Cow;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gw_config::GatewayConfig;
 use gw_state::GatewayState;
 use gw_views::AppState;
 use tracing_subscriber::EnvFilter;
+
+const BATCH_STALE_SECS: i64 = 120;
+const BATCH_POLL: Duration = Duration::from_secs(2);
+const CONFIG_FEED_RETRY: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,22 +29,13 @@ async fn main() -> anyhow::Result<()> {
 
     // reloads re-read this captured source
     let config_source = env::var("GW_CONFIG").ok();
-    let read_source_text = {
-        let src = config_source.clone();
-        move || -> Result<String, String> {
-            match &src {
-                Some(path) => {
-                    std::fs::read_to_string(path).map_err(|e| format!("read config {path}: {e}"))
-                }
-                None => Ok(gw_config::DEFAULT_YAML.to_owned()),
-            }
-        }
-    };
     match &config_source {
         Some(path) => tracing::info!("loading config from {path}"),
         None => tracing::info!("using embedded default config (set GW_CONFIG to override)"),
     }
-    let boot_yaml = read_source_text().map_err(|e| anyhow::anyhow!(e))?;
+    let boot_yaml = read_source_text(config_source.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let cfg = GatewayConfig::from_yaml(&boot_yaml)?;
 
     let config_store = if cfg.storage.postgres_url.is_empty() {
@@ -115,9 +112,11 @@ async fn main() -> anyhow::Result<()> {
             })
         }
         None => Arc::new(move || {
-            let text = read_source_text();
-            Box::pin(async move { GatewayConfig::from_yaml(&text?).map_err(|e| e.to_string()) })
-                as gw_views::ConfigFuture
+            let src = config_source.clone();
+            Box::pin(async move {
+                let text = read_source_text(src.as_deref()).await?;
+                GatewayConfig::from_yaml(&text).map_err(|e| e.to_string())
+            }) as gw_views::ConfigFuture
         }),
     };
     let mut app_state = AppState::with_config(shared.clone(), transport, Some(loader));
@@ -126,15 +125,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // fleet batch drain: on a distributed store any instance claims submitted batches
-    if distributed_batches {
+    let batch_task = if distributed_batches {
         let offline = app_state.offline.clone();
-        tokio::spawn(async move {
-            offline
-                .drain_forever(120, std::time::Duration::from_secs(2))
-                .await
-        });
         tracing::info!("batch drain loop started (distributed store)");
-    }
+        Some(tokio::spawn(async move {
+            offline.drain_forever(BATCH_STALE_SECS, BATCH_POLL).await
+        }))
+    } else {
+        None
+    };
 
     // change feed: reload on every published config version; reconnects forever
     if config_store.is_some() {
@@ -160,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => tracing::warn!(error = %e, "config change feed connect failed"),
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(CONFIG_FEED_RETRY).await;
             }
         });
     }
@@ -211,8 +210,21 @@ async fn main() -> anyhow::Result<()> {
     avail_task.abort();
     alert_task.abort();
     avail_alert_task.abort();
+    if let Some(task) = batch_task {
+        task.abort();
+    }
     tracing::info!("gw drained and exiting");
     Ok(())
+}
+
+async fn read_source_text(src: Option<&str>) -> Result<Cow<'static, str>, String> {
+    match src {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .map(Cow::Owned)
+            .map_err(|e| format!("read config {path}: {e}")),
+        None => Ok(Cow::Borrowed(gw_config::DEFAULT_YAML)),
+    }
 }
 
 // GW_TRANSPORT: mock = zero egress, http = real HTTP, unset = mock:// in-process and real URLs over HTTP

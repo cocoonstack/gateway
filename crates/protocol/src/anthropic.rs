@@ -105,16 +105,16 @@ pub fn image_to_image_url(mut block: Value) -> Value {
     if block["type"] != "image" {
         return block;
     }
-    let source = block["source"].take();
+    let mut source = block["source"].take();
     let url = match source["type"].as_str() {
         Some("base64") => format!(
             "data:{};base64,{}",
             source["media_type"].as_str().unwrap_or("image/png"),
             source["data"].as_str().unwrap_or_default()
         ),
-        _ => match source.get("url").and_then(Value::as_str) {
-            Some(url) => url.to_owned(),
-            None => {
+        _ => match source.get_mut("url") {
+            Some(Value::String(url)) => std::mem::take(url),
+            _ => {
                 block["source"] = source;
                 return block;
             }

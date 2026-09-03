@@ -3,6 +3,8 @@
 //! `GatewayResponse` + stream chunks, and keeps the raw usage subtree on
 //! `raw_usage` for the CommonUsage DAG node.
 
+use std::borrow::Cow;
+
 use gw_models::{GResult, GatewayError, GatewayResponse};
 use gw_protocol::reasoning::is_thinking_block;
 use serde_json::{Map, Value, json};
@@ -235,14 +237,14 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
         if let Some(name) = f["function"]["name"].as_str()
             && call["function"].get("name").is_none()
         {
-            call["function"]["name"] = json!(name);
+            call["function"]["name"] = Value::from(name);
         }
         if let Some(args) = f["function"]["arguments"].as_str() {
             // append in place — rebuilding the string per fragment is quadratic
             if let Value::String(acc) = &mut call["function"]["arguments"] {
                 acc.push_str(args);
             } else {
-                call["function"]["arguments"] = json!(args);
+                call["function"]["arguments"] = Value::from(args);
             }
         }
     }
@@ -402,7 +404,7 @@ fn normalize_tools_openai(tools: Value) -> Value {
 /// The request's `reasoning_effort`: the client's own, else derived from
 /// `output_config.effort`, a `thinking` budget or an OpenRouter budget;
 /// `adaptive` without an effort and `disabled` leave the vendor default.
-fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
+fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static, str>> {
     if let Some(effort) = reasoning.effort {
         return Some(effort);
     }
@@ -410,7 +412,7 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
         .output_config
         .and_then(|mut config| config.get_mut("effort").map(Value::take))
     {
-        return Some(effort);
+        return Some(Cow::Owned(effort));
     }
     let budget = reasoning.budget_tokens.or_else(|| {
         reasoning
@@ -418,7 +420,7 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
             .filter(|thinking| thinking["type"] == "enabled")
             .and_then(|thinking| thinking["budget_tokens"].as_i64())
     })?;
-    Some(gw_protocol::reasoning::budget_effort(budget).to_owned())
+    Some(Cow::Borrowed(gw_protocol::reasoning::budget_effort(budget)))
 }
 
 /// OpenAI's own reasoning families — o-series and GPT-5 onward.

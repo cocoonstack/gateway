@@ -2,6 +2,7 @@
 //! `GatewayRequest`, call the handler, shape the wire response, and emit one
 //! structured access-log line per request.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -2557,22 +2558,22 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
 }
 
 /// finish_reason mapping, anthropic → openai.
-fn finish_openai(fr: String) -> String {
+fn finish_openai(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
-        "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => "stop".to_owned(),
-        "max_tokens" => "length".to_owned(),
-        "tool_use" => "tool_calls".to_owned(),
-        _ => fr,
+        "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => Cow::Borrowed("stop"),
+        "max_tokens" => Cow::Borrowed("length"),
+        "tool_use" => Cow::Borrowed("tool_calls"),
+        _ => Cow::Owned(fr),
     }
 }
 
 /// finish_reason mapping, openai → anthropic.
-fn finish_anthropic(fr: String) -> String {
+fn finish_anthropic(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
-        "" | "stop" => "end_turn".to_owned(),
-        "length" => "max_tokens".to_owned(),
-        "tool_calls" => "tool_use".to_owned(),
-        _ => fr,
+        "" | "stop" => Cow::Borrowed("end_turn"),
+        "length" => Cow::Borrowed("max_tokens"),
+        "tool_calls" => Cow::Borrowed("tool_use"),
+        _ => Cow::Owned(fr),
     }
 }
 
@@ -2644,18 +2645,18 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
 /// OpenRouter's `reasoning{effort, max_tokens, enabled}`.
 fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Box<ReasoningParam>> {
     let mut param = ReasoningParam {
-        effort,
+        effort: effort.map(Cow::Owned),
         ..Default::default()
     };
     if let Some(Value::Object(mut reasoning)) = reasoning {
         if let Some(Value::String(effort)) = reasoning.remove("effort") {
-            param.effort = Some(effort);
+            param.effort = Some(Cow::Owned(effort));
         }
         param.budget_tokens = reasoning.get("max_tokens").and_then(Value::as_i64);
         if param.effort.is_none() && param.budget_tokens.is_none() {
             param.effort = match reasoning.get("enabled").and_then(Value::as_bool) {
-                Some(true) => Some("medium".to_owned()),
-                Some(false) => Some("none".to_owned()),
+                Some(true) => Some(Cow::Borrowed("medium")),
+                Some(false) => Some(Cow::Borrowed("none")),
                 None => None,
             };
         }
@@ -2684,7 +2685,7 @@ async fn chat_completions(
                 .map(|c| c.into_text_and_parts())
                 .unwrap_or_default();
             ChatMsg {
-                role: m.role,
+                role: m.role.into_owned(),
                 content,
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
@@ -2959,7 +2960,7 @@ fn chat_stream_response(
         id: String,
         created: i64,
         model: String,
-        pending_finish: Option<String>,
+        pending_finish: Option<Cow<'static, str>>,
         tool_index: usize,
     }
     impl SseEncodeState for St {
@@ -3025,11 +3026,8 @@ fn chat_stream_response(
                         &self.model,
                         Some(usage),
                     );
-                    fin.choices[0].finish_reason = Some(
-                        self.pending_finish
-                            .take()
-                            .unwrap_or_else(|| "stop".to_owned()),
-                    );
+                    fin.choices[0].finish_reason =
+                        Some(self.pending_finish.take().unwrap_or(Cow::Borrowed("stop")));
                     if let Ok(payload) = serde_json::to_string(&fin) {
                         self.queue.push_back(Event::default().data(payload));
                     }
@@ -3360,7 +3358,7 @@ fn messages_stream_response(
         next_idx: usize,
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
-        pending_finish: Option<String>,
+        pending_finish: Option<Cow<'static, str>>,
         thinking_capture: Option<ThinkingStreamCapture>,
     }
 
@@ -3463,7 +3461,7 @@ fn messages_stream_response(
             let stop = self
                 .pending_finish
                 .take()
-                .unwrap_or_else(|| "end_turn".to_owned());
+                .unwrap_or(Cow::Borrowed("end_turn"));
             let usage = anthropic_usage(input_tokens, output_tokens, detail);
             self.queue.push_back(Self::ev(
                 "message_delta",

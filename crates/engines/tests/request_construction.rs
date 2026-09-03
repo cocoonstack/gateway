@@ -1179,7 +1179,7 @@ fn reasoning_req(mt: Protocol, name: &str, reasoning: gw_models::ReasoningParam)
 #[tokio::test]
 async fn anthropic_effort_maps_by_model_generation_and_owns_the_conflicting_knobs() {
     let effort = |level: &str| gw_models::ReasoningParam {
-        effort: Some(level.to_owned()),
+        effort: Some(level.to_owned().into()),
         ..Default::default()
     };
     let t = RecordingTransport::new(CLAUDE_OK);
@@ -1254,7 +1254,7 @@ async fn anthropic_budget_and_client_thinking_precedence() {
         Protocol::AnthropicMessages,
         "claude-haiku-4-5",
         gw_models::ReasoningParam {
-            effort: Some("high".to_owned()),
+            effort: Some("high".into()),
             ..Default::default()
         },
     );
@@ -1328,7 +1328,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         Protocol::OpenaiChat,
         "gpt-5",
         gw_models::ReasoningParam {
-            effort: Some("high".to_owned()),
+            effort: Some("high".into()),
             ..Default::default()
         },
     );
@@ -1418,7 +1418,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         Protocol::OpenaiChat,
         "deepseek-v4",
         gw_models::ReasoningParam {
-            effort: Some("high".to_owned()),
+            effort: Some("high".into()),
             ..Default::default()
         },
     );
