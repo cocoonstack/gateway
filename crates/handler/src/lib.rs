@@ -33,21 +33,16 @@ static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct OnlineHandler {
     pub config: SharedConfig,
     pub transport: SharedTransport,
-    plan: Arc<gw_dag::Plan>,
+    layers: Arc<[gw_dag::Layer]>,
     moderator: Arc<dyn moderation::Moderator>,
 }
 
 impl OnlineHandler {
-    /// Panics only if the static DAG topology has a cycle — a build-time bug,
-    /// caught by tests.
     pub fn new(config: SharedConfig, transport: SharedTransport) -> Self {
-        #[allow(clippy::expect_used)]
-        let plan =
-            Arc::new(gw_dag::Plan::build(gw_dag::default_layers()).expect("static dag topology"));
         let handler = Self {
             config,
             transport,
-            plan,
+            layers: Arc::from(gw_dag::default_layers()),
             moderator: moderation::default_moderator(),
         };
         handler.push_policies(&handler.cfg());
@@ -266,7 +261,7 @@ impl OnlineHandler {
         }
 
         // a panicking node must refund too; the refund reads only whole-written ctx fields
-        let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.plan, &mut ctx))
+        let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err(GatewayError::internal("pipeline panicked")));

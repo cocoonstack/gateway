@@ -86,9 +86,6 @@ impl DagNode for ResolveModel {
     fn name(&self) -> &'static str {
         "resolve_model"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["model_quota"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let param = ctx
             .request
@@ -125,9 +122,6 @@ impl DagNode for TenantEntitlement {
     fn name(&self) -> &'static str {
         "tenant_entitlement"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["resolve_model"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let name = ctx
             .request
@@ -158,9 +152,6 @@ pub struct VariantSelect;
 impl DagNode for VariantSelect {
     fn name(&self) -> &'static str {
         "variant_select"
-    }
-    fn deps(&self) -> &'static [&'static str] {
-        &["tenant_entitlement"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
@@ -204,9 +195,6 @@ pub struct CacheLookup;
 impl DagNode for CacheLookup {
     fn name(&self) -> &'static str {
         "cache_lookup"
-    }
-    fn deps(&self) -> &'static [&'static str] {
-        &["variant_select"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
@@ -286,9 +274,6 @@ impl DagNode for QuotaCheck {
     fn name(&self) -> &'static str {
         "quota_check"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["cache_lookup"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = reserve_estimate(&ctx.request);
         let at = gw_state::epoch_secs();
@@ -367,9 +352,6 @@ impl DagNode for RateLimit {
     fn name(&self) -> &'static str {
         "rate_limit"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["tenant_rate"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         admission::check_ak_rate(ctx.state.governance.as_ref(), &ctx.ak)
             .await
@@ -385,9 +367,6 @@ impl DagNode for ProductQpmLimit {
     fn name(&self) -> &'static str {
         "product_qpm"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["rate_limit"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         admission::check_product_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.product)
             .await
@@ -402,9 +381,6 @@ pub struct ModelQpmLimit;
 impl DagNode for ModelQpmLimit {
     fn name(&self) -> &'static str {
         "model_qpm"
-    }
-    fn deps(&self) -> &'static [&'static str] {
-        &["product_qpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         // fail loud: silently skipping would waive the limit on a broken plan
@@ -427,9 +403,6 @@ impl DagNode for AkTpmLimit {
     fn name(&self) -> &'static str {
         "ak_tpm"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["model_qpm"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = ctx
             .quota_reserved
@@ -449,9 +422,6 @@ pub struct UserBudgetGate;
 impl DagNode for UserBudgetGate {
     fn name(&self) -> &'static str {
         "user_budget"
-    }
-    fn deps(&self) -> &'static [&'static str] {
-        &["ak_tpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         admission::check_user_budget(
@@ -474,9 +444,6 @@ pub struct CallEngine;
 impl DagNode for CallEngine {
     fn name(&self) -> &'static str {
         "call_engine"
-    }
-    fn deps(&self) -> &'static [&'static str] {
-        &["user_budget"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let mut engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
@@ -636,9 +603,6 @@ pub struct CostCalc;
 impl DagNode for CostCalc {
     fn name(&self) -> &'static str {
         "cost_calc"
-    }
-    fn deps(&self) -> &'static [&'static str] {
-        &["common_usage"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let outcome = ctx
@@ -904,9 +868,6 @@ impl DagNode for CacheStore {
     fn name(&self) -> &'static str {
         "cache_store"
     }
-    fn deps(&self) -> &'static [&'static str] {
-        &["cost_calc"]
-    }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         if !ctx.request.buffered_online() {
             return Ok(());
@@ -1020,6 +981,47 @@ fn quota_denied(msg: String) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_layers_pin_layer_and_node_order() {
+        let got: Vec<(&str, Vec<&str>)> = super::default_layers()
+            .iter()
+            .map(|l| (l.name, l.nodes.iter().map(|n| n.name()).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "preprocess",
+                    vec![
+                        "model_quota",
+                        "resolve_model",
+                        "tenant_entitlement",
+                        "variant_select",
+                        "cache_lookup",
+                        "quota_check",
+                    ],
+                ),
+                ("account_select", vec!["select_account"]),
+                (
+                    "model_access",
+                    vec![
+                        "tenant_rate",
+                        "rate_limit",
+                        "product_qpm",
+                        "model_qpm",
+                        "ak_tpm",
+                        "user_budget",
+                        "call_engine",
+                    ],
+                ),
+                (
+                    "post_process",
+                    vec!["common_usage", "cost_calc", "cache_store"],
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn bill_tokens_weighted_prices_estimate_paths() {
         let rate = gw_models::TokenRate {
