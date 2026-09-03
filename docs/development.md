@@ -15,8 +15,9 @@ make run         # cargo run -p gw-server
 
 CI runs fmt/clippy/test and `cargo deny` on every push to `main` and every pull request. A `v*` tag cuts one
 GitHub release (`.github/workflows/release.yml`): native runners build `gw`
-for linux/darwin × amd64/arm64, goreleaser builds the `control-plane` binaries
-and the web-asset tarball, attaches everything, and generates the changelog.
+for linux/darwin × amd64/arm64 and `npm run build` packs the web assets;
+goreleaser builds the `control-plane` binaries, attaches the `gw` and
+web-asset tarballs, and generates the changelog.
 The tag is the version — the release build stamps it into the workspace before
 compiling, so nothing needs bumping in `Cargo.toml`. Multi-arch container
 images for both components go to ghcr on the same tag

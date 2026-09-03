@@ -125,5 +125,6 @@ admin API details remain in [`../docs/api.md`](../docs/api.md).
 
 Version tags publish multi-arch (`linux/amd64` + `linux/arm64`) Docker images
 for the gateway and the control plane (`.github/workflows/docker.yml`), plus
-control-plane binary tarballs for linux/darwin × amd64/arm64 with the built
-web assets bundled (`.github/workflows/release.yml`).
+control-plane binary tarballs for linux/darwin × amd64/arm64 and a separate
+`control-plane-web-dist` tarball of the built web assets
+(`.github/workflows/release.yml`).

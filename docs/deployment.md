@@ -7,7 +7,7 @@ Download a tagged release tarball (Linux/macOS, x86_64/arm64) and extract the
 
 ```bash
 # substitute the release tag and target platform
-VERSION=v0.4.1
+VERSION=v0.1.9
 OS=linux      # or darwin
 ARCH=amd64    # or arm64
 curl --proto '=https' --tlsv1.2 -LsSf -o gw.tar.gz \
@@ -99,8 +99,9 @@ storage:
 The browser console in [`control-plane/`](../control-plane/) deploys beside the
 gateway fleet: a single Go binary serving the built web assets, plus its own
 Postgres (identities) and Redis (sessions) — never the gateway's tables.
-Releases ship `ghcr.io/cocoonstack/gateway-control-plane` (multi-arch) and
-binary tarballs for linux/darwin × amd64/arm64 with the web assets bundled.
+Releases ship `ghcr.io/cocoonstack/gateway-control-plane` (multi-arch),
+binary tarballs for linux/darwin × amd64/arm64, and the built web assets as a
+separate `control-plane-web-dist` tarball.
 
 Point it at the fleet with `CP_GATEWAY_TARGETS`, give it the global admin token
 via `CP_GATEWAY_ADMIN_TOKEN`, and hand each tenant's scoped token to
