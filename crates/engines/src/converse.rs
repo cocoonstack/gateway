@@ -81,7 +81,7 @@ pub(crate) fn reply(mut v: Value, model: &str) -> Value {
         Value::Array(blocks) => blocks.into_iter().filter_map(anthropic_block).collect(),
         _ => Vec::new(),
     };
-    let usage = usage(&v["usage"]);
+    let usage = usage(&mut v["usage"]);
     object([
         ("id", "msg_converse".into()),
         ("type", "message".into()),
@@ -206,7 +206,7 @@ impl Events {
                 object([
                     ("type", "message_delta".into()),
                     ("delta", json!({})),
-                    ("usage", usage(&ev["usage"])),
+                    ("usage", usage(&mut ev["usage"])),
                 ]),
                 json!({"type": "message_stop"}),
             ],
@@ -384,7 +384,7 @@ fn anthropic_block(mut block: Value) -> Option<Value> {
     None
 }
 
-fn usage(u: &Value) -> Value {
+fn usage(u: &mut Value) -> Value {
     let mut out = Map::with_capacity(5);
     for (from, to) in [
         ("inputTokens", "input_tokens"),
@@ -392,8 +392,8 @@ fn usage(u: &Value) -> Value {
         ("cacheReadInputTokens", "cache_read_input_tokens"),
         ("cacheWriteInputTokens", "cache_creation_input_tokens"),
     ] {
-        if let Some(n) = u.get(from).filter(|n| !n.is_null()) {
-            out.insert(to.into(), n.clone());
+        if let Some(n) = u.get_mut(from).filter(|n| !n.is_null()).map(Value::take) {
+            out.insert(to.into(), n);
         }
     }
     if let Some(tokens) = u["cacheDetails"].as_array().and_then(|details| {

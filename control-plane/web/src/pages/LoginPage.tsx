@@ -1,10 +1,10 @@
-import { type FormEvent, useState } from "react";
+import { type FormEvent, type ReactElement, useState } from "react";
 import { api, jsonBody } from "../api";
 import { ErrorNotice } from "../components/UI";
 import { useAction } from "../hooks";
 import type { Session } from "../types";
 
-export default function LoginPage({ onLogin }: { onLogin: (session: Session) => void }) {
+export default function LoginPage({ onLogin }: { onLogin: (session: Session) => void }): ReactElement {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const { run, busy, error } = useAction("Sign in failed");

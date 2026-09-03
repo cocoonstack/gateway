@@ -132,7 +132,8 @@ mod tests {
             state,
             Arc::new(gw_engines::MockTransport),
             Default::default(),
-            gw_state::AkInfo {
+            Arc::new(gw_state::AkInfo {
+                ak_id: gw_state::access_key_fingerprint("t").into(),
                 ak: "t".into(),
                 product: "demo".into(),
                 tenant: "default".into(),
@@ -144,7 +145,7 @@ mod tests {
                 banned: false,
                 suspended_until_epoch_secs: None,
                 model_quotas: Default::default(),
-            },
+            }),
         )
     }
 

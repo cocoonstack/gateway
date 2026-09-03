@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
-import { api, jsonBody } from "../api";
+import { type ReactElement, useEffect, useState } from "react";
+import { api, APIError, jsonBody } from "../api";
 import { Card, ErrorNotice, Loading, PageHeader } from "../components/UI";
 import { dateTime } from "../format";
 import { useAPI, useAction } from "../hooks";
 import type { ConfigDocument, ConfigVersion } from "../types";
 
-export default function ConfigPage() {
+export default function ConfigPage(): ReactElement {
   const current = useAPI<ConfigDocument>("/api/v1/admin/config");
   const history = useAPI<{ versions: ConfigVersion[] }>("/api/v1/admin/config/versions");
   const [yaml, setYAML] = useState("");
@@ -27,9 +27,9 @@ export default function ConfigPage() {
         });
         setMessage("Configuration is valid and ready to publish.");
       } else {
-        const result = await api<{ version: number }>("/api/v1/admin/config", {
-          method: "PUT",
-          ...jsonBody({ yaml, expected_version: current.data?.version ?? 0 }),
+        const result = await publish(yaml, current.data?.version ?? 0).catch((err: unknown) => {
+          if (err instanceof APIError && err.status === 409) current.reload();
+          throw err;
         });
         setMessage(`Published as version ${result.version}.`);
         current.reload();
@@ -104,4 +104,11 @@ export default function ConfigPage() {
       </div>
     </>
   );
+}
+
+function publish(yaml: string, expectedVersion: number): Promise<{ version: number }> {
+  return api<{ version: number }>("/api/v1/admin/config", {
+    method: "PUT",
+    ...jsonBody({ yaml, expected_version: expectedVersion }),
+  });
 }

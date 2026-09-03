@@ -500,7 +500,6 @@ async fn ernie_request_shape() {
         Some("application/json")
     );
 
-    // a Qianfan v2 API key travels as Bearer, never in the query
     let var = "GW_TEST_QIANFAN_V2_KEY";
     // SAFETY: the var name is unique to this test and nothing reads it concurrently.
     unsafe { std::env::set_var(var, "bce-v3/ALTAK-x/secret") };

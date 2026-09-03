@@ -90,10 +90,13 @@ default is always false, for every store backend.
 | `CP_WEB_DIR` | `web/dist` | Built browser assets |
 | `CP_SESSION_TTL` | `12h` | Browser session lifetime |
 | `CP_COOKIE_SECURE` | `false` | Secure cookie flag; enable behind HTTPS |
+| `CP_TRUSTED_PROXY` | `false` | Trust `X-Forwarded-For`/`X-Real-IP` for the client IP used by login throttling and audit lines; enable only when every request arrives through a proxy that rewrites those headers |
+| `CP_LOG_LEVEL` | `info` | Log level |
 | `CP_BOOTSTRAP_ADMIN_EMAIL` | — | Optional first Postgres system admin |
 | `CP_BOOTSTRAP_ADMIN_PASSWORD` | — | Password paired with bootstrap email |
 
-The Postgres schema contains only `users`. Redis uses only
+The Postgres schema contains only `users` plus the `schema_migrations`
+bookkeeping table. Redis uses only
 `gateway:control-plane:session:*`. Neither connection points at gateway-owned
 state.
 

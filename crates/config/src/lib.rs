@@ -496,6 +496,9 @@ pub struct StorageConf {
     /// Keep at most this many billing records (oldest pruned first); 0 = unlimited.
     #[serde(default)]
     pub ledger_max_rows: u64,
+    /// Postgres pool size for the store and key-table pools; 0 = their built-in defaults.
+    #[serde(default)]
+    pub postgres_max_connections: u32,
 }
 
 /// Admin surface gate: `/admin/*` is disabled unless `token_env` names an env

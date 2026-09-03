@@ -17,11 +17,13 @@ const (
 	argonThreads = 2
 	argonKeyLen  = 32
 	argonSaltLen = 16
+
+	minPasswordLen = 10
 )
 
 func HashPassword(password string) (string, error) {
-	if len(password) < 10 {
-		return "", fmt.Errorf("password must be at least 10 characters")
+	if len(password) < minPasswordLen {
+		return "", fmt.Errorf("password must be at least %d characters", minPasswordLen)
 	}
 	salt := make([]byte, argonSaltLen)
 	if _, err := rand.Read(salt); err != nil {
@@ -65,8 +67,8 @@ func VerifyPassword(encoded, password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
-func RandomToken(bytes int) (string, error) {
-	buf := make([]byte, bytes)
+func RandomToken(n int) (string, error) {
+	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("read random token: %w", err)
 	}

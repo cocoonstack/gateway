@@ -14,6 +14,7 @@ listen:
 #   sqlite_path: /var/lib/gw/store.db
 #   postgres_url: postgres://gw:secret@db.internal/gw
 #   redis_url: redis://cache.internal:6379
+#   postgres_max_connections: 10
 
 # Dynamic-config admin surface (SIGHUP / POST /admin/reload, key CRUD) and the
 # /internal/* operator reads. Disabled (404) until the named env var holds a

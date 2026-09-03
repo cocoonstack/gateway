@@ -83,7 +83,7 @@ impl OnlineHandler {
 
     /// Run one request: plugin pre → DAG (4 layers) → plugin post.
     /// The returned context carries the outcome, decision log, billing effects.
-    pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
+    pub async fn run(&self, mut request: GatewayRequest, ak: Arc<AkInfo>) -> GResult<DagContext> {
         if request.request_id.is_empty() {
             request.request_id = new_request_id();
         }
@@ -91,7 +91,14 @@ impl OnlineHandler {
         let snap = self.config.load();
         let retention = active_retention(&snap.cfg, &ak.tenant);
         let terminal = retention.map(|retention| (retention, TerminalSubject::new(&ak, &request)));
-        let result = self.run_inner(request, ak, &snap, retention).await;
+        let mut deferred = Vec::new();
+        let result = self
+            .run_inner(request, ak, &snap, retention, &mut deferred)
+            .await;
+        if !deferred.is_empty() {
+            let store = snap.state.store.as_ref();
+            futures::future::join_all(deferred.iter().map(|e| e.record(store))).await;
+        }
         let settled_here = match result.as_ref() {
             Err(_) => true,
             Ok(ctx) => !ctx.request.buffered_online() && !ctx.billing_deferred,
@@ -106,9 +113,10 @@ impl OnlineHandler {
     async fn run_inner(
         &self,
         mut request: GatewayRequest,
-        ak: AkInfo,
+        ak: Arc<AkInfo>,
         snap: &gw_state::Snapshot,
         retention: Option<gw_config::RetentionConf>,
+        deferred: &mut Vec<gw_state::SecurityEvent>,
     ) -> GResult<DagContext> {
         let sec = snap.cfg.security_for(&ak.tenant);
         // outbound redaction buffers the response: a masked span can straddle deltas
@@ -128,10 +136,13 @@ impl OnlineHandler {
         );
         ctx.billing_deferred = dlp && ctx.request.is_online && ctx.request.stream;
         // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
-        for hit in &scan.hits {
-            emit_security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count).await;
-        }
+        let rows: Vec<gw_state::SecurityEvent> = scan
+            .hits
+            .iter()
+            .map(|hit| security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count))
+            .collect();
         if let Some(block) = scan.block {
+            deferred.extend(rows);
             ctx.decide(
                 "security_check",
                 format!("blocked (code {})", block.err_code),
@@ -139,6 +150,7 @@ impl OnlineHandler {
             ctx.outcome = Some(content_filter_outcome(block));
             return Ok(ctx);
         }
+        deferred.extend(rows);
 
         // pre-DLP text, computed once for moderation and the retained prompt
         let inbound =
@@ -154,13 +166,12 @@ impl OnlineHandler {
                     let masked = match plugins::apply_moderation_mask(&mut ctx.request, &spans) {
                         Ok(masked) => masked,
                         Err(protected) => {
-                            emit_security_event(
+                            deferred.push(security_event(
                                 &ctx,
                                 "moderation",
                                 "block_protected",
                                 protected as i64,
-                            )
-                            .await;
+                            ));
                             return Err(GatewayError::bad_request(
                                 "moderation cannot rewrite signed thinking content",
                             ));
@@ -168,12 +179,17 @@ impl OnlineHandler {
                     };
                     if masked > 0 {
                         ctx.decide("moderation", format!("masked {masked} span(s)"));
-                        emit_security_event(&ctx, "moderation", "mask", masked as i64).await;
+                        deferred.push(security_event(&ctx, "moderation", "mask", masked as i64));
                     }
                 }
                 Moderation::Degrade => {
                     if ctx.request.pins_reasoning_route() {
-                        emit_security_event(&ctx, "moderation", "block_pinned_thinking", 1).await;
+                        deferred.push(security_event(
+                            &ctx,
+                            "moderation",
+                            "block_pinned_thinking",
+                            1,
+                        ));
                         deny_moderation(
                             &mut ctx,
                             "degrade would change a pinned thinking model: denied",
@@ -191,14 +207,14 @@ impl OnlineHandler {
                     match swapped {
                         Some(admission::FallbackSwap::Swapped(from, fb)) => {
                             ctx.decide("moderation", format!("degraded {from} -> {fb}"));
-                            emit_security_event(&ctx, "moderation", "degrade", 1).await;
+                            deferred.push(security_event(&ctx, "moderation", "degrade", 1));
                         }
                         Some(admission::FallbackSwap::AlreadyServing) => {
                             ctx.decide("moderation", "already serving the fallback");
-                            emit_security_event(&ctx, "moderation", "degrade", 1).await;
+                            deferred.push(security_event(&ctx, "moderation", "degrade", 1));
                         }
                         _ => {
-                            emit_security_event(&ctx, "moderation", "block", 1).await;
+                            deferred.push(security_event(&ctx, "moderation", "block", 1));
                             deny_moderation(
                                 &mut ctx,
                                 "degrade without a fallback: denied",
@@ -210,7 +226,7 @@ impl OnlineHandler {
                     }
                 }
                 Moderation::Deny(reason) => {
-                    emit_security_event(&ctx, "moderation", "block", 1).await;
+                    deferred.push(security_event(&ctx, "moderation", "block", 1));
                     deny_moderation(&mut ctx, "denied", reason, gw_consts::ErrCode::EMPTY_RESP);
                     return Ok(ctx);
                 }
@@ -232,7 +248,12 @@ impl OnlineHandler {
                 "dlp",
                 format!("rejected {protected_dlp} protected thinking span(s)"),
             );
-            emit_security_event(&ctx, "dlp", "block_protected", protected_dlp as i64).await;
+            deferred.push(security_event(
+                &ctx,
+                "dlp",
+                "block_protected",
+                protected_dlp as i64,
+            ));
             return Err(GatewayError::bad_request(
                 "signed thinking contains sensitive data and cannot be safely redacted",
             ));
@@ -241,7 +262,7 @@ impl OnlineHandler {
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
-            emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
+            deferred.push(security_event(&ctx, "dlp", "redact", redacted as i64));
         }
 
         // a panicking node must refund too; the refund reads only whole-written ctx fields
@@ -302,7 +323,12 @@ impl OnlineHandler {
                 "dlp",
                 format!("stripped signed thinking ({stripped} hit(s))"),
             );
-            emit_security_event(&ctx, "dlp", "strip_protected_out", stripped as i64).await;
+            deferred.push(security_event(
+                &ctx,
+                "dlp",
+                "strip_protected_out",
+                stripped as i64,
+            ));
         }
 
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
@@ -336,7 +362,12 @@ impl OnlineHandler {
         }
         if redacted_out > 0 {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
-            emit_security_event(&ctx, "dlp", "redact_out", redacted_out as i64).await;
+            deferred.push(security_event(
+                &ctx,
+                "dlp",
+                "redact_out",
+                redacted_out as i64,
+            ));
         }
         Ok(ctx)
     }
@@ -508,7 +539,7 @@ async fn note_abuse(ctx: &DagContext) {
         ..Default::default()
     };
     if let Err(e) = ctx.state.auth.patch(&ctx.ak.ak, &patch).await {
-        let ak_id = gw_state::access_key_fingerprint(&ctx.ak.ak);
+        let ak_id = &*ctx.ak.ak_id;
         tracing::warn!(error = %e, ak_id, "abuse suspension patch failed");
         return;
     }
@@ -563,9 +594,14 @@ fn content_filter_outcome(block: Block) -> EngineOutcome {
     }
 }
 
-/// Record a content-safety outcome (no prompt text) against this request's
-/// key/user/tenant; best-effort.
-async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
+/// One content-safety outcome (no prompt text) against this request's
+/// key/user/tenant, stamped when the rule fired.
+fn security_event(
+    ctx: &DagContext,
+    rule: &str,
+    action: &str,
+    hits: i64,
+) -> gw_state::SecurityEvent {
     let surface = if ctx.request.is_online {
         ctx.request
             .model_param_v2
@@ -587,8 +623,6 @@ async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i
         action: action.to_owned(),
         hits,
     }
-    .record(ctx.state.store.as_ref())
-    .await;
 }
 
 /// Persist one lifecycle result row (no provider message or user content).
@@ -890,7 +924,7 @@ mod tests {
         );
     }
 
-    async fn ak(h: &OnlineHandler) -> AkInfo {
+    async fn ak(h: &OnlineHandler) -> Arc<AkInfo> {
         h.state().auth.authenticate("ak-demo-123").await.unwrap()
     }
 
@@ -901,7 +935,7 @@ mod tests {
         OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport)
     }
 
-    async fn retained_ak(h: &OnlineHandler) -> AkInfo {
+    async fn retained_ak(h: &OnlineHandler) -> Arc<AkInfo> {
         h.state().auth.authenticate("retained-ak").await.unwrap()
     }
 
@@ -1336,7 +1370,7 @@ mod tests {
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let key = h.state().auth.authenticate("k1").await.unwrap();
-        let reject = |k: AkInfo| h.run(chat_req("gpt-4o", "hi"), k);
+        let reject = |k: Arc<AkInfo>| h.run(chat_req("gpt-4o", "hi"), k);
         assert_eq!(
             reject(key.clone()).await.err().map(|e| e.http_status),
             Some(429)
@@ -2397,6 +2431,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let key = gw_state::AkInfo {
+            ak_id: gw_state::access_key_fingerprint("ak-t1").into(),
             ak: "ak-t1".into(),
             product: "p".into(),
             tenant: "t1".into(),
@@ -2414,6 +2449,7 @@ mod tests {
             .put(key.clone(), gw_state::KeySource::Admin)
             .await
             .unwrap();
+        let key = Arc::new(key);
         assert!(
             h.run(chat_req("m1", "hi"), key.clone()).await.is_ok(),
             "entitled while t1 is declared"
@@ -2662,6 +2698,7 @@ mod tests {
         let j = completed.expect("drain completed the batch");
         assert_eq!(j.results.len(), 2, "both items executed exactly once");
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
+        gw_state::admission::flush_billing(&state).await;
         let (_, ledger) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
         let users: std::collections::HashSet<&str> =
             ledger.iter().map(|r| r.user_id.as_str()).collect();

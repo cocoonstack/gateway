@@ -2,6 +2,8 @@
 //! instance's background task; a distributed store (Postgres) only persists the
 //! items and a fleet drain loop on any instance claims and runs them.
 
+use std::sync::Arc;
+
 use gw_models::{BatchItem, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
 
@@ -23,7 +25,7 @@ impl OfflineHandler {
     /// through the SAME online DAG (billed per item; the request cache is bypassed).
     pub async fn submit(
         &self,
-        ak: AkInfo,
+        ak: Arc<AkInfo>,
         model: String,
         items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
@@ -66,7 +68,7 @@ impl OfflineHandler {
     async fn execute(
         &self,
         id: &str,
-        ak: &AkInfo,
+        ak: &Arc<AkInfo>,
         model: &str,
         items: Vec<BatchItem>,
         claim: i64,

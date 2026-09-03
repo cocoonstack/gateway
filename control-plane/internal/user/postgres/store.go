@@ -2,13 +2,10 @@
 package postgres
 
 import (
-	"cmp"
 	"context"
 	"embed"
 	"errors"
 	"fmt"
-	"io/fs"
-	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -17,8 +14,12 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
 )
 
-const userSelect = `SELECT id, email, display_name, password_hash, tenant,
+const (
+	userSelect = `SELECT id, email, display_name, password_hash, tenant,
  gateway_user_id, role, disabled, password_changed_at, created_at, updated_at FROM users`
+
+	migrationLockKey int64 = 0x63705f6d6967
+)
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
@@ -119,18 +120,25 @@ func (s *Store) Update(ctx context.Context, u user.User) error {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migrations: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrationLockKey); err != nil {
+		return fmt.Errorf("lock migrations: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"); err != nil {
 		return fmt.Errorf("create schema migrations: %w", err)
 	}
 	entries, err := migrationFiles.ReadDir("migrations")
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
 	}
-	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return cmp.Compare(a.Name(), b.Name()) })
 	for _, entry := range entries {
 		name := entry.Name()
 		var applied bool
-		if err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = $1)", name).Scan(&applied); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = $1)", name).Scan(&applied); err != nil {
 			return fmt.Errorf("check migration %s: %w", name, err)
 		}
 		if applied {
@@ -140,21 +148,15 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
-		tx, err := s.pool.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin migration %s: %w", name, err)
-		}
 		if _, err := tx.Exec(ctx, string(body)); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (name) VALUES ($1)", name); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("record migration %s: %w", name, err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %s: %w", name, err)
-		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migrations: %w", err)
 	}
 	return nil
 }
@@ -164,11 +166,7 @@ func isDuplicate(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
-type scanner interface {
-	Scan(...any) error
-}
-
-func scanUser(row scanner) (user.User, error) {
+func scanUser(row pgx.Row) (user.User, error) {
 	var u user.User
 	if err := row.Scan(
 		&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash, &u.Tenant,

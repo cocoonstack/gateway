@@ -106,7 +106,7 @@ impl VertexEngine {
             if let Some(mt) = p.max_tokens {
                 gen_cfg["maxOutputTokens"] = json!(mt);
             }
-            if gen_cfg.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            if gen_cfg.as_object().is_some_and(|o| !o.is_empty()) {
                 body["generationConfig"] = gen_cfg;
             }
         }

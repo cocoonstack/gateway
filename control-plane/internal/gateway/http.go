@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+const (
+	requestTimeout      = 8 * time.Second
+	maxIdleConns        = 32
+	maxIdleConnsPerHost = 8
+)
+
 type Target struct {
 	ID  string
 	URL string
@@ -35,11 +41,14 @@ func NewHTTP(rawTargets, adminToken string, tenantTokens map[string]string) (*HT
 	if err != nil {
 		return nil, err
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = maxIdleConns
+	transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
 	return &HTTPClient{
 		targets:      targets,
 		adminToken:   adminToken,
 		tenantTokens: tenantTokens,
-		client:       &http.Client{Timeout: 8 * time.Second},
+		client:       &http.Client{Timeout: requestTimeout, Transport: transport},
 	}, nil
 }
 
@@ -329,7 +338,7 @@ func parseTargets(raw string) ([]Target, error) {
 	for _, part := range parts {
 		id, endpoint, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok || id == "" || endpoint == "" {
-			return nil, fmt.Errorf("CP_GATEWAY_TARGETS entries must be id=url")
+			return nil, errors.New("CP_GATEWAY_TARGETS entries must be id=url")
 		}
 		parsed, err := url.Parse(endpoint)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -342,7 +351,7 @@ func parseTargets(raw string) ([]Target, error) {
 		targets = append(targets, Target{ID: id, URL: strings.TrimRight(endpoint, "/")})
 	}
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("at least one gateway target is required")
+		return nil, errors.New("at least one gateway target is required")
 	}
 	return targets, nil
 }

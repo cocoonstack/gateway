@@ -500,8 +500,9 @@ impl<'a> SseState<'a> {
                     }
                     if self.preserve_native {
                         self.native_blocks.push(block.clone());
+                    } else {
+                        native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
                     }
-                    native_chunk.tool_calls = Some(Value::Array(vec![block.clone()]));
                     self.tool_blocks.push(block);
                 }
             }

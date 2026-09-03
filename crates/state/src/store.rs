@@ -23,9 +23,7 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
 /// accumulators; far above any real response.
 const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
-/// Prune the SQL ledger every Nth insert (the cap is approximate by that many
-/// rows); rows the rollup has not folded yet are spared, so a burst may exceed
-/// `ledger_max_rows` briefly rather than lose usage.
+// scan the in-process ledger on 1 in N inserts past the cap, so the cost amortizes
 const LEDGER_PRUNE_EVERY: usize = 64;
 
 /// Usage-rollup bucket width.
@@ -50,6 +48,9 @@ const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60
 
 /// A put prunes async video jobs older than this (vendor results expire far sooner).
 const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
+// store pool size when storage.postgres_max_connections is unset
+const PG_MAX_CONNECTIONS: u32 = 10;
 
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -514,6 +515,17 @@ pub struct AdminAudit {
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_add(&self, r: &BillingRecord) -> GResult<()>;
+    /// Insert many rows in one statement; duplicate request ids are ignored.
+    async fn ledger_add_batch(&self, rows: &[BillingRecord]) -> GResult<()> {
+        for r in rows {
+            self.ledger_add(r).await?;
+        }
+        Ok(())
+    }
+    /// Whether rows may batch off the request path; in-process backends stay synchronous.
+    fn deferred_ledger_writes(&self) -> bool {
+        false
+    }
     /// Total count plus the most recent `limit` records in chronological order;
     /// the ledger is append-only, so count/page skew is at most one fresh record.
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
@@ -549,6 +561,10 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// is idempotent, self-heals missed ticks, and a bucket outlives the raw
     /// rows it summarizes. Returns the buckets written.
     async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64>;
+    /// Delete rolled billing rows past `ledger_max_rows`; returns rows deleted.
+    async fn ledger_prune(&self) -> GResult<u64> {
+        Ok(0)
+    }
 
     /// Append a content-safety event (no prompt text retained).
     async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()>;
@@ -768,6 +784,7 @@ pub struct MemoryStore {
     seq: AtomicUsize,
     /// oldest records beyond this are pruned on write; 0 = unlimited.
     ledger_max_rows: usize,
+    prune_seq: AtomicUsize,
 }
 
 impl MemoryStore {
@@ -806,23 +823,27 @@ impl Store for MemoryStore {
             return Ok(());
         }
         ledger.rows.push(r.clone());
-        if self.ledger_max_rows > 0 && ledger.rows.len() > self.ledger_max_rows {
+        if self.ledger_max_rows > 0
+            && ledger.rows.len() > self.ledger_max_rows
+            && self
+                .prune_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(LEDGER_PRUNE_EVERY)
+        {
             // spare unrolled rows (the cap yields to billing integrity); a full scan, since
             // completion order can wedge a young row ahead of prunable ones
-            let mut excess = ledger.rows.len() - self.ledger_max_rows;
-            let mut removed = Vec::new();
-            ledger.rows.retain(|r| {
+            let low_water = self.ledger_max_rows - self.ledger_max_rows / 10;
+            let mut excess = ledger.rows.len() - low_water;
+            let MemoryLedger { rows, request_ids } = &mut *ledger;
+            rows.retain(|r| {
                 if excess > 0 && r.created_at_epoch_secs < watermark {
                     excess -= 1;
-                    removed.push(r.request_id.clone());
+                    request_ids.remove(&r.request_id);
                     false
                 } else {
                     true
                 }
             });
-            for request_id in removed {
-                ledger.request_ids.remove(&request_id);
-            }
         }
         Ok(())
     }
@@ -1296,7 +1317,6 @@ where
 pub struct SqliteStore {
     pool: sqlx::SqlitePool,
     ledger_max_rows: u64,
-    prune_seq: AtomicUsize,
 }
 
 impl SqliteStore {
@@ -1305,7 +1325,7 @@ impl SqliteStore {
         Self::open_with_cap(path, 0).await
     }
 
-    /// `ledger_max_rows` > 0 prunes the oldest billing rows past the cap on write.
+    /// `ledger_max_rows` > 0 caps the ledger; the rollup task prunes past it.
     pub async fn open_with_cap(path: &str, ledger_max_rows: u64) -> GResult<Self> {
         let opts = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(path)
@@ -1421,7 +1441,6 @@ impl SqliteStore {
         Ok(Self {
             pool,
             ledger_max_rows,
-            prune_seq: AtomicUsize::new(0),
         })
     }
 }
@@ -1464,54 +1483,67 @@ macro_rules! sql_store_impl {
             $($specific)*
 
             async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
-                sqlx::query(dialect_sql!(
-                    $dialect,
-                    "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
-                     prompt_tokens, completion_tokens, total_tokens, cost_micros,
-                     vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-                     estimated, billed_units)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     ON CONFLICT (request_id) DO NOTHING"
-                ))
-                .bind(&r.ak)
-                .bind(&r.product)
-                .bind(&r.tenant)
-                .bind(&r.model)
-                .bind(&r.served_model)
-                .bind(&r.protocol)
-                .bind(&r.account)
-                .bind(r.prompt_tokens)
-                .bind(r.completion_tokens)
-                .bind(r.total_tokens)
-                .bind(r.cost_micros)
-                .bind(r.vendor_cost_micros)
-                .bind(r.ptu_spillover)
-                .bind(&r.user_id)
-                .bind(&r.request_id)
-                .bind(r.created_at_epoch_secs)
-                .bind(r.estimated)
-                .bind(r.billed_units)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("insert billing record", e))?;
-                if self.ledger_max_rows > 0
-                    && self
-                        .prune_seq
-                        .fetch_add(1, Ordering::Relaxed)
-                        .is_multiple_of(LEDGER_PRUNE_EVERY)
-                {
-                    sqlx::query(dialect_sql!(
-                        $dialect,
-                        "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?
-                         AND created_at_epoch_secs <
-                          (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)"
-                    ))
-                    .bind(self.ledger_max_rows as i64)
+                self.ledger_add_batch(std::slice::from_ref(r)).await
+            }
+
+            async fn ledger_add_batch(&self, rows: &[BillingRecord]) -> GResult<()> {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                // QueryBuilder numbers the placeholders per dialect, so no dialect_sql! here
+                let mut qb = sqlx::QueryBuilder::new(
+                    "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
+                     account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
+                     vendor_cost_micros, ptu_spillover, user_id, request_id,
+                     created_at_epoch_secs, estimated, billed_units) ",
+                );
+                qb.push_values(rows, |mut v, r| {
+                    v.push_bind(&r.ak)
+                        .push_bind(&r.product)
+                        .push_bind(&r.tenant)
+                        .push_bind(&r.model)
+                        .push_bind(&r.served_model)
+                        .push_bind(&r.protocol)
+                        .push_bind(&r.account)
+                        .push_bind(r.prompt_tokens)
+                        .push_bind(r.completion_tokens)
+                        .push_bind(r.total_tokens)
+                        .push_bind(r.cost_micros)
+                        .push_bind(r.vendor_cost_micros)
+                        .push_bind(r.ptu_spillover)
+                        .push_bind(&r.user_id)
+                        .push_bind(&r.request_id)
+                        .push_bind(r.created_at_epoch_secs)
+                        .push_bind(r.estimated)
+                        .push_bind(r.billed_units);
+                });
+                qb.push(" ON CONFLICT (request_id) DO NOTHING")
+                    .build()
                     .execute(&self.pool)
                     .await
-                    .map_err(|e| crate::sqlx_err("prune billing records", e))?;
-                }
+                    .map_err(|e| crate::sqlx_err("insert billing record", e))?;
                 Ok(())
+            }
+
+            fn deferred_ledger_writes(&self) -> bool {
+                true
+            }
+
+            async fn ledger_prune(&self) -> GResult<u64> {
+                if self.ledger_max_rows == 0 {
+                    return Ok(0);
+                }
+                let done = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?
+                     AND created_at_epoch_secs <
+                      (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)"
+                ))
+                .bind(self.ledger_max_rows as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+                Ok(done.rows_affected())
             }
 
             async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
@@ -2176,18 +2208,25 @@ async fn prune_terminal_items(
 pub struct PostgresStore {
     pool: sqlx::PgPool,
     ledger_max_rows: u64,
-    prune_seq: AtomicUsize,
 }
 
 impl PostgresStore {
     pub async fn connect(url: &str) -> GResult<Self> {
-        Self::connect_with_cap(url, 0).await
+        Self::connect_with_cap(url, 0, 0).await
     }
 
-    /// `ledger_max_rows` > 0 prunes the oldest billing rows past the cap on write.
-    pub async fn connect_with_cap(url: &str, ledger_max_rows: u64) -> GResult<Self> {
+    /// `ledger_max_rows` > 0 caps the ledger; the rollup task prunes past it.
+    pub async fn connect_with_cap(
+        url: &str,
+        ledger_max_rows: u64,
+        max_connections: u32,
+    ) -> GResult<Self> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(if max_connections == 0 {
+                PG_MAX_CONNECTIONS
+            } else {
+                max_connections
+            })
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres store", e))?;
@@ -2290,7 +2329,6 @@ impl PostgresStore {
         Ok(Self {
             pool,
             ledger_max_rows,
-            prune_seq: AtomicUsize::new(0),
         })
     }
 }
@@ -3069,6 +3107,17 @@ mod tests {
         }
     }
 
+    async fn batch_insert_is_idempotent(store: &dyn Store) {
+        let rows: Vec<BillingRecord> = (0..3).map(|i| record(&format!("mb{i}"))).collect();
+        store.ledger_add_batch(&rows).await.unwrap();
+        store.ledger_add_batch(&rows).await.unwrap();
+        let (_, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        for r in &rows {
+            let seen = page.iter().filter(|p| p.request_id == r.request_id).count();
+            assert_eq!(seen, 1, "one row per request id after a replayed batch");
+        }
+    }
+
     async fn exercise(store: &dyn Store) {
         store.ledger_add(&record("m1")).await.unwrap();
         store.ledger_add(&record("m2")).await.unwrap();
@@ -3820,6 +3869,7 @@ mod tests {
             .unwrap()
             .expect("item row still present");
         assert!(fresh.messages.is_empty(), "pre-dispatch snapshot sees it");
+        batch_insert_is_idempotent(&store).await;
     }
 
     #[tokio::test]
@@ -3968,19 +4018,25 @@ mod tests {
         let (total, _) = mem.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 3, "unrolled rows are spared from the cap");
         mem.usage_rollup_advance(1_000 + 3 * 60).await.unwrap();
-        let mut c = record("c");
-        c.created_at_epoch_secs = 1_200;
-        mem.ledger_add(&c).await.unwrap();
+        for _ in 0..LEDGER_PRUNE_EVERY {
+            let mut c = record("c");
+            c.created_at_epoch_secs = 1_200;
+            mem.ledger_add(&c).await.unwrap();
+        }
         let (total, page) = mem.ledger_snapshot(usize::MAX).await.unwrap();
-        assert_eq!(total, 2, "rolled rows prune to the cap");
-        assert_eq!(page[0].model, "unrolled");
+        assert_eq!(total, LEDGER_PRUNE_EVERY, "rolled rows prune to the cap");
+        assert!(
+            page.iter().all(|r| r.created_at_epoch_secs == 1_200),
+            "only rolled rows are pruned"
+        );
         let usage = mem
             .usage_by_user(Some("default"), None, 0, i64::MAX)
             .await
             .unwrap();
         let total_requests: i64 = usage.iter().map(|r| r.requests).sum();
         assert_eq!(
-            total_requests, 4,
+            total_requests,
+            3 + LEDGER_PRUNE_EVERY as i64,
             "pruned rows stay billed via their buckets"
         );
 
@@ -3988,24 +4044,31 @@ mod tests {
         let store = SqliteStore::open_with_cap(dir.path().join("r.db").to_str().unwrap(), 2)
             .await
             .unwrap();
-        for i in 0..=LEDGER_PRUNE_EVERY {
+        for i in 0..4 {
             store.ledger_add(&record(&format!("m{i}"))).await.unwrap();
         }
-        let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(
-            total,
-            LEDGER_PRUNE_EVERY + 1,
+            store.ledger_prune().await.unwrap(),
+            0,
             "nothing prunes before the rollup folds the rows"
         );
         store.usage_rollup_advance(1_000 + 3 * 60).await.unwrap();
-        for i in 0..LEDGER_PRUNE_EVERY {
-            store.ledger_add(&record(&format!("n{i}"))).await.unwrap();
-        }
-        let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
-        assert!(
-            total <= 2 + LEDGER_PRUNE_EVERY,
-            "prune cycle enforces the cap on rolled rows (got {total})"
+        assert_eq!(
+            store.ledger_prune().await.unwrap(),
+            2,
+            "the rollup task prunes rolled rows past the cap"
         );
+        let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(total, 2, "the cap holds after the prune");
+    }
+
+    #[tokio::test]
+    async fn ledger_batch_insert_is_multi_row_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("b.db").to_str().unwrap())
+            .await
+            .unwrap();
+        batch_insert_is_idempotent(&store).await;
     }
 
     #[tokio::test]
@@ -4021,8 +4084,9 @@ mod tests {
         }
         store.usage_rollup_advance(1_180).await.unwrap();
         store.ledger_add(&at(5_000)).await.unwrap();
-        store.ledger_add(&at(1_010)).await.unwrap();
-        store.ledger_add(&at(1_010)).await.unwrap();
+        for _ in 0..LEDGER_PRUNE_EVERY {
+            store.ledger_add(&at(1_010)).await.unwrap();
+        }
         let (total, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(
             total, 2,

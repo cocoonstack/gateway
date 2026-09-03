@@ -8,8 +8,7 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-/// Buckets older than this fall off the memory ring / expire in Redis. History
-/// beyond the classification window belongs to metrics, not this store.
+// buckets older than this fall off the memory ring and expire in Redis
 const RETAIN_MINUTES: i64 = 60;
 
 /// Availability verdict over the recent window.
@@ -31,28 +30,6 @@ impl AvailState {
             AvailState::Unavailable => "unavailable",
             AvailState::NoData => "no_data",
         }
-    }
-}
-
-/// Classify a window's counts against the configured error-rate thresholds.
-pub fn classify(
-    ok: u64,
-    err: u64,
-    min_samples: u64,
-    unstable: f64,
-    unavailable: f64,
-) -> AvailState {
-    let total = ok + err;
-    if total < min_samples.max(1) {
-        return AvailState::NoData;
-    }
-    let rate = err as f64 / total as f64;
-    if rate >= unavailable {
-        AvailState::Unavailable
-    } else if rate >= unstable {
-        AvailState::Unstable
-    } else {
-        AvailState::Available
     }
 }
 
@@ -187,6 +164,28 @@ impl AvailStore for RedisAvail {
         pairs.iter().fold((0, 0), |(o, e), [ok, err]| {
             (o + ok.unwrap_or(0), e + err.unwrap_or(0))
         })
+    }
+}
+
+/// Classify a window's counts against the configured error-rate thresholds.
+pub fn classify(
+    ok: u64,
+    err: u64,
+    min_samples: u64,
+    unstable: f64,
+    unavailable: f64,
+) -> AvailState {
+    let total = ok + err;
+    if total < min_samples.max(1) {
+        return AvailState::NoData;
+    }
+    let rate = err as f64 / total as f64;
+    if rate >= unavailable {
+        AvailState::Unavailable
+    } else if rate >= unstable {
+        AvailState::Unstable
+    } else {
+        AvailState::Available
     }
 }
 

@@ -8,12 +8,10 @@ use async_trait::async_trait;
 
 use crate::AccountHealth;
 
-/// How long a local view of another instance's cooldown may lag; selection
-/// scans every candidate per request, so reads stay local.
+// a local view of another instance's cooldown may lag by this much
 const AVAILABLE_CACHE_TTL: Duration = Duration::from_millis(1000);
 const AVAILABLE_CACHE_MAX: u64 = 10_000;
-/// Failure streaks self-expire after an hour idle (the in-process `FAILS_DECAY`
-/// mirrors it); a success deletes them outright.
+// failure streaks self-expire after an hour idle, mirroring the in-process FAILS_DECAY
 const FAILS_TTL_MS: i64 = 3_600_000;
 
 /// Consecutive-failure cooldown with auto-recovery, shared or per-node.
@@ -114,7 +112,6 @@ impl HealthStore for RedisHealth {
             .arg(cd_key(name))
             .query_async::<i64>(&mut conn)
             .await;
-        self.cache.invalidate(name);
     }
 
     async fn available(&self, name: &str) -> bool {

@@ -16,6 +16,20 @@ var patchableKeyFields = map[string]bool{
 	"expires_at_epoch_secs": true, "banned": true, "suspended_until_epoch_secs": true,
 }
 
+type userCreate struct {
+	Email         string    `json:"email"`
+	DisplayName   string    `json:"display_name"`
+	Password      string    `json:"password"`
+	Tenant        string    `json:"tenant"`
+	GatewayUserID string    `json:"gateway_user_id"`
+	Role          user.Role `json:"role"`
+}
+
+type configPayload struct {
+	YAML            string `json:"yaml"`
+	ExpectedVersion int64  `json:"expected_version"`
+}
+
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := s.users.List(r.Context())
 	if err != nil {
@@ -29,14 +43,7 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Email         string    `json:"email"`
-		DisplayName   string    `json:"display_name"`
-		Password      string    `json:"password"`
-		Tenant        string    `json:"tenant"`
-		GatewayUserID string    `json:"gateway_user_id"`
-		Role          user.Role `json:"role"`
-	}
+	var body userCreate
 	if !decodeJSON(w, r, maxJSONBody, &body) {
 		return
 	}
@@ -60,7 +67,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		writeUserSaveError(w, err)
 		return
 	}
-	auditLog(r, "user_create", u.Email)
+	s.auditLog(r, "user_create", u.Email)
 	writeJSON(w, http.StatusCreated, publicUser(u))
 }
 
@@ -114,7 +121,7 @@ func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 		writeUserSaveError(w, err)
 		return
 	}
-	auditLog(r, "user_patch", u.ID)
+	s.auditLog(r, "user_patch", u.ID)
 	writeJSON(w, http.StatusOK, publicUser(u))
 }
 
@@ -144,7 +151,7 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	auditLog(r, "key_create", key.AK)
+	s.auditLog(r, "key_create", key.AK)
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "created", "ak": key.AK})
 }
 
@@ -165,7 +172,7 @@ func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	auditLog(r, "key_patch", ak)
+	s.auditLog(r, "key_patch", ak)
 	writeJSON(w, http.StatusOK, key)
 }
 
@@ -175,7 +182,7 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	auditLog(r, "key_delete", ak)
+	s.auditLog(r, "key_delete", ak)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -211,7 +218,7 @@ func (s *Server) publishConfig(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	auditLog(r, "config_publish", strconv.FormatInt(version, 10))
+	s.auditLog(r, "config_publish", strconv.FormatInt(version, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "published", "version": version})
 }
 
@@ -235,7 +242,7 @@ func (s *Server) rollbackConfig(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	auditLog(r, "config_rollback", strconv.FormatInt(version, 10))
+	s.auditLog(r, "config_rollback", strconv.FormatInt(version, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "rolled_back", "version": version})
 }
 
@@ -276,11 +283,6 @@ func writeUserSaveError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusBadRequest, err.Error())
-}
-
-type configPayload struct {
-	YAML            string `json:"yaml"`
-	ExpectedVersion int64  `json:"expected_version"`
 }
 
 func configBody(w http.ResponseWriter, r *http.Request) (configPayload, bool) {

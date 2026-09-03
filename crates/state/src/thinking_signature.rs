@@ -421,7 +421,7 @@ struct SequenceFingerprint {
 }
 
 fn new_mac(key: &Digest) -> HmacSha256 {
-    #[allow(clippy::expect_used)] // HMAC-SHA256 accepts any key length
+    #[allow(clippy::expect_used)]
     HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length")
 }
 

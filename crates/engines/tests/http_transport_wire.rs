@@ -321,7 +321,6 @@ async fn per_account_policy_and_connect_retry() {
         "an account dropped from the reload falls back to the default"
     );
 
-    // re-draw if another process steals the freed port before we dial it (CI runners do)
     let closed = std::iter::repeat_with(|| {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
