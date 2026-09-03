@@ -5,6 +5,7 @@ pub mod moderation;
 pub mod offline;
 pub mod plugins;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -366,11 +367,11 @@ impl OnlineHandler {
         match self.moderation(sec, text).await {
             Moderation::Allow => RtModeration::Allow,
             Moderation::Mask(spans) => RtModeration::Mask(spans),
-            Moderation::Degrade => RtModeration::Deny(
-                "content requires degraded serving; not available on a live session".to_owned(),
-            ),
-            Moderation::Deny(reason) => RtModeration::Deny(reason),
-            Moderation::Unavailable => RtModeration::Deny(MODERATION_UNAVAILABLE.to_owned()),
+            Moderation::Degrade => RtModeration::Deny(Cow::Borrowed(
+                "content requires degraded serving; not available on a live session",
+            )),
+            Moderation::Deny(reason) => RtModeration::Deny(Cow::Owned(reason)),
+            Moderation::Unavailable => RtModeration::Deny(Cow::Borrowed(MODERATION_UNAVAILABLE)),
         }
     }
 
@@ -419,7 +420,7 @@ impl OnlineHandler {
 pub enum RtModeration {
     Allow,
     Mask(Vec<std::ops::Range<usize>>),
-    Deny(String),
+    Deny(Cow<'static, str>),
 }
 
 /// One resolved moderator verdict; `Unavailable` is a moderator error under a fail-closed posture.

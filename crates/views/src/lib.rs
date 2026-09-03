@@ -199,7 +199,7 @@ async fn track_requests(
 }
 
 /// The status label without a per-request allocation for the codes this gateway emits.
-fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
+fn status_label(status: StatusCode) -> Cow<'static, str> {
     match status.as_u16() {
         200 => "200".into(),
         201 => "201".into(),
@@ -218,15 +218,22 @@ fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
 }
 
 /// In-band realtime error event; never terminal, only a Close frame or disconnect ends the session.
-fn rt_error(class: ErrClass, message: impl Into<String>) -> Value {
-    json!({"type":"error","error":{
+fn rt_error(class: ErrClass, message: impl Into<Cow<'static, str>>) -> Value {
+    let mut event = json!({"type":"error","error":{
         "type": class.openai_type(),
         "code": class.code(),
-        "message": message.into(),
-    }})
+    }});
+    event["error"]["message"] = match message.into() {
+        Cow::Borrowed(s) => Value::from(s),
+        Cow::Owned(s) => Value::String(s),
+    };
+    event
 }
 
-fn rt_error_frame(class: ErrClass, message: impl Into<String>) -> axum::extract::ws::Message {
+fn rt_error_frame(
+    class: ErrClass,
+    message: impl Into<Cow<'static, str>>,
+) -> axum::extract::ws::Message {
     axum::extract::ws::Message::Text(rt_error(class, message).to_string().into())
 }
 
@@ -1465,14 +1472,14 @@ async fn rt_inbound_policy(
     ak: &AkInfo,
     hint: &str,
     frame: &mut Value,
-) -> Result<usize, String> {
+) -> Result<usize, Cow<'static, str>> {
     let cfg = s.handler.cfg();
     let sec = cfg.security_for(&ak.tenant);
     let (scan, text, walk_redacted) =
         gw_handler::plugins::realtime_frame_scan(sec, frame, sec.moderate);
     emit_rt_hits(s, ak, &scan.hits, hint).await;
     if let Some(block) = scan.block {
-        return Err(block.message);
+        return Err(Cow::Owned(block.message));
     }
     if sec.moderate && !text.is_empty() {
         match s.handler.moderate_rt(sec, &text).await {
@@ -2286,12 +2293,12 @@ async fn admin_usage_series(
 
 /// A CSV field, RFC-4180 quoted and neutralized against spreadsheet formula
 /// injection (`= + - @` / tab / CR openers get a `'` prefix; the value can carry a user id).
-fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
+fn csv_field(s: &str) -> Cow<'_, str> {
     let needs_prefix = s
         .chars()
         .next()
         .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
-    let body: std::borrow::Cow<'_, str> = if needs_prefix {
+    let body: Cow<'_, str> = if needs_prefix {
         format!("'{s}").into()
     } else {
         s.into()
@@ -5619,7 +5626,7 @@ mod tests {
         let mut frame = json!({"type":"input_text","text":"hello there"});
         assert_eq!(
             rt_inbound_policy(&app, &ak, "", &mut frame).await,
-            Err("blocked by moderator".to_owned())
+            Err(Cow::Borrowed("blocked by moderator"))
         );
         let mut secret = json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
         let n = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut secret);
