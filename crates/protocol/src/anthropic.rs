@@ -179,6 +179,8 @@ pub fn tool_use_to_tool_calls(blocks: Vec<Value>, index: &mut usize) -> Vec<Valu
 mod tests {
     use serde_json::json;
 
+    use super::*;
+
     #[test]
     fn image_parts_convert_both_ways() {
         let part = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}});
@@ -203,8 +205,6 @@ mod tests {
         let file = json!({"type":"image","source":{"type":"file","file_id":"file_1"}});
         assert_eq!(image_to_image_url(file.clone()), file);
     }
-
-    use super::*;
 
     #[test]
     fn tool_use_blocks_convert_to_tool_calls() {
