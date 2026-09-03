@@ -221,11 +221,7 @@ impl ThinkingSignatureAudit {
     ) -> ReviewVerdict {
         let anchor = self.anchor_digest(context, tool_id);
         let now = Instant::now();
-        let mut cache = self
-            .inner
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = crate::lock(&self.inner.cache);
         let Some(entry) = cache.entries.get(&anchor) else {
             return ReviewVerdict::Miss;
         };
@@ -259,11 +255,7 @@ impl ThinkingSignatureAudit {
             .iter()
             .map(|tool_id| self.anchor_digest(context, tool_id))
             .collect::<HashSet<_>>();
-        let mut cache = self
-            .inner
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = crate::lock(&self.inner.cache);
         let additional = |cache: &AuditCache| {
             anchors
                 .iter()

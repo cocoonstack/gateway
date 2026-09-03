@@ -38,10 +38,7 @@ impl AlertBus {
 
     /// The single consumer end; `None` after the first take.
     pub fn take_receiver(&self) -> Option<mpsc::Receiver<AlertEvent>> {
-        self.rx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        crate::lock(&self.rx).take()
     }
 }
 

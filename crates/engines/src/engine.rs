@@ -182,6 +182,15 @@ pub fn fill_total_if_zero(resp: &mut GatewayResponse) {
     }
 }
 
+pub(crate) fn openai_common_usage(resp: &GatewayResponse) -> Option<gw_models::CommonUsage> {
+    Some(gw_models::CommonUsage::from_openai_parts(
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        resp.read_cached_prompt_tokens,
+        resp.reasoning_tokens,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

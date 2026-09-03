@@ -395,7 +395,7 @@ impl DashScopeEngine {
         .await?;
         resp.message = full;
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.common_usage = dashscope_common_usage(&resp);
+        resp.common_usage = crate::engine::openai_common_usage(&resp);
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
@@ -423,7 +423,7 @@ impl ModelEngine for DashScopeEngine {
         };
         dashscope_apply_usage(&v["usage"], &mut resp);
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.common_usage = dashscope_common_usage(&resp);
+        resp.common_usage = crate::engine::openai_common_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }
 }
@@ -480,15 +480,6 @@ fn dashscope_apply_usage(usage: &Value, resp: &mut GatewayResponse) {
     if let Some(cached) = usage["prompt_tokens_details"]["cached_tokens"].as_i64() {
         resp.read_cached_prompt_tokens = cached.max(0);
     }
-}
-
-fn dashscope_common_usage(resp: &GatewayResponse) -> Option<gw_models::CommonUsage> {
-    Some(gw_models::CommonUsage::from_openai_parts(
-        resp.prompt_tokens,
-        resp.completion_tokens,
-        resp.read_cached_prompt_tokens,
-        0,
-    ))
 }
 
 #[cfg(test)]
@@ -660,6 +651,7 @@ mod tests {
         assert!(out.response.message.contains("[mock-llama]"));
         assert!(out.response.total_tokens > 0);
     }
+
     #[tokio::test]
     async fn dashscope_stream_decodes_frames() {
         let mut r = req(Protocol::Dashscope, "qwen-max");

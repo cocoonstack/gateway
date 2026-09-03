@@ -12,6 +12,8 @@ use dashmap::DashMap;
 use gw_models::GResult;
 use sqlx::Row;
 
+use crate::lock;
+
 /// Consuming the sequence explicitly keeps id and n on one atomic value —
 /// concurrent PG writers would race a MAX(n)+1 subselect.
 const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, status, total)
@@ -543,10 +545,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         since: i64,
         until: i64,
     ) -> GResult<Vec<UserUsageRow>>;
-    /// Bucketed usage totals over `[since, until]`: one `(bucket_start,
-    /// totals)` per `bucket_secs` bucket with traffic, ascending. Same
-    /// rollup-plus-tail sourcing and filters as [`Store::usage_by_user`];
-    /// the `user_id`/`model` fields of the totals are empty.
+    /// One `(bucket_start, totals)` per `bucket_secs` bucket with traffic over `[since, until]`, ascending;
+    /// sourced and filtered like [`Store::usage_by_user`], with empty `user_id`/`model`.
     async fn usage_series(
         &self,
         tenant: Option<&str>,
@@ -587,14 +587,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Delete content whose `expires_at_epoch_secs` is in `(0, now]`; returns the
     /// number deleted. Rows with `expires_at = 0` are kept until manual purge.
     async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
-    /// Erase every retained trace of `user`'s content, optionally confined to
-    /// one tenant (a tenant admin's scope): retained prompt/response rows,
-    /// generated batch-result messages, and still-queued batch inputs (a
-    /// terminal batch's inputs are already pruned at its status write).
-    /// `audit` (its `summary` set to the erased-row count here) is written in
-    /// the same transaction on the SQL backends, so a recorded success can't
-    /// separate from the deletion. Returns rows erased. Ledger rows and
-    /// security events carry no content and are kept.
+    /// Erase every retained trace of `user`'s content, optionally confined to one tenant:
+    /// prompt/response rows, batch-result messages, and still-queued batch inputs.
+    /// `audit` (its `summary` set to the erased-row count) is written in the same
+    /// transaction on the SQL backends. Returns rows erased; ledger rows and security
+    /// events carry no content and are kept.
     async fn content_erase_user(
         &self,
         tenant: Option<&str>,
@@ -1247,11 +1244,6 @@ fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRo
         .keys()
         .next_back()
         .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
-}
-
-/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn next_col(col: &mut usize) -> usize {

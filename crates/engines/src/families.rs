@@ -142,7 +142,7 @@ impl VertexEngine {
         .await?;
         resp.message = full;
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.common_usage = vertex_common_usage(&resp);
+        resp.common_usage = crate::engine::openai_common_usage(&resp);
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
@@ -181,7 +181,7 @@ impl ModelEngine for VertexEngine {
         };
         vertex_apply_usage(&v["usageMetadata"], &mut resp);
         crate::engine::fill_total_if_zero(&mut resp);
-        resp.common_usage = vertex_common_usage(&resp);
+        resp.common_usage = crate::engine::openai_common_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }
 }
@@ -249,15 +249,6 @@ fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if let Some(tt) = um["totalTokenCount"].as_i64() {
         resp.total_tokens = tt.max(0);
     }
-}
-
-fn vertex_common_usage(resp: &GatewayResponse) -> Option<gw_models::CommonUsage> {
-    Some(gw_models::CommonUsage::from_openai_parts(
-        resp.prompt_tokens,
-        resp.completion_tokens,
-        0,
-        resp.reasoning_tokens,
-    ))
 }
 
 base_engine!(EmbeddingsEngine);

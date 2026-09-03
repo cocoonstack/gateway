@@ -957,6 +957,11 @@ fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
 }
 
 /// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
+/// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn settle_on(counter: &mut i64, delta: i64) {
     *counter = counter.saturating_add(delta).max(0);
 }
