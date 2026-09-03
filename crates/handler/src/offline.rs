@@ -1,6 +1,5 @@
-//! Offline batch orchestration: local backends execute a batch on the receiving
-//! instance's background task; a distributed store (Postgres) only persists the
-//! items and a fleet drain loop on any instance claims and runs them.
+//! Offline batch orchestration: a local backend runs the batch on the receiving
+//! instance, a distributed store persists items for any instance's drain loop.
 
 use std::sync::Arc;
 
@@ -20,9 +19,7 @@ impl OfflineHandler {
         Self { online }
     }
 
-    /// Submit a batch. Local stores execute it now on a background task;
-    /// distributed stores leave it pending for the fleet drain loop. Items run
-    /// through the SAME online DAG (billed per item; the request cache is bypassed).
+    /// Submit a batch: local stores run it now on a task, distributed stores leave it for the drain loop.
     pub async fn submit(
         &self,
         ak: Arc<AkInfo>,
@@ -61,10 +58,7 @@ impl OfflineHandler {
         }
     }
 
-    /// Run every item of a batch through the online DAG, writing results and
-    /// the terminal status, heartbeating between items. `claim` is the fence
-    /// token (0 for the in-process path); once a heartbeat reports the batch
-    /// reclaimed, this executor stops rather than double-running items.
+    /// `claim` fences this executor; it stops once a heartbeat reports the batch reclaimed.
     async fn execute(
         &self,
         id: &str,
@@ -204,8 +198,7 @@ impl OfflineHandler {
         }
     }
 
-    /// Fleet drain loop (distributed stores only): claim and execute pending batches,
-    /// requeuing those whose executor went stale; polls only when the queue is empty.
+    /// Fleet drain loop for distributed stores: claim and execute pending batches, requeuing stale ones.
     pub async fn drain_forever(&self, stale_secs: i64, poll: std::time::Duration) {
         let store = self.online.state().store.clone();
         loop {

@@ -1,7 +1,5 @@
-//! Request orchestration (L4): the seam between HTTP views and the DAG.
-//! `OnlineHandler` runs the plugin pre-stage (security block / DLP), the four
-//! DAG layers, then the plugin post-stage; `OfflineHandler` reuses the same
-//! chain for batches.
+//! Request orchestration (L4), the seam between HTTP views and the DAG: plugin
+//! pre-stage, the four DAG layers, plugin post-stage; batches reuse the chain.
 
 pub mod moderation;
 pub mod offline;
@@ -49,15 +47,13 @@ impl OnlineHandler {
         handler
     }
 
-    /// Plug an external content moderator into the pre-stage (enable per tenant
-    /// via `security.moderate`).
+    /// Plug an external content moderator into the pre-stage, enabled per tenant by `security.moderate`.
     pub fn with_moderator(mut self, moderator: Arc<dyn moderation::Moderator>) -> Self {
         self.moderator = moderator;
         self
     }
 
-    /// The live config snapshot (cheap atomic load). Introspection surfaces read
-    /// through this so a runtime reload takes effect immediately.
+    /// The live config snapshot: a cheap atomic load, so a reload takes effect on the next call.
     pub fn cfg(&self) -> Arc<GatewayConfig> {
         self.config.load().cfg.clone()
     }
@@ -66,8 +62,7 @@ impl OnlineHandler {
         self.config.load().state.clone()
     }
 
-    /// Swap in a new config, then refresh its timeout/connect policies. Status
-    /// replay permission stays on each request's selected account snapshot.
+    /// Swap in a new config, then refresh its timeout/connect policies.
     pub async fn reload(&self, cfg: GatewayConfig) -> GResult<()> {
         let handoff = self.config.reload(cfg).await;
         if handoff.is_ok() {
@@ -76,8 +71,7 @@ impl OnlineHandler {
         handoff
     }
 
-    /// Run one request: plugin pre → DAG (4 layers) → plugin post.
-    /// The returned context carries the outcome, decision log, billing effects.
+    /// Run one request (plugin pre → DAG → plugin post); the context carries outcome, log and billing.
     pub async fn run(&self, mut request: GatewayRequest, ak: Arc<AkInfo>) -> GResult<DagContext> {
         if request.request_id.is_empty() {
             request.request_id = new_request_id();
@@ -367,10 +361,7 @@ impl OnlineHandler {
         Ok(ctx)
     }
 
-    /// Run the wired moderator over raw text; the seam the realtime surface
-    /// uses (it has no `DagContext`), so the caller records the security event
-    /// on its own surface. [`Self::moderation`] narrowed to this surface: a
-    /// live session can't switch models, so `Degrade` denies here instead.
+    /// Moderate raw text for the realtime surface, where `Degrade` denies: a live session cannot switch models.
     pub async fn moderate_rt(&self, sec: &gw_config::SecurityConf, text: &str) -> RtModeration {
         match self.moderation(sec, text).await {
             Moderation::Allow => RtModeration::Allow,
@@ -383,8 +374,7 @@ impl OnlineHandler {
         }
     }
 
-    /// The one moderator-verdict resolution every surface shares, so the
-    /// fail-open posture can't drift between REST and realtime.
+    /// The one verdict resolution every surface shares, so the fail-open posture cannot drift.
     async fn moderation(&self, sec: &gw_config::SecurityConf, text: &str) -> Moderation {
         match self.moderator.review(text).await {
             Ok(moderation::Verdict::Allow) => Moderation::Allow,
@@ -402,8 +392,6 @@ impl OnlineHandler {
         }
     }
 
-    /// Derive the per-account upstream policies from `cfg` and apply them to
-    /// the transport live.
     fn push_policies(&self, cfg: &GatewayConfig) {
         let default = UpstreamPolicy::default();
         let per_account: HashMap<String, UpstreamPolicy> = cfg
@@ -434,8 +422,7 @@ pub enum RtModeration {
     Deny(String),
 }
 
-/// One resolved moderator verdict: `Unavailable` is a moderator error under a
-/// fail-closed posture (fail-open resolves to `Allow`).
+/// One resolved moderator verdict; `Unavailable` is a moderator error under a fail-closed posture.
 enum Moderation {
     Allow,
     Mask(Vec<std::ops::Range<usize>>),
@@ -464,8 +451,7 @@ impl TerminalSubject {
     }
 }
 
-/// A fleet-unique request id, `req-<process instance>-<seq>`: one relaxed atomic
-/// add per id, the random instance tag drawn once per process.
+/// A fleet-unique request id, `req-<process instance>-<seq>`; the instance tag is drawn once per process.
 pub fn new_request_id() -> String {
     format!(
         "req-{}-{}",
@@ -474,14 +460,12 @@ pub fn new_request_id() -> String {
     )
 }
 
-/// Persist the final HTTP result for an online non-streaming request after its
-/// view has finished rendering the response.
+/// Persist the final HTTP result of an online non-streaming request, after the view rendered it.
 pub async fn persist_terminal_response(ctx: &DagContext, http_status: u16) {
     persist_ctx_terminal(ctx, || terminal_status_body(http_status)).await;
 }
 
-/// Settle billing and terminal retention after an outbound-DLP buffered stream
-/// has been replayed by the HTTP view.
+/// Settle billing and terminal retention after the view replayed an outbound-DLP buffered stream.
 pub async fn complete_buffered_stream(
     ctx: &mut DagContext,
     delivery: gw_dag::StreamDelivery,
@@ -504,8 +488,7 @@ async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_jso
     persist_terminal(ctx.state.store.as_ref(), &subject, retention, body()).await;
 }
 
-/// Count one admission rejection against the key's fleet-shared daily abuse
-/// counter and suspend it when a configured tier trips (deny path only).
+/// Count one admission rejection and suspend the key when a configured abuse tier trips.
 async fn note_abuse(ctx: &DagContext) {
     let tiers = &ctx.cfg.abuse.tiers;
     if tiers.is_empty() {
@@ -560,8 +543,7 @@ async fn note_abuse(ctx: &DagContext) {
         .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
 }
 
-/// Record a moderation denial: decision line + content-filter outcome. Event
-/// emission stays at the call sites (`Unavailable` deliberately records none).
+/// Record a moderation denial; event emission stays at the call sites.
 fn deny_moderation(
     ctx: &mut DagContext,
     decision: &str,
@@ -589,8 +571,7 @@ fn content_filter_outcome(block: Block) -> EngineOutcome {
     }
 }
 
-/// One content-safety outcome (no prompt text) against this request's
-/// key/user/tenant, stamped when the rule fired.
+/// One content-safety event for this request; it carries no prompt text.
 fn security_event(
     ctx: &DagContext,
     rule: &str,
@@ -711,8 +692,7 @@ fn retention_expiry(retention: gw_config::RetentionConf, now: i64) -> i64 {
     }
 }
 
-/// Persist the pre-DLP prompt and the response per the tenant's retention:
-/// sealed when `store_full` (full level AND a content key), else PII/secret-stripped; best-effort.
+/// Persist the pre-DLP prompt and response: sealed when `store_full`, else PII-stripped; best-effort.
 async fn persist_content(
     ctx: &DagContext,
     retention: gw_config::RetentionConf,

@@ -1,8 +1,5 @@
-//! The moderation seam: an optional external content-review pass, plugged into
-//! the pre-stage. The default [`AllowModerator`] is a deterministic no-op, so
-//! the hot path pays nothing until a real moderator is wired in and a tenant
-//! turns `moderate` on. External review is latency-bearing and pull-driven, so
-//! this ships as a trait, not a built-in integration.
+//! The moderation seam: an optional external content-review pass in the pre-stage.
+//! The default [`AllowModerator`] is a no-op, so the hot path pays nothing.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -11,27 +8,21 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
-    /// Redact these byte ranges of the reviewed text, then serve. Offsets
-    /// address the exact string `review` received; the caller maps them back
-    /// onto the request's text slots.
+    /// Redact these byte ranges of the reviewed text, then serve; offsets address the string `review` saw.
     Mask(Vec<Range<usize>>),
-    /// Serve via the tenant's fallback model. Denies when no fallback is
-    /// configured or the surface can't switch models mid-session (realtime).
+    /// Serve via the tenant's fallback model; denies when there is none or the surface cannot switch.
     Degrade,
     /// Deny with a user-facing reason.
     Deny(String),
 }
 
-/// A pluggable content moderator. `review` sees the request's concatenated
-/// inbound text; a real impl calls an external service. An `Err` is a moderator
-/// failure — the caller resolves it per its fail-open/closed posture.
+/// A pluggable content moderator over the request's concatenated inbound text; `Err` is a failure.
 #[async_trait::async_trait]
 pub trait Moderator: Send + Sync + std::fmt::Debug {
     async fn review(&self, text: &str) -> Result<Verdict, String>;
 }
 
-/// The default: allow everything (a real moderator replaces it via
-/// [`crate::OnlineHandler::with_moderator`]).
+/// The default: allow everything.
 #[derive(Debug, Default)]
 pub struct AllowModerator;
 

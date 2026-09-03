@@ -1,8 +1,5 @@
-//! Request/response plugins, rule-based from config.security. The pre-stage
-//! runs before the DAG: a blocklist hit → Block (skipping engine and billing);
-//! DLP redacts inbound messages, the Responses native body, and the family
-//! typed params. The post-stage redacts the outbound message; streaming
-//! surfaces buffer and replay the redacted text when outbound DLP is on.
+//! Rule-based request/response plugins from `config.security`: the pre-stage
+//! blocks and DLP-redacts inbound text, the post-stage redacts the response.
 
 use gw_config::{Action, SecurityConf};
 use gw_models::{Block, ChatMsg, GatewayRequest, GatewayResponse, ModelParamV2};
@@ -18,16 +15,14 @@ pub struct RuleHit {
     pub count: i64,
 }
 
-/// One request's scan: `block` is set by a block-action hit; every fired rule
-/// (block/flag/shadow) lands in `hits` for the audit stream.
+/// One request's scan: `block` comes from a block-action hit, `hits` from every fired rule.
 #[derive(Default)]
 pub struct ScanOutcome {
     pub block: Option<Block>,
     pub hits: Vec<RuleHit>,
 }
 
-/// Blocklist + regex scan over every string leaf (signed-thinking opaque fields
-/// included, so no field is a bypass); `&mut` only shares the walk, nothing is rewritten.
+/// Blocklist + regex scan over every string leaf, opaque signed-thinking fields included.
 pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanOutcome {
     if sec.blocklist.is_empty() && sec.regexes.is_empty() {
         return ScanOutcome::default();
@@ -37,8 +32,7 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
     counts.outcome()
 }
 
-/// Per-rule hit counters for one scan, shared by the REST request scan and the
-/// realtime frame scan so the two apply identical action semantics.
+/// Per-rule hit counters shared by the REST and realtime scans, so their semantics cannot drift.
 struct ScanCounts<'a> {
     sec: &'a SecurityConf,
     blocklist: i64,
@@ -62,8 +56,7 @@ impl<'a> ScanCounts<'a> {
         0
     }
 
-    /// Fold the counts into a [`ScanOutcome`]: a rule with count > 0 is a hit
-    /// at its action; any block-action hit denies.
+    /// Fold the counts into a [`ScanOutcome`]; any block-action hit denies.
     fn outcome(self) -> ScanOutcome {
         let mut hits = Vec::new();
         if self.blocklist > 0 {
@@ -90,8 +83,7 @@ impl<'a> ScanCounts<'a> {
     }
 }
 
-/// The text view moderation reviews and retention records: signed-thinking
-/// prose included, opaque signatures/redacted data excluded; nothing is rewritten.
+/// The text moderation reviews and retention records: signed-thinking prose in, opaque proof out.
 pub fn inbound_text(request: &mut GatewayRequest) -> String {
     let mut out = String::new();
     for_each_request_text(request, SignedThinking::Prose, &mut |s, _| {
@@ -110,9 +102,7 @@ fn push_text(out: &mut String, s: &str) {
     }
 }
 
-/// Apply moderator mask spans (byte ranges into [`inbound_text`]) onto the
-/// request's text slots; `Err(n)` = n spans land in signed thinking (which
-/// cannot be rewritten) and nothing was mutated, so the caller denies.
+/// Apply mask spans over [`inbound_text`]; `Err(n)` means n spans hit signed thinking and nothing changed.
 pub fn apply_moderation_mask(
     request: &mut GatewayRequest,
     spans: &[std::ops::Range<usize>],
@@ -141,8 +131,7 @@ pub fn apply_moderation_mask(
     Ok(masker.hits)
 }
 
-/// Moderator mask spans applied to one realtime frame (spans address the
-/// frame's collected text).
+/// Moderator mask spans applied to one realtime frame, addressing its collected text.
 pub fn apply_mask_spans_frame(
     frame: &mut serde_json::Value,
     spans: &[std::ops::Range<usize>],
@@ -151,8 +140,7 @@ pub fn apply_mask_spans_frame(
     gw_engines::realtime::visit_frame_text(frame, &mut |s| masker.apply(s))
 }
 
-/// Replays the `push_text` walk to map global byte spans onto slots; spans are
-/// merged and snapped to char boundaries so a sloppy service can't split UTF-8.
+/// Replays the `push_text` walk to map global byte spans onto slots, snapped to char boundaries.
 struct SpanMasker {
     spans: Vec<std::ops::Range<usize>>,
     base: usize,
@@ -180,8 +168,7 @@ impl SpanMasker {
         }
     }
 
-    /// Advance the offset cursor over one slot, mirroring the `push_text`
-    /// walk; `None` for the empty slots that walk skips.
+    /// Advance the cursor over one slot, mirroring `push_text`; `None` for the empty slots it skips.
     fn advance(&mut self, len: usize) -> Option<(usize, usize)> {
         if len == 0 {
             return None;
@@ -241,8 +228,7 @@ fn snap_ceil(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// Case-insensitive blocklist test; terms are pre-lowercased at config load.
-/// ASCII text matches without allocating; non-ASCII falls back to a lowercase copy.
+/// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.
 fn blocklist_hit(sec: &SecurityConf, text: &str) -> bool {
     if text.is_ascii() {
         return sec
@@ -262,8 +248,7 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// Walk every string leaf of a JSON value with a visitor that may rewrite it;
-/// returns summed hits. One walker serves both the blocklist scan and DLP.
+/// Walk every string leaf of a JSON value with a rewriting visitor; returns summed hits.
 fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     match v {
         serde_json::Value::String(s) => f(s),
@@ -273,23 +258,18 @@ fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) 
     }
 }
 
-/// How a walk treats a native assistant turn's signed thinking blocks; anywhere
-/// else such blocks are ordinary client data and every policy degrades to `Visit`.
+/// How a walk treats a native assistant turn's signed thinking; elsewhere every policy is `Visit`.
 #[derive(Clone, Copy, PartialEq)]
 enum SignedThinking {
-    /// Every string leaf, opaque proof included — the security scans; a
-    /// field choice must never dodge the scanner.
+    /// Every string leaf, opaque proof included: no field choice may dodge the scanner.
     Visit,
     /// Skip the whole block — a rewrite would invalidate the signature.
     Skip,
-    /// Prose without the opaque signature/data — the moderation/retention
-    /// view and the mask walk, whose offsets must match that view.
+    /// Prose without the opaque proof: the moderation view the mask offsets must match.
     Prose,
 }
 
-/// The ONE per-request text walk (messages + tail params) shared by scan,
-/// inbound-text view, masking and DLP so they cannot drift field by field; the
-/// visitor's second argument marks signed-thinking prose.
+/// The ONE per-request text walk shared by scan, masking and DLP; the second visitor argument marks signed prose.
 fn for_each_request_text(
     request: &mut GatewayRequest,
     signed: SignedThinking,
@@ -310,8 +290,7 @@ fn for_each_request_text(
     n
 }
 
-/// The ONE per-message field list (content, parts, tool_calls, replayed
-/// reasoning) every scan and rewrite traverses.
+/// The ONE per-message field list every scan and rewrite traverses.
 fn for_each_message_text(
     msg: &mut ChatMsg,
     signed: SignedThinking,
@@ -333,8 +312,7 @@ fn for_each_message_text(
     n
 }
 
-/// The ONE tail field list (raw native body + typed params) all scans traverse;
-/// `raw` gets the media-aware walk (base64 skipped, tool/metadata bags in full).
+/// The ONE tail field list all scans traverse; `raw` gets the media-aware walk.
 fn for_each_param_text(
     param: &mut ModelParamV2,
     f: &mut impl FnMut(&mut String) -> usize,
@@ -350,8 +328,7 @@ fn for_each_param_text(
     n
 }
 
-/// The ONE typed-param field list scan and DLP traverse; chat `tools`/
-/// `tool_choice` are forwarded client JSON, so their string leaves count too.
+/// The ONE typed-param field list scan and DLP traverse, forwarded client JSON included.
 fn for_each_typed_text(
     typed: &mut gw_models::TypedParams,
     f: &mut impl FnMut(&mut String) -> usize,
@@ -379,8 +356,7 @@ fn for_each_typed_text(
     }
 }
 
-/// Whether a `type` names a media block (payload keys carry base64/URL data);
-/// only inside one does [`walk_part_text`] skip the media payload keys.
+/// Whether a `type` names a media block; only inside one are the media payload keys skipped.
 fn is_media_block(ty: &str) -> bool {
     matches!(
         ty,
@@ -396,9 +372,7 @@ fn is_media_block(ty: &str) -> bool {
     )
 }
 
-/// Claude signs the whole thinking block, so rewriting its prose or opaque data
-/// invalidates a tool-use continuation; the chat surface carries the same units
-/// as `reasoning.text` / `reasoning.encrypted` details.
+/// Claude signs the whole thinking block, so any rewrite invalidates a tool-use continuation.
 fn is_signed_thinking_block(block: &serde_json::Map<String, serde_json::Value>) -> bool {
     let opaque = match block.get("type").and_then(serde_json::Value::as_str) {
         Some("thinking" | "reasoning.text") => "signature",
@@ -411,9 +385,7 @@ fn is_signed_thinking_block(block: &serde_json::Map<String, serde_json::Value>) 
         .is_some_and(|proof| !proof.is_empty())
 }
 
-/// A media block's payload keys (base64/URL leaves, nested media containers,
-/// `file_id`, `encrypted_content`) — skipped only inside an [`is_media_block`]
-/// object; the same name in a tool argument or metadata bag stays scanned.
+/// A media block's payload keys, skipped only inside an [`is_media_block`] object.
 fn is_media_payload_key(k: &str) -> bool {
     matches!(
         k,
@@ -430,8 +402,7 @@ fn is_media_payload_key(k: &str) -> bool {
     )
 }
 
-/// Walk a content array with a visitor that may rewrite prose; only the array's
-/// direct blocks honor the signed-thinking policy.
+/// Walk a content array; only its direct blocks honor the signed-thinking policy.
 fn walk_part_text(
     v: &mut serde_json::Value,
     signed: SignedThinking,
@@ -458,8 +429,7 @@ fn walk_part_text(
     walk_part_value(v, &mut |s| f(s, false))
 }
 
-/// A signed block's prose fields — everything but the opaque
-/// signature/redacted data, which no scanner can read and no mask may touch.
+/// A signed block's prose fields: everything but the opaque signature or redacted data.
 fn walk_signed_prose(
     v: &mut serde_json::Value,
     f: &mut impl FnMut(&mut String, bool) -> usize,
@@ -506,8 +476,7 @@ fn walk_part_value(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) ->
     }
 }
 
-/// The REST scan policy on a realtime frame (blocklist + regexes, a block hit
-/// denies); `collect_text` gathers the moderation text in the same walk.
+/// The REST scan policy on a realtime frame; `collect_text` gathers the moderation text in the same walk.
 pub fn realtime_frame_scan(
     sec: &SecurityConf,
     frame: &mut serde_json::Value,
@@ -538,8 +507,7 @@ pub fn realtime_frame_scan(
     (counts.outcome(), text, redacted)
 }
 
-/// DLP-redact a realtime frame in place (PII + secrets, as REST); per-frame
-/// best effort — a span straddling two deltas is beyond an unbuffered relay.
+/// DLP-redact a realtime frame in place; per-frame best effort, a span straddling deltas is missed.
 pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
     if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
@@ -548,9 +516,7 @@ pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Val
     gw_engines::realtime::visit_frame_text(frame, &mut |s| redact_in_place(s, pii, secrets))
 }
 
-/// DLP hits inside signed thinking (opaque signature/data included), which
-/// cannot be rewritten without invalidating it — the handler rejects instead of
-/// bypassing DLP; nothing is rewritten here.
+/// DLP hits inside signed thinking, which the handler rejects rather than rewrite.
 pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
     if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
@@ -575,8 +541,7 @@ pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequ
     hits
 }
 
-/// DLP inbound redaction: emails, 11-digit phone numbers, and — when
-/// `detect_secrets` is on — API keys / credentials.
+/// DLP inbound redaction: emails, 11-digit phone numbers, and credentials under `detect_secrets`.
 pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
     if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
@@ -587,16 +552,14 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     })
 }
 
-/// A retention copy of `text` with PII and secrets ALWAYS stripped, independent
-/// of the tenant's forwarding DLP flags.
+/// A retention copy of `text` with PII and secrets ALWAYS stripped, whatever the tenant's DLP flags.
 pub fn redact_retained(text: &str) -> String {
     let mut s = text.to_owned();
     redact_in_place(&mut s, true, true);
     s
 }
 
-/// Redact one string in place (email/phone via `pii`, secrets via `secrets`);
-/// the hit count.
+/// Redact one string in place and return the hit count.
 fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     let mut hits = 0;
     if pii && let Some((redacted, n)) = redact(s) {
@@ -610,8 +573,7 @@ fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     hits
 }
 
-/// [`redact_in_place`]'s hit count without the rewrite — the probe used where
-/// redaction is impossible (signed thinking) or unwanted (buffered events).
+/// [`redact_in_place`]'s hit count without the rewrite, for text no mask may touch.
 fn redaction_hits(text: &str, pii: bool, secrets: bool) -> usize {
     let mut hits = 0;
     if pii && let Some((_, n)) = redact(text) {
@@ -623,8 +585,7 @@ fn redaction_hits(text: &str, pii: bool, secrets: bool) -> usize {
     hits
 }
 
-/// Mask credential shapes (API keys, tokens, private-key headers); high-precision
-/// patterns so normal text is not mauled.
+/// Mask credential shapes with high-precision patterns, so normal text survives.
 fn redact_secrets(text: &str) -> Option<(String, usize)> {
     static SECRETS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         #[allow(clippy::expect_used)] // a compile-time literal, covered by tests
@@ -641,8 +602,7 @@ fn redact_secrets(text: &str) -> Option<(String, usize)> {
     (count > 0).then(|| (out.into_owned(), count))
 }
 
-/// DLP probe of native SSE events before buffered replay: signature deltas and
-/// encrypted reasoning are opaque, every other delta payload is covered; nothing is rewritten.
+/// DLP probe of native SSE events before buffered replay; opaque deltas aside, nothing is rewritten.
 pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::StreamChunk]) -> usize {
     if !sec.redacts_output() {
         return 0;
@@ -828,8 +788,7 @@ fn collect_delta_fragments(
     }
 }
 
-/// Outbound DLP (PII + secrets) over `message` and the structured payloads the
-/// surfaces serialize verbatim (`response_v2`, `tool_calls`).
+/// Outbound DLP over `message` and the payloads the surfaces serialize verbatim.
 pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
     if !sec.redacts_output() {
         return 0;
@@ -863,9 +822,7 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     hits
 }
 
-/// Strip signed thinking the tenant cannot serve (a block-action hit or a DLP
-/// hit nothing can redact without breaking the signature) so the client still
-/// gets the redacted turn; returns the hit count, the caller drops the raw events.
+/// Strip signed thinking the tenant cannot serve, so the client still gets the redacted turn.
 pub fn strip_unservable_thinking(
     sec: &SecurityConf,
     response: &mut GatewayResponse,
@@ -930,8 +887,7 @@ fn has_signed_unit(units: Option<&[serde_json::Value]>) -> bool {
     })
 }
 
-/// Cheap byte scan gating the full scanner: an email needs an '@', a phone
-/// needs an 11-digit run — clean text pays no allocation at all.
+/// Cheap byte gate on the full scanner: clean text pays no allocation.
 fn has_pii_candidate(b: &[u8]) -> bool {
     let mut digits = 0;
     for &c in b {
@@ -950,8 +906,7 @@ fn has_pii_candidate(b: &[u8]) -> bool {
     false
 }
 
-/// Hand-rolled scanner for `local@domain.tld` and 11-digit CN-mobile runs;
-/// `None` when nothing matched keeps the common case allocation-free.
+/// Hand-rolled scanner for emails and 11-digit CN-mobile runs; `None` keeps the clean path allocation-free.
 fn redact(text: &str) -> Option<(String, usize)> {
     let b = text.as_bytes();
     if !has_pii_candidate(b) {
