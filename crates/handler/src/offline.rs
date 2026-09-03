@@ -213,7 +213,7 @@ impl OfflineHandler {
             let claimed = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                    if stopping(changed, &shutdown) {
                         return;
                     }
                     continue;
@@ -261,30 +261,36 @@ impl OfflineHandler {
                     .await;
                 }
                 Ok(None) => {
-                    tokio::select! {
-                        biased;
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                return;
-                            }
-                        }
-                        _ = tokio::time::sleep(poll) => {}
+                    if pause_or_stop(&mut shutdown, poll).await {
+                        return;
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "batch claim failed; backing off");
-                    tokio::select! {
-                        biased;
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                return;
-                            }
-                        }
-                        _ = tokio::time::sleep(poll) => {}
+                    if pause_or_stop(&mut shutdown, poll).await {
+                        return;
                     }
                 }
             }
         }
+    }
+}
+
+fn stopping(
+    changed: Result<(), tokio::sync::watch::error::RecvError>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    changed.is_err() || *shutdown.borrow()
+}
+
+async fn pause_or_stop(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    poll: std::time::Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => stopping(changed, shutdown),
+        _ = tokio::time::sleep(poll) => false,
     }
 }
 
