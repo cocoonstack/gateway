@@ -142,8 +142,7 @@ impl OnlineHandler {
             .map(|hit| security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count))
             .collect();
         if let Some(block) = scan.block {
-            let store = ctx.state.store.as_ref();
-            futures::future::join_all(rows.iter().map(|e| e.record(store))).await;
+            deferred.extend(rows);
             ctx.decide(
                 "security_check",
                 format!("blocked (code {})", block.err_code),
@@ -167,13 +166,12 @@ impl OnlineHandler {
                     let masked = match plugins::apply_moderation_mask(&mut ctx.request, &spans) {
                         Ok(masked) => masked,
                         Err(protected) => {
-                            emit_security_event(
+                            deferred.push(security_event(
                                 &ctx,
                                 "moderation",
                                 "block_protected",
                                 protected as i64,
-                            )
-                            .await;
+                            ));
                             return Err(GatewayError::bad_request(
                                 "moderation cannot rewrite signed thinking content",
                             ));
@@ -181,12 +179,17 @@ impl OnlineHandler {
                     };
                     if masked > 0 {
                         ctx.decide("moderation", format!("masked {masked} span(s)"));
-                        emit_security_event(&ctx, "moderation", "mask", masked as i64).await;
+                        deferred.push(security_event(&ctx, "moderation", "mask", masked as i64));
                     }
                 }
                 Moderation::Degrade => {
                     if ctx.request.pins_reasoning_route() {
-                        emit_security_event(&ctx, "moderation", "block_pinned_thinking", 1).await;
+                        deferred.push(security_event(
+                            &ctx,
+                            "moderation",
+                            "block_pinned_thinking",
+                            1,
+                        ));
                         deny_moderation(
                             &mut ctx,
                             "degrade would change a pinned thinking model: denied",
@@ -204,14 +207,14 @@ impl OnlineHandler {
                     match swapped {
                         Some(admission::FallbackSwap::Swapped(from, fb)) => {
                             ctx.decide("moderation", format!("degraded {from} -> {fb}"));
-                            emit_security_event(&ctx, "moderation", "degrade", 1).await;
+                            deferred.push(security_event(&ctx, "moderation", "degrade", 1));
                         }
                         Some(admission::FallbackSwap::AlreadyServing) => {
                             ctx.decide("moderation", "already serving the fallback");
-                            emit_security_event(&ctx, "moderation", "degrade", 1).await;
+                            deferred.push(security_event(&ctx, "moderation", "degrade", 1));
                         }
                         _ => {
-                            emit_security_event(&ctx, "moderation", "block", 1).await;
+                            deferred.push(security_event(&ctx, "moderation", "block", 1));
                             deny_moderation(
                                 &mut ctx,
                                 "degrade without a fallback: denied",
@@ -223,7 +226,7 @@ impl OnlineHandler {
                     }
                 }
                 Moderation::Deny(reason) => {
-                    emit_security_event(&ctx, "moderation", "block", 1).await;
+                    deferred.push(security_event(&ctx, "moderation", "block", 1));
                     deny_moderation(&mut ctx, "denied", reason, gw_consts::ErrCode::EMPTY_RESP);
                     return Ok(ctx);
                 }
@@ -245,7 +248,12 @@ impl OnlineHandler {
                 "dlp",
                 format!("rejected {protected_dlp} protected thinking span(s)"),
             );
-            emit_security_event(&ctx, "dlp", "block_protected", protected_dlp as i64).await;
+            deferred.push(security_event(
+                &ctx,
+                "dlp",
+                "block_protected",
+                protected_dlp as i64,
+            ));
             return Err(GatewayError::bad_request(
                 "signed thinking contains sensitive data and cannot be safely redacted",
             ));
@@ -254,7 +262,7 @@ impl OnlineHandler {
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
-            emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
+            deferred.push(security_event(&ctx, "dlp", "redact", redacted as i64));
         }
 
         // a panicking node must refund too; the refund reads only whole-written ctx fields
@@ -315,7 +323,12 @@ impl OnlineHandler {
                 "dlp",
                 format!("stripped signed thinking ({stripped} hit(s))"),
             );
-            emit_security_event(&ctx, "dlp", "strip_protected_out", stripped as i64).await;
+            deferred.push(security_event(
+                &ctx,
+                "dlp",
+                "strip_protected_out",
+                stripped as i64,
+            ));
         }
 
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
@@ -349,7 +362,12 @@ impl OnlineHandler {
         }
         if redacted_out > 0 {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
-            emit_security_event(&ctx, "dlp", "redact_out", redacted_out as i64).await;
+            deferred.push(security_event(
+                &ctx,
+                "dlp",
+                "redact_out",
+                redacted_out as i64,
+            ));
         }
         Ok(ctx)
     }
@@ -605,13 +623,6 @@ fn security_event(
         action: action.to_owned(),
         hits,
     }
-}
-
-/// Record one content-safety outcome; best-effort.
-async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
-    security_event(ctx, rule, action, hits)
-        .record(ctx.state.store.as_ref())
-        .await;
 }
 
 /// Persist one lifecycle result row (no provider message or user content).

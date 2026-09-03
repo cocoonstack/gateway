@@ -38,9 +38,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.users.ByEmail(r.Context(), body.Email)
-	if err != nil {
+	if errors.Is(err, user.ErrNotFound) {
 		auth.VerifyPassword(dummyHash(), body.Password)
 		writeError(w, http.StatusUnauthorized, "invalid email or password")
+		return
+	}
+	if err != nil {
+		loginError(r.Context(), w, err)
 		return
 	}
 	if !auth.VerifyPassword(u.PasswordHash, body.Password) || u.Disabled {

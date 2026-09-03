@@ -116,19 +116,22 @@ impl PostgresKeyStore {
 #[async_trait]
 impl KeyStore for PostgresKeyStore {
     async fn authenticate(&self, ak: &str) -> Option<Arc<AkInfo>> {
-        let raced = std::sync::atomic::AtomicBool::new(false);
+        let fetched_at = std::sync::atomic::AtomicU64::new(u64::MAX);
         let loaded = self
             .cache
             .try_get_with_by_ref(ak, async {
-                let epoch = self.write_epoch.load(std::sync::atomic::Ordering::Acquire);
+                fetched_at.store(
+                    self.write_epoch.load(std::sync::atomic::Ordering::Acquire),
+                    std::sync::atomic::Ordering::Release,
+                );
                 let info = self.fetch(ak).await?;
-                if self.write_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
-                    raced.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
                 Ok::<_, sqlx::Error>(info)
             })
             .await;
-        if raced.load(std::sync::atomic::Ordering::Relaxed) {
+        // checked after publication: a write landing before the insert would find no entry to evict
+        let start = fetched_at.load(std::sync::atomic::Ordering::Acquire);
+        if start != u64::MAX && self.write_epoch.load(std::sync::atomic::Ordering::Acquire) != start
+        {
             self.cache.invalidate(ak).await;
         }
         match loaded {

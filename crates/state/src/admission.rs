@@ -67,6 +67,7 @@ impl BillingLedger {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(LEDGER_BATCH_MAX);
             let mut ack = None;
+            let mut dropped = 0u64;
             while let Some(msg) = pending.recv().await {
                 msg.take(&mut batch, &mut ack);
                 while ack.is_none() && batch.len() < LEDGER_BATCH_MAX {
@@ -75,9 +76,12 @@ impl BillingLedger {
                     };
                     next.take(&mut batch, &mut ack);
                 }
-                Self::commit(&worker_store, &mut batch).await;
+                let rows = batch.len() as u64;
+                if !Self::commit(&worker_store, &mut batch).await {
+                    dropped += rows;
+                }
                 if let Some(tx) = ack.take() {
-                    let _ = tx.send(());
+                    let _ = tx.send(std::mem::take(&mut dropped));
                 }
             }
         });
@@ -88,18 +92,19 @@ impl BillingLedger {
         }
     }
 
-    /// Commit what the writer still holds; the shutdown path awaits this.
-    pub(crate) async fn flush(&self) {
+    /// Commit what the writer still holds and return the rows it dropped since the last flush.
+    pub(crate) async fn flush(&self) -> u64 {
         let Some(queue) = &self.queue else {
-            return;
+            return 0;
         };
         let (tx, rx) = oneshot::channel();
-        if queue.send(LedgerWrite::Flush(tx)).await.is_ok() {
-            let _ = rx.await;
+        if queue.send(LedgerWrite::Flush(tx)).await.is_err() {
+            return 0;
         }
+        rx.await.unwrap_or(0)
     }
 
-    // deferred on SQL backends: a SIGKILL between the response and the next flush loses one batch
+    // deferred on SQL backends: a SIGKILL between the response and the next flush loses the queue plus the batch in flight (4352 rows at the defaults)
     async fn write(&self, record: &BillingRecord) {
         if self.deferred
             && let Some(queue) = &self.queue
@@ -121,13 +126,15 @@ impl BillingLedger {
         }
     }
 
-    async fn commit(store: &Arc<dyn Store>, batch: &mut Vec<BillingRecord>) {
+    async fn commit(store: &Arc<dyn Store>, batch: &mut Vec<BillingRecord>) -> bool {
         if batch.is_empty() {
-            return;
+            return true;
         }
         let mut delay = LEDGER_RETRY_INITIAL;
+        let mut committed = false;
         for attempt in 1..=LEDGER_RETRY_ATTEMPTS {
             let Err(e) = store.ledger_add_batch(batch).await else {
+                committed = true;
                 break;
             };
             metrics::counter!("gateway_ledger_write_failures_total").increment(batch.len() as u64);
@@ -140,6 +147,7 @@ impl BillingLedger {
             delay = delay.saturating_mul(2).min(LEDGER_RETRY_MAX);
         }
         batch.clear();
+        committed
     }
 }
 
@@ -148,11 +156,11 @@ impl BillingLedger {
 #[derive(Debug)]
 enum LedgerWrite {
     Row(BillingRecord),
-    Flush(oneshot::Sender<()>),
+    Flush(oneshot::Sender<u64>),
 }
 
 impl LedgerWrite {
-    fn take(self, batch: &mut Vec<BillingRecord>, ack: &mut Option<oneshot::Sender<()>>) {
+    fn take(self, batch: &mut Vec<BillingRecord>, ack: &mut Option<oneshot::Sender<u64>>) {
         match self {
             LedgerWrite::Row(r) => batch.push(r),
             LedgerWrite::Flush(tx) => *ack = Some(tx),
@@ -162,7 +170,10 @@ impl LedgerWrite {
 
 /// Commit billing rows the batching writer still holds, before the process exits.
 pub async fn flush_billing(state: &GatewayState) {
-    state.billing.flush().await;
+    let dropped = state.billing.flush().await;
+    if dropped > 0 {
+        tracing::error!(rows = dropped, "billing rows dropped before shutdown");
+    }
 }
 
 /// Per-user daily token budget (soft cap): admit while under the tenant's limit;
@@ -519,5 +530,9 @@ mod tests {
         .await
         .expect("the queue must drain once the retries are exhausted");
         assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 0);
+        assert!(
+            ledger.flush().await > 0,
+            "flush reports the rows the exhausted retries dropped"
+        );
     }
 }
