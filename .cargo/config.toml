@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-C", "llvm-args=-align-all-functions=6", "-C", "llvm-args=-align-all-nofallthru-blocks=5"]

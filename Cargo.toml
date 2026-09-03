@@ -23,6 +23,10 @@ repository = "https://github.com/cocoonstack/gateway"
 rust-version = "1.98"
 publish = false
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
@@ -76,6 +80,7 @@ gw-handler = { path = "crates/handler" }
 gw-task = { path = "crates/task" }
 gw-views = { path = "crates/views" }
 base64 = "0.22"
+tikv-jemallocator = "0.7"
 tiktoken-rs = "0.12"
 # pure-compute crypto (SigV4 signing, cache keys, content-at-rest AEAD) — no network capability
 sha2 = "0.10"
