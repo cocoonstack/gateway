@@ -55,11 +55,9 @@ impl MockTransport {
     }
 
     fn ok_json(v: Value) -> GResult<UpstreamResponse> {
-        let body = serde_json::to_vec(&v)
-            .map_err(|e| GatewayError::internal("mock: encode response").with_source(e))?;
         Ok(UpstreamResponse {
             status: 200,
-            body: UpstreamBody::Json(body.into()),
+            body: UpstreamBody::Json(bytes::Bytes::from(v.to_string())),
             headers: HeaderMap::new(),
         })
     }
