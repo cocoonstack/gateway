@@ -17,8 +17,6 @@ const LEDGER_QUEUE_CAPACITY: usize = 4_096;
 const LEDGER_BATCH_MAX: usize = 256;
 const LEDGER_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const LEDGER_RETRY_MAX: Duration = Duration::from_secs(30);
-// a store that refuses writes must drain the queue rather than wedge it
-const LEDGER_RETRY_ATTEMPTS: usize = 8;
 
 /// Outcome of a tenant-fallback swap; `AlreadyServing` IS degraded (nowhere
 /// further to go) and must not be denied as `Unconfigured`.
@@ -67,7 +65,6 @@ impl BillingLedger {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(LEDGER_BATCH_MAX);
             let mut ack = None;
-            let mut dropped = 0u64;
             while let Some(msg) = pending.recv().await {
                 msg.take(&mut batch, &mut ack);
                 while ack.is_none() && batch.len() < LEDGER_BATCH_MAX {
@@ -76,12 +73,9 @@ impl BillingLedger {
                     };
                     next.take(&mut batch, &mut ack);
                 }
-                let rows = batch.len() as u64;
-                if !Self::commit(&worker_store, &mut batch).await {
-                    dropped += rows;
-                }
+                Self::commit(&worker_store, &mut batch).await;
                 if let Some(tx) = ack.take() {
-                    let _ = tx.send(std::mem::take(&mut dropped));
+                    let _ = tx.send(());
                 }
             }
         });
@@ -92,16 +86,16 @@ impl BillingLedger {
         }
     }
 
-    /// Commit what the writer still holds and return the rows it dropped since the last flush.
-    pub(crate) async fn flush(&self) -> u64 {
+    /// Commit what the writer still holds; false means the worker stopped first.
+    pub(crate) async fn flush(&self) -> bool {
         let Some(queue) = &self.queue else {
-            return 0;
+            return true;
         };
         let (tx, rx) = oneshot::channel();
         if queue.send(LedgerWrite::Flush(tx)).await.is_err() {
-            return 0;
+            return false;
         }
-        rx.await.unwrap_or(0)
+        rx.await.is_ok()
     }
 
     // deferred on SQL backends: a SIGKILL between the response and the next flush loses the queue plus the batch in flight (4352 rows at the defaults)
@@ -126,28 +120,21 @@ impl BillingLedger {
         }
     }
 
-    async fn commit(store: &Arc<dyn Store>, batch: &mut Vec<BillingRecord>) -> bool {
+    async fn commit(store: &Arc<dyn Store>, batch: &mut Vec<BillingRecord>) {
         if batch.is_empty() {
-            return true;
+            return;
         }
         let mut delay = LEDGER_RETRY_INITIAL;
-        let mut committed = false;
-        for attempt in 1..=LEDGER_RETRY_ATTEMPTS {
+        loop {
             let Err(e) = store.ledger_add_batch(batch).await else {
-                committed = true;
-                break;
+                batch.clear();
+                return;
             };
             metrics::counter!("gateway_ledger_write_failures_total").increment(batch.len() as u64);
-            if attempt == LEDGER_RETRY_ATTEMPTS {
-                tracing::error!(error = %e, rows = batch.len(), "billing ledger retries exhausted; rows dropped");
-                break;
-            }
             tracing::error!(error = %e, rows = batch.len(), "billing ledger write failed; retrying");
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(LEDGER_RETRY_MAX);
         }
-        batch.clear();
-        committed
     }
 }
 
@@ -156,11 +143,11 @@ impl BillingLedger {
 #[derive(Debug)]
 enum LedgerWrite {
     Row(BillingRecord),
-    Flush(oneshot::Sender<u64>),
+    Flush(oneshot::Sender<()>),
 }
 
 impl LedgerWrite {
-    fn take(self, batch: &mut Vec<BillingRecord>, ack: &mut Option<oneshot::Sender<u64>>) {
+    fn take(self, batch: &mut Vec<BillingRecord>, ack: &mut Option<oneshot::Sender<()>>) {
         match self {
             LedgerWrite::Row(r) => batch.push(r),
             LedgerWrite::Flush(tx) => *ack = Some(tx),
@@ -170,9 +157,8 @@ impl LedgerWrite {
 
 /// Commit billing rows the batching writer still holds, before the process exits.
 pub async fn flush_billing(state: &GatewayState) {
-    let dropped = state.billing.flush().await;
-    if dropped > 0 {
-        tracing::error!(rows = dropped, "billing rows dropped before shutdown");
+    if !state.billing.flush().await {
+        tracing::error!("billing ledger repair worker stopped before shutdown flush");
     }
 }
 
@@ -501,38 +487,23 @@ mod tests {
         store.fail_next_ledger_writes(1);
         let ledger = BillingLedger::repairing(store.clone());
         ledger.write(&record("req-flush")).await;
-        ledger.flush().await;
+        assert!(ledger.flush().await);
         let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows[0].request_id, "req-flush");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn billing_ledger_drains_a_store_that_never_accepts() {
+    async fn billing_ledger_retries_until_store_recovers() {
         let store = Arc::new(crate::MemoryStore::default());
-        store.fail_next_ledger_writes(usize::MAX);
+        store.fail_next_ledger_writes(10);
         let ledger = BillingLedger::repairing(store.clone());
 
-        tokio::time::timeout(Duration::from_secs(3_600), async {
-            for i in 0..=LEDGER_QUEUE_CAPACITY {
-                ledger.write(&record(format!("req-{i}"))).await;
-            }
-        })
-        .await
-        .expect("write must not wedge on a permanently failing store");
+        ledger.write(&record("req-eventual-repair")).await;
+        assert!(ledger.flush().await);
 
-        let queue = ledger.queue.as_ref().unwrap();
-        tokio::time::timeout(Duration::from_secs(3_600), async {
-            while queue.capacity() != LEDGER_QUEUE_CAPACITY {
-                tokio::time::sleep(LEDGER_RETRY_INITIAL).await;
-            }
-        })
-        .await
-        .expect("the queue must drain once the retries are exhausted");
-        assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 0);
-        assert!(
-            ledger.flush().await > 0,
-            "flush reports the rows the exhausted retries dropped"
-        );
+        let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rows[0].request_id, "req-eventual-repair");
     }
 }
