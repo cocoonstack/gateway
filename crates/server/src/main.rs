@@ -125,11 +125,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // fleet batch drain: on a distributed store any instance claims submitted batches
+    let (batch_shutdown_tx, batch_shutdown_rx) = tokio::sync::watch::channel(false);
     let batch_task = if distributed_batches {
         let offline = app_state.offline.clone();
         tracing::info!("batch drain loop started (distributed store)");
         Some(tokio::spawn(async move {
-            offline.drain_forever(BATCH_STALE_SECS, BATCH_POLL).await
+            offline
+                .drain_until(BATCH_STALE_SECS, BATCH_POLL, batch_shutdown_rx)
+                .await
         }))
     } else {
         None
@@ -200,9 +203,17 @@ async fn main() -> anyhow::Result<()> {
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        batch_shutdown_tx.send_replace(true);
+    })
     .await?;
 
+    if let Some(task) = batch_task
+        && let Err(e) = task.await
+    {
+        tracing::error!(error = %e, "batch drain task failed during shutdown");
+    }
     gw_state::admission::flush_billing(&shared.load().state).await;
     quota_task.abort();
     purge_task.abort();
@@ -210,9 +221,6 @@ async fn main() -> anyhow::Result<()> {
     avail_task.abort();
     alert_task.abort();
     avail_alert_task.abort();
-    if let Some(task) = batch_task {
-        task.abort();
-    }
     tracing::info!("gw drained and exiting");
     Ok(())
 }
