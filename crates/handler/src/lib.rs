@@ -2655,7 +2655,7 @@ mod tests {
         assert_eq!(pending.status, gw_state::BatchStatus::Pending);
 
         let drainer = OfflineHandler::new(online);
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let drain = tokio::spawn(async move {
             drainer
                 .drain_until(120, std::time::Duration::from_millis(50), shutdown_rx)
@@ -2671,7 +2671,11 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        drain.abort();
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("drain stops once shutdown is signalled")
+            .unwrap();
         let j = completed.expect("drain completed the batch");
         assert_eq!(j.results.len(), 2, "both items executed exactly once");
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));

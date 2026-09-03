@@ -502,6 +502,24 @@ mod tests {
         assert_eq!(rows[0].request_id, "req-attributed");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn attributed_write_falls_back_to_a_direct_write_when_the_batch_is_dropped() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(LEDGER_RETRY_ATTEMPTS);
+        let ledger = BillingLedger {
+            deferred: true,
+            ..BillingLedger::repairing(store.clone())
+        };
+        let mut row = record("req-fallback");
+        row.user_id = "user-42".into();
+
+        ledger.write(&row).await;
+
+        let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rows[0].request_id, "req-fallback");
+    }
+
     #[tokio::test]
     async fn billing_ledger_backpressures_at_capacity_then_repairs_every_row() {
         let store = Arc::new(crate::MemoryStore::default());
