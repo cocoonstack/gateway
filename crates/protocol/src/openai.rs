@@ -4,6 +4,8 @@
 //! tool_choice / tool_calls, sampling params, logprobs & response_format
 //! passthrough, streaming chunks.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -51,7 +53,7 @@ pub struct FunctionCall {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
+    pub role: Cow<'static, str>,
     /// `null` when the assistant message carries only tool_calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContent>,
@@ -73,7 +75,7 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn text(role: impl Into<Cow<'static, str>>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             content: Some(MessageContent::Text(content.into())),
@@ -148,13 +150,13 @@ pub struct CompletionTokensDetails {
 pub struct Choice {
     pub index: i32,
     pub message: ChatMessage,
-    pub finish_reason: String,
+    pub finish_reason: Cow<'static, str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
-    pub object: String, // "chat.completion"
+    pub object: Cow<'static, str>,
     pub created: i64,
     pub model: String,
     pub choices: Vec<Choice>,
@@ -167,7 +169,7 @@ impl ChatCompletionResponse {
         created: i64,
         model: impl Into<String>,
         content: impl Into<String>,
-        finish_reason: impl Into<String>,
+        finish_reason: impl Into<Cow<'static, str>>,
         usage: Usage,
     ) -> Self {
         Self::with_message(
@@ -194,12 +196,12 @@ impl ChatCompletionResponse {
             created,
             model,
             ChatMessage {
-                role: "assistant".to_owned(),
+                role: "assistant".into(),
                 content: (!content.is_empty()).then_some(MessageContent::Text(content)),
                 tool_calls: Some(calls),
                 ..Default::default()
             },
-            "tool_calls".to_owned(),
+            "tool_calls".into(),
             usage,
         )
     }
@@ -209,12 +211,12 @@ impl ChatCompletionResponse {
         created: i64,
         model: impl Into<String>,
         message: ChatMessage,
-        finish_reason: String,
+        finish_reason: Cow<'static, str>,
         usage: Usage,
     ) -> Self {
         Self {
             id: id.into(),
-            object: "chat.completion".to_owned(),
+            object: Cow::Borrowed("chat.completion"),
             created,
             model: model.into(),
             choices: vec![Choice {
@@ -245,7 +247,7 @@ pub struct ChunkDelta {
 pub struct ChunkChoice {
     pub index: i32,
     pub delta: ChunkDelta,
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<Cow<'static, str>>,
 }
 
 /// Borrows `id`/`model` from the stream state: chunks are built and serialized
@@ -318,7 +320,7 @@ impl<'a> ChatCompletionChunk<'a> {
             created,
             model,
             ChunkDelta::default(),
-            Some("stop".to_owned()),
+            Some(Cow::Borrowed("stop")),
             usage,
         )
     }
@@ -328,7 +330,7 @@ impl<'a> ChatCompletionChunk<'a> {
         created: i64,
         model: &'a str,
         delta: ChunkDelta,
-        finish_reason: Option<String>,
+        finish_reason: Option<Cow<'static, str>>,
         usage: Option<Usage>,
     ) -> Self {
         Self {

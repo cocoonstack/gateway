@@ -1,4 +1,5 @@
-package gateway
+// Package http reaches the Rust gateway admin API over HTTP.
+package http
 
 import (
 	"bytes"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 )
 
 const (
@@ -27,16 +30,16 @@ type Target struct {
 	URL string
 }
 
-var _ Client = (*HTTPClient)(nil)
+var _ gateway.Client = (*Client)(nil)
 
-type HTTPClient struct {
+type Client struct {
 	targets      []Target
 	adminToken   string
 	tenantTokens map[string]string
 	client       *http.Client
 }
 
-func NewHTTP(rawTargets, adminToken string, tenantTokens map[string]string) (*HTTPClient, error) {
+func New(rawTargets, adminToken string, tenantTokens map[string]string) (*Client, error) {
 	targets, err := parseTargets(rawTargets)
 	if err != nil {
 		return nil, err
@@ -44,7 +47,7 @@ func NewHTTP(rawTargets, adminToken string, tenantTokens map[string]string) (*HT
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = maxIdleConns
 	transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
-	return &HTTPClient{
+	return &Client{
 		targets:      targets,
 		adminToken:   adminToken,
 		tenantTokens: tenantTokens,
@@ -52,12 +55,12 @@ func NewHTTP(rawTargets, adminToken string, tenantTokens map[string]string) (*HT
 	}, nil
 }
 
-func (c *HTTPClient) Usage(ctx context.Context, scope Scope, since, until int64) ([]UsageRow, error) {
+func (c *Client) Usage(ctx context.Context, scope gateway.Scope, since, until int64) ([]gateway.UsageRow, error) {
 	q := scopeQuery(scope)
 	q.Set("since", strconv.FormatInt(since, 10))
 	q.Set("until", strconv.FormatInt(until, 10))
 	var resp struct {
-		Usage []UsageRow `json:"usage"`
+		Usage []gateway.UsageRow `json:"usage"`
 	}
 	if err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/usage/users?"+q.Encode(), nil, &resp, c.readBearer(scope.Tenant)); err != nil {
 		return nil, err
@@ -65,24 +68,24 @@ func (c *HTTPClient) Usage(ctx context.Context, scope Scope, since, until int64)
 	return resp.Usage, nil
 }
 
-func (c *HTTPClient) UsageSeries(ctx context.Context, scope Scope, bucket string, since, until int64) (Series, error) {
+func (c *Client) UsageSeries(ctx context.Context, scope gateway.Scope, bucket string, since, until int64) (gateway.Series, error) {
 	q := scopeQuery(scope)
 	q.Set("bucket", bucket)
 	q.Set("since", strconv.FormatInt(since, 10))
 	q.Set("until", strconv.FormatInt(until, 10))
-	var series Series
+	var series gateway.Series
 	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/usage/series?"+q.Encode(), nil, &series, c.readBearer(scope.Tenant))
 	return series, err
 }
 
-func (c *HTTPClient) Models(ctx context.Context, scope Scope) ([]ModelStatus, error) {
+func (c *Client) Models(ctx context.Context, scope gateway.Scope) ([]gateway.ModelStatus, error) {
 	q := scopeQuery(scope)
 	path := "/admin/models/status"
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
 	var resp struct {
-		Models []ModelStatus `json:"models"`
+		Models []gateway.ModelStatus `json:"models"`
 	}
 	if err := c.doJSON(ctx, c.primary(), http.MethodGet, path, nil, &resp, c.readBearer(scope.Tenant)); err != nil {
 		return nil, err
@@ -90,7 +93,7 @@ func (c *HTTPClient) Models(ctx context.Context, scope Scope) ([]ModelStatus, er
 	return resp.Models, nil
 }
 
-func (c *HTTPClient) Keys(ctx context.Context, tenant string, offset, limit int64) ([]Key, error) {
+func (c *Client) Keys(ctx context.Context, tenant string, offset, limit int64) ([]gateway.Key, error) {
 	q := make(url.Values)
 	if offset > 0 {
 		q.Set("offset", strconv.FormatInt(offset, 10))
@@ -102,7 +105,7 @@ func (c *HTTPClient) Keys(ctx context.Context, tenant string, offset, limit int6
 		q.Set("tenant", tenant)
 	}
 	var resp struct {
-		Keys []Key `json:"keys"`
+		Keys []gateway.Key `json:"keys"`
 	}
 	if err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/keys?"+q.Encode(), nil, &resp, c.readBearer(tenant)); err != nil {
 		return nil, err
@@ -110,7 +113,7 @@ func (c *HTTPClient) Keys(ctx context.Context, tenant string, offset, limit int6
 	return resp.Keys, nil
 }
 
-func (c *HTTPClient) CreateKey(ctx context.Context, actingTenant string, key Key) error {
+func (c *Client) CreateKey(ctx context.Context, actingTenant string, key gateway.Key) error {
 	bearer, err := c.mutateBearer(actingTenant)
 	if err != nil {
 		return err
@@ -118,17 +121,17 @@ func (c *HTTPClient) CreateKey(ctx context.Context, actingTenant string, key Key
 	return c.doJSON(ctx, c.primary(), http.MethodPost, "/admin/keys", key, nil, bearer)
 }
 
-func (c *HTTPClient) PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (Key, error) {
+func (c *Client) PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (gateway.Key, error) {
 	bearer, err := c.mutateBearer(actingTenant)
 	if err != nil {
-		return Key{}, err
+		return gateway.Key{}, err
 	}
-	var key Key
+	var key gateway.Key
 	err = c.doJSON(ctx, c.primary(), http.MethodPatch, "/admin/keys/"+url.PathEscape(ak), patch, &key, bearer)
 	return key, err
 }
 
-func (c *HTTPClient) DeleteKey(ctx context.Context, actingTenant, ak string) error {
+func (c *Client) DeleteKey(ctx context.Context, actingTenant, ak string) error {
 	bearer, err := c.mutateBearer(actingTenant)
 	if err != nil {
 		return err
@@ -136,12 +139,12 @@ func (c *HTTPClient) DeleteKey(ctx context.Context, actingTenant, ak string) err
 	return c.doJSON(ctx, c.primary(), http.MethodDelete, "/admin/keys/"+url.PathEscape(ak), nil, nil, bearer)
 }
 
-func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
-	ch := make(chan Instance, len(c.targets))
+func (c *Client) Instances(ctx context.Context) ([]gateway.Instance, error) {
+	ch := make(chan gateway.Instance, len(c.targets))
 	for _, target := range c.targets {
 		go func() {
 			started := time.Now()
-			instance := Instance{ID: target.ID, URL: target.URL, Status: "unavailable", Accounts: []Account{}}
+			instance := gateway.Instance{ID: target.ID, URL: target.URL, Status: "unavailable", Accounts: []gateway.Account{}}
 			var health struct {
 				Status string `json:"status"`
 			}
@@ -152,7 +155,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 				return
 			}
 			var accounts struct {
-				Accounts []Account `json:"accounts"`
+				Accounts []gateway.Account `json:"accounts"`
 			}
 			if err := c.doJSON(ctx, target, http.MethodGet, "/internal/accounts", nil, &accounts, c.adminToken); err != nil {
 				instance.Status = "degraded"
@@ -165,27 +168,27 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 			ch <- instance
 		}()
 	}
-	instances := make([]Instance, 0, len(c.targets))
+	instances := make([]gateway.Instance, 0, len(c.targets))
 	for range c.targets {
 		instances = append(instances, <-ch)
 	}
-	slices.SortFunc(instances, func(a, b Instance) int { return cmp.Compare(a.ID, b.ID) })
+	slices.SortFunc(instances, func(a, b gateway.Instance) int { return cmp.Compare(a.ID, b.ID) })
 	return instances, nil
 }
 
-func (c *HTTPClient) Config(ctx context.Context) (ConfigDocument, error) {
-	var doc ConfigDocument
+func (c *Client) Config(ctx context.Context) (gateway.ConfigDocument, error) {
+	var doc gateway.ConfigDocument
 	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/config", nil, &doc, c.adminToken)
 	return doc, err
 }
 
-func (c *HTTPClient) ValidateConfig(ctx context.Context, yaml string) (map[string]any, error) {
+func (c *Client) ValidateConfig(ctx context.Context, yaml string) (map[string]any, error) {
 	var result map[string]any
 	err := c.doText(ctx, c.primary(), http.MethodPost, "/admin/config/validate", yaml, &result)
 	return result, err
 }
 
-func (c *HTTPClient) PublishConfig(ctx context.Context, yaml string, expectedVersion int64) (int64, error) {
+func (c *Client) PublishConfig(ctx context.Context, yaml string, expectedVersion int64) (int64, error) {
 	path := "/admin/config"
 	if expectedVersion > 0 {
 		path += "?expected_version=" + strconv.FormatInt(expectedVersion, 10)
@@ -197,15 +200,15 @@ func (c *HTTPClient) PublishConfig(ctx context.Context, yaml string, expectedVer
 	return result.Version, err
 }
 
-func (c *HTTPClient) ConfigVersions(ctx context.Context) ([]ConfigVersion, error) {
+func (c *Client) ConfigVersions(ctx context.Context) ([]gateway.ConfigVersion, error) {
 	var result struct {
-		Versions []ConfigVersion `json:"versions"`
+		Versions []gateway.ConfigVersion `json:"versions"`
 	}
 	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/config/versions", nil, &result, c.adminToken)
 	return result.Versions, err
 }
 
-func (c *HTTPClient) RollbackConfig(ctx context.Context, id int64) (int64, error) {
+func (c *Client) RollbackConfig(ctx context.Context, id int64) (int64, error) {
 	var result struct {
 		Version int64 `json:"version"`
 	}
@@ -214,30 +217,30 @@ func (c *HTTPClient) RollbackConfig(ctx context.Context, id int64) (int64, error
 	return result.Version, err
 }
 
-func (c *HTTPClient) Audit(ctx context.Context) ([]AuditEntry, error) {
+func (c *Client) Audit(ctx context.Context) ([]gateway.AuditEntry, error) {
 	var result struct {
-		Entries []AuditEntry `json:"entries"`
+		Entries []gateway.AuditEntry `json:"entries"`
 	}
 	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/audit/ops?limit=200", nil, &result, c.adminToken)
 	return result.Entries, err
 }
 
-func (c *HTTPClient) SecurityEvents(ctx context.Context, tenant string) ([]SecurityEvent, error) {
+func (c *Client) SecurityEvents(ctx context.Context, tenant string) ([]gateway.SecurityEvent, error) {
 	q := make(url.Values)
 	q.Set("limit", "200")
 	if tenant != "" {
 		q.Set("tenant", tenant)
 	}
 	var result struct {
-		Events []SecurityEvent `json:"events"`
+		Events []gateway.SecurityEvent `json:"events"`
 	}
 	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/audit/events?"+q.Encode(), nil, &result, c.readBearer(tenant))
 	return result.Events, err
 }
 
-func (c *HTTPClient) primary() Target { return c.targets[0] }
+func (c *Client) primary() Target { return c.targets[0] }
 
-func (c *HTTPClient) readBearer(tenant string) string {
+func (c *Client) readBearer(tenant string) string {
 	if token, ok := c.tenantTokens[tenant]; ok {
 		return token
 	}
@@ -245,7 +248,7 @@ func (c *HTTPClient) readBearer(tenant string) string {
 }
 
 // mutateBearer fails closed: a global-token fallback would erase the tenant boundary the gateway enforces.
-func (c *HTTPClient) mutateBearer(actingTenant string) (string, error) {
+func (c *Client) mutateBearer(actingTenant string) (string, error) {
 	if actingTenant == "" {
 		return c.adminToken, nil
 	}
@@ -256,7 +259,7 @@ func (c *HTTPClient) mutateBearer(actingTenant string) (string, error) {
 	return token, nil
 }
 
-func (c *HTTPClient) doJSON(ctx context.Context, target Target, method, path string, input, output any, bearer string) error {
+func (c *Client) doJSON(ctx context.Context, target Target, method, path string, input, output any, bearer string) error {
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -275,26 +278,26 @@ func (c *HTTPClient) doJSON(ctx context.Context, target Target, method, path str
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	if rid := RequestIDFrom(ctx); rid != "" {
+	if rid := gateway.RequestIDFrom(ctx); rid != "" {
 		req.Header.Set("X-Request-ID", rid)
 	}
 	return c.send(req, output)
 }
 
-func (c *HTTPClient) doText(ctx context.Context, target Target, method, path, input string, output any) error {
+func (c *Client) doText(ctx context.Context, target Target, method, path, input string, output any) error {
 	req, err := http.NewRequestWithContext(ctx, method, target.URL+path, strings.NewReader(input))
 	if err != nil {
 		return fmt.Errorf("create gateway request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/yaml")
 	req.Header.Set("Authorization", "Bearer "+c.adminToken)
-	if rid := RequestIDFrom(ctx); rid != "" {
+	if rid := gateway.RequestIDFrom(ctx); rid != "" {
 		req.Header.Set("X-Request-ID", rid)
 	}
 	return c.send(req, output)
 }
 
-func (c *HTTPClient) send(req *http.Request, output any) (err error) {
+func (c *Client) send(req *http.Request, output any) (err error) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request gateway: %w", err)
@@ -317,9 +320,9 @@ func (c *HTTPClient) send(req *http.Request, output any) (err error) {
 		}
 		switch resp.StatusCode {
 		case http.StatusNotFound:
-			return fmt.Errorf("%w: %s", ErrNotFound, message)
+			return fmt.Errorf("%w: %s", gateway.ErrNotFound, message)
 		case http.StatusConflict:
-			return fmt.Errorf("%w: %s", ErrConflict, message)
+			return fmt.Errorf("%w: %s", gateway.ErrConflict, message)
 		}
 		return fmt.Errorf("gateway %s: %s", resp.Status, message)
 	}
@@ -356,7 +359,7 @@ func parseTargets(raw string) ([]Target, error) {
 	return targets, nil
 }
 
-func scopeQuery(scope Scope) url.Values {
+func scopeQuery(scope gateway.Scope) url.Values {
 	q := make(url.Values)
 	if scope.Tenant != "" {
 		q.Set("tenant", scope.Tenant)

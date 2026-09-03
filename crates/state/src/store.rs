@@ -4,7 +4,7 @@
 //! [`SqliteStore`] (`storage.sqlite_path`, one durable node), and
 //! [`PostgresStore`] (`storage.postgres_url`, shared across a fleet).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -777,7 +777,7 @@ pub struct MemoryStore {
     content: Mutex<MemoryContent>,
     /// Latest erasure instant per (tenant, user), backing
     /// [`Store::user_erased_since`] — one entry per pair, not a log.
-    erasures: Mutex<std::collections::HashMap<(String, String), i64>>,
+    erasures: Mutex<HashMap<String, HashMap<String, i64>>>,
     files: DashMap<String, StoredFile>,
     jobs: DashMap<String, BatchJob>,
     videos: DashMap<String, (VideoJob, bool)>,
@@ -1064,10 +1064,10 @@ impl Store for MemoryStore {
                 }
             }
         }
-        lock(&self.erasures).insert(
-            (tenant.unwrap_or_default().to_owned(), user.to_owned()),
-            crate::epoch_millis(),
-        );
+        lock(&self.erasures)
+            .entry(tenant.unwrap_or_default().to_owned())
+            .or_default()
+            .insert(user.to_owned(), crate::epoch_millis());
         audit.summary = format!("rows={erased}");
         lock(&self.audit).push(audit);
         Ok(erased)
@@ -1077,7 +1077,8 @@ impl Store for MemoryStore {
         let erasures = lock(&self.erasures);
         let hit = |t: &str| {
             erasures
-                .get(&(t.to_owned(), user.to_owned()))
+                .get(t)
+                .and_then(|users| users.get(user))
                 .is_some_and(|at| *at >= since)
         };
         Ok(hit("") || hit(tenant))

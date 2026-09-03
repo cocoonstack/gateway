@@ -55,15 +55,6 @@ pub struct InMessage {
     pub content: Value,
 }
 
-/// Joined text of the `text`/untyped blocks in an Anthropic content array.
-pub fn blocks_text(blocks: &[Value]) -> String {
-    blocks
-        .iter()
-        .filter(|b| b["type"] == "text" || b.get("type").is_none())
-        .filter_map(|b| b["text"].as_str())
-        .collect()
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthUsage {
     pub input_tokens: i64,
@@ -73,6 +64,15 @@ pub struct AnthUsage {
     pub cache_read_input_tokens: i64,
     #[serde(default)]
     pub cache_creation_input_tokens: i64,
+}
+
+/// Joined text of the `text`/untyped blocks in an Anthropic content array.
+pub fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b["type"] == "text" || b.get("type").is_none())
+        .filter_map(|b| b["text"].as_str())
+        .collect()
 }
 
 /// An OpenAI `image_url` part as an Anthropic `image` block (data URI → base64
@@ -105,16 +105,16 @@ pub fn image_to_image_url(mut block: Value) -> Value {
     if block["type"] != "image" {
         return block;
     }
-    let source = block["source"].take();
+    let mut source = block["source"].take();
     let url = match source["type"].as_str() {
         Some("base64") => format!(
             "data:{};base64,{}",
             source["media_type"].as_str().unwrap_or("image/png"),
             source["data"].as_str().unwrap_or_default()
         ),
-        _ => match source.get("url").and_then(Value::as_str) {
-            Some(url) => url.to_owned(),
-            None => {
+        _ => match source.get_mut("url") {
+            Some(Value::String(url)) => std::mem::take(url),
+            _ => {
                 block["source"] = source;
                 return block;
             }

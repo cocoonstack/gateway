@@ -19,36 +19,6 @@ pub fn is_client_turn(provider: &str, frame: &Value) -> bool {
     is_response_create(frame)
 }
 
-/// String values that never carry human text (base64 media, protocol ids);
-/// everything else is scanned, fail closed, and config objects still recurse.
-fn skip_scalar(k: &str, text_delta: bool) -> bool {
-    matches!(
-        k,
-        "audio"
-            | "data"
-            | "file_data"
-            | "file_url"
-            | "image_url"
-            | "type"
-            | "object"
-            | "status"
-            | "role"
-            | "voice"
-            | "model"
-            | "format"
-    ) || (k == "delta" && !text_delta)
-        || k == "id"
-        || k.ends_with("_id")
-}
-
-/// Whether a frame's top-level `delta` carries text (audio deltas reuse the key
-/// for base64 a rewrite would corrupt).
-fn delta_is_text(frame_type: &str) -> bool {
-    frame_type.contains("text")
-        || frame_type.contains("transcript")
-        || frame_type.contains("arguments")
-}
-
 /// Visit a realtime frame's text-bearing string leaves with a visitor that may
 /// rewrite them; returns summed hits (see [`skip_scalar`] for what is not text).
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
@@ -196,6 +166,36 @@ pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
             .unwrap_or(0)
             .max(0),
     )
+}
+
+/// String values that never carry human text (base64 media, protocol ids);
+/// everything else is scanned, fail closed, and config objects still recurse.
+fn skip_scalar(k: &str, text_delta: bool) -> bool {
+    matches!(
+        k,
+        "audio"
+            | "data"
+            | "file_data"
+            | "file_url"
+            | "image_url"
+            | "type"
+            | "object"
+            | "status"
+            | "role"
+            | "voice"
+            | "model"
+            | "format"
+    ) || (k == "delta" && !text_delta)
+        || k == "id"
+        || k.ends_with("_id")
+}
+
+/// Whether a frame's top-level `delta` carries text (audio deltas reuse the key
+/// for base64 a rewrite would corrupt).
+fn delta_is_text(frame_type: &str) -> bool {
+    frame_type.contains("text")
+        || frame_type.contains("transcript")
+        || frame_type.contains("arguments")
 }
 
 #[cfg(test)]

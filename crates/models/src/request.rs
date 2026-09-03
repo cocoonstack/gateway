@@ -114,15 +114,6 @@ impl GatewayRequest {
     }
 }
 
-/// Whether a content block is Anthropic protected thinking
-/// (`thinking` / `redacted_thinking`).
-pub(crate) fn is_protected_anthropic_block(block: &serde_json::Value) -> bool {
-    matches!(
-        block.get("type").and_then(serde_json::Value::as_str),
-        Some("thinking" | "redacted_thinking")
-    )
-}
-
 /// One queued batch item: messages plus the end-user attribution, persisted so
 /// a distributed drainer still attributes and budgets it (owner overrides at billing).
 #[derive(Debug, Clone)]
@@ -290,6 +281,15 @@ pub mod domain {
             Some((access, secret))
         }
     }
+}
+
+/// Whether a content block is Anthropic protected thinking
+/// (`thinking` / `redacted_thinking`).
+pub(crate) fn is_protected_anthropic_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(serde_json::Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 #[cfg(test)]

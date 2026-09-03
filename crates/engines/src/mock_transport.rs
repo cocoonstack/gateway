@@ -55,9 +55,11 @@ impl MockTransport {
     }
 
     fn ok_json(v: Value) -> GResult<UpstreamResponse> {
+        let body = serde_json::to_vec(&v)
+            .map_err(|e| GatewayError::internal("mock: encode response").with_source(e))?;
         Ok(UpstreamResponse {
             status: 200,
-            body: UpstreamBody::Json(bytes::Bytes::from(v.to_string())),
+            body: UpstreamBody::Json(body.into()),
             headers: HeaderMap::new(),
         })
     }
@@ -168,7 +170,12 @@ impl MockTransport {
     fn anthropic_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "anthropic")?;
         let model = body["model"].as_str().unwrap_or("mock-claude");
-        let user = Self::last_user_text(body["messages"].as_array().unwrap_or(&vec![]));
+        let user = Self::last_user_text(
+            body["messages"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let sys_note = Self::sys_note(body["system"].as_str().unwrap_or_default());
         let reply = format!("[mock-anthropic:{model}] {sys_note}you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
@@ -217,7 +224,12 @@ impl MockTransport {
 
     fn dashscope_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "dashscope")?;
-        let user = Self::last_user_text(body["input"]["messages"].as_array().unwrap_or(&vec![]));
+        let user = Self::last_user_text(
+            body["input"]["messages"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let reply = format!("[mock-dashscope] you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         if req.stream {
@@ -254,7 +266,12 @@ impl MockTransport {
 
     fn ernie_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "ernie")?;
-        let user = Self::last_user_text(body["messages"].as_array().unwrap_or(&vec![]));
+        let user = Self::last_user_text(
+            body["messages"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let reply = format!("[mock-ernie] you said: {user}");
         let (pt, ct) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         Self::ok_json(json!({

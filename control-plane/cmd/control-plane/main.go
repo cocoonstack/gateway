@@ -16,6 +16,8 @@ import (
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
 	"github.com/cocoonstack/gateway/control-plane/internal/config"
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
+	gatewayhttp "github.com/cocoonstack/gateway/control-plane/internal/gateway/http"
+	gatewaymock "github.com/cocoonstack/gateway/control-plane/internal/gateway/mock"
 	"github.com/cocoonstack/gateway/control-plane/internal/httpapi"
 	"github.com/cocoonstack/gateway/control-plane/internal/kv"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
@@ -122,9 +124,9 @@ func buildSessionStore(ctx context.Context, cfg config.Config) (kv.Sessions, err
 
 func buildGateway(cfg config.Config) (gateway.Client, error) {
 	if cfg.GatewayMode == "mock" {
-		return gateway.NewMock(), nil
+		return gatewaymock.New(), nil
 	}
-	return gateway.NewHTTP(cfg.GatewayTargets, cfg.GatewayAdminToken, cfg.GatewayTenantTokens)
+	return gatewayhttp.New(cfg.GatewayTargets, cfg.GatewayAdminToken, cfg.GatewayTenantTokens)
 }
 
 func seedUsers(ctx context.Context, store user.Store, cfg config.Config) error {

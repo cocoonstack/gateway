@@ -3,6 +3,8 @@
 //! `GatewayResponse` + stream chunks, and keeps the raw usage subtree on
 //! `raw_usage` for the CommonUsage DAG node.
 
+use std::borrow::Cow;
+
 use gw_models::{GResult, GatewayError, GatewayResponse};
 use gw_protocol::reasoning::is_thinking_block;
 use serde_json::{Map, Value, json};
@@ -205,6 +207,49 @@ impl ModelEngine for OpenAiEngine {
     }
 }
 
+/// Merge one `index`-keyed tool-call fragment: the first carries id/type/name,
+/// later ones append to `function.arguments`.
+pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
+    let Some(frags) = fragment.as_array() else {
+        return;
+    };
+    let calls = acc.get_or_insert_with(|| Value::Array(Vec::new()));
+    let Some(calls) = calls.as_array_mut() else {
+        return;
+    };
+    for f in frags {
+        // an index-less fragment continues the open call; indices stay contiguous
+        let idx = f["index"]
+            .as_u64()
+            .map_or(calls.len().saturating_sub(1), |i| i as usize)
+            .min(calls.len());
+        if idx == calls.len() {
+            calls.push(json!({"function": {}}));
+        }
+        let call = &mut calls[idx];
+        for key in ["id", "type"] {
+            if let Some(v) = f.get(key).filter(|v| !v.is_null())
+                && call.get(key).is_none()
+            {
+                call[key] = v.clone();
+            }
+        }
+        if let Some(name) = f["function"]["name"].as_str()
+            && call["function"].get("name").is_none()
+        {
+            call["function"]["name"] = Value::from(name);
+        }
+        if let Some(args) = f["function"]["arguments"].as_str() {
+            // append in place — rebuilding the string per fragment is quadratic
+            if let Value::String(acc) = &mut call["function"]["arguments"] {
+                acc.push_str(args);
+            } else {
+                call["function"]["arguments"] = Value::from(args);
+            }
+        }
+    }
+}
+
 /// Apply one decoded SSE event to the accumulating response; returns the
 /// chunks the event yields.
 fn apply_sse_event(
@@ -277,49 +322,6 @@ fn apply_sse_event(
         apply_openai_usage(resp, usage.take());
     }
     Ok(chunks)
-}
-
-/// Merge one `index`-keyed tool-call fragment: the first carries id/type/name,
-/// later ones append to `function.arguments`.
-pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
-    let Some(frags) = fragment.as_array() else {
-        return;
-    };
-    let calls = acc.get_or_insert_with(|| Value::Array(Vec::new()));
-    let Some(calls) = calls.as_array_mut() else {
-        return;
-    };
-    for f in frags {
-        // an index-less fragment continues the open call; indices stay contiguous
-        let idx = f["index"]
-            .as_u64()
-            .map_or(calls.len().saturating_sub(1), |i| i as usize)
-            .min(calls.len());
-        if idx == calls.len() {
-            calls.push(json!({"function": {}}));
-        }
-        let call = &mut calls[idx];
-        for key in ["id", "type"] {
-            if let Some(v) = f.get(key).filter(|v| !v.is_null())
-                && call.get(key).is_none()
-            {
-                call[key] = v.clone();
-            }
-        }
-        if let Some(name) = f["function"]["name"].as_str()
-            && call["function"].get("name").is_none()
-        {
-            call["function"]["name"] = json!(name);
-        }
-        if let Some(args) = f["function"]["arguments"].as_str() {
-            // append in place — rebuilding the string per fragment is quadratic
-            if let Value::String(acc) = &mut call["function"]["arguments"] {
-                acc.push_str(args);
-            } else {
-                call["function"]["arguments"] = json!(args);
-            }
-        }
-    }
 }
 
 /// Hold back the `arguments: "{}"` some vendors open a tool call with — the
@@ -402,7 +404,7 @@ fn normalize_tools_openai(tools: Value) -> Value {
 /// The request's `reasoning_effort`: the client's own, else derived from
 /// `output_config.effort`, a `thinking` budget or an OpenRouter budget;
 /// `adaptive` without an effort and `disabled` leave the vendor default.
-fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
+fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static, str>> {
     if let Some(effort) = reasoning.effort {
         return Some(effort);
     }
@@ -410,7 +412,7 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
         .output_config
         .and_then(|mut config| config.get_mut("effort").map(Value::take))
     {
-        return Some(effort);
+        return Some(Cow::Owned(effort));
     }
     let budget = reasoning.budget_tokens.or_else(|| {
         reasoning
@@ -418,7 +420,7 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<String> {
             .filter(|thinking| thinking["type"] == "enabled")
             .and_then(|thinking| thinking["budget_tokens"].as_i64())
     })?;
-    Some(gw_protocol::reasoning::budget_effort(budget).to_owned())
+    Some(Cow::Borrowed(gw_protocol::reasoning::budget_effort(budget)))
 }
 
 /// OpenAI's own reasoning families — o-series and GPT-5 onward.

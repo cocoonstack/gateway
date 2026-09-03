@@ -2,6 +2,8 @@
 //! one typed param set; vendor-specific fields pass through verbatim in
 //! `ModelParamV2.raw`.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -70,7 +72,7 @@ pub struct ChatParams {
 pub struct ReasoningParam {
     /// OpenAI vocabulary: none | minimal | low | medium | high | xhigh | max.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    pub effort: Option<Cow<'static, str>>,
     /// OpenRouter `reasoning.max_tokens`: a thinking budget in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<i64>,

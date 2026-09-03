@@ -2,6 +2,7 @@
 //! `GatewayRequest`, call the handler, shape the wire response, and emit one
 //! structured access-log line per request.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -99,9 +100,7 @@ impl AppState {
         self
     }
 
-    /// Reload config from source and swap it in atomically (transport policy
-    /// rides along in the handler); storage-backend (redis/sqlite URL) changes
-    /// need a restart and are ignored here.
+    /// Reload config from source and swap it in atomically; a storage-backend change needs a restart.
     pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
         let cfg = loader().await?;
@@ -200,7 +199,7 @@ async fn track_requests(
 }
 
 /// The status label without a per-request allocation for the codes this gateway emits.
-fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
+fn status_label(status: StatusCode) -> Cow<'static, str> {
     match status.as_u16() {
         200 => "200".into(),
         201 => "201".into(),
@@ -218,22 +217,27 @@ fn status_label(status: StatusCode) -> std::borrow::Cow<'static, str> {
     }
 }
 
-/// In-band realtime error event. Never terminal: the session
-/// stays open, and only a Close frame or disconnect ends it.
-fn rt_error(class: ErrClass, message: impl Into<String>) -> Value {
-    json!({"type":"error","error":{
+/// In-band realtime error event; never terminal, only a Close frame or disconnect ends the session.
+fn rt_error(class: ErrClass, message: impl Into<Cow<'static, str>>) -> Value {
+    let mut event = json!({"type":"error","error":{
         "type": class.openai_type(),
         "code": class.code(),
-        "message": message.into(),
-    }})
+    }});
+    event["error"]["message"] = match message.into() {
+        Cow::Borrowed(s) => Value::from(s),
+        Cow::Owned(s) => Value::String(s),
+    };
+    event
 }
 
-fn rt_error_frame(class: ErrClass, message: impl Into<String>) -> axum::extract::ws::Message {
+fn rt_error_frame(
+    class: ErrClass,
+    message: impl Into<Cow<'static, str>>,
+) -> axum::extract::ws::Message {
     axum::extract::ws::Message::Text(rt_error(class, message).to_string().into())
 }
 
-/// The AK carried as `gw-api-key.<ak>` in `Sec-WebSocket-Protocol` — the one
-/// header a browser WebSocket can set; a query param would leak into LB logs.
+/// The AK carried as `gw-api-key.<ak>` in `Sec-WebSocket-Protocol`, the one header a browser can set.
 fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
     headers
         .get("sec-websocket-protocol")?
@@ -245,8 +249,7 @@ fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// GET /v1/realtime?model=... (WebSocket upgrade): bridge to the vendor's
-/// realtime WebSocket, or the local mock session for an endpoint-less account.
+/// GET /v1/realtime (WebSocket upgrade): bridge to the vendor's socket, or the mock for an endpoint-less account.
 async fn realtime_ws(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -294,7 +297,6 @@ async fn realtime_ws(
     // client attribution hint captured at connect (no per-turn body user field)
     let hint = user_header(&headers).unwrap_or_default();
     // variant split pins for the whole session, sticky by the attributed user
-    // (per-connection spread when anonymous) — the REST semantics, one level up
     let served = match model_conf {
         Some(conf) if !conf.variants.is_empty() => {
             let sticky = ak.attributed_user(&hint);
@@ -346,25 +348,18 @@ async fn realtime_ws(
     }
 }
 
-/// A realtime session's model identity: entitlement, the per-(AK, model)
-/// counter and availability samples judge `requested`; QPM, pricing and the
-/// upstream URL follow `served` (the REST semantics).
+/// A realtime session's model identity: entitlement judges `requested`, pricing and routing follow `served`.
 struct RtModel {
     requested: String,
     served: String,
-    /// Whether `served` came from config at handshake — only then can a
-    /// reload invalidate it (wire-direct sessions have no config row).
+    /// Whether `served` came from config at handshake; only then can a reload invalidate it.
     from_config: bool,
 }
 
-/// A turn admitted by [`realtime_gate`]: the re-authenticated key, the reserves,
-/// the admission day (settle/refund land on the same bucket) and the admission
-/// snapshot (settlement must not drift when a reload lands mid-turn).
+/// A turn admitted by [`realtime_gate`]: the re-authenticated key, the reserves and the admission snapshot.
 struct RealtimeAdmit {
     ak: Arc<AkInfo>,
-    /// Effective attribution user for this turn: the key's owner if set, else
-    /// the client's connect-time `x-gw-user` hint; empty for an ownerless key
-    /// with no hint. Captured at admission so billing and budget agree.
+    /// Effective attribution user, captured at admission so billing and budget agree.
     user: String,
     reserved: i64,
     /// Tokens reserved in the AK TPM window; `None` when the key has no TPM cap.
@@ -413,11 +408,7 @@ impl RealtimeTurn {
     }
 }
 
-/// The REST admission chain per realtime generation (key re-fetched each turn
-/// so mid-session bans apply). Divergences from the DAG: over-quota denies
-/// instead of degrading, the reserve is a fixed turn estimate, denials carry
-/// an ErrClass (no ErrCode hooks). Reserves are taken last so a denial never
-/// leaves one behind.
+/// The REST admission chain per realtime generation; reserves are taken last so a denial leaves none behind.
 async fn realtime_gate(
     s: &AppState,
     ak: &AkInfo,
@@ -446,9 +437,7 @@ async fn realtime_gate(
             ),
         ));
     }
-    // a reload may have removed the pinned model and an unknown model bills zero: deny
-    // so the client reconnects against the live config (wire-direct sessions have nothing to
-    // vanish)
+    // an unknown model bills zero: deny so the client reconnects against the live config
     if m.from_config && cfg.find_model(&m.served).is_none() {
         return Err((
             ErrClass::ResourceNotFound,
@@ -506,8 +495,7 @@ async fn realtime_gate(
     })
 }
 
-/// Settle one realtime turn through [`admission::settle_and_bill`] on the turn's
-/// admission snapshot; a zero-usage terminal frame refunds and writes nothing.
+/// Settle one realtime turn on its admission snapshot; a zero-usage terminal frame refunds and writes nothing.
 async fn bill_realtime_turn(
     admit: &RealtimeAdmit,
     m: &RtModel,
@@ -718,8 +706,7 @@ async fn realtime_session(
     }
 }
 
-/// Cross the axum↔tungstenite text-frame boundary without copying (both wrap
-/// `bytes::Bytes`); the lossy fallback is unreachable, the input was validated.
+/// Cross the axum↔tungstenite text-frame boundary without copying; both wrap `bytes::Bytes`.
 fn client_text_to_upstream(
     t: axum::extract::ws::Utf8Bytes,
 ) -> tokio_tungstenite::tungstenite::Message {
@@ -743,8 +730,7 @@ fn upstream_text_to_client(
     }
 }
 
-/// Bridge one realtime session to a real upstream: transparent relay plus auth,
-/// per-generation gates and per-turn billing.
+/// Bridge one realtime session to a real upstream: relay plus auth, gates and per-turn billing.
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -808,8 +794,7 @@ async fn realtime_bridge(
     let mut generations = 0u64;
     // boundary frames recognized; zero while generations flowed = unmetered dialect
     let mut recognized = 0u64;
-    // the one admitted turn awaiting settle (OpenAI allows a single active response); refunded on
-    // exit
+    // the one admitted turn awaiting settle; refunded on exit
     let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
@@ -820,8 +805,7 @@ async fn realtime_bridge(
     loop {
         tokio::select! {
             m = cl_rx.next() => {
-                // text and binary parse alike so neither encoding bypasses the gate; non-JSON
-                // (audio) relays as-is
+                // text and binary parse alike so neither encoding bypasses the gate
                 let (frame, mut forward) = match m {
                     Some(Ok(CMsg::Text(t))) => (serde_json::from_str::<Value>(&t).ok(), client_text_to_upstream(t)),
                     Some(Ok(CMsg::Binary(b))) => (serde_json::from_slice::<Value>(&b).ok(), UMsg::binary(b)),
@@ -835,8 +819,7 @@ async fn realtime_bridge(
                             setup.insert("model".into(), format!("models/{}", rtm.served).into());
                             forward = UMsg::text(frame.to_string());
                         }
-                        // audio-driven turns and barge-in have no admission point yet: refuse
-                        // loudly, keep the session
+                        // audio-driven turns and barge-in have no admission point yet: refuse, keep the session
                         let ungoverned = frame.get("realtimeInput").is_some()
                             || frame.get("realtime_input").is_some()
                             || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
@@ -927,8 +910,7 @@ async fn realtime_bridge(
                                 suppress = false;
                             }
                         }
-                        // server-VAD auto-starts a turn with no client response.create — gate it
-                        // like a manual one
+                        // server-VAD auto-starts a turn with no client response.create: gate it like a manual one
                         else if realtime_turn_started(account.wire_kind(), &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
@@ -947,8 +929,7 @@ async fn realtime_bridge(
                                 (it, ot) = gemini_tokens(&u);
                                 v["usageMetadata"] = u;
                             }
-                            // turn boundary: settle the admitted turn; one with no gated turn bills
-                            // unreserved
+                            // turn boundary: settle the admitted turn; an ungated one bills unreserved
                             match pending.take() {
                                 Some(turn) if it.saturating_add(ot) > 0 => {
                                     bill_realtime_turn(
@@ -1006,8 +987,7 @@ async fn realtime_bridge(
                             recognized += 1;
                             turn_ended = true;
                         }
-                        // outbound DLP per frame: a span straddling deltas is beyond an unbuffered
-                        // relay
+                        // outbound DLP per frame: a span straddling deltas is beyond an unbuffered relay
                         let n = if relay {
                             gw_handler::plugins::dlp_redact_realtime_frame(
                                 s.handler.cfg().security_for(&ak.tenant),
@@ -1028,8 +1008,7 @@ async fn realtime_bridge(
                         if n > 0 {
                             redacted = Some(v);
                         }
-                        // per-token events would be too hot: sum the turn, record once at its
-                        // boundary
+                        // per-token events would be too hot: sum the turn, record once at its boundary
                         out_redacted += n as i64;
                         if turn_ended {
                             flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
@@ -1493,14 +1472,14 @@ async fn rt_inbound_policy(
     ak: &AkInfo,
     hint: &str,
     frame: &mut Value,
-) -> Result<usize, String> {
+) -> Result<usize, Cow<'static, str>> {
     let cfg = s.handler.cfg();
     let sec = cfg.security_for(&ak.tenant);
     let (scan, text, walk_redacted) =
         gw_handler::plugins::realtime_frame_scan(sec, frame, sec.moderate);
     emit_rt_hits(s, ak, &scan.hits, hint).await;
     if let Some(block) = scan.block {
-        return Err(block.message);
+        return Err(Cow::Owned(block.message));
     }
     if sec.moderate && !text.is_empty() {
         match s.handler.moderate_rt(sec, &text).await {
@@ -2314,12 +2293,12 @@ async fn admin_usage_series(
 
 /// A CSV field, RFC-4180 quoted and neutralized against spreadsheet formula
 /// injection (`= + - @` / tab / CR openers get a `'` prefix; the value can carry a user id).
-fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
+fn csv_field(s: &str) -> Cow<'_, str> {
     let needs_prefix = s
         .chars()
         .next()
         .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
-    let body: std::borrow::Cow<'_, str> = if needs_prefix {
+    let body: Cow<'_, str> = if needs_prefix {
         format!("'{s}").into()
     } else {
         s.into()
@@ -2586,22 +2565,22 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
 }
 
 /// finish_reason mapping, anthropic → openai.
-fn finish_openai(fr: String) -> String {
+fn finish_openai(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
-        "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => "stop".to_owned(),
-        "max_tokens" => "length".to_owned(),
-        "tool_use" => "tool_calls".to_owned(),
-        _ => fr,
+        "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => Cow::Borrowed("stop"),
+        "max_tokens" => Cow::Borrowed("length"),
+        "tool_use" => Cow::Borrowed("tool_calls"),
+        _ => Cow::Owned(fr),
     }
 }
 
 /// finish_reason mapping, openai → anthropic.
-fn finish_anthropic(fr: String) -> String {
+fn finish_anthropic(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
-        "" | "stop" => "end_turn".to_owned(),
-        "length" => "max_tokens".to_owned(),
-        "tool_calls" => "tool_use".to_owned(),
-        _ => fr,
+        "" | "stop" => Cow::Borrowed("end_turn"),
+        "length" => Cow::Borrowed("max_tokens"),
+        "tool_calls" => Cow::Borrowed("tool_use"),
+        _ => Cow::Owned(fr),
     }
 }
 
@@ -2673,18 +2652,18 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
 /// OpenRouter's `reasoning{effort, max_tokens, enabled}`.
 fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Box<ReasoningParam>> {
     let mut param = ReasoningParam {
-        effort,
+        effort: effort.map(Cow::Owned),
         ..Default::default()
     };
     if let Some(Value::Object(mut reasoning)) = reasoning {
         if let Some(Value::String(effort)) = reasoning.remove("effort") {
-            param.effort = Some(effort);
+            param.effort = Some(Cow::Owned(effort));
         }
         param.budget_tokens = reasoning.get("max_tokens").and_then(Value::as_i64);
         if param.effort.is_none() && param.budget_tokens.is_none() {
             param.effort = match reasoning.get("enabled").and_then(Value::as_bool) {
-                Some(true) => Some("medium".to_owned()),
-                Some(false) => Some("none".to_owned()),
+                Some(true) => Some(Cow::Borrowed("medium")),
+                Some(false) => Some(Cow::Borrowed("none")),
                 None => None,
             };
         }
@@ -2713,7 +2692,7 @@ async fn chat_completions(
                 .map(|c| c.into_text_and_parts())
                 .unwrap_or_default();
             ChatMsg {
-                role: m.role,
+                role: m.role.into_owned(),
                 content,
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
@@ -2988,7 +2967,7 @@ fn chat_stream_response(
         id: String,
         created: i64,
         model: String,
-        pending_finish: Option<String>,
+        pending_finish: Option<Cow<'static, str>>,
         tool_index: usize,
     }
     impl SseEncodeState for St {
@@ -3054,11 +3033,8 @@ fn chat_stream_response(
                         &self.model,
                         Some(usage),
                     );
-                    fin.choices[0].finish_reason = Some(
-                        self.pending_finish
-                            .take()
-                            .unwrap_or_else(|| "stop".to_owned()),
-                    );
+                    fin.choices[0].finish_reason =
+                        Some(self.pending_finish.take().unwrap_or(Cow::Borrowed("stop")));
                     if let Ok(payload) = serde_json::to_string(&fin) {
                         self.queue.push_back(Event::default().data(payload));
                     }
@@ -3389,7 +3365,7 @@ fn messages_stream_response(
         next_idx: usize,
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
-        pending_finish: Option<String>,
+        pending_finish: Option<Cow<'static, str>>,
         thinking_capture: Option<ThinkingStreamCapture>,
     }
 
@@ -3492,7 +3468,7 @@ fn messages_stream_response(
             let stop = self
                 .pending_finish
                 .take()
-                .unwrap_or_else(|| "end_turn".to_owned());
+                .unwrap_or(Cow::Borrowed("end_turn"));
             let usage = anthropic_usage(input_tokens, output_tokens, detail);
             self.queue.push_back(Self::ev(
                 "message_delta",
@@ -5650,7 +5626,7 @@ mod tests {
         let mut frame = json!({"type":"input_text","text":"hello there"});
         assert_eq!(
             rt_inbound_policy(&app, &ak, "", &mut frame).await,
-            Err("blocked by moderator".to_owned())
+            Err(Cow::Borrowed("blocked by moderator"))
         );
         let mut secret = json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
         let n = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut secret);

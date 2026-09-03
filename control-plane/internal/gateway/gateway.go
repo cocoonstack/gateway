@@ -123,8 +123,7 @@ type Scope struct {
 	User   string
 }
 
-// Client is the control plane's only dependency on the Rust gateway; key mutations
-// carry the acting tenant ("" = global) so the gateway's own AdminScope draws the boundary.
+// Client is the control plane's only dependency on the Rust gateway; key mutations carry the acting tenant.
 type Client interface {
 	Usage(ctx context.Context, scope Scope, since, until int64) ([]UsageRow, error)
 	UsageSeries(ctx context.Context, scope Scope, bucket string, since, until int64) (Series, error)
