@@ -2655,9 +2655,10 @@ mod tests {
         assert_eq!(pending.status, gw_state::BatchStatus::Pending);
 
         let drainer = OfflineHandler::new(online);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let drain = tokio::spawn(async move {
             drainer
-                .drain_forever(120, std::time::Duration::from_millis(50))
+                .drain_until(120, std::time::Duration::from_millis(50), shutdown_rx)
                 .await
         });
         let mut completed = None;

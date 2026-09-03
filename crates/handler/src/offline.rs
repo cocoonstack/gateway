@@ -198,11 +198,29 @@ impl OfflineHandler {
         }
     }
 
-    /// Fleet drain loop for distributed stores: claim and execute pending batches, requeuing stale ones.
-    pub async fn drain_forever(&self, stale_secs: i64, poll: std::time::Duration) {
+    /// Fleet drain loop for distributed stores: stop claiming on shutdown, finish the claimed batch.
+    pub async fn drain_until(
+        &self,
+        stale_secs: i64,
+        poll: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         let store = self.online.state().store.clone();
         loop {
-            match store.batch_claim_pending(stale_secs).await {
+            if *shutdown.borrow() {
+                return;
+            }
+            let claimed = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                claimed = store.batch_claim_pending(stale_secs) => claimed,
+            };
+            match claimed {
                 Ok(Some((job, claim))) => {
                     // a key revoked/banned/expired since submit stops its queued work
                     let ak = match self.online.state().auth.authenticate(&job.ak).await {
@@ -242,10 +260,28 @@ impl OfflineHandler {
                     )
                     .await;
                 }
-                Ok(None) => tokio::time::sleep(poll).await,
+                Ok(None) => {
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(poll) => {}
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "batch claim failed; backing off");
-                    tokio::time::sleep(poll).await;
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(poll) => {}
+                    }
                 }
             }
         }

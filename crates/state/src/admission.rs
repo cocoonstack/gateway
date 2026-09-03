@@ -66,19 +66,24 @@ impl BillingLedger {
         // The bounded worker owns accepted rows through caller cancellation.
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(LEDGER_BATCH_MAX);
+            let mut row_acks = Vec::with_capacity(LEDGER_BATCH_MAX);
             let mut ack = None;
             let mut dropped = 0u64;
             while let Some(msg) = pending.recv().await {
-                msg.take(&mut batch, &mut ack);
+                msg.take(&mut batch, &mut row_acks, &mut ack);
                 while ack.is_none() && batch.len() < LEDGER_BATCH_MAX {
                     let Ok(next) = pending.try_recv() else {
                         break;
                     };
-                    next.take(&mut batch, &mut ack);
+                    next.take(&mut batch, &mut row_acks, &mut ack);
                 }
                 let rows = batch.len() as u64;
-                if !Self::commit(&worker_store, &mut batch).await {
+                let committed = Self::commit(&worker_store, &mut batch).await;
+                if !committed {
                     dropped += rows;
+                }
+                for tx in row_acks.drain(..) {
+                    let _ = tx.send(());
                 }
                 if let Some(tx) = ack.take() {
                     let _ = tx.send(std::mem::take(&mut dropped));
@@ -104,13 +109,20 @@ impl BillingLedger {
         rx.await.unwrap_or(0)
     }
 
-    // deferred on SQL backends: a SIGKILL between the response and the next flush loses the queue plus the batch in flight (4352 rows at the defaults)
     async fn write(&self, record: &BillingRecord) {
         if self.deferred
             && let Some(queue) = &self.queue
-            && queue.try_send(LedgerWrite::Row(record.clone())).is_ok()
         {
-            return;
+            if record.user_id.is_empty() {
+                if queue
+                    .try_send(LedgerWrite::Row(record.clone(), None))
+                    .is_ok()
+                {
+                    return;
+                }
+            } else if Self::queue_attributed(queue, record).await {
+                return;
+            }
         }
         let Err(e) = self.store.ledger_add(record).await else {
             return;
@@ -121,9 +133,29 @@ impl BillingLedger {
             return;
         };
         tracing::error!(error = %e, "billing ledger write failed; queued for repair");
-        if queue.send(LedgerWrite::Row(record.clone())).await.is_err() {
+        let queued = if record.user_id.is_empty() {
+            queue
+                .send(LedgerWrite::Row(record.clone(), None))
+                .await
+                .is_ok()
+        } else {
+            Self::queue_attributed(queue, record).await
+        };
+        if !queued {
             tracing::error!("billing ledger repair worker stopped");
         }
+    }
+
+    async fn queue_attributed(queue: &mpsc::Sender<LedgerWrite>, record: &BillingRecord) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if queue
+            .send(LedgerWrite::Row(record.clone(), Some(tx)))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.is_ok()
     }
 
     async fn commit(store: &Arc<dyn Store>, batch: &mut Vec<BillingRecord>) -> bool {
@@ -155,14 +187,24 @@ impl BillingLedger {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum LedgerWrite {
-    Row(BillingRecord),
+    Row(BillingRecord, Option<oneshot::Sender<()>>),
     Flush(oneshot::Sender<u64>),
 }
 
 impl LedgerWrite {
-    fn take(self, batch: &mut Vec<BillingRecord>, ack: &mut Option<oneshot::Sender<u64>>) {
+    fn take(
+        self,
+        batch: &mut Vec<BillingRecord>,
+        row_acks: &mut Vec<oneshot::Sender<()>>,
+        ack: &mut Option<oneshot::Sender<u64>>,
+    ) {
         match self {
-            LedgerWrite::Row(r) => batch.push(r),
+            LedgerWrite::Row(r, tx) => {
+                batch.push(r);
+                if let Some(tx) = tx {
+                    row_acks.push(tx);
+                }
+            }
             LedgerWrite::Flush(tx) => *ack = Some(tx),
         }
     }
@@ -407,7 +449,7 @@ mod tests {
             ak: "ak".into(),
             product: "p".into(),
             tenant: "default".into(),
-            user_id: "u".into(),
+            user_id: String::new(),
             request_id: request_id.into(),
             created_at_epoch_secs: 1,
             model: "m".into(),
@@ -445,6 +487,21 @@ mod tests {
         .expect("ledger repair did not finish");
         assert_eq!(count, 1);
         assert_eq!(rows[0].request_id, "req-repair");
+    }
+
+    #[tokio::test]
+    async fn attributed_write_returns_after_repair_commits() {
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(1);
+        let ledger = BillingLedger::repairing(store.clone());
+        let mut row = record("req-attributed");
+        row.user_id = "user-42".into();
+
+        ledger.write(&row).await;
+
+        let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rows[0].request_id, "req-attributed");
     }
 
     #[tokio::test]
