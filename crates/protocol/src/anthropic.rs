@@ -55,15 +55,6 @@ pub struct InMessage {
     pub content: Value,
 }
 
-/// Joined text of the `text`/untyped blocks in an Anthropic content array.
-pub fn blocks_text(blocks: &[Value]) -> String {
-    blocks
-        .iter()
-        .filter(|b| b["type"] == "text" || b.get("type").is_none())
-        .filter_map(|b| b["text"].as_str())
-        .collect()
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthUsage {
     pub input_tokens: i64,
@@ -73,6 +64,15 @@ pub struct AnthUsage {
     pub cache_read_input_tokens: i64,
     #[serde(default)]
     pub cache_creation_input_tokens: i64,
+}
+
+/// Joined text of the `text`/untyped blocks in an Anthropic content array.
+pub fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b["type"] == "text" || b.get("type").is_none())
+        .filter_map(|b| b["text"].as_str())
+        .collect()
 }
 
 /// An OpenAI `image_url` part as an Anthropic `image` block (data URI → base64

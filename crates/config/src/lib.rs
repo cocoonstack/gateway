@@ -158,29 +158,6 @@ pub struct VariantConf {
     pub weight: u32,
 }
 
-/// Cumulative-weight pick over a model's variants by a stable hash, so every
-/// instance maps the same key to the same bucket with no shared state.
-pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
-    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
-    let mut roll = fnv1a(key) % total.max(1);
-    for v in variants {
-        if roll < u64::from(v.weight) {
-            return Some(v);
-        }
-        roll -= u64::from(v.weight);
-    }
-    // weights are validated >= 1, so only an empty list falls through
-    variants.first()
-}
-
-/// FNV-1a 64: deterministic across processes and releases (std's hasher is
-/// neither), which the fleet-consistent sticky mapping depends on.
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 /// Per-component billing weights relative to the model's unit prices
 /// (e.g. cache reads at 0.1, cache writes at 1.25). Missing fields stay 1.0.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -238,10 +215,6 @@ pub struct LongContextConf {
     pub completion_weight: f64,
 }
 
-fn weight_one() -> f64 {
-    1.0
-}
-
 /// Upstream account slot (mock credentials unless a live endpoint is configured).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountConf {
@@ -289,10 +262,6 @@ pub struct AccountConf {
     #[serde(default)]
     pub cost_unit_price_micros: i64,
     pub protocols: Vec<String>,
-}
-
-fn default_priority() -> i32 {
-    1
 }
 
 /// What a fired content rule does: `block` denies, `flag` records, `shadow`
@@ -411,25 +380,6 @@ impl Default for StabilityConf {
     }
 }
 
-fn default_failure_threshold() -> usize {
-    3
-}
-fn default_availability_window_minutes() -> i64 {
-    5
-}
-fn default_unstable_error_rate() -> f64 {
-    0.1
-}
-fn default_unavailable_error_rate() -> f64 {
-    0.5
-}
-fn default_availability_min_samples() -> u64 {
-    20
-}
-fn default_cooldown_seconds() -> u64 {
-    30
-}
-
 /// One automatic-suspension tier: this many admission rejections in a day
 /// suspend the key for `suspend_hours`.
 #[derive(Debug, Clone, Deserialize)]
@@ -471,10 +421,6 @@ impl Default for AlertsConf {
             dedup_seconds: default_alert_dedup_seconds(),
         }
     }
-}
-
-fn default_alert_dedup_seconds() -> u64 {
-    300
 }
 
 /// Durable-record backend selection.
@@ -624,78 +570,6 @@ pub struct ProviderConf {
     /// Statuses safe to replay for this vendor; handed down to its accounts.
     #[serde(default)]
     pub retry_status: Vec<u16>,
-}
-
-struct ProviderPreset {
-    endpoint: &'static str,
-    wires: &'static [&'static str],
-    default_model_wire: &'static str,
-}
-
-fn provider_preset(kind: &str) -> Option<ProviderPreset> {
-    Some(match kind {
-        "openai" => ProviderPreset {
-            endpoint: "https://api.openai.com",
-            wires: &[
-                "openai-chat",
-                "embeddings",
-                "image",
-                "tts",
-                "stt",
-                "responses",
-                "completions",
-                "realtime",
-                "moderations",
-                "video",
-            ],
-            default_model_wire: "openai-chat",
-        },
-        "anthropic" => ProviderPreset {
-            endpoint: "https://api.anthropic.com",
-            wires: &["anthropic-messages"],
-            default_model_wire: "anthropic-messages",
-        },
-        "gemini" => ProviderPreset {
-            endpoint: "https://generativelanguage.googleapis.com",
-            wires: &["gemini", "realtime"],
-            default_model_wire: "gemini",
-        },
-        // OpenAI-protocol vendors: same wire shape, different base URL.
-        "deepseek" => ProviderPreset {
-            endpoint: "https://api.deepseek.com",
-            wires: &["openai-chat"],
-            default_model_wire: "openai-chat",
-        },
-        "openrouter" => ProviderPreset {
-            endpoint: "https://openrouter.ai/api",
-            wires: &["openai-chat"],
-            default_model_wire: "openai-chat",
-        },
-        "moonshot" => ProviderPreset {
-            endpoint: "https://api.moonshot.cn",
-            wires: &["openai-chat"],
-            default_model_wire: "openai-chat",
-        },
-        "xai" => ProviderPreset {
-            endpoint: "https://api.x.ai",
-            wires: &["openai-chat", "responses", "image", "video", "realtime"],
-            default_model_wire: "openai-chat",
-        },
-        "siliconflow" => ProviderPreset {
-            endpoint: "https://api.siliconflow.cn",
-            wires: &[
-                "openai-chat",
-                "embeddings",
-                "rerank",
-                "tts",
-                "stt",
-                "image",
-                "video",
-            ],
-            default_model_wire: "openai-chat",
-        },
-        _ => return None,
-    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1214,6 +1088,60 @@ impl GatewayConfig {
     }
 }
 
+/// Cumulative-weight pick over a model's variants by a stable hash, so every
+/// instance maps the same key to the same bucket with no shared state.
+pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
+    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
+    let mut roll = fnv1a(key) % total.max(1);
+    for v in variants {
+        if roll < u64::from(v.weight) {
+            return Some(v);
+        }
+        roll -= u64::from(v.weight);
+    }
+    // weights are validated >= 1, so only an empty list falls through
+    variants.first()
+}
+
+/// FNV-1a 64: deterministic across processes and releases (std's hasher is
+/// neither), which the fleet-consistent sticky mapping depends on.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn weight_one() -> f64 {
+    1.0
+}
+
+fn default_priority() -> i32 {
+    1
+}
+
+fn default_failure_threshold() -> usize {
+    3
+}
+fn default_availability_window_minutes() -> i64 {
+    5
+}
+fn default_unstable_error_rate() -> f64 {
+    0.1
+}
+fn default_unavailable_error_rate() -> f64 {
+    0.5
+}
+fn default_availability_min_samples() -> u64 {
+    20
+}
+fn default_cooldown_seconds() -> u64 {
+    30
+}
+
+fn default_alert_dedup_seconds() -> u64 {
+    300
+}
+
 /// Normalize a security policy at load: lower-case the blocklist and compile
 /// the regex rules (dropping any that fail, loudly).
 fn compile_security(sec: &mut SecurityConf) {
@@ -1285,6 +1213,78 @@ fn check_unique<'a>(
         }
     }
     Ok(())
+}
+
+struct ProviderPreset {
+    endpoint: &'static str,
+    wires: &'static [&'static str],
+    default_model_wire: &'static str,
+}
+
+fn provider_preset(kind: &str) -> Option<ProviderPreset> {
+    Some(match kind {
+        "openai" => ProviderPreset {
+            endpoint: "https://api.openai.com",
+            wires: &[
+                "openai-chat",
+                "embeddings",
+                "image",
+                "tts",
+                "stt",
+                "responses",
+                "completions",
+                "realtime",
+                "moderations",
+                "video",
+            ],
+            default_model_wire: "openai-chat",
+        },
+        "anthropic" => ProviderPreset {
+            endpoint: "https://api.anthropic.com",
+            wires: &["anthropic-messages"],
+            default_model_wire: "anthropic-messages",
+        },
+        "gemini" => ProviderPreset {
+            endpoint: "https://generativelanguage.googleapis.com",
+            wires: &["gemini", "realtime"],
+            default_model_wire: "gemini",
+        },
+        // OpenAI-protocol vendors: same wire shape, different base URL.
+        "deepseek" => ProviderPreset {
+            endpoint: "https://api.deepseek.com",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "openrouter" => ProviderPreset {
+            endpoint: "https://openrouter.ai/api",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "moonshot" => ProviderPreset {
+            endpoint: "https://api.moonshot.cn",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "xai" => ProviderPreset {
+            endpoint: "https://api.x.ai",
+            wires: &["openai-chat", "responses", "image", "video", "realtime"],
+            default_model_wire: "openai-chat",
+        },
+        "siliconflow" => ProviderPreset {
+            endpoint: "https://api.siliconflow.cn",
+            wires: &[
+                "openai-chat",
+                "embeddings",
+                "rerank",
+                "tts",
+                "stt",
+                "image",
+                "video",
+            ],
+            default_model_wire: "openai-chat",
+        },
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

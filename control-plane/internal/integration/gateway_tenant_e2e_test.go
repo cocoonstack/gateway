@@ -23,7 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
-	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
+	gatewayhttp "github.com/cocoonstack/gateway/control-plane/internal/gateway/http"
 	"github.com/cocoonstack/gateway/control-plane/internal/httpapi"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
@@ -251,7 +251,7 @@ func startGateway(t *testing.T, bin, pgURL, redisURL string) string {
 
 func startControlPlane(t *testing.T, gwURL string) *httptest.Server {
 	t.Helper()
-	client, err := gateway.NewHTTP("gw="+gwURL, "root-e2e-token", map[string]string{"acme": "acme-e2e-token"})
+	client, err := gatewayhttp.New("gw="+gwURL, "root-e2e-token", map[string]string{"acme": "acme-e2e-token"})
 	if err != nil {
 		t.Fatalf("build gateway client: %v", err)
 	}

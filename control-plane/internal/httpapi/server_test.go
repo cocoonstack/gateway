@@ -11,6 +11,7 @@ import (
 
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
+	gatewaymock "github.com/cocoonstack/gateway/control-plane/internal/gateway/mock"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
 	usermemory "github.com/cocoonstack/gateway/control-plane/internal/user/memory"
@@ -265,7 +266,7 @@ func newTestServer(t *testing.T, store user.Store, trustedProxy bool) *Server {
 	return New(Options{
 		Users:        store,
 		Sessions:     kvmemory.New(),
-		Gateway:      gateway.NewMock(),
+		Gateway:      gatewaymock.New(),
 		SessionTTL:   time.Hour,
 		TrustedProxy: trustedProxy,
 		WebDir:       t.TempDir(),
