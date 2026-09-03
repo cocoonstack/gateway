@@ -860,8 +860,7 @@ impl GatewayConfig {
     /// Structural and value invariants checked before use: wire types, prices,
     /// token-rate weights, retry_status range, quota/variant shape.
     fn validate(&self) -> Result<(), ConfigError> {
-        // video/search wires are provider-specific (dialect by provider name): an
-        // unpinned model would round-robin one vendor's body into another's API
+        // an unpinned video/search model would round-robin one vendor's body into another's API
         if let Some(m) = self
             .models
             .iter()

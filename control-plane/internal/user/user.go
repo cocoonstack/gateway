@@ -30,8 +30,7 @@ type User struct {
 	GatewayUserID string `json:"gateway_user_id"`
 	Role          Role   `json:"role"`
 	Disabled      bool   `json:"disabled"`
-	// PasswordChangedAt evicts sessions issued at or before it (epoch secs);
-	// zero = never reset.
+	// PasswordChangedAt evicts sessions issued at or before it (epoch secs); zero = never reset.
 	PasswordChangedAt int64 `json:"-"`
 	CreatedAt         int64 `json:"created_at"`
 	UpdatedAt         int64 `json:"updated_at"`

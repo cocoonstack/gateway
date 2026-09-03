@@ -164,10 +164,8 @@ mod tests {
             audio_completion: 3,
             ..Default::default()
         };
-        // 6×1 + 4×4 + 4×1.25 + 2×2 = 31; 2×1 + 3×8 = 26
         assert_eq!(weighted_prompt(&input, &rate), 31);
         assert_eq!(weighted_completion(&input, &rate), 26);
-        // subsets never exceed their parent counts
         let hostile = TokenInput {
             prompt: 2,
             audio_prompt: 9,

@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         "gateway state built"
     );
 
-    // daily quota reset; governance is a preserved seam, so this survives reloads
+    // governance is a preserved seam: the quota reset survives reloads
     let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
     let purge_task = gw_task::spawn_content_purge(state.clone(), gw_task::PURGE_PERIOD);
     let rollup_task = gw_task::spawn_usage_rollup(state.clone(), gw_task::ROLLUP_PERIOD);
@@ -215,8 +215,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The upstream transport from `GW_TRANSPORT`: `mock` forces zero egress, `http`
-/// forces real HTTP, anything else routes `mock://` in-process and real URLs over HTTP.
+// GW_TRANSPORT: mock = zero egress, http = real HTTP, unset = mock:// in-process and real URLs over HTTP
 fn select_transport() -> anyhow::Result<gw_engines::SharedTransport> {
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
