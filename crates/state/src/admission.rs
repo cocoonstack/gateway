@@ -77,10 +77,10 @@ impl BillingLedger {
                     };
                     next.take(&mut batch, &mut row_acks, &mut ack);
                 }
-                let rows = batch.len() as u64;
+                let unacked = (batch.len() - row_acks.len()) as u64;
                 let committed = Self::commit(&worker_store, &mut batch).await;
                 if !committed {
-                    dropped += rows;
+                    dropped += unacked;
                 }
                 for tx in row_acks.drain(..) {
                     let _ = tx.send(committed);
