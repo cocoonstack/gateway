@@ -1438,18 +1438,25 @@ impl SqliteStore {
     }
 }
 
-/// Rewrite `?` placeholders to Postgres `$1..$N`. Only used on the shared
-/// queries below, none of which carries a literal `?`.
+/// Rewrite `?` placeholders to Postgres `$1..$N`; a numbered `?N` keeps its N.
+/// Only used on the shared queries below, none of which carries a literal `?`.
 fn pg_numbered(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 8);
     let mut n = 0;
-    for ch in sql.chars() {
-        if ch == '?' {
-            n += 1;
-            out.push('$');
-            out.push_str(&n.to_string());
-        } else {
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '?' {
             out.push(ch);
+            continue;
+        }
+        out.push('$');
+        if chars.peek().is_some_and(char::is_ascii_digit) {
+            while let Some(d) = chars.next_if(char::is_ascii_digit) {
+                out.push(d);
+            }
+        } else {
+            n += 1;
+            out.push_str(&n.to_string());
         }
     }
     out
@@ -1467,6 +1474,192 @@ macro_rules! dialect_sql {
     }};
 }
 
+macro_rules! sql_bigint {
+    (sqlite) => {
+        ""
+    };
+    (postgres) => {
+        "::BIGINT"
+    };
+}
+
+macro_rules! sql_text {
+    (sqlite) => {
+        ""
+    };
+    (postgres) => {
+        "::text"
+    };
+}
+
+macro_rules! sql_greatest {
+    (sqlite) => {
+        "MAX"
+    };
+    (postgres) => {
+        "GREATEST"
+    };
+}
+
+macro_rules! sql_opt_eq {
+    ($d:ident, $ph:literal, $col:literal) => {
+        concat!(
+            "(",
+            $ph,
+            sql_text!($d),
+            " IS NULL OR ",
+            $col,
+            " = ",
+            $ph,
+            ")"
+        )
+    };
+}
+
+macro_rules! usage_sums {
+    ($d:ident) => {
+        concat!(
+            "SUM(prompt_tokens)",
+            sql_bigint!($d),
+            ", SUM(completion_tokens)",
+            sql_bigint!($d),
+            ", SUM(total_tokens)",
+            sql_bigint!($d),
+            ", SUM(cost_micros)",
+            sql_bigint!($d),
+            ", SUM(vendor_cost_micros)",
+            sql_bigint!($d),
+            ", SUM(billed_units)",
+            sql_bigint!($d)
+        )
+    };
+}
+
+macro_rules! q_ledger_usage {
+    ($d:ident, $where:literal) => {
+        concat!(
+            "SELECT tenant, model, COUNT(*), ",
+            usage_sums!($d),
+            " FROM billing",
+            $where,
+            " GROUP BY tenant, model ORDER BY tenant, model"
+        )
+    };
+}
+
+macro_rules! q_user_usage_rolled {
+    ($d:ident) => {
+        concat!(
+            "SELECT user_id, model, SUM(requests)",
+            sql_bigint!($d),
+            ", ",
+            usage_sums!($d),
+            " FROM usage_rollup WHERE ",
+            sql_opt_eq!($d, "?1", "tenant"),
+            " AND ",
+            sql_opt_eq!($d, "?2", "user_id"),
+            " AND minute_epoch BETWEEN ?3 AND ?4 GROUP BY user_id, model"
+        )
+    };
+}
+
+macro_rules! q_user_usage_raw {
+    ($d:ident) => {
+        concat!(
+            "SELECT user_id, model, COUNT(*), ",
+            usage_sums!($d),
+            " FROM billing WHERE ",
+            sql_opt_eq!($d, "?1", "tenant"),
+            " AND ",
+            sql_opt_eq!($d, "?2", "user_id"),
+            " AND created_at_epoch_secs BETWEEN ",
+            sql_greatest!($d),
+            "(?3, ?5) AND ?4 GROUP BY user_id, model"
+        )
+    };
+}
+
+macro_rules! q_series_rolled {
+    ($d:ident) => {
+        concat!(
+            "SELECT minute_epoch - (minute_epoch % ?5), SUM(requests)",
+            sql_bigint!($d),
+            ", ",
+            usage_sums!($d),
+            " FROM usage_rollup WHERE ",
+            sql_opt_eq!($d, "?1", "tenant"),
+            " AND ",
+            sql_opt_eq!($d, "?2", "user_id"),
+            " AND minute_epoch BETWEEN ?3 AND ?4 GROUP BY 1"
+        )
+    };
+}
+
+macro_rules! q_series_raw {
+    ($d:ident) => {
+        concat!(
+            "SELECT created_at_epoch_secs - (created_at_epoch_secs % ?6), COUNT(*), ",
+            usage_sums!($d),
+            " FROM billing WHERE ",
+            sql_opt_eq!($d, "?1", "tenant"),
+            " AND ",
+            sql_opt_eq!($d, "?2", "user_id"),
+            " AND created_at_epoch_secs BETWEEN ",
+            sql_greatest!($d),
+            "(?3, ?5) AND ?4 GROUP BY 1"
+        )
+    };
+}
+
+macro_rules! q_rollup_insert {
+    ($d:ident) => {
+        concat!(
+            "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests, \
+             prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, \
+             billed_units) SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*), ",
+            usage_sums!($d),
+            " FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2 \
+             GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET requests = ",
+            sql_greatest!($d), "(usage_rollup.requests, excluded.requests), prompt_tokens = ",
+            sql_greatest!($d), "(usage_rollup.prompt_tokens, excluded.prompt_tokens), completion_tokens = ",
+            sql_greatest!($d), "(usage_rollup.completion_tokens, excluded.completion_tokens), total_tokens = ",
+            sql_greatest!($d), "(usage_rollup.total_tokens, excluded.total_tokens), cost_micros = ",
+            sql_greatest!($d), "(usage_rollup.cost_micros, excluded.cost_micros), vendor_cost_micros = ",
+            sql_greatest!($d), "(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros), billed_units = ",
+            sql_greatest!($d), "(usage_rollup.billed_units, excluded.billed_units)"
+        )
+    };
+}
+
+macro_rules! q_security_events {
+    ($d:ident) => {
+        concat!(
+            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule, action, hits \
+             FROM security_events WHERE ",
+            sql_opt_eq!($d, "?1", "tenant"), " ORDER BY n DESC LIMIT ?2"
+        )
+    };
+}
+
+macro_rules! q_content_list {
+    ($d:ident, bodies) => {
+        concat!(q_content_list!(@head), "content", q_content_list!(@tail $d))
+    };
+    ($d:ident, empty) => {
+        concat!(q_content_list!(@head), "''", sql_text!($d), q_content_list!(@tail $d))
+    };
+    (@head) => {
+        "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, "
+    };
+    (@tail $d:ident) => {
+        concat!(
+            ", sealed, expires_at_epoch_secs FROM request_content WHERE user_id = ?1 AND ",
+            sql_opt_eq!($d, "?2", "tenant"),
+            " ORDER BY n DESC LIMIT ?3"
+        )
+    };
+}
+
 /// One `impl Store` per SQL backend: the dialect-independent methods expand from
 /// this body, `$specific` carries the dialect-bound ones.
 macro_rules! sql_store_impl {
@@ -1474,6 +1667,134 @@ macro_rules! sql_store_impl {
         #[async_trait::async_trait]
         impl Store for $T {
             $($specific)*
+
+            async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
+                // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
+                let rows = match tenant {
+                    Some(t) => {
+                        sqlx::query(dialect_sql!($dialect, q_ledger_usage!($dialect, " WHERE tenant = ?")))
+                            .bind(t)
+                            .fetch_all(&self.pool)
+                            .await
+                    }
+                    None => {
+                        sqlx::query(dialect_sql!($dialect, q_ledger_usage!($dialect, "")))
+                            .fetch_all(&self.pool)
+                            .await
+                    }
+                }
+                .map_err(|e| crate::sqlx_err("roll up usage", e))?;
+                Ok(rows.iter().map(usage_row).collect())
+            }
+
+            async fn usage_by_user(
+                &self,
+                tenant: Option<&str>,
+                user: Option<&str>,
+                since: i64,
+                until: i64,
+            ) -> GResult<Vec<UserUsageRow>> {
+                let (since, until) = align_bounds(since, until);
+                let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+                let rolled = sqlx::query(dialect_sql!($dialect, q_user_usage_rolled!($dialect)))
+                    .bind(tenant)
+                    .bind(user)
+                    .bind(since)
+                    .bind(until)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
+                let raw = sqlx::query(dialect_sql!($dialect, q_user_usage_raw!($dialect)))
+                    .bind(tenant)
+                    .bind(user)
+                    .bind(since)
+                    .bind(until)
+                    .bind(watermark)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
+                let mut map = BTreeMap::new();
+                fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
+                fold_user_usage(&mut map, raw.iter().map(user_usage_row));
+                Ok(map.into_values().collect())
+            }
+
+            async fn usage_series(
+                &self,
+                tenant: Option<&str>,
+                user: Option<&str>,
+                since: i64,
+                until: i64,
+                bucket_secs: i64,
+            ) -> GResult<Vec<(i64, UserUsageRow)>> {
+                let (since, until) = align_bounds(since, until);
+                let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+                let rolled = sqlx::query(dialect_sql!($dialect, q_series_rolled!($dialect)))
+                    .bind(tenant)
+                    .bind(user)
+                    .bind(since)
+                    .bind(until)
+                    .bind(bucket_secs)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("read rolled series", e))?;
+                let raw = sqlx::query(dialect_sql!($dialect, q_series_raw!($dialect)))
+                    .bind(tenant)
+                    .bind(user)
+                    .bind(since)
+                    .bind(until)
+                    .bind(watermark)
+                    .bind(bucket_secs)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
+                let mut map = BTreeMap::new();
+                fold_series(&mut map, rolled.iter().map(series_row));
+                fold_series(&mut map, raw.iter().map(series_row));
+                Ok(map.into_iter().collect())
+            }
+
+            async fn security_events(
+                &self,
+                tenant: Option<&str>,
+                limit: usize,
+            ) -> GResult<Vec<SecurityEvent>> {
+                let rows = sqlx::query(dialect_sql!($dialect, q_security_events!($dialect)))
+                    .bind(tenant)
+                    .bind(limit.min(i64::MAX as usize) as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("read security events", e))?;
+                Ok(rows.iter().map(security_event_row).collect())
+            }
+
+            async fn content_list_user(
+                &self,
+                tenant: Option<&str>,
+                user: &str,
+                limit: usize,
+                with_bodies: bool,
+            ) -> GResult<Vec<crate::ContentRecord>> {
+                let sql = if with_bodies {
+                    dialect_sql!($dialect, q_content_list!($dialect, bodies))
+                } else {
+                    dialect_sql!($dialect, q_content_list!($dialect, empty))
+                };
+                let rows = sqlx::query(sql)
+                    .bind(user)
+                    .bind(tenant)
+                    .bind(limit.min(i64::MAX as usize) as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("list user content", e))?;
+                Ok(rows.iter().map(content_row).collect())
+            }
 
             async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
                 self.ledger_add_batch(std::slice::from_ref(r)).await
@@ -1807,182 +2128,19 @@ macro_rules! sql_store_impl {
 }
 
 sql_store_impl!(SqliteStore, sqlite, {
-    async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
-        // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
-        let rows =
-            match tenant {
-                Some(t) => sqlx::query(
-                    "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-                     FROM billing WHERE tenant = ?
-                     GROUP BY tenant, model ORDER BY tenant, model",
-                )
-                .bind(t)
-                .fetch_all(&self.pool)
-                .await,
-                None => sqlx::query(
-                    "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                     SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-                     FROM billing
-                     GROUP BY tenant, model ORDER BY tenant, model",
-                )
-                .fetch_all(&self.pool)
-                .await,
-            }
-            .map_err(|e| crate::sqlx_err("roll up usage", e))?;
-        Ok(rows.iter().map(usage_row).collect())
-    }
-
-    async fn usage_by_user(
-        &self,
-        tenant: Option<&str>,
-        user: Option<&str>,
-        since: i64,
-        until: i64,
-    ) -> GResult<Vec<UserUsageRow>> {
-        let (since, until) = align_bounds(since, until);
-        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
-        let rolled = sqlx::query(
-            "SELECT user_id, model, SUM(requests), SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-             FROM usage_rollup
-             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
-               AND minute_epoch BETWEEN ?3 AND ?4
-             GROUP BY user_id, model",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
-        let raw = sqlx::query(
-            "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-             FROM billing
-             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
-               AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
-             GROUP BY user_id, model",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .bind(watermark)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        let mut map = BTreeMap::new();
-        fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
-        fold_user_usage(&mut map, raw.iter().map(user_usage_row));
-        Ok(map.into_values().collect())
-    }
-
-    async fn usage_series(
-        &self,
-        tenant: Option<&str>,
-        user: Option<&str>,
-        since: i64,
-        until: i64,
-        bucket_secs: i64,
-    ) -> GResult<Vec<(i64, UserUsageRow)>> {
-        let (since, until) = align_bounds(since, until);
-        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
-        let rolled = sqlx::query(
-            "SELECT minute_epoch - (minute_epoch % ?5), SUM(requests),
-             SUM(prompt_tokens), SUM(completion_tokens),
-             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-             FROM usage_rollup
-             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
-               AND minute_epoch BETWEEN ?3 AND ?4
-             GROUP BY 1",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .bind(bucket_secs)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read rolled series", e))?;
-        let raw = sqlx::query(
-            "SELECT created_at_epoch_secs - (created_at_epoch_secs % ?6), COUNT(*),
-             SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-             SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-             FROM billing
-             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
-               AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
-             GROUP BY 1",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .bind(watermark)
-        .bind(bucket_secs)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
-        let mut map = BTreeMap::new();
-        fold_series(&mut map, rolled.iter().map(series_row));
-        fold_series(&mut map, raw.iter().map(series_row));
-        Ok(map.into_iter().collect())
-    }
-
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
-        let r = sqlx::query(
-            "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
-              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units)
-             SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
-              SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-              SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units)
-             FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2
-             GROUP BY 1, 2, 3, 4
-             ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
-              requests = MAX(usage_rollup.requests, excluded.requests),
-              prompt_tokens = MAX(usage_rollup.prompt_tokens, excluded.prompt_tokens),
-              completion_tokens = MAX(usage_rollup.completion_tokens, excluded.completion_tokens),
-              total_tokens = MAX(usage_rollup.total_tokens, excluded.total_tokens),
-              cost_micros = MAX(usage_rollup.cost_micros, excluded.cost_micros),
-              vendor_cost_micros = MAX(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros),
-              billed_units = MAX(usage_rollup.billed_units, excluded.billed_units)",
-        )
-        .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
-        .bind(hi)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("advance usage rollup", e))?;
+        let r = sqlx::query(dialect_sql!(sqlite, q_rollup_insert!(sqlite)))
+            .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
+            .bind(hi)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("advance usage rollup", e))?;
         Ok(r.rows_affected())
-    }
-
-    async fn security_events(
-        &self,
-        tenant: Option<&str>,
-        limit: usize,
-    ) -> GResult<Vec<SecurityEvent>> {
-        let rows = sqlx::query(
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule,
-             action, hits FROM security_events
-             WHERE (?1 IS NULL OR tenant = ?1) ORDER BY n DESC LIMIT ?2",
-        )
-        .bind(tenant)
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read security events", e))?;
-        Ok(rows.iter().map(security_event_row).collect())
     }
 
     async fn content_erase_user(
@@ -2043,34 +2201,6 @@ sql_store_impl!(SqliteStore, sqlite, {
             .await
             .map_err(|e| crate::sqlx_err("commit erase", e))?;
         Ok(erased)
-    }
-
-    async fn content_list_user(
-        &self,
-        tenant: Option<&str>,
-        user: &str,
-        limit: usize,
-        with_bodies: bool,
-    ) -> GResult<Vec<crate::ContentRecord>> {
-        let sql = if with_bodies {
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
-             sealed, expires_at_epoch_secs FROM request_content
-             WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
-             ORDER BY n DESC LIMIT ?3"
-        } else {
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '',
-             sealed, expires_at_epoch_secs FROM request_content
-             WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)
-             ORDER BY n DESC LIMIT ?3"
-        };
-        let rows = sqlx::query(sql)
-            .bind(user)
-            .bind(tenant)
-            .bind(limit.min(i64::MAX as usize) as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("list user content", e))?;
-        Ok(rows.iter().map(content_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -2327,144 +2457,6 @@ impl PostgresStore {
 }
 
 sql_store_impl!(PostgresStore, postgres, {
-    async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
-        // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
-        let rows = match tenant {
-            Some(t) => {
-                sqlx::query(
-                    "SELECT tenant, model, COUNT(*),
-                     SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-                     SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-                     SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-                     FROM billing WHERE tenant = $1
-                     GROUP BY tenant, model ORDER BY tenant, model",
-                )
-                .bind(t)
-                .fetch_all(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    "SELECT tenant, model, COUNT(*),
-                     SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-                     SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-                     SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-                     FROM billing
-                     GROUP BY tenant, model ORDER BY tenant, model",
-                )
-                .fetch_all(&self.pool)
-                .await
-            }
-        }
-        .map_err(|e| crate::sqlx_err("roll up usage", e))?;
-        Ok(rows.iter().map(usage_row).collect())
-    }
-
-    async fn usage_by_user(
-        &self,
-        tenant: Option<&str>,
-        user: Option<&str>,
-        since: i64,
-        until: i64,
-    ) -> GResult<Vec<UserUsageRow>> {
-        let (since, until) = align_bounds(since, until);
-        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
-        let rolled = sqlx::query(
-            "SELECT user_id, model, SUM(requests)::BIGINT,
-             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-             FROM usage_rollup
-             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
-               AND minute_epoch BETWEEN $3 AND $4
-             GROUP BY user_id, model",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read rolled usage", e))?;
-        let raw = sqlx::query(
-            "SELECT user_id, model, COUNT(*),
-             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-             FROM billing
-             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
-               AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
-             GROUP BY user_id, model",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .bind(watermark)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        let mut map = BTreeMap::new();
-        fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
-        fold_user_usage(&mut map, raw.iter().map(user_usage_row));
-        Ok(map.into_values().collect())
-    }
-
-    async fn usage_series(
-        &self,
-        tenant: Option<&str>,
-        user: Option<&str>,
-        since: i64,
-        until: i64,
-        bucket_secs: i64,
-    ) -> GResult<Vec<(i64, UserUsageRow)>> {
-        let (since, until) = align_bounds(since, until);
-        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
-        let rolled = sqlx::query(
-            "SELECT minute_epoch - (minute_epoch % $5), SUM(requests)::BIGINT,
-             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-             FROM usage_rollup
-             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
-               AND minute_epoch BETWEEN $3 AND $4
-             GROUP BY 1",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .bind(bucket_secs)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read rolled series", e))?;
-        let raw = sqlx::query(
-            "SELECT created_at_epoch_secs - (created_at_epoch_secs % $6), COUNT(*),
-             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT, SUM(total_tokens)::BIGINT,
-             SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-             FROM billing
-             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
-               AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
-             GROUP BY 1",
-        )
-        .bind(tenant)
-        .bind(user)
-        .bind(since)
-        .bind(until)
-        .bind(watermark)
-        .bind(bucket_secs)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
-        let mut map = BTreeMap::new();
-        fold_series(&mut map, rolled.iter().map(series_row));
-        fold_series(&mut map, raw.iter().map(series_row));
-        Ok(map.into_iter().collect())
-    }
-
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut tx = self
@@ -2484,53 +2476,16 @@ sql_store_impl!(PostgresStore, postgres, {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
-        let r = sqlx::query(
-            "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests,
-              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units)
-             SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*),
-              SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
-              SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT,
-              SUM(vendor_cost_micros)::BIGINT, SUM(billed_units)::BIGINT
-             FROM billing WHERE created_at_epoch_secs >= $1 AND created_at_epoch_secs < $2
-             GROUP BY 1, 2, 3, 4
-             ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET
-              requests = GREATEST(usage_rollup.requests, excluded.requests),
-              prompt_tokens = GREATEST(usage_rollup.prompt_tokens, excluded.prompt_tokens),
-              completion_tokens =
-               GREATEST(usage_rollup.completion_tokens, excluded.completion_tokens),
-              total_tokens = GREATEST(usage_rollup.total_tokens, excluded.total_tokens),
-              cost_micros = GREATEST(usage_rollup.cost_micros, excluded.cost_micros),
-              vendor_cost_micros =
-               GREATEST(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros),
-              billed_units = GREATEST(usage_rollup.billed_units, excluded.billed_units)",
-        )
-        .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
-        .bind(hi)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| crate::sqlx_err("advance usage rollup", e))?;
+        let r = sqlx::query(dialect_sql!(postgres, q_rollup_insert!(postgres)))
+            .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
+            .bind(hi)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("advance usage rollup", e))?;
         tx.commit()
             .await
             .map_err(|e| crate::sqlx_err("commit rollup", e))?;
         Ok(r.rows_affected())
-    }
-
-    async fn security_events(
-        &self,
-        tenant: Option<&str>,
-        limit: usize,
-    ) -> GResult<Vec<SecurityEvent>> {
-        let rows = sqlx::query(
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule,
-             action, hits FROM security_events
-             WHERE ($1::text IS NULL OR tenant = $1) ORDER BY n DESC LIMIT $2",
-        )
-        .bind(tenant)
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read security events", e))?;
-        Ok(rows.iter().map(security_event_row).collect())
     }
 
     async fn content_erase_user(
@@ -2593,34 +2548,6 @@ sql_store_impl!(PostgresStore, postgres, {
             .await
             .map_err(|e| crate::sqlx_err("commit erase", e))?;
         Ok(erased)
-    }
-
-    async fn content_list_user(
-        &self,
-        tenant: Option<&str>,
-        user: &str,
-        limit: usize,
-        with_bodies: bool,
-    ) -> GResult<Vec<crate::ContentRecord>> {
-        let sql = if with_bodies {
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
-             sealed, expires_at_epoch_secs FROM request_content
-             WHERE user_id = $1 AND ($2::text IS NULL OR tenant = $2)
-             ORDER BY n DESC LIMIT $3"
-        } else {
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, ''::text,
-             sealed, expires_at_epoch_secs FROM request_content
-             WHERE user_id = $1 AND ($2::text IS NULL OR tenant = $2)
-             ORDER BY n DESC LIMIT $3"
-        };
-        let rows = sqlx::query(sql)
-            .bind(user)
-            .bind(tenant)
-            .bind(limit.min(i64::MAX as usize) as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("list user content", e))?;
-        Ok(rows.iter().map(content_row).collect())
     }
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -2936,7 +2863,96 @@ mod tests {
     static RECORD_SEQ: AtomicUsize = AtomicUsize::new(1);
 
     #[test]
+    fn shared_sql_renders_the_pre_share_text_per_dialect() {
+        fn norm(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        let cases: [(&str, &str, &str); 10] = [
+            (
+                q_ledger_usage!(sqlite, " WHERE tenant = ?"),
+                pg_numbered(q_ledger_usage!(postgres, " WHERE tenant = ?")).leak(),
+                "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM billing WHERE tenant = ? GROUP BY tenant, model ORDER BY tenant, model",
+            ),
+            (
+                q_ledger_usage!(sqlite, ""),
+                pg_numbered(q_ledger_usage!(postgres, "")).leak(),
+                "SELECT tenant, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM billing GROUP BY tenant, model ORDER BY tenant, model",
+            ),
+            (
+                q_user_usage_rolled!(sqlite),
+                pg_numbered(q_user_usage_rolled!(postgres)).leak(),
+                "SELECT user_id, model, SUM(requests), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM usage_rollup WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2) AND minute_epoch BETWEEN ?3 AND ?4 GROUP BY user_id, model",
+            ),
+            (
+                q_user_usage_raw!(sqlite),
+                pg_numbered(q_user_usage_raw!(postgres)).leak(),
+                "SELECT user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM billing WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2) AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4 GROUP BY user_id, model",
+            ),
+            (
+                q_series_rolled!(sqlite),
+                pg_numbered(q_series_rolled!(postgres)).leak(),
+                "SELECT minute_epoch - (minute_epoch % ?5), SUM(requests), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM usage_rollup WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2) AND minute_epoch BETWEEN ?3 AND ?4 GROUP BY 1",
+            ),
+            (
+                q_series_raw!(sqlite),
+                pg_numbered(q_series_raw!(postgres)).leak(),
+                "SELECT created_at_epoch_secs - (created_at_epoch_secs % ?6), COUNT(*), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM billing WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2) AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4 GROUP BY 1",
+            ),
+            (
+                q_rollup_insert!(sqlite),
+                pg_numbered(q_rollup_insert!(postgres)).leak(),
+                "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests, prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, billed_units) SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros), SUM(billed_units) FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2 GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET requests = MAX(usage_rollup.requests, excluded.requests), prompt_tokens = MAX(usage_rollup.prompt_tokens, excluded.prompt_tokens), completion_tokens = MAX(usage_rollup.completion_tokens, excluded.completion_tokens), total_tokens = MAX(usage_rollup.total_tokens, excluded.total_tokens), cost_micros = MAX(usage_rollup.cost_micros, excluded.cost_micros), vendor_cost_micros = MAX(usage_rollup.vendor_cost_micros, excluded.vendor_cost_micros), billed_units = MAX(usage_rollup.billed_units, excluded.billed_units)",
+            ),
+            (
+                q_security_events!(sqlite),
+                pg_numbered(q_security_events!(postgres)).leak(),
+                "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, surface, rule, action, hits FROM security_events WHERE (?1 IS NULL OR tenant = ?1) ORDER BY n DESC LIMIT ?2",
+            ),
+            (
+                q_content_list!(sqlite, bodies),
+                pg_numbered(q_content_list!(postgres, bodies)).leak(),
+                "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content, sealed, expires_at_epoch_secs FROM request_content WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2) ORDER BY n DESC LIMIT ?3",
+            ),
+            (
+                q_content_list!(sqlite, empty),
+                pg_numbered(q_content_list!(postgres, empty)).leak(),
+                "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, '', sealed, expires_at_epoch_secs FROM request_content WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2) ORDER BY n DESC LIMIT ?3",
+            ),
+        ];
+        for (sqlite, postgres, pre_share_sqlite) in cases {
+            assert_eq!(norm(sqlite), norm(pre_share_sqlite));
+            let pre_share_postgres = pre_share_sqlite
+                .replace(", SUM(requests), ", ", SUM(requests)::BIGINT, ")
+                .replace("SUM(prompt_tokens),", "SUM(prompt_tokens)::BIGINT,")
+                .replace("SUM(completion_tokens),", "SUM(completion_tokens)::BIGINT,")
+                .replace("SUM(total_tokens),", "SUM(total_tokens)::BIGINT,")
+                .replace("SUM(cost_micros),", "SUM(cost_micros)::BIGINT,")
+                .replace(
+                    "SUM(vendor_cost_micros),",
+                    "SUM(vendor_cost_micros)::BIGINT,",
+                )
+                .replace("SUM(billed_units) FROM", "SUM(billed_units)::BIGINT FROM")
+                .replace("(?1 IS NULL", "($1::text IS NULL")
+                .replace("(?2 IS NULL", "($2::text IS NULL")
+                .replace("MAX(", "GREATEST(")
+                .replace("kind, '',", "kind, ''::text,")
+                .replace("?1", "$1")
+                .replace("?2", "$2")
+                .replace("?3", "$3")
+                .replace("?4", "$4")
+                .replace("?5", "$5")
+                .replace("?6", "$6")
+                .replace("tenant = ? GROUP", "tenant = $1 GROUP");
+            assert_eq!(norm(postgres), norm(&pre_share_postgres));
+        }
+    }
+
+    #[test]
     fn pg_numbered_rewrites_placeholders_in_order() {
+        assert_eq!(
+            pg_numbered("x BETWEEN MAX(?3, ?5) AND ?4 OR ?1 IS NULL"),
+            "x BETWEEN MAX($3, $5) AND $4 OR $1 IS NULL"
+        );
         assert_eq!(
             pg_numbered("a = ? AND b IN (?, ?)"),
             "a = $1 AND b IN ($2, $3)"
