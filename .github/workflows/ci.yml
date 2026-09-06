@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       # Run cargo-deny directly (pinned) rather than the action, whose musl
       # container mis-resolves rust-toolchain.toml and tracks a floating CLI.
-      - uses: taiki-e/install-action@v2.87.2
+      - uses: taiki-e/install-action@v2.87.4
         with:
           tool: cargo-deny@0.20.2
       - uses: Swatinem/rust-cache@v2.9.2
