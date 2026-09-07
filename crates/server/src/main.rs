@@ -13,7 +13,11 @@ use std::time::Duration;
 use gw_config::GatewayConfig;
 use gw_state::GatewayState;
 use gw_views::AppState;
-use tracing_subscriber::EnvFilter;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 const BATCH_STALE_SECS: i64 = 120;
 const BATCH_POLL: Duration = Duration::from_secs(2);
@@ -24,11 +28,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let tracer_provider = init_tracing()?;
 
     // reloads re-read this captured source
     let config_source = env::var("GW_CONFIG").ok();
@@ -225,7 +225,75 @@ async fn main() -> anyhow::Result<()> {
     alert_task.abort();
     avail_alert_task.abort();
     tracing::info!("gw drained and exiting");
+    if let Some(provider) = tracer_provider
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::error!(error = %e, "trace exporter shutdown");
+    }
     Ok(())
+}
+
+/// Logs to stdout under RUST_LOG; the request span additionally exports over
+/// OTLP when the standard OTEL_EXPORTER_OTLP_* environment names a collector.
+fn init_tracing() -> anyhow::Result<Option<SdkTracerProvider>> {
+    let log_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive(format!("{}=off", gw_views::TRACE_TARGET).parse()?);
+    let provider = otlp_provider()?;
+    let traces = provider.as_ref().map(|p| {
+        tracing_opentelemetry::layer()
+            .with_tracer(p.tracer("gw"))
+            .with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                m.target() == gw_views::TRACE_TARGET
+            }))
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(log_filter))
+        .with(traces)
+        .init();
+    Ok(provider)
+}
+
+fn otlp_provider() -> anyhow::Result<Option<SdkTracerProvider>> {
+    if env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none()
+        && env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_none()
+    {
+        return Ok(None);
+    }
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()?;
+    let mut resource = opentelemetry_sdk::Resource::builder();
+    if env::var_os("OTEL_SERVICE_NAME").is_none() {
+        resource = resource.with_service_name("gw");
+    }
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource.build())
+        .with_sampler(sampler_from_env())
+        .build();
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+    Ok(Some(provider))
+}
+
+/// OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG, defaulting to parent-based always-on.
+fn sampler_from_env() -> Sampler {
+    let ratio = env::var("OTEL_TRACES_SAMPLER_ARG")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    match env::var("OTEL_TRACES_SAMPLER").as_deref() {
+        Ok("always_on") => Sampler::AlwaysOn,
+        Ok("always_off") => Sampler::AlwaysOff,
+        Ok("traceidratio") => Sampler::TraceIdRatioBased(ratio),
+        Ok("parentbased_always_off") => Sampler::ParentBased(Box::new(Sampler::AlwaysOff)),
+        Ok("parentbased_traceidratio") => {
+            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio)))
+        }
+        _ => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+    }
 }
 
 async fn read_source_text(src: Option<&str>) -> Result<Cow<'static, str>, String> {

@@ -287,7 +287,10 @@ trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unf
 `gateway_upstream_status_retries_total` (account, status),
 `gateway_thinking_signature_review_total` (result) and
 `gateway_thinking_signature_cache_events_total` (event). One structured access
-log line per successfully served request goes to stdout.
+log line per successfully served request goes to stdout. Setting
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) exports
+one span per request over OTLP/HTTP, sampled per `OTEL_TRACES_SAMPLER`; see
+[Observability](observability.md#traces).
 
 ## Going live against real upstreams
 
