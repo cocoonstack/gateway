@@ -932,6 +932,7 @@ dependencies = [
  "gw-models",
  "gw-state",
  "regex",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",

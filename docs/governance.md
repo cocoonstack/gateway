@@ -115,6 +115,18 @@ the delivered text.
 Turn `dlp_redact` off to keep incremental delivery; note the embedded demo
 config ships with it on.
 
+`security.moderate` routes the inbound text through the external moderator
+named by the top-level `moderation:` section — today AWS Bedrock Guardrails
+(`kind: bedrock_guardrail`, `ApplyGuardrail` on the configured guardrail id and
+version, authenticated with a Bedrock API key). A `BLOCKED` assessment (denied
+topic, custom or managed word, content filter, blocked PII) denies the request
+with the policy names in the reason; `ANONYMIZED` PII entities mask their
+matches in place before the prompt leaves the gateway (Bedrock anonymizes only
+under `source: OUTPUT`; the default `INPUT` blocks); no intervention allows.
+Every outcome is a `moderation` security event. A moderator error follows the
+tenant's `moderation_fail_open` posture (default: deny). The moderator is built
+at startup, so changing `moderation:` needs a restart.
+
 ## Per-user attribution and billing
 
 Every ledger row carries a `user_id`, `request_id`, and `created_at_epoch_secs`.
