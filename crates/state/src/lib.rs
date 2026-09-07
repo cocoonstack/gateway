@@ -74,25 +74,6 @@ pub struct AkInfo {
     pub mcp: Arc<McpAccess>,
 }
 
-/// Which MCP servers a key reaches and which of their tools it may call.
-#[derive(Debug, Default)]
-pub struct McpAccess {
-    pub servers: Vec<String>,
-    /// Per-server allowlist; a server absent here exposes every tool.
-    pub tools: std::collections::HashMap<String, Vec<String>>,
-}
-
-impl McpAccess {
-    pub fn reaches(&self, server: &str) -> bool {
-        self.servers.iter().any(|s| s == server)
-    }
-
-    /// The allowlist for `server`, when one is configured.
-    pub fn allowed_tools(&self, server: &str) -> Option<&[String]> {
-        self.tools.get(server).map(Vec::as_slice)
-    }
-}
-
 impl AkInfo {
     /// Lifecycle state at `now` (unix seconds). Ban wins over suspension,
     /// suspension over expiry; an elapsed suspension self-recovers.
@@ -167,6 +148,25 @@ impl From<&gw_config::AkConf> for AkInfo {
                 tools: k.mcp_tools.clone(),
             }),
         }
+    }
+}
+
+/// Which MCP servers a key reaches and which of their tools it may call.
+#[derive(Debug, Default)]
+pub struct McpAccess {
+    pub servers: Vec<String>,
+    /// Per-server allowlist; a server absent here exposes every tool.
+    pub tools: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl McpAccess {
+    pub fn reaches(&self, server: &str) -> bool {
+        self.servers.iter().any(|s| s == server)
+    }
+
+    /// The allowlist for `server`, when one is configured.
+    pub fn allowed_tools(&self, server: &str) -> Option<&[String]> {
+        self.tools.get(server).map(Vec::as_slice)
     }
 }
 

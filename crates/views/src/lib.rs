@@ -4728,10 +4728,11 @@ async fn batches_get(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    use super::*;
 
     #[derive(Debug)]
     struct InvalidTtsPayload;

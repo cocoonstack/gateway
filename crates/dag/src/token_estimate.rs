@@ -30,16 +30,6 @@ impl TokenEncoder for TiktokenEncoder {
     }
 }
 
-/// Process-wide default encoder: cl100k BPE, falling back to the heuristic if
-/// the embedded vocabulary cannot be loaded.
-pub fn default_encoder() -> &'static dyn TokenEncoder {
-    static ENC: LazyLock<Box<dyn TokenEncoder>> = LazyLock::new(|| match TiktokenEncoder::new() {
-        Ok(t) => Box::new(t),
-        Err(_) => Box::new(HeuristicEncoder),
-    });
-    &**ENC
-}
-
 /// Approximation of cl100k_base counting (NOT tiktoken): ASCII letters ~1 token
 /// per 4 chars, digits per 3, punctuation 1 each, non-ASCII 1 per char;
 /// whitespace folds into the following word.
@@ -104,6 +94,16 @@ impl Run {
         }
         *self = Run::None;
     }
+}
+
+/// Process-wide default encoder: cl100k BPE, falling back to the heuristic if
+/// the embedded vocabulary cannot be loaded.
+pub fn default_encoder() -> &'static dyn TokenEncoder {
+    static ENC: LazyLock<Box<dyn TokenEncoder>> = LazyLock::new(|| match TiktokenEncoder::new() {
+        Ok(t) => Box::new(t),
+        Err(_) => Box::new(HeuristicEncoder),
+    });
+    &**ENC
 }
 
 /// Estimate the prompt tokens a chat request will cost upstream; `tools` (OpenAI

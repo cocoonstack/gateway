@@ -7,93 +7,6 @@
 use gw_protocol::object;
 use serde_json::{Map, Value, json};
 
-/// A Messages body as a Converse body; Claude-only knobs and passthrough extras
-/// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids).
-pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
-    let mut out = Map::with_capacity(6);
-    if let Some(system) = body.remove("system") {
-        let blocks = match system {
-            Value::String(text) => vec![object([("text", text.into())])],
-            Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
-            _ => Vec::new(),
-        };
-        if !blocks.is_empty() {
-            out.insert("system".into(), Value::Array(blocks));
-        }
-    }
-    let messages: Vec<Value> = match body.remove("messages") {
-        Some(Value::Array(messages)) => messages.into_iter().map(message).collect(),
-        _ => Vec::new(),
-    };
-    out.insert("messages".into(), Value::Array(messages));
-
-    let mut inference = Map::new();
-    for (from, to) in [
-        ("max_tokens", "maxTokens"),
-        ("temperature", "temperature"),
-        ("top_p", "topP"),
-        ("stop_sequences", "stopSequences"),
-    ] {
-        if let Some(v) = body.remove(from) {
-            inference.insert(to.into(), v);
-        }
-    }
-    if !inference.is_empty() {
-        out.insert("inferenceConfig".into(), Value::Object(inference));
-    }
-
-    let tools: Vec<Value> = match body.remove("tools") {
-        Some(Value::Array(tools)) => tools
-            .into_iter()
-            .flat_map(|tool| tool_spec(tool, claude))
-            .collect(),
-        _ => Vec::new(),
-    };
-    let (disable_tools, tool_choice) = body
-        .remove("tool_choice")
-        .map(converse_tool_choice)
-        .unwrap_or_default();
-    if !tools.is_empty() && !disable_tools {
-        let mut config = Map::with_capacity(2);
-        config.insert("tools".into(), Value::Array(tools));
-        if let Some(choice) = tool_choice {
-            config.insert("toolChoice".into(), choice);
-        }
-        out.insert("toolConfig".into(), Value::Object(config));
-    }
-
-    if !claude {
-        body.remove("thinking");
-        body.remove("output_config");
-    }
-    body.remove("model");
-    body.remove("stream");
-    body.remove("metadata");
-    if !body.is_empty() {
-        out.insert("additionalModelRequestFields".into(), Value::Object(body));
-    }
-    Value::Object(out)
-}
-
-/// A buffered Converse reply as a Messages reply.
-pub(crate) fn reply(mut v: Value, model: &str) -> Value {
-    let content: Vec<Value> = match v["output"]["message"]["content"].take() {
-        Value::Array(blocks) => blocks.into_iter().filter_map(anthropic_block).collect(),
-        _ => Vec::new(),
-    };
-    let usage = usage(&mut v["usage"]);
-    object([
-        ("id", "msg_converse".into()),
-        ("type", "message".into()),
-        ("role", "assistant".into()),
-        ("model", model.into()),
-        ("content", Value::Array(content)),
-        ("stop_reason", stop_reason(v["stopReason"].as_str()).into()),
-        ("stop_sequence", Value::Null),
-        ("usage", usage),
-    ])
-}
-
 /// Converse stream events as the Anthropic sequence: implicit text/reasoning
 /// blocks get a synthesized `content_block_start`, the trailing `metadata`
 /// becomes the `message_delta` usage overlay plus `message_stop`.
@@ -213,6 +126,93 @@ impl Events {
             _ => Vec::new(),
         }
     }
+}
+
+/// A Messages body as a Converse body; Claude-only knobs and passthrough extras
+/// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids).
+pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
+    let mut out = Map::with_capacity(6);
+    if let Some(system) = body.remove("system") {
+        let blocks = match system {
+            Value::String(text) => vec![object([("text", text.into())])],
+            Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
+            _ => Vec::new(),
+        };
+        if !blocks.is_empty() {
+            out.insert("system".into(), Value::Array(blocks));
+        }
+    }
+    let messages: Vec<Value> = match body.remove("messages") {
+        Some(Value::Array(messages)) => messages.into_iter().map(message).collect(),
+        _ => Vec::new(),
+    };
+    out.insert("messages".into(), Value::Array(messages));
+
+    let mut inference = Map::new();
+    for (from, to) in [
+        ("max_tokens", "maxTokens"),
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("stop_sequences", "stopSequences"),
+    ] {
+        if let Some(v) = body.remove(from) {
+            inference.insert(to.into(), v);
+        }
+    }
+    if !inference.is_empty() {
+        out.insert("inferenceConfig".into(), Value::Object(inference));
+    }
+
+    let tools: Vec<Value> = match body.remove("tools") {
+        Some(Value::Array(tools)) => tools
+            .into_iter()
+            .flat_map(|tool| tool_spec(tool, claude))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let (disable_tools, tool_choice) = body
+        .remove("tool_choice")
+        .map(converse_tool_choice)
+        .unwrap_or_default();
+    if !tools.is_empty() && !disable_tools {
+        let mut config = Map::with_capacity(2);
+        config.insert("tools".into(), Value::Array(tools));
+        if let Some(choice) = tool_choice {
+            config.insert("toolChoice".into(), choice);
+        }
+        out.insert("toolConfig".into(), Value::Object(config));
+    }
+
+    if !claude {
+        body.remove("thinking");
+        body.remove("output_config");
+    }
+    body.remove("model");
+    body.remove("stream");
+    body.remove("metadata");
+    if !body.is_empty() {
+        out.insert("additionalModelRequestFields".into(), Value::Object(body));
+    }
+    Value::Object(out)
+}
+
+/// A buffered Converse reply as a Messages reply.
+pub(crate) fn reply(mut v: Value, model: &str) -> Value {
+    let content: Vec<Value> = match v["output"]["message"]["content"].take() {
+        Value::Array(blocks) => blocks.into_iter().filter_map(anthropic_block).collect(),
+        _ => Vec::new(),
+    };
+    let usage = usage(&mut v["usage"]);
+    object([
+        ("id", "msg_converse".into()),
+        ("type", "message".into()),
+        ("role", "assistant".into()),
+        ("model", model.into()),
+        ("content", Value::Array(content)),
+        ("stop_reason", stop_reason(v["stopReason"].as_str()).into()),
+        ("stop_sequence", Value::Null),
+        ("usage", usage),
+    ])
 }
 
 /// `{"type": <kind>, <key>: <value>}` — the shape of every Anthropic delta and block.
