@@ -26,6 +26,7 @@ opentelemetry = { workspace = true }
 metrics = { workspace = true }
 tokio = { workspace = true }
 base64 = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

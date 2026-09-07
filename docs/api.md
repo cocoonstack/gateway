@@ -182,6 +182,20 @@ while the clip renders does not change it), taking the vendor cost from xAI's
 failed and expired jobs bill nothing beyond the submit row. Jobs are kept 30
 days.
 
+## MCP
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message, `Mcp-Session-Id`, `MCP-Protocol-Version`, `Accept` and `Last-Event-ID` pass through both ways, the server's own bearer token is attached upstream; JSON and `text/event-stream` replies stream back as the server sends them |
+
+The access key rides as usual (`Authorization: Bearer` or `x-api-key`) and
+must be entitled to the server (`access_keys[].mcp_servers`); when the key has
+an allowlist for that server (`access_keys[].mcp_tools`), `tools/list` results
+are filtered to it and a `tools/call` outside it answers a JSON-RPC error
+(`-32000`) without reaching the server. Every `tools/call` — served or denied —
+is a `mcp` security event (`rule = mcp:<server>`, `action = call:<tool>` /
+`deny:<tool>`). JSON-RPC batches are refused (400); the key's QPS applies.
+
 ## Batch & files
 
 | Method | Path | Notes |

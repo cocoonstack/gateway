@@ -307,6 +307,7 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
         ),
         owner: row.get(9),
         suspended_until_epoch_secs: row.get(10),
+        mcp: Default::default(),
     }
 }
 
@@ -335,6 +336,7 @@ mod tests {
             banned: false,
             suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
+            mcp: Default::default(),
         }
     }
 
