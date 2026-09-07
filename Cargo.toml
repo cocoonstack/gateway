@@ -54,6 +54,10 @@ anyhow = "1"
 # --- local stdout logging only (no exporters, no reporting) ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
 # --- misc ---
 bytes = "1"
 dashmap = "6"

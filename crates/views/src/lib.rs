@@ -40,7 +40,10 @@ use gw_state::admission;
 use gw_state::{
     AkInfo, GatewayState, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture, VideoJob,
 };
+use opentelemetry::propagation::Extractor;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
@@ -49,6 +52,8 @@ const CONTENT_PAGE_DEFAULT: usize = 200;
 const CONTENT_PAGE_MAX: usize = 1_000;
 const USAGE_SERIES_MAX_POINTS: i64 = 400;
 const STREAM_CHANNEL_CAP: usize = 64;
+/// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
+pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
@@ -176,7 +181,21 @@ async fn wrong_method() -> Response {
     error_response(405, "method not allowed for this route")
 }
 
-/// Counts every response with bounded labels: route template and status code.
+/// W3C `traceparent` extraction from the inbound headers.
+struct HeaderCarrier<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderCarrier<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Counts every response with bounded labels: route template and status code,
+/// and wraps the request in the exportable span (disabled without a collector).
 async fn track_requests(
     matched: Option<axum::extract::MatchedPath>,
     req: axum::extract::Request,
@@ -185,8 +204,22 @@ async fn track_requests(
     let route: metrics::SharedString = matched
         .map(|m| Arc::<str>::from(m.as_str()).into())
         .unwrap_or_default();
+    let span = request_span(&route, req.method().as_str());
+    if !span.is_disabled() {
+        let parent = opentelemetry::global::get_text_map_propagator(|p| {
+            p.extract(&HeaderCarrier(req.headers()))
+        });
+        if let Err(e) = span.set_parent(parent) {
+            tracing::debug!(error = %e, "trace parent not applied");
+        }
+    }
     let started = Instant::now();
-    let resp = next.run(req).await;
+    let resp = next.run(req).instrument(span.clone()).await;
+    let status = resp.status();
+    span.record("http.response.status_code", u64::from(status.as_u16()));
+    if status.is_server_error() {
+        span.record("otel.status_code", "ERROR");
+    }
     metrics::counter!(
         "gateway_requests_total",
         "route" => route.clone(),
@@ -196,6 +229,32 @@ async fn track_requests(
     metrics::histogram!("gateway_request_duration_seconds", "route" => route)
         .record(started.elapsed().as_secs_f64());
     resp
+}
+
+/// The request span: named by the route template (the method for an unmatched
+/// path), pipeline fields recorded by the access log.
+fn request_span(route: &str, method: &str) -> tracing::Span {
+    tracing::info_span!(
+        target: TRACE_TARGET,
+        "request",
+        otel.kind = "server",
+        otel.name = if route.is_empty() { method } else { route },
+        otel.status_code = tracing::field::Empty,
+        http.request.method = method,
+        http.route = route,
+        http.response.status_code = tracing::field::Empty,
+        gw.request_id = tracing::field::Empty,
+        gw.surface = tracing::field::Empty,
+        gw.model = tracing::field::Empty,
+        gw.protocol = tracing::field::Empty,
+        gw.account = tracing::field::Empty,
+        gw.tenant = tracing::field::Empty,
+        gw.ak_id = tracing::field::Empty,
+        gw.user_id = tracing::field::Empty,
+        gw.prompt_tokens = tracing::field::Empty,
+        gw.completion_tokens = tracing::field::Empty,
+        gw.decisions = tracing::field::Empty,
+    )
 }
 
 /// The status label without a per-request allocation for the codes this gateway emits.
@@ -1111,6 +1170,20 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
     let ak_id = &*ctx.ak.ak_id;
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
+    let span = tracing::Span::current();
+    if !span.is_disabled() {
+        span.record("gw.request_id", ctx.request.request_id.as_str())
+            .record("gw.surface", surface)
+            .record("gw.model", model)
+            .record("gw.protocol", mt)
+            .record("gw.account", account)
+            .record("gw.tenant", ctx.ak.tenant.as_str())
+            .record("gw.ak_id", ak_id)
+            .record("gw.user_id", user_id)
+            .record("gw.prompt_tokens", pt)
+            .record("gw.completion_tokens", ct)
+            .record("gw.decisions", decisions.as_str());
+    }
     tracing::info!(
         target: "access",
         surface,
@@ -2816,100 +2889,104 @@ fn spawn_stream_pipeline(
         request.stream_tx = Some(tx.clone());
     }
     let handler = s.handler.clone();
-    tokio::spawn(async move {
-        match handler.run(request, ak).await {
-            Ok(mut ctx) => {
-                let dlp = ctx.billing_deferred;
-                if !dlp {
-                    log_access(surface, &ctx, started);
-                }
-                if let Some(outcome) = ctx.outcome.as_mut() {
-                    let usage_totals = (
-                        outcome.response.prompt_tokens,
-                        outcome.response.completion_tokens,
-                        outcome.response.total_tokens,
-                    );
-                    let common_usage = outcome.response.common_usage;
-                    let mut tail = if dlp && outcome.chunks.is_empty() {
-                        redacted_stream_tail(outcome)
-                    } else if outcome.streamed_live {
-                        Vec::new()
-                    } else {
-                        synth_chunks(outcome)
-                    };
-                    tail.push(gw_engines::StreamChunk {
-                        usage_totals: Some(usage_totals),
-                        common_usage,
-                        ..Default::default()
-                    });
-                    if dlp {
-                        let mut delivered = 0i64;
-                        let mut complete = true;
-                        for chunk in tail {
-                            let tokens = stream_chunk_output_tokens(&chunk);
-                            if tx.send(chunk).await.is_err() {
-                                complete = false;
-                                break;
-                            }
-                            delivered = delivered.saturating_add(tokens);
-                        }
-                        let delivery = if complete {
-                            gw_dag::StreamDelivery::Complete
-                        } else if delivered > 0 {
-                            gw_dag::StreamDelivery::Partial(delivered)
+    let span = tracing::Span::current();
+    tokio::spawn(
+        async move {
+            match handler.run(request, ak).await {
+                Ok(mut ctx) => {
+                    let dlp = ctx.billing_deferred;
+                    if !dlp {
+                        log_access(surface, &ctx, started);
+                    }
+                    if let Some(outcome) = ctx.outcome.as_mut() {
+                        let usage_totals = (
+                            outcome.response.prompt_tokens,
+                            outcome.response.completion_tokens,
+                            outcome.response.total_tokens,
+                        );
+                        let common_usage = outcome.response.common_usage;
+                        let mut tail = if dlp && outcome.chunks.is_empty() {
+                            redacted_stream_tail(outcome)
+                        } else if outcome.streamed_live {
+                            Vec::new()
                         } else {
-                            gw_dag::StreamDelivery::None
+                            synth_chunks(outcome)
                         };
-                        if let Err(e) =
-                            gw_handler::complete_buffered_stream(&mut ctx, delivery).await
-                        {
-                            tracing::error!(error = %e, "buffered stream settlement failed");
-                        }
-                        log_access(surface, &ctx, started);
-                    } else {
-                        for chunk in tail {
-                            if tx.send(chunk).await.is_err() {
-                                break;
+                        tail.push(gw_engines::StreamChunk {
+                            usage_totals: Some(usage_totals),
+                            common_usage,
+                            ..Default::default()
+                        });
+                        if dlp {
+                            let mut delivered = 0i64;
+                            let mut complete = true;
+                            for chunk in tail {
+                                let tokens = stream_chunk_output_tokens(&chunk);
+                                if tx.send(chunk).await.is_err() {
+                                    complete = false;
+                                    break;
+                                }
+                                delivered = delivered.saturating_add(tokens);
+                            }
+                            let delivery = if complete {
+                                gw_dag::StreamDelivery::Complete
+                            } else if delivered > 0 {
+                                gw_dag::StreamDelivery::Partial(delivered)
+                            } else {
+                                gw_dag::StreamDelivery::None
+                            };
+                            if let Err(e) =
+                                gw_handler::complete_buffered_stream(&mut ctx, delivery).await
+                            {
+                                tracing::error!(error = %e, "buffered stream settlement failed");
+                            }
+                            log_access(surface, &ctx, started);
+                        } else {
+                            for chunk in tail {
+                                if tx.send(chunk).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                    }
-                } else {
-                    let _ = tx
-                        .send(gw_engines::StreamChunk {
-                            error: Some(Box::new(gw_models::StreamError {
-                                class: ErrClass::InternalServer,
-                                message: NO_OUTCOME.to_owned(),
-                                original_status: None,
-                            })),
-                            ..Default::default()
-                        })
-                        .await;
-                    if dlp {
-                        if let Err(e) = gw_handler::complete_buffered_stream(
-                            &mut ctx,
-                            gw_dag::StreamDelivery::None,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %e, "buffered stream settlement failed");
+                    } else {
+                        let _ = tx
+                            .send(gw_engines::StreamChunk {
+                                error: Some(Box::new(gw_models::StreamError {
+                                    class: ErrClass::InternalServer,
+                                    message: NO_OUTCOME.to_owned(),
+                                    original_status: None,
+                                })),
+                                ..Default::default()
+                            })
+                            .await;
+                        if dlp {
+                            if let Err(e) = gw_handler::complete_buffered_stream(
+                                &mut ctx,
+                                gw_dag::StreamDelivery::None,
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "buffered stream settlement failed");
+                            }
+                            log_access(surface, &ctx, started);
                         }
-                        log_access(surface, &ctx, started);
                     }
                 }
-            }
-            Err(e) => {
-                // 499 client-closed classifies to None: the peer is gone, no frame is rendered
-                if let Some(error) = gw_models::StreamError::from_error(e) {
-                    let _ = tx
-                        .send(gw_engines::StreamChunk {
-                            error: Some(Box::new(error)),
-                            ..Default::default()
-                        })
-                        .await;
+                Err(e) => {
+                    // 499 client-closed classifies to None: the peer is gone, no frame is rendered
+                    if let Some(error) = gw_models::StreamError::from_error(e) {
+                        let _ = tx
+                            .send(gw_engines::StreamChunk {
+                                error: Some(Box::new(error)),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
                 }
             }
         }
-    });
+        .instrument(span),
+    );
     rx
 }
 

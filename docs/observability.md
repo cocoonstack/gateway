@@ -22,6 +22,33 @@ including error statuses and the realtime WebSocket upgrade — is counted, whic
 makes error-rate dashboards possible. All labels are bounded (route templates,
 status codes, protocol/stage names) — no per-key or per-model cardinality.
 
+## Traces
+
+Every request runs inside one span named by its route template
+(`/v1/chat/completions`, `/v1/messages`, …). It carries `http.request.method`,
+`http.route`, `http.response.status_code` and, once the pipeline has served
+the request, the same fields as the access log: `gw.request_id`,
+`gw.surface`, `gw.model`, `gw.protocol`, `gw.account`, `gw.tenant`,
+`gw.ak_id`, `gw.user_id`, `gw.prompt_tokens`, `gw.completion_tokens`,
+`gw.decisions`. A streamed response keeps its span open until the last frame,
+so the span duration is the whole turn; a 5xx marks the span as an error.
+
+The span exports over OTLP/HTTP (protobuf) when the standard OpenTelemetry
+environment names a collector — nothing else to configure:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318   # or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+export OTEL_SERVICE_NAME=gw                                # default when unset
+export OTEL_TRACES_SAMPLER=parentbased_traceidratio        # default parentbased_always_on
+export OTEL_TRACES_SAMPLER_ARG=0.1
+```
+
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` apply as usual.
+An inbound W3C `traceparent` header joins the request to the caller's trace;
+the gateway's span is then a child of it. Without a collector the span is
+disabled at its call site and costs nothing per request; with one, span
+attributes are recorded in-process and batches leave on a background thread.
+
 ## Access log
 
 One structured line per successfully served request goes to stdout (via
