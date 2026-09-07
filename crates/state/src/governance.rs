@@ -31,8 +31,8 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
     /// Tokens spent today by `ak`.
     async fn quota_used(&self, ak: &str) -> i64;
-    /// Add to `ak`'s spent tokens.
-    async fn quota_consume(&self, ak: &str, tokens: i64);
+    /// Add to `ak`'s spent tokens; returns the day's new total.
+    async fn quota_consume(&self, ak: &str, tokens: i64) -> i64;
     /// Reset every daily counter.
     async fn quota_reset_all(&self);
 
@@ -96,8 +96,8 @@ impl Governance for MemoryGovernance {
     async fn quota_used(&self, ak: &str) -> i64 {
         self.quota.used(ak)
     }
-    async fn quota_consume(&self, ak: &str, tokens: i64) {
-        self.quota.consume(ak, tokens);
+    async fn quota_consume(&self, ak: &str, tokens: i64) -> i64 {
+        self.quota.consume(ak, tokens)
     }
     async fn quota_reset_all(&self) {
         self.quota.reset_all();
@@ -256,13 +256,13 @@ impl Governance for RedisGovernance {
         )
         .await;
     }
-    async fn quota_consume(&self, ak: &str, tokens: i64) {
+    async fn quota_consume(&self, ak: &str, tokens: i64) -> i64 {
         self.incr_window(
             &quota_key(ak),
             tokens,
             Duration::from_millis(QUOTA_TTL_MS as u64),
         )
-        .await;
+        .await
     }
     async fn quota_reset_all(&self) {
         // no-op: quota keys are stamped by UTC day, a per-instance sweep would wipe the shared

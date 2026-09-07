@@ -346,9 +346,10 @@ impl QuotaStore {
     }
 
     /// Post-consume actual usage; saturating against a hostile i64::MAX count.
-    pub fn consume(&self, ak: &str, tokens: i64) {
+    pub fn consume(&self, ak: &str, tokens: i64) -> i64 {
         let mut e = slot_mut(&self.used, ak, || 0);
         *e = e.saturating_add(tokens);
+        *e
     }
 
     /// Admission with reservation, atomic under the entry guard.

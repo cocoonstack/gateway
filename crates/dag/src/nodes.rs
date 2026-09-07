@@ -414,20 +414,20 @@ impl DagNode for AkTpmLimit {
     }
 }
 
-/// model_access/user_budget: per-user daily token budget (soft cap), keyed by
-/// the effective end user. No-op without a tenant limit or a user attribution.
-pub struct UserBudgetGate;
+/// model_access/budget: the tenant's daily token and cost budgets (soft caps)
+/// for this key and its effective end user. No-op without a configured cap.
+pub struct BudgetGate;
 
 #[async_trait::async_trait]
-impl DagNode for UserBudgetGate {
+impl DagNode for BudgetGate {
     fn name(&self) -> &'static str {
-        "user_budget"
+        "budget"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        admission::check_user_budget(
+        admission::check_budgets(
             ctx.state.governance.as_ref(),
             &ctx.cfg,
-            &ctx.ak.tenant,
+            &ctx.ak,
             ctx.effective_user_id(),
         )
         .await
@@ -842,12 +842,13 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         },
     )
     .await;
-    admission::consume_user_budget(
-        ctx.state.governance.as_ref(),
+    admission::consume_budgets(
+        ctx.state.as_ref(),
         &ctx.cfg,
-        &ctx.ak.tenant,
+        &ctx.ak,
         ctx.effective_user_id(),
         record.total_tokens,
+        record.cost_micros,
     )
     .await;
     ctx.decide(
@@ -931,7 +932,7 @@ pub fn default_layers() -> Vec<Layer> {
                 Box::new(ProductQpmLimit),
                 Box::new(ModelQpmLimit),
                 Box::new(AkTpmLimit),
-                Box::new(UserBudgetGate),
+                Box::new(BudgetGate),
                 Box::new(CallEngine),
             ],
         },
@@ -1010,7 +1011,7 @@ mod tests {
                         "product_qpm",
                         "model_qpm",
                         "ak_tpm",
-                        "user_budget",
+                        "budget",
                         "call_engine",
                     ],
                 ),
