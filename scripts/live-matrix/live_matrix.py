@@ -43,6 +43,7 @@ GROUPS = [
     "openrouter",
     "rerank",
     "bedrock",
+    "bedrock-jp",
     "xai",
     "video",
     "search",
@@ -1228,3 +1229,63 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    elif group == "bedrock-jp":
+        haiku, sonnet46 = "jp.anthropic.claude-haiku-4-5-20251001-v1:0", "jp.anthropic.claude-sonnet-4-6"
+        sonnet5, opus5 = "global.anthropic.claude-sonnet-5", "global.anthropic.claude-opus-5"
+        fable = "global.anthropic.claude-fable-5-1"
+        steps = "Solve 23*47 step by step briefly."
+        # the 5 family skips adaptive thinking on the easy prompt; this one makes it think
+        arith = "What is 123456 * 789? Work it out carefully before answering, then give only the number."
+        case_messages(gw, haiku, "aws-anthropic")
+        case_messages(
+            gw,
+            haiku,
+            "aws-anthropic thinking",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_chat(
+            gw, haiku, "aws-anthropic chat reasoning", prompt=prime, expect_reasoning=True, reasoning_effort="low"
+        )
+        case_prompt_cache(gw, haiku, native=True, words=340, expect_write=True)
+        case_thinking_replay(gw, haiku, native=True)
+        case_messages(gw, sonnet46, "converse")
+        case_messages(
+            gw,
+            sonnet46,
+            "converse thinking adaptive",
+            stream=True,
+            thinking={"type": "adaptive"},
+            prompt=steps,
+            expect_thinking=True,
+        )
+        case_prompt_cache(gw, sonnet46, native=True, words=220, expect_write=True)
+        case_messages(gw, sonnet5, "aws-anthropic")
+        case_messages(
+            gw,
+            sonnet5,
+            "aws-anthropic thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt=arith,
+            expect_thinking=True,
+        )
+        case_messages(gw, opus5, "converse")
+        case_chat(gw, opus5, "converse chat", stream=True)
+        case_messages(gw, fable, "aws-anthropic")
+        case_messages(
+            gw,
+            fable,
+            "aws-anthropic thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt=arith,
+            expect_thinking=True,
+        )
+        # adaptive thinking may skip reasoning on an easy prompt: presence is reported, not asserted
+        case_thinking_tiers(gw, fable, native=False, tiers=["low", "high"], expect_reasoning=False)
+        case_chat(gw, "apac.amazon.nova-lite-v1:0", "converse chat")
+        case_chat(gw, "apac.amazon.nova-lite-v1:0", "converse chat", stream=True)
+        case_chat(gw, "openai.gpt-oss-20b-1:0", "converse reasoning", prompt=prime, expect_reasoning=True)

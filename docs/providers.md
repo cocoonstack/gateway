@@ -136,7 +136,11 @@ Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images)
 against AWS itself (eu-north-1 inference profiles: Haiku 4.5, Sonnet 4.5 /
 4.6 / 5 — buffered and streamed on both surfaces, tools, signed thinking
 replayed through a tool loop, the native event stream, prompt-cache
-breakpoints with weighted billing), as is Bedrock Llama (us-east-1: Llama 3
+breakpoints with weighted billing; ap-northeast-1 `jp.` and `global.`
+profiles: Haiku 4.5, Sonnet 4.6, Sonnet 5, Opus 5 and Fable 5.1 — Fable needs
+the account's Bedrock data-retention mode set to `aws_review` in the calling
+region, otherwise AWS answers `data retention mode 'default' is not available`),
+as is Bedrock Llama (us-east-1: Llama 3
 8B on demand, Llama 3.3 70B and Llama 4 Scout profiles — buffered, streamed,
 multi-turn, both surfaces) and Bedrock Converse (Nova micro/lite/pro incl. image input, Mistral Large 3
 and Pixtral, Llama 3.3 / Llama 4 Scout, DeepSeek R1 and V3.2, gpt-oss-20b,
