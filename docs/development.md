@@ -56,6 +56,7 @@ the whole pipeline runs offline in tests:
 | `Transport` | dispatch (mock in-process, HTTP for real URLs) | force mock / force HTTP |
 | `Store` | in-memory | SQLite / Postgres (fleet) |
 | `Governance` | in-memory counters | Redis |
+| `Moderator` | allow-all | AWS Bedrock Guardrails (`moderation:`) |
 | `TokenEncoder` | tiktoken cl100k BPE | heuristic fallback |
 
 ## Testing

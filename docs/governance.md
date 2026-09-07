@@ -48,8 +48,8 @@ unconfigured (key, model) pairs never touch a counter.
 | QPM | per model | `models[].qpm` |
 | QPM | per product | `products[].qpm` |
 
-Exceeding a QPS, QPM or TPM limit returns `429`; the daily-token and per-user
-caps return `400 service_quota_exceeded_exception`. QPS uses a smooth GCRA
+Exceeding a QPS, QPM or TPM limit returns `429`; the daily-token, cost-budget
+and per-user caps return `400 service_quota_exceeded_exception`. QPS uses a smooth GCRA
 limiter in-process (in Redis: a fixed 1s window for qps ≥ 1, a 1/qps-second
 window below); the token/window counters are fixed windows. When Redis is
 configured and unreachable, limits fail open (requests pass) and a warning is
@@ -149,7 +149,7 @@ topic, custom or managed word, content filter, blocked PII) denies the request
 with the policy names in the reason; `ANONYMIZED` PII entities mask their
 matches in place before the prompt leaves the gateway (Bedrock anonymizes only
 under `source: OUTPUT`; the default `INPUT` blocks); no intervention allows.
-Every outcome is a `moderation` security event. A moderator error follows the
+A deny, a degrade and a non-empty mask are recorded as `moderation` security events. A moderator error follows the
 tenant's `moderation_fail_open` posture (default: deny). The moderator is built
 at startup, so changing `moderation:` needs a restart.
 
