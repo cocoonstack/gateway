@@ -45,6 +45,8 @@ models:
   - {name: text-embedding-3-small, provider: openai, protocol: embeddings, input_price_per_1k_micros: 20}
   - {name: gpt-5.4-mini, provider: openai, input_price_per_1k_micros: 250, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}
   - {name: gpt-4.1-nano, provider: openai, protocol: responses, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # codex cli speaks the native responses wire with encrypted reasoning; needs a reasoning model on that protocol
+  - {name: gpt-5.4, provider: openai, protocol: responses, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 10000, token_rate: {read_cache: 0.1}}
   # gemini
   - {name: gemini-3.6-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
   - {name: gemini-3.7-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
@@ -102,14 +104,23 @@ models:
   - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
   - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
   # bedrock (long-term bearer key, us-east-1)
-  - {name: "us.anthropic.claude-haiku-4-5-20251001-v1:0", protocol: aws-anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
-  - {name: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", protocol: aws-converse, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}, prompt_cache: true}
-  - {name: "us.amazon.nova-lite-v1:0", protocol: aws-converse, input_price_per_1k_micros: 60, output_price_per_1k_micros: 240}
-  - {name: "mistral.mistral-large-2402-v1:0", protocol: aws-converse, input_price_per_1k_micros: 4000, output_price_per_1k_micros: 12000}
-  - {name: "amazon.titan-embed-text-v2:0", protocol: aws-embed, input_price_per_1k_micros: 20, output_price_per_1k_micros: 0}
-  - {name: "cohere.embed-english-v3", protocol: aws-embed, input_price_per_1k_micros: 100, output_price_per_1k_micros: 0}
-  - {name: "us.deepseek.r1-v1:0", protocol: aws-converse, input_price_per_1k_micros: 1350, output_price_per_1k_micros: 5400}
-  - {name: "us.meta.llama3-1-8b-instruct-v1:0", protocol: aws-llama, input_price_per_1k_micros: 220, output_price_per_1k_micros: 220}
+  - {name: "us.anthropic.claude-haiku-4-5-20251001-v1:0", provider: aws, protocol: aws-anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
+  - {name: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", provider: aws, protocol: aws-converse, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}, prompt_cache: true}
+  - {name: "us.amazon.nova-lite-v1:0", provider: aws, protocol: aws-converse, input_price_per_1k_micros: 60, output_price_per_1k_micros: 240}
+  - {name: "mistral.mistral-large-2402-v1:0", provider: aws, protocol: aws-converse, input_price_per_1k_micros: 4000, output_price_per_1k_micros: 12000}
+  - {name: "amazon.titan-embed-text-v2:0", provider: aws, protocol: aws-embed, input_price_per_1k_micros: 20, output_price_per_1k_micros: 0}
+  - {name: "cohere.embed-english-v3", provider: aws, protocol: aws-embed, input_price_per_1k_micros: 100, output_price_per_1k_micros: 0}
+  - {name: "us.deepseek.r1-v1:0", provider: aws, protocol: aws-converse, input_price_per_1k_micros: 1350, output_price_per_1k_micros: 5400}
+  - {name: "us.meta.llama3-1-8b-instruct-v1:0", provider: aws, protocol: aws-llama, input_price_per_1k_micros: 220, output_price_per_1k_micros: 220}
+
+  # bedrock ap-northeast-1 (long-term bearer key): jp. and global. profiles; fable needs account data retention aws_review
+  - {name: "jp.anthropic.claude-haiku-4-5-20251001-v1:0", provider: aws-jp, protocol: aws-anthropic, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 5000, token_rate: {read_cache: 0.1, write_cache: 1.25}, prompt_cache: true}
+  - {name: "jp.anthropic.claude-sonnet-4-6", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 3000, output_price_per_1k_micros: 15000, token_rate: {read_cache: 0.1, write_cache: 1.25}, prompt_cache: true}
+  - {name: "global.anthropic.claude-sonnet-5", provider: aws-jp, protocol: aws-anthropic, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 10000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
+  - {name: "global.anthropic.claude-opus-5", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 5000, output_price_per_1k_micros: 25000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
+  - {name: "global.anthropic.claude-fable-5-1", provider: aws-jp, protocol: aws-anthropic, input_price_per_1k_micros: 10000, output_price_per_1k_micros: 50000, token_rate: {read_cache: 0.025, write_cache: 1.25}}
+  - {name: "apac.amazon.nova-lite-v1:0", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 60, output_price_per_1k_micros: 240}
+  - {name: "openai.gpt-oss-20b-1:0", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 70, output_price_per_1k_micros: 300}
 
 accounts:
   - name: dashscope-native
@@ -130,6 +141,7 @@ accounts:
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
   - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama", "aws-embed"], timeout_seconds: 120}
+  - {name: bedrock-jp, provider: aws-jp, endpoint: https://bedrock-runtime.ap-northeast-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK_JP, protocols: ["aws-anthropic", "aws-converse"], timeout_seconds: 180}
 
 security:
   dlp_redact: false

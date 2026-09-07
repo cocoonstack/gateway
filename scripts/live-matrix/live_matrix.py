@@ -43,6 +43,8 @@ GROUPS = [
     "openrouter",
     "rerank",
     "bedrock",
+    "bedrock-jp",
+    "agents",
     "xai",
     "video",
     "search",
@@ -83,8 +85,19 @@ class Gateway:
         self.ak = ak
         self.admin = admin
 
-    def call(self, path: str, body: Any = None, admin: bool = False, timeout: int = 300) -> tuple[int, str]:
-        headers = {"content-type": "application/json", "Authorization": f"Bearer {self.admin if admin else self.ak}"}
+    def call(
+        self,
+        path: str,
+        body: Any = None,
+        admin: bool = False,
+        timeout: int = 300,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        headers = {
+            "content-type": "application/json",
+            "Authorization": f"Bearer {self.admin if admin else self.ak}",
+            **(headers or {}),
+        }
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, headers=headers, method="POST" if data else "GET")
         status, raw = self._open(req, timeout)
@@ -855,6 +868,88 @@ def case_thinking_replay(gw: Gateway, model: str, native: bool = True) -> None:
     record(name, bool(ok) and after == before + 2, detail + f"; ledger +{after - before}")
 
 
+def case_claude_code(gw: Gateway, model: str) -> None:
+    """Claude Code's turn: beta header, system blocks with cache points, a tool set, thinking, context management."""
+    name = f"{model} claude-code turn"
+    before, _ = gw.ledger()
+    body = {
+        "model": model,
+        "max_tokens": 4000,
+        "stream": True,
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=test; cc_entrypoint=sdk-cli;"},
+            {"type": "text", "text": "You are a coding agent. " + PREFIX_SENTENCE * 20, "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Reply with exactly one word: hello", "cache_control": {"type": "ephemeral"}}]}],
+        "tools": WEATHER_TOOL_ANTHROPIC,
+        "thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"},
+        "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        "metadata": {"user_id": json.dumps({"device_id": "d1", "session_id": "s1"})},
+    }
+    headers = {
+        "anthropic-beta": "interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
+        "anthropic-version": "2023-06-01",
+    }
+    st, txt = gw.call("/v1/messages?beta=true", body, headers=headers)
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:300]}")
+        return
+    text, stop = "", ""
+    for e in parse_sse(txt):
+        if isinstance(e, dict) and e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
+            text += e["delta"]["text"]
+        if isinstance(e, dict) and e.get("type") == "message_delta":
+            stop = e["delta"].get("stop_reason") or ""
+    after, row = gw.ledger()
+    ok = after == before + 1 and stop == "end_turn" and row["user_id"].startswith("{")
+    record(name, ok, f"stop={stop} text={text[:30]!r} user_id={row.get('user_id', '')[:40]!r} ledger +{after - before}")
+
+
+def case_codex(gw: Gateway, model: str) -> None:
+    """Codex CLI's turn on the native Responses wire: instructions, developer item, function + custom tools, encrypted reasoning."""
+    name = f"{model} codex turn"
+    before, _ = gw.ledger()
+    body = {
+        "model": model,
+        "instructions": "You are Codex, a coding agent.",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Answer tersely."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply with exactly one word: hello"}]},
+        ],
+        "tools": [
+            {"type": "function", "name": "exec_command", "description": "run a command", "strict": False,
+             "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+            {"type": "custom", "name": "apply_patch", "description": "apply a patch"},
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "live-matrix",
+        "text": {"verbosity": "low"},
+    }
+    st, txt = gw.call("/v1/responses", body, headers={"originator": "codex_exec"})
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:300]}")
+        return
+    completed, text, encrypted = False, "", False
+    for e in parse_sse(txt):
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "response.output_text.delta":
+            text += e.get("delta", "")
+        if e.get("type") == "response.completed":
+            completed = True
+            for item in e["response"].get("output", []):
+                if item.get("type") == "reasoning" and item.get("encrypted_content"):
+                    encrypted = True
+    after, _ = gw.ledger()
+    ok = completed and after == before + 1
+    record(name, ok, f"completed={completed} encrypted_reasoning={encrypted} text={text[:30]!r} ledger +{after - before}")
+
+
 def case_thinking_tiers(gw: Gateway, model: str, native: bool, tiers: list[Any], expect_reasoning: bool) -> None:
     """Every effort/budget tier through one model: budgets on /v1/messages (max_tokens above the budget,
     as Anthropic requires), efforts on chat; the reasoning share per tier lands in the note."""
@@ -1184,6 +1279,70 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, "us.deepseek.r1-v1:0", "converse reasoning", prompt=prime, expect_reasoning=True)
         case_chat(gw, "us.meta.llama3-1-8b-instruct-v1:0", "aws-llama")
         case_chat(gw, "us.meta.llama3-1-8b-instruct-v1:0", "aws-llama", stream=True)
+    elif group == "bedrock-jp":
+        haiku, sonnet46 = "jp.anthropic.claude-haiku-4-5-20251001-v1:0", "jp.anthropic.claude-sonnet-4-6"
+        sonnet5, opus5 = "global.anthropic.claude-sonnet-5", "global.anthropic.claude-opus-5"
+        fable = "global.anthropic.claude-fable-5-1"
+        steps = "Solve 23*47 step by step briefly."
+        # the 5 family skips adaptive thinking on the easy prompt; this one makes it think
+        arith = "What is 123456 * 789? Work it out carefully before answering, then give only the number."
+        case_messages(gw, haiku, "aws-anthropic")
+        case_messages(
+            gw,
+            haiku,
+            "aws-anthropic thinking",
+            stream=True,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+            expect_thinking=True,
+        )
+        case_chat(
+            gw, haiku, "aws-anthropic chat reasoning", prompt=prime, expect_reasoning=True, reasoning_effort="low"
+        )
+        case_prompt_cache(gw, haiku, native=True, words=340, expect_write=True)
+        case_thinking_replay(gw, haiku, native=True)
+        case_messages(gw, sonnet46, "converse")
+        case_messages(
+            gw,
+            sonnet46,
+            "converse thinking adaptive",
+            stream=True,
+            thinking={"type": "adaptive"},
+            prompt=steps,
+            expect_thinking=True,
+        )
+        case_prompt_cache(gw, sonnet46, native=True, words=220, expect_write=True)
+        case_messages(gw, sonnet5, "aws-anthropic")
+        case_messages(
+            gw,
+            sonnet5,
+            "aws-anthropic thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt=arith,
+            expect_thinking=True,
+        )
+        case_messages(gw, opus5, "converse")
+        case_chat(gw, opus5, "converse chat", stream=True)
+        case_messages(gw, fable, "aws-anthropic")
+        case_messages(
+            gw,
+            fable,
+            "aws-anthropic thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt=arith,
+            expect_thinking=True,
+        )
+        # adaptive thinking may skip reasoning on an easy prompt: presence is reported, not asserted
+        case_thinking_tiers(gw, fable, native=False, tiers=["low", "high"], expect_reasoning=False)
+        case_chat(gw, "apac.amazon.nova-lite-v1:0", "converse chat")
+        case_chat(gw, "apac.amazon.nova-lite-v1:0", "converse chat", stream=True)
+        case_chat(gw, "openai.gpt-oss-20b-1:0", "converse reasoning", prompt=prime, expect_reasoning=True)
+    elif group == "agents":
+        case_claude_code(gw, "claude-haiku-4-5-20251001")
+        case_codex(gw, "gpt-5.4")
+        case_chat(gw, "gpt-4o-mini", "cursor/copilot tool stream", stream=True, tools=WEATHER_TOOL_OPENAI, tool_choice="auto")
     else:
         raise SystemExit(f"unknown group {group}")
 

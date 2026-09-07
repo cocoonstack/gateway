@@ -199,6 +199,80 @@ answers 400 for a value it does not list — and the usage's `cached_tokens` /
 clients reach Grok through `/v1/messages` (the gateway converts; xAI's own
 Anthropic-compatible endpoint is deprecated).
 
+## Coding agents
+
+Every coding agent that takes a base URL and a key works against the gateway;
+the gateway serves the exact wire each one speaks. What each client sends was
+captured from the real client and replays in the live matrix (`agents` group).
+
+**Claude Code** — the Anthropic wire, so the gateway model must speak it
+natively or by conversion. Claude Code sends a system-block array with
+`cache_control` points, its tool set, `thinking` (with `display: omitted`),
+`context_management`, and its user id in `metadata.user_id`; it enables beta
+features through the `anthropic-beta` header, which the gateway forwards to
+Anthropic-wire upstreams (the header for `kind: anthropic`, the
+`anthropic_beta` body list for `aws-anthropic`). Point it at the gateway with
+the access key as the API key:
+
+```bash
+export ANTHROPIC_BASE_URL=https://gw.example.com
+export ANTHROPIC_API_KEY=ak-...
+claude --model claude-sonnet-5        # any configured Anthropic-wire model
+```
+
+`ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` pick the main and helper
+models when the flag is absent; both names must be configured on the gateway.
+The ledger attributes each turn to the JSON Claude Code puts in
+`metadata.user_id` unless the key has an `owner`.
+
+**Codex CLI** — the native Responses wire with `store: false`, encrypted
+reasoning (`include: ["reasoning.encrypted_content"]`), function and `custom`
+tools, and `prompt_cache_key`. Serve it a reasoning model on
+`protocol: responses` — the surface is a native passthrough, so the model has
+to speak that wire:
+
+```yaml
+models:
+  - {name: gpt-5.4, provider: openai, protocol: responses}
+```
+
+```toml
+# ~/.codex/config.toml
+model = "gpt-5.4"
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "https://gw.example.com/v1"
+env_key = "GW_API_KEY"          # export GW_API_KEY=ak-...
+wire_api = "responses"
+```
+
+Codex tries a WebSocket first and falls back to HTTPS on its own.
+
+**VS Code chat (GitHub Copilot)** — *Chat: Manage Language Models* → *Add
+Models* → *Custom Endpoint*: pick the API type (Chat Completions, Responses
+or Anthropic Messages), give the full endpoint URL
+(`https://gw.example.com/v1/chat/completions`, `/v1/responses` or
+`/v1/messages`) and the access key; the model entries land in
+`chatLanguageModels.json` with `"vendor": "customendpoint"`. No Copilot plan
+is needed for bring-your-own-key models.
+
+**opencode** — an OpenAI-compatible provider block in `opencode.json`:
+
+```json
+{
+  "provider": {
+    "gateway": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "gateway",
+      "options": {"baseURL": "https://gw.example.com/v1", "apiKey": "{env:GW_API_KEY}"},
+      "models": {"claude-sonnet-5": {"name": "claude-sonnet-5"}}
+    }
+  }
+}
+```
+
 ## Cursor and other bring-your-own-key clients
 
 Cursor's *Models → API Keys* lets you point its OpenAI, Anthropic and Google

@@ -74,7 +74,7 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `dashscope` | Alibaba Qwen (native) | `https://dashscope-intl.aliyuncs.com` | `Bearer`; streams via `X-DashScope-SSE` + `incremental_output` |
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
-| `aws-anthropic` | Anthropic Claude on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`anthropic.claude-…`, `us.anthropic.claude-…`); the full Messages engine (system, tools, thinking dialects by generation, prompt-cache breakpoints, signed reasoning) on the InvokeModel wire — `anthropic_version` in the body, model and streaming in the path; streams via InvokeModelWithResponseStream (EventStream frames decoded into the same event sequence) |
+| `aws-anthropic` | Anthropic Claude on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`anthropic.claude-…`, `us.anthropic.claude-…`); the full Messages engine (system, tools, thinking dialects by generation, prompt-cache breakpoints, signed reasoning) on the InvokeModel wire — `anthropic_version` in the body, the client's `anthropic-beta` header as the `anthropic_beta` list, model and streaming in the path; streams via InvokeModelWithResponseStream (EventStream frames decoded into the same event sequence) |
 | `aws-converse` | any model on AWS Bedrock via the Converse API | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API key (see below); model name = the Bedrock model id or inference profile (`eu.amazon.nova-micro-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `mistral.pixtral-large-2502-v1:0`, `anthropic.claude-…`); the Messages engine transcoded to Converse — system, tools + tool results, images, thinking replay, prompt-cache points — and back (buffered and `converse-stream`); Claude reasoning knobs ride in `additionalModelRequestFields`, other passthrough extras too |
 | `aws-embed` | Titan / Cohere embeddings on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API-key Bearer (see below); model name = the Bedrock model id; Titan `{inputText}` → `{embedding, inputTextTokenCount}` takes exactly one input per call (a batch is refused with 400; `dimensions` forwarded when the client sends it), Cohere `{texts, input_type: search_document}` → `{embeddings}` in one call; answered in the OpenAI `/v1/embeddings` list shape, usage from Bedrock's `x-amzn-bedrock-*-token-count` headers |
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id or inference profile (`meta.llama3-8b-instruct-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.meta.llama4-scout-17b-instruct-v1:0`); the conversation is rendered into the Llama 3 (or Llama 4) chat template; usage from the token-count headers / invocation metrics, else the body counts |
@@ -136,7 +136,11 @@ Cohere and Jina rerank, SiliconFlow (chat, embeddings, rerank, TTS, STT, images)
 against AWS itself (eu-north-1 inference profiles: Haiku 4.5, Sonnet 4.5 /
 4.6 / 5 — buffered and streamed on both surfaces, tools, signed thinking
 replayed through a tool loop, the native event stream, prompt-cache
-breakpoints with weighted billing), as is Bedrock Llama (us-east-1: Llama 3
+breakpoints with weighted billing; ap-northeast-1 `jp.` and `global.`
+profiles: Haiku 4.5, Sonnet 4.6, Sonnet 5, Opus 5 and Fable 5.1 — Fable needs
+the account's Bedrock data-retention mode set to `aws_review` in the calling
+region, otherwise AWS answers `data retention mode 'default' is not available`),
+as is Bedrock Llama (us-east-1: Llama 3
 8B on demand, Llama 3.3 70B and Llama 4 Scout profiles — buffered, streamed,
 multi-turn, both surfaces) and Bedrock Converse (Nova micro/lite/pro incl. image input, Mistral Large 3
 and Pixtral, Llama 3.3 / Llama 4 Scout, DeepSeek R1 and V3.2, gpt-oss-20b,

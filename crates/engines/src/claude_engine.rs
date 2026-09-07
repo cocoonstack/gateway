@@ -80,6 +80,12 @@ impl ClaudeEngine {
         let mut body = Map::new();
         if param.protocol == gw_consts::Protocol::AwsAnthropic {
             body.insert("anthropic_version".into(), "bedrock-2023-05-31".into());
+            if let Some(betas) = self.base.request.anthropic_beta.as_deref() {
+                body.insert(
+                    "anthropic_beta".into(),
+                    Value::Array(betas.split(',').map(|b| Value::from(b.trim())).collect()),
+                );
+            }
         } else if !bedrock {
             body.insert("model".into(), param.model_name.clone().into());
             body.insert("stream".into(), self.base.request.stream.into());
@@ -177,6 +183,15 @@ impl ClaudeEngine {
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let body = self.build_body()?;
+        let mut headers = vec![
+            ("content-type", "application/json".into()),
+            ("x-api-key", self.base.api_key()),
+            // Anthropic API mandates this header; a real call 400s without it.
+            ("anthropic-version", "2023-06-01".into()),
+        ];
+        if let Some(betas) = self.base.request.anthropic_beta.take() {
+            headers.push(("anthropic-beta", betas));
+        }
         Ok(UpstreamRequest {
             protocol: self.base.param()?.protocol,
             method: "POST",
@@ -184,12 +199,7 @@ impl ClaudeEngine {
                 "{}/v1/messages",
                 self.base.base_url("mock://api.anthropic.com")
             ),
-            headers: vec![
-                ("content-type", "application/json".into()),
-                ("x-api-key", self.base.api_key()),
-                // Anthropic API mandates this header; a real call 400s without it.
-                ("anthropic-version", "2023-06-01".into()),
-            ],
+            headers,
             body: crate::base::body_bytes(&Value::Object(body))?,
             stream: self.base.request.stream,
             account: self.base.account(),
@@ -869,6 +879,39 @@ mod tests {
         assert!(out.response.is_messages_protocol);
         assert_eq!(out.response.finish_reason, "end_turn");
         assert!(out.response.total_tokens > 0);
+    }
+
+    #[test]
+    fn client_betas_ride_the_anthropic_header_and_the_bedrock_body() {
+        let betas = "context-management-2025-06-27, interleaved-thinking-2025-05-14";
+        let mut r = base_req();
+        r.anthropic_beta = Some(betas.to_owned());
+        let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
+        let up = e.build_upstream().unwrap();
+        let header = up.headers.iter().find(|(k, _)| *k == "anthropic-beta");
+        assert_eq!(header.map(|(_, v)| v.as_str()), Some(betas));
+        let body: Value = serde_json::from_slice(&up.body).unwrap();
+        assert!(body.get("anthropic_beta").is_none());
+
+        let mut r = base_req();
+        r.anthropic_beta = Some(betas.to_owned());
+        r.model_param_v2 = Some(ModelParamV2::with_name(
+            Protocol::AwsAnthropic,
+            "anthropic.claude-sonnet-5",
+        ));
+        let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
+        let body = e.build_body().unwrap();
+        assert_eq!(
+            body["anthropic_beta"],
+            json!([
+                "context-management-2025-06-27",
+                "interleaved-thinking-2025-05-14"
+            ])
+        );
+
+        let mut e = ClaudeEngine::new(base_req(), Arc::new(MockTransport));
+        let up = e.build_upstream().unwrap();
+        assert!(!up.headers.iter().any(|(k, _)| *k == "anthropic-beta"));
     }
 
     #[test]
