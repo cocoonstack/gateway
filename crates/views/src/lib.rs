@@ -459,7 +459,7 @@ async fn realtime_gate(
     admission::check_model_qpm(gov, cfg, &m.served)
         .await
         .map_err(throttled)?;
-    admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint))
+    admission::check_budgets(gov, cfg, &ak, ak.attributed_user(hint))
         .await
         .map_err(quota_exceeded)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
@@ -529,7 +529,7 @@ async fn bill_realtime_turn(
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
-    admission::settle_and_bill(
+    let record = admission::settle_and_bill(
         state,
         cfg,
         admission::SettleInput {
@@ -562,12 +562,13 @@ async fn bill_realtime_turn(
         },
     )
     .await;
-    admission::consume_user_budget(
-        state.governance.as_ref(),
+    admission::consume_budgets(
+        state,
         cfg,
-        &ak.tenant,
+        ak,
         admit.user.as_str(),
         total,
+        record.cost_micros,
     )
     .await;
     if !estimated {

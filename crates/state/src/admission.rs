@@ -43,6 +43,44 @@ pub struct SettleInput<'a> {
     pub model_quota_key: Option<String>,
 }
 
+/// One daily budget: its governance counter and cap.
+struct Budget {
+    scope: BudgetScope,
+    key: String,
+    limit: i64,
+}
+
+#[derive(Clone, Copy)]
+enum BudgetScope {
+    UserTokens,
+    TenantCost,
+    KeyCost,
+    UserCost,
+}
+
+impl BudgetScope {
+    fn per_user(self) -> bool {
+        matches!(self, Self::UserTokens | Self::UserCost)
+    }
+
+    fn charges_cost(self) -> bool {
+        !matches!(self, Self::UserTokens)
+    }
+
+    fn unit(self) -> &'static str {
+        if self.charges_cost() { "cost" } else { "token" }
+    }
+
+    /// The alert subject; the key is named by its fingerprint, never the credential.
+    fn subject(self, ak: &AkInfo, user: &str) -> String {
+        match self {
+            Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),
+            Self::TenantCost => format!("tenant:{}", ak.tenant),
+            Self::KeyCost => format!("key:{}", ak.ak_id),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BillingLedger {
     store: Arc<dyn Store>,
@@ -216,41 +254,53 @@ pub async fn flush_billing(state: &GatewayState) {
     }
 }
 
-/// Per-user daily token budget (soft cap): admit while under the tenant's limit;
-/// skipped without a limit or user attribution, consumed via [`consume_user_budget`].
-pub async fn check_user_budget(
+/// Daily budgets (soft caps: check-then-consume, so concurrent turns can
+/// overshoot by one): admit while every configured scope is under its cap.
+pub async fn check_budgets(
     gov: &dyn Governance,
     cfg: &GatewayConfig,
-    tenant: &str,
+    ak: &AkInfo,
     user: &str,
 ) -> Result<(), String> {
-    if user.is_empty() {
-        return Ok(());
+    for b in budgets(cfg, ak, user) {
+        if !gov.quota_check(&b.key, b.limit).await {
+            return Err(format!(
+                "daily {} budget exhausted for {}",
+                b.scope.unit(),
+                b.scope.subject(ak, user)
+            ));
+        }
     }
-    let Some(limit) = user_budget_limit(cfg, tenant) else {
-        return Ok(());
-    };
-    admit(
-        gov.quota_check(&user_budget_key(tenant, user), limit).await,
-        || format!("daily token budget exhausted for user `{user}`"),
-    )
+    Ok(())
 }
 
-/// Accrue actual usage to the per-user daily budget (no-op without a limit or
-/// user). Soft cap: check-then-consume, so a burst can overshoot by one turn.
-pub async fn consume_user_budget(
-    gov: &dyn Governance,
+/// Accrue actual usage to the daily budgets; a scope that reaches its cap
+/// raises a `budget_exhausted` alert (the bus dedups repeats).
+pub async fn consume_budgets(
+    state: &GatewayState,
     cfg: &GatewayConfig,
-    tenant: &str,
+    ak: &AkInfo,
     user: &str,
-    total: i64,
+    tokens: i64,
+    cost_micros: i64,
 ) {
-    if user.is_empty() || total <= 0 {
-        return;
-    }
-    if user_budget_limit(cfg, tenant).is_some() {
-        gov.quota_consume(&user_budget_key(tenant, user), total)
-            .await;
+    for b in budgets(cfg, ak, user) {
+        let amount = if b.scope.charges_cost() {
+            cost_micros
+        } else {
+            tokens
+        };
+        if amount <= 0 {
+            continue;
+        }
+        let used = state.governance.quota_consume(&b.key, amount).await;
+        if used >= b.limit {
+            state.alerts.emit(
+                "budget_exhausted",
+                b.scope.subject(ak, user),
+                format!("daily {} budget: {used} of {}", b.scope.unit(), b.limit),
+            );
+        }
     }
 }
 
@@ -428,14 +478,46 @@ fn model_qpm_key(model: &str) -> String {
     format!("model:{model}")
 }
 
-// namespaced by tenant so the same user id under two tenants meters separately
-fn user_budget_key(tenant: &str, user: &str) -> String {
-    format!("ub:{tenant}:{user}")
-}
-
-fn user_budget_limit(cfg: &GatewayConfig, tenant: &str) -> Option<i64> {
-    cfg.find_tenant(tenant)
-        .and_then(|t| t.user_daily_token_quota)
+/// The tenant's daily budgets that apply to `ak` and `user`; empty when none is configured.
+fn budgets(cfg: &GatewayConfig, ak: &AkInfo, user: &str) -> Vec<Budget> {
+    let Some(t) = cfg.find_tenant(&ak.tenant) else {
+        return Vec::new();
+    };
+    let tenant = &ak.tenant;
+    // user scopes are namespaced by tenant so one user id under two tenants meters separately
+    let scopes = [
+        (
+            BudgetScope::UserTokens,
+            t.user_daily_token_quota,
+            format!("ub:{tenant}:{user}"),
+        ),
+        (
+            BudgetScope::TenantCost,
+            t.daily_cost_quota_micros,
+            format!("cb:tenant:{tenant}"),
+        ),
+        (
+            BudgetScope::KeyCost,
+            t.key_daily_cost_quota_micros,
+            format!("cb:ak:{}", ak.ak),
+        ),
+        (
+            BudgetScope::UserCost,
+            t.user_daily_cost_quota_micros,
+            format!("cb:user:{tenant}:{user}"),
+        ),
+    ];
+    scopes
+        .into_iter()
+        .filter(|(scope, _, _)| !scope.per_user() || !user.is_empty())
+        .filter_map(|(scope, limit, key)| {
+            Some(Budget {
+                scope,
+                key,
+                limit: limit?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

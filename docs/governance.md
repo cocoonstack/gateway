@@ -40,6 +40,10 @@ unconfigured (key, model) pairs never touch a counter.
 | QPS | pooled per tenant | `tenants[].qps` |
 | Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
 | Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override |
+| Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
+| Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
+| Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
+| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (soft) |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |
 | QPM | per product | `products[].qpm` |
@@ -132,6 +136,16 @@ enforced with a hard `400 service_quota_exceeded_exception` once exceeded;
 by one before the counter accrues.
 The per-(key, model) quota is soft the same way: it is a routing trigger (the
 fallback-model degrade), while the reserved per-key daily quota hard-caps spend.
+The daily cost budgets — `daily_cost_quota_micros` pooled over the tenant's
+keys, `key_daily_cost_quota_micros` per key, `user_daily_cost_quota_micros`
+per end user — are soft caps of the same kind over the ledger's charged
+`cost_micros` (list price or the tenant's `model_prices`, so unit-priced
+surfaces count too); they apply on every surface, realtime and batch included,
+and a response-cache hit, which bills nothing, counts nothing.
+Keys without a tenant take a declared `default` tenant's budgets. Reaching any
+budget raises a `budget_exhausted` alert on the webhook — subject
+`tenant:<name>`, `key:<fingerprint>` or `user:<tenant>/<id>`, detail the
+day's total against the cap — muted per `alerts.dedup_seconds` while it holds.
 
 A background task folds completed ledger minutes into durable per-(minute,
 tenant, user, model) rollup buckets. Each pass recomputes from the rollup

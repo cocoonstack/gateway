@@ -79,6 +79,9 @@ tenants:
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
       tts-1: {unit_price_micros: 20}
     user_daily_token_quota: 100000  # optional soft per-end-user daily cap
+    daily_cost_quota_micros: 50000000      # optional: $50/day pooled across acme's keys
+    key_daily_cost_quota_micros: 10000000  # optional: $10/day per key
+    user_daily_cost_quota_micros: 2000000  # optional: $2/day per end user
     security:                # optional; overrides the global `security:` WHOLE for this tenant
       blocklist: ["forbidden"]
       blocklist_action: flag        # block | flag | shadow
@@ -94,7 +97,8 @@ Keys without a `tenant` join the implicit `default` tenant (no pooled limits,
 entitled to every model), so a flat config keeps working unchanged. The model
 catalog (`GET /v1/models`) filters to the caller's entitlement.
 
-`user_daily_token_quota`, `security`, and `retention` are enterprise controls
+`user_daily_token_quota`, the `*_cost_quota_micros` budgets, `security`, and
+`retention` are enterprise controls
 detailed in [Governance](governance.md); `security` replaces the global policy
 outright when present (it is not merged field-by-field).
 
@@ -249,6 +253,7 @@ abuse:                         # automatic suspension; omit = off
 alerts:                        # outbound webhook; omit = off
   webhook_url_env: GW_ALERT_WEBHOOK   # env var naming the URL (secrets stay out of config)
   dedup_seconds: 300           # mute repeats of the same (kind, subject)
+                               # kinds: abuse_suspend, account_cooldown, model_availability, budget_exhausted
 ```
 
 Every rule that fires (block / flag / DLP / moderation) is recorded without the

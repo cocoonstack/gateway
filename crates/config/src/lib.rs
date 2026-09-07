@@ -512,6 +512,15 @@ pub struct TenantConf {
     /// unlimited. Enforced only when the request carries a user attribution.
     #[serde(default)]
     pub user_daily_token_quota: Option<i64>,
+    /// Daily charged-cost cap in micro-dollars pooled across the tenant's keys; `None` = unlimited.
+    #[serde(default)]
+    pub daily_cost_quota_micros: Option<i64>,
+    /// Daily charged-cost cap in micro-dollars metered per key; `None` = unlimited.
+    #[serde(default)]
+    pub key_daily_cost_quota_micros: Option<i64>,
+    /// Daily charged-cost cap in micro-dollars per end user; `None` = unlimited.
+    #[serde(default)]
+    pub user_daily_cost_quota_micros: Option<i64>,
     /// Content-safety policy for this tenant; `None` = use the global `security:`.
     #[serde(default)]
     pub security: Option<SecurityConf>,
@@ -860,6 +869,9 @@ impl GatewayConfig {
         for t in &self.tenants {
             if t.qps.is_some_and(neg_or_nan)
                 || t.user_daily_token_quota.is_some_and(|v| v < 0)
+                || t.daily_cost_quota_micros.is_some_and(|v| v < 0)
+                || t.key_daily_cost_quota_micros.is_some_and(|v| v < 0)
+                || t.user_daily_cost_quota_micros.is_some_and(|v| v < 0)
                 || t.model_quotas.values().any(|v| *v < 0)
             {
                 return Err(neg_limit(format!("tenant {}", t.name)));
