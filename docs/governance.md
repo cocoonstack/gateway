@@ -81,6 +81,28 @@ upstream failure) is billed for what was delivered: the vendor's usage frame
 never arrives, so the token count is estimated from the request and the
 delivered text. A disconnect *before* any bytes are sent bills nothing.
 
+## MCP tool access
+
+`/mcp/{server}` proxies the Model Context Protocol servers declared under
+`mcp_servers`. A key reaches only the servers named in its `mcp_servers`
+entitlement, and `mcp_tools` narrows a server to an allowlist: `tools/list` is
+filtered to it before the client sees the catalog, and a `tools/call` for any
+other tool is answered with a JSON-RPC error inside the gateway. Every tool
+call and every denial lands in the security-event stream (`surface = mcp`,
+`rule = mcp:<server>`, `action = call:<tool>` or `deny:<tool>`, attributed to
+the key's `owner`), and `gateway_mcp_requests_total{server, method, result}`
+counts the traffic. Keys created through the admin API carry no MCP
+entitlement; the servers' own credentials stay in the gateway's environment
+(`mcp_servers[].api_key_env`), so an agent never holds them.
+
+```yaml
+mcp_servers:
+  - {name: tools, endpoint: http://tools.internal:3001/mcp, api_key_env: TOOLS_TOKEN}
+access_keys:
+  - {ak: ak-agent, product: p, qps: 20, daily_token_quota: 1000000,
+     mcp_servers: [tools], mcp_tools: {tools: [search, read_file]}}
+```
+
 ## Request cache
 
 A model with `cache_ttl_seconds` set caches non-streaming responses for that

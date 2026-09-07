@@ -70,6 +70,27 @@ pub struct AkInfo {
     /// Per-model daily token caps overriding the tenant defaults; empty = none.
     /// Arc'd: a patch copy-on-writes the whole `AkInfo` and the map is write-rare.
     pub model_quotas: Arc<std::collections::HashMap<String, i64>>,
+    /// MCP entitlement; keys created through the admin API carry none.
+    pub mcp: Arc<McpAccess>,
+}
+
+/// Which MCP servers a key reaches and which of their tools it may call.
+#[derive(Debug, Default)]
+pub struct McpAccess {
+    pub servers: Vec<String>,
+    /// Per-server allowlist; a server absent here exposes every tool.
+    pub tools: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl McpAccess {
+    pub fn reaches(&self, server: &str) -> bool {
+        self.servers.iter().any(|s| s == server)
+    }
+
+    /// The allowlist for `server`, when one is configured.
+    pub fn allowed_tools(&self, server: &str) -> Option<&[String]> {
+        self.tools.get(server).map(Vec::as_slice)
+    }
 }
 
 impl AkInfo {
@@ -141,6 +162,10 @@ impl From<&gw_config::AkConf> for AkInfo {
             banned: k.banned,
             suspended_until_epoch_secs: None,
             model_quotas: Arc::new(k.model_quotas.clone()),
+            mcp: Arc::new(McpAccess {
+                servers: k.mcp_servers.clone(),
+                tools: k.mcp_tools.clone(),
+            }),
         }
     }
 }
@@ -1027,6 +1052,7 @@ mod tests {
             banned: false,
             suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
+            mcp: Default::default(),
         }
     }
 

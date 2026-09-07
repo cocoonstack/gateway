@@ -273,6 +273,18 @@ is needed for bring-your-own-key models.
 }
 ```
 
+**MCP servers through the gateway** — any MCP client that speaks Streamable
+HTTP with a bearer header reaches the servers a key is entitled to:
+
+```bash
+claude mcp add --transport http tools https://gw.example.com/mcp/tools \
+  --header "Authorization: Bearer ak-..."
+codex mcp add tools --url https://gw.example.com/mcp/tools --bearer-token-env-var GW_API_KEY
+```
+
+The key's `mcp_tools` allowlist decides which tools the client is shown and may
+call; the gateway records each call in `/admin/audit/events`.
+
 ## Cursor and other bring-your-own-key clients
 
 Cursor's *Models → API Keys* lets you point its OpenAI, Anthropic and Google
