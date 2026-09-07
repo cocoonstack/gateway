@@ -89,7 +89,15 @@ impl AppState {
         transport: SharedTransport,
         loader: Option<ConfigLoader>,
     ) -> Self {
+        let moderator = gw_handler::moderation::from_config(config.load().cfg.moderation.as_ref());
         let handler = OnlineHandler::new(config, transport);
+        let handler = match moderator {
+            Ok(moderator) => handler.with_moderator(moderator),
+            Err(e) => {
+                tracing::error!(error = %e, "moderator not built; requests under security.moderate are denied");
+                handler
+            }
+        };
         let offline = OfflineHandler::new(handler.clone());
         Self {
             handler,

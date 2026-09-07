@@ -229,6 +229,15 @@ security:                      # global default; a tenant may override it whole
                                # tenant fallback model / deny)
   moderation_fail_open: false  # on a moderator error: admit (true) or deny (false)
 
+moderation:                    # the external moderator behind security.moderate; omit = allow-all
+  kind: bedrock_guardrail      # AWS Bedrock Guardrails ApplyGuardrail
+  endpoint: https://bedrock-runtime.us-east-1.amazonaws.com
+  api_key_env: AWS_BEARER_TOKEN_BEDROCK   # Bedrock API key, sent as a bearer token
+  guardrail_id: k714dscw77j5
+  guardrail_version: "1"       # default DRAFT
+  source: INPUT                # INPUT (default) | OUTPUT — Bedrock anonymizes PII only under OUTPUT
+  timeout_seconds: 10
+
 stability:
   failure_threshold: 3         # consecutive failures before an account cools down
   cooldown_seconds: 30

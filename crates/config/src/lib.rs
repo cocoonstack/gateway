@@ -60,6 +60,10 @@ pub enum ConfigError {
     },
     #[error("`{owner}` sets a negative or non-finite limit")]
     NegativeLimit { owner: String },
+    #[error(
+        "moderation: kind must be bedrock_guardrail with endpoint, guardrail_id and source INPUT|OUTPUT"
+    )]
+    Moderation,
     #[error("storage.shared_cache needs storage.redis_url")]
     SharedCacheNeedsRedis,
 }
@@ -423,6 +427,32 @@ impl Default for AlertsConf {
     }
 }
 
+/// The external content moderator behind `security.moderate`; built once at
+/// startup. `bedrock_guardrail` calls AWS Bedrock Guardrails `ApplyGuardrail`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModerationConf {
+    pub kind: String,
+    /// `https://bedrock-runtime.<region>.amazonaws.com`
+    pub endpoint: String,
+    /// Env var holding the Bedrock API key (sent as a bearer token).
+    pub api_key_env: String,
+    pub guardrail_id: String,
+    #[serde(default = "default_guardrail_version")]
+    pub guardrail_version: String,
+    /// `INPUT` (default) or `OUTPUT`; Bedrock anonymizes PII only under `OUTPUT`.
+    #[serde(default = "default_guardrail_source")]
+    pub source: String,
+    #[serde(default = "default_moderation_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl ModerationConf {
+    /// The API key, read from its env var at call time.
+    pub fn api_key(&self) -> Option<String> {
+        token_from_env(&self.api_key_env)
+    }
+}
+
 /// Durable-record backend selection.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StorageConf {
@@ -603,6 +633,9 @@ pub struct GatewayConfig {
     /// Outbound alert webhook (unset = off).
     #[serde(default)]
     pub alerts: AlertsConf,
+    /// External content moderator (unset = the allow-all default).
+    #[serde(default)]
+    pub moderation: Option<ModerationConf>,
     /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
     /// default: the audit records the real TCP peer, which a client can't forge.
     /// Enable only when a trusted proxy fronts the gateway and sets those headers.
@@ -864,6 +897,14 @@ impl GatewayConfig {
             {
                 return Err(neg_limit(format!("tenant {}", t.name)));
             }
+        }
+        if let Some(m) = &self.moderation
+            && (m.kind != "bedrock_guardrail"
+                || m.endpoint.is_empty()
+                || m.guardrail_id.is_empty()
+                || !matches!(m.source.as_str(), "INPUT" | "OUTPUT"))
+        {
+            return Err(ConfigError::Moderation);
         }
         for m in &self.models {
             if m.qpm.is_some_and(|v| v < 0) {
@@ -1136,6 +1177,18 @@ fn default_availability_min_samples() -> u64 {
 }
 fn default_cooldown_seconds() -> u64 {
     30
+}
+
+fn default_guardrail_version() -> String {
+    "DRAFT".to_owned()
+}
+
+fn default_guardrail_source() -> String {
+    "INPUT".to_owned()
+}
+
+fn default_moderation_timeout() -> u64 {
+    10
 }
 
 fn default_alert_dedup_seconds() -> u64 {
