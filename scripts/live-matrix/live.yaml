@@ -45,6 +45,8 @@ models:
   - {name: text-embedding-3-small, provider: openai, protocol: embeddings, input_price_per_1k_micros: 20}
   - {name: gpt-5.4-mini, provider: openai, input_price_per_1k_micros: 250, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}
   - {name: gpt-4.1-nano, provider: openai, protocol: responses, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # codex cli speaks the native responses wire with encrypted reasoning; needs a reasoning model on that protocol
+  - {name: gpt-5.4, provider: openai, protocol: responses, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 10000, token_rate: {read_cache: 0.1}}
   # gemini
   - {name: gemini-3.6-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
   - {name: gemini-3.7-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
@@ -139,7 +141,7 @@ accounts:
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
   - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama", "aws-embed"], timeout_seconds: 120}
+  - {name: bedrock-jp, provider: aws-jp, endpoint: https://bedrock-runtime.ap-northeast-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK_JP, protocols: ["aws-anthropic", "aws-converse"], timeout_seconds: 180}
 
 security:
-  - {name: bedrock-jp, provider: aws-jp, endpoint: https://bedrock-runtime.ap-northeast-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK_JP, protocols: ["aws-anthropic", "aws-converse"], timeout_seconds: 180}
   dlp_redact: false

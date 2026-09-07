@@ -17,6 +17,8 @@ pub struct GatewayRequest {
     pub preserve_anthropic_wire: bool,
     /// The request originated on `/v1/responses` (native events forward only there).
     pub preserve_responses_wire: bool,
+    /// The client's `anthropic-beta` header, forwarded verbatim to Anthropic-wire upstreams.
+    pub anthropic_beta: Option<String>,
     /// The served model asks for prompt-cache breakpoints (Anthropic engines).
     pub prompt_cache: bool,
     pub model_param_v2: Option<ModelParamV2>,

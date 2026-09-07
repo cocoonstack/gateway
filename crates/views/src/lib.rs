@@ -3225,6 +3225,10 @@ async fn messages(
         is_online: true,
         stream: body.stream,
         preserve_anthropic_wire: true,
+        anthropic_beta: headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
         message: body
             .messages
             .into_iter()

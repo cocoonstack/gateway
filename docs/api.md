@@ -120,7 +120,7 @@ inside `prompt_tokens` there, so a client can reconcile the write premium.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/v1/messages` | streaming + non-streaming |
+| POST | `/v1/messages` | streaming + non-streaming; the client's `anthropic-beta` header is forwarded to Anthropic-wire upstreams (as the `anthropic_beta` body list on Bedrock) |
 
 `/v1/messages` works on both Anthropic-protocol models and OpenAI-protocol
 models — the gateway converts between the two, including the streaming event
