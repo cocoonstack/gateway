@@ -55,7 +55,8 @@ pub(crate) async fn proxy(
     if let Err(e) = admission::check_ak_rate(snap.state.governance.as_ref(), &ak).await {
         return error_response(429, e);
     }
-    let call = if method == Method::POST {
+    let is_post = method == Method::POST;
+    let call = if is_post {
         match parse_call(&body) {
             Ok(call) => call,
             Err(msg) => return error_response(400, msg),
@@ -67,7 +68,7 @@ pub(crate) async fn proxy(
     if let Some(tool) = call.tool.as_deref()
         && allowed.is_some_and(|list| !list.iter().any(|t| t == tool))
     {
-        audit(&snap.state, &ak, &server, &format!("deny:{tool}")).await;
+        audit(&snap.state, &ak, &server, format!("deny:{tool}")).await;
         count(&server, "tools/call", "denied");
         return jsonrpc_error(
             call.id,
@@ -75,10 +76,10 @@ pub(crate) async fn proxy(
             format!("tool `{tool}` is not permitted for this key"),
         );
     }
-    let mut upstream = s
-        .mcp
-        .request(method.clone(), &conf.endpoint)
-        .timeout(Duration::from_secs(conf.timeout_seconds));
+    let mut upstream = s.mcp.request(method.clone(), &conf.endpoint);
+    if method != Method::GET {
+        upstream = upstream.timeout(Duration::from_secs(conf.timeout_seconds));
+    }
     for name in FORWARDED_HEADERS {
         if let Some(v) = headers.get(name) {
             upstream = upstream.header(name, v);
@@ -87,7 +88,7 @@ pub(crate) async fn proxy(
     if let Some(key) = conf.api_key() {
         upstream = upstream.bearer_auth(key);
     }
-    if method == Method::POST {
+    if is_post {
         upstream = upstream.body(body);
     }
     let reply = match upstream.send().await {
@@ -98,13 +99,13 @@ pub(crate) async fn proxy(
         }
     };
     if let Some(tool) = call.tool.as_deref() {
-        audit(&snap.state, &ak, &server, &format!("call:{tool}")).await;
+        audit(&snap.state, &ak, &server, format!("call:{tool}")).await;
     }
     let status = reply.status();
     count(
         &server,
         method_label(&call.method),
-        crate::status_label(status).as_ref(),
+        crate::status_label(status),
     );
     let mut out = HeaderMap::new();
     for name in RETURNED_HEADERS {
@@ -140,7 +141,11 @@ fn parse_call(body: &[u8]) -> Result<Call, String> {
         .unwrap_or_default()
         .to_owned();
     let tool = (method == "tools/call")
-        .then(|| obj["params"]["name"].as_str().map(str::to_owned))
+        .then(|| {
+            obj.get("params")
+                .and_then(|p| p["name"].as_str())
+                .map(str::to_owned)
+        })
         .flatten();
     Ok(Call {
         method,
@@ -163,7 +168,7 @@ fn filter_tool_list(bytes: &[u8], sse: bool, allowed: &[String]) -> Vec<u8> {
     };
     if !sse {
         return match serde_json::from_slice::<Value>(bytes) {
-            Ok(msg) => serde_json::to_vec(&keep(msg)).unwrap_or_else(|_| bytes.to_vec()),
+            Ok(msg) => serde_json::to_vec(&keep(msg)).unwrap_or_default(),
             Err(_) => bytes.to_vec(),
         };
     }
@@ -198,17 +203,17 @@ fn method_label(method: &str) -> &'static str {
     }
 }
 
-fn count(server: &str, method: &'static str, result: &str) {
+fn count(server: &str, method: &'static str, result: impl Into<metrics::SharedString>) {
     metrics::counter!(
         "gateway_mcp_requests_total",
         "server" => server.to_owned(),
         "method" => method,
-        "result" => result.to_owned(),
+        "result" => result.into(),
     )
     .increment(1);
 }
 
-async fn audit(state: &GatewayState, ak: &AkInfo, server: &str, action: &str) {
+async fn audit(state: &GatewayState, ak: &AkInfo, server: &str, action: String) {
     SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: gw_handler::new_request_id(),
@@ -217,7 +222,7 @@ async fn audit(state: &GatewayState, ak: &AkInfo, server: &str, action: &str) {
         tenant: ak.tenant.clone(),
         surface: "mcp".to_owned(),
         rule: format!("mcp:{server}"),
-        action: action.to_owned(),
+        action,
         hits: 1,
     }
     .record(state.store.as_ref())
@@ -419,6 +424,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_without_params_is_forwarded_not_panicked() {
+        let (app, _) = app_with(&spawn_stub().await).await;
+        let bare = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call"}"#;
+        let resp = app
+            .oneshot(rpc("k-add", "tools", bare, "application/json"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]

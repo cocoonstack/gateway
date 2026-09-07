@@ -896,9 +896,11 @@ def case_claude_code(gw: Gateway, model: str) -> None:
         return
     text, stop = "", ""
     for e in parse_sse(txt):
-        if isinstance(e, dict) and e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
             text += e["delta"]["text"]
-        if isinstance(e, dict) and e.get("type") == "message_delta":
+        if e.get("type") == "message_delta":
             stop = e["delta"].get("stop_reason") or ""
     after, row = gw.ledger()
     ok = after == before + 1 and stop == "end_turn" and row["user_id"].startswith("{")

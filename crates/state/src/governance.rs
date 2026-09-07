@@ -292,12 +292,12 @@ impl Governance for RedisGovernance {
     }
 }
 
-/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
-/// callers pass the admission time so a reserve and its settle hit the same day.
 fn tpm_key(key: &str) -> String {
     format!("gw:tpm:{key}")
 }
 
+/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
+/// callers pass the admission time so a reserve and its settle hit the same day.
 fn quota_key_at(key: &str, at_epoch_secs: i64) -> String {
     format!("gw:quota:{}:{key}", at_epoch_secs / 86_400)
 }

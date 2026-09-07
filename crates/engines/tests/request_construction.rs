@@ -1036,7 +1036,8 @@ async fn anthropic_chat_history_tool_round_trip() {
         ..Default::default()
     };
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
-    let msgs = t.body_json()["messages"].clone();
+    let body = t.body_json();
+    let msgs = &body["messages"];
     assert_eq!(msgs.as_array().unwrap().len(), 3, "turns: {msgs}");
     assert_eq!(msgs[0]["role"], "user");
     assert_eq!(msgs[0]["content"], "list files");
@@ -1094,7 +1095,8 @@ async fn anthropic_chat_history_drops_empty_turns_and_alternates() {
         ..Default::default()
     };
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
-    let msgs = t.body_json()["messages"].clone();
+    let body = t.body_json();
+    let msgs = &body["messages"];
     let roles: Vec<&str> = msgs
         .as_array()
         .unwrap()

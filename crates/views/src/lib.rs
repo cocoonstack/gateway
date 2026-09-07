@@ -23,8 +23,8 @@ use gw_consts::ErrClass;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
 use gw_engines::realtime::{
-    gemini_audio_tokens, gemini_tokens, gemini_usage_update, is_client_turn, realtime_audio_tokens,
-    realtime_output_delta, realtime_turn_started, realtime_usage,
+    gemini_audio_tokens, gemini_tokens, gemini_usage_update, is_client_turn,
+    is_realtime_turn_started, realtime_audio_tokens, realtime_output_delta, realtime_usage,
 };
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
@@ -93,15 +93,7 @@ impl AppState {
         transport: SharedTransport,
         loader: Option<ConfigLoader>,
     ) -> Self {
-        let moderator = gw_handler::moderation::from_config(config.load().cfg.moderation.as_ref());
         let handler = OnlineHandler::new(config, transport);
-        let handler = match moderator {
-            Ok(moderator) => handler.with_moderator(moderator),
-            Err(e) => {
-                tracing::error!(error = %e, "moderator not built; requests under security.moderate are denied");
-                handler
-            }
-        };
         let offline = OfflineHandler::new(handler.clone());
         Self {
             handler,
@@ -240,7 +232,7 @@ async fn track_requests(
     metrics::counter!(
         "gateway_requests_total",
         "route" => route.clone(),
-        "status" => status_label(resp.status()),
+        "status" => status_label(status),
     )
     .increment(1);
     metrics::histogram!("gateway_request_duration_seconds", "route" => route)
@@ -988,7 +980,7 @@ async fn realtime_bridge(
                             }
                         }
                         // server-VAD auto-starts a turn with no client response.create: gate it like a manual one
-                        else if realtime_turn_started(account.wire_kind(), &v) && pending.is_none() {
+                        else if is_realtime_turn_started(account.wire_kind(), &v) && pending.is_none() {
                             match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(RealtimeTurn::new(admit)),
                                 Err((class, denied)) => {
@@ -2461,8 +2453,7 @@ async fn admin_content_get(
         .into_iter()
         .filter(|r| scope.covers(&r.tenant))
         .map(|r| {
-            let content = unsealed_content(r.sealed, r.content);
-            json!({
+            let mut row = json!({
                 "created_at_epoch_secs": r.created_at_epoch_secs,
                 "kind": r.kind,
                 "ak": r.ak,
@@ -2470,8 +2461,9 @@ async fn admin_content_get(
                 "tenant": r.tenant,
                 "sealed": r.sealed,
                 "expires_at_epoch_secs": r.expires_at_epoch_secs,
-                "content": content,
-            })
+            });
+            row["content"] = unsealed_content(r.sealed, r.content);
+            row
         })
         .collect();
     Json(json!({ "request_id": request_id, "entries": entries })).into_response()
@@ -2908,7 +2900,6 @@ fn spawn_stream_pipeline(
         request.stream_tx = Some(tx.clone());
     }
     let handler = s.handler.clone();
-    let span = tracing::Span::current();
     tokio::spawn(
         async move {
             match handler.run(request, ak).await {
@@ -3004,7 +2995,7 @@ fn spawn_stream_pipeline(
                 }
             }
         }
-        .instrument(span),
+        .in_current_span(),
     );
     rx
 }
@@ -3385,17 +3376,17 @@ async fn messages(
         _ => {
             let mut blocks = Vec::new();
             if !outcome.response.reasoning.is_empty() {
-                blocks.push(json!({
-                    "type":"thinking",
-                    "thinking":Value::String(std::mem::take(&mut outcome.response.reasoning)),
-                    "signature":""
-                }));
+                blocks.push(object([
+                    ("type", "thinking".into()),
+                    ("thinking", take(&mut outcome.response.reasoning).into()),
+                    ("signature", "".into()),
+                ]));
             }
             if !outcome.response.message.is_empty() {
-                blocks.push(json!({
-                    "type":"text",
-                    "text":Value::String(std::mem::take(&mut outcome.response.message))
-                }));
+                blocks.push(object([
+                    ("type", "text".into()),
+                    ("text", take(&mut outcome.response.message).into()),
+                ]));
             }
             blocks.extend(anthropic_tool_blocks(outcome.response.tool_calls.take()));
             blocks

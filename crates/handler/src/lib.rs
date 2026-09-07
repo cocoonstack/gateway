@@ -38,11 +38,12 @@ pub struct OnlineHandler {
 
 impl OnlineHandler {
     pub fn new(config: SharedConfig, transport: SharedTransport) -> Self {
+        let moderator = moderation::from_config(config.load().cfg.moderation.as_ref());
         let handler = Self {
             config,
             transport,
             layers: Arc::from(gw_dag::default_layers()),
-            moderator: moderation::default_moderator(),
+            moderator,
         };
         handler.push_policies(&handler.cfg());
         handler

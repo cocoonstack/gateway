@@ -390,7 +390,7 @@ mod tests {
             {"type":"image_url","image_url":{"url":"data:image/png;base64,xx"}},
             {"type":"text","text":"what is it?"}]}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
-        let c = req.messages[0].content.clone().unwrap();
+        let c = req.messages.into_iter().next().unwrap().content.unwrap();
         let (text, parts) = c.into_text_and_parts();
         assert_eq!(text, "look: what is it?");
         assert_eq!(parts.unwrap().len(), 3);

@@ -71,6 +71,16 @@ impl BudgetScope {
         if self.charges_cost() { "cost" } else { "token" }
     }
 
+    /// The governance counter; user scopes carry the tenant so one user id under two tenants meters apart.
+    fn key(self, ak: &AkInfo, user: &str) -> String {
+        match self {
+            Self::UserTokens => format!("ub:{}:{user}", ak.tenant),
+            Self::TenantCost => format!("cb:tenant:{}", ak.tenant),
+            Self::KeyCost => format!("cb:ak:{}", ak.ak),
+            Self::UserCost => format!("cb:user:{}:{user}", ak.tenant),
+        }
+    }
+
     /// The alert subject; the key is named by its fingerprint, never the credential.
     fn subject(self, ak: &AkInfo, user: &str) -> String {
         match self {
@@ -483,38 +493,21 @@ fn budgets(cfg: &GatewayConfig, ak: &AkInfo, user: &str) -> Vec<Budget> {
     let Some(t) = cfg.find_tenant(&ak.tenant) else {
         return Vec::new();
     };
-    let tenant = &ak.tenant;
-    // user scopes are namespaced by tenant so one user id under two tenants meters separately
     let scopes = [
-        (
-            BudgetScope::UserTokens,
-            t.user_daily_token_quota,
-            format!("ub:{tenant}:{user}"),
-        ),
-        (
-            BudgetScope::TenantCost,
-            t.daily_cost_quota_micros,
-            format!("cb:tenant:{tenant}"),
-        ),
-        (
-            BudgetScope::KeyCost,
-            t.key_daily_cost_quota_micros,
-            format!("cb:ak:{}", ak.ak),
-        ),
-        (
-            BudgetScope::UserCost,
-            t.user_daily_cost_quota_micros,
-            format!("cb:user:{tenant}:{user}"),
-        ),
+        (BudgetScope::UserTokens, t.user_daily_token_quota),
+        (BudgetScope::TenantCost, t.daily_cost_quota_micros),
+        (BudgetScope::KeyCost, t.key_daily_cost_quota_micros),
+        (BudgetScope::UserCost, t.user_daily_cost_quota_micros),
     ];
     scopes
         .into_iter()
-        .filter(|(scope, _, _)| !scope.per_user() || !user.is_empty())
-        .filter_map(|(scope, limit, key)| {
+        .filter(|(scope, _)| !scope.per_user() || !user.is_empty())
+        .filter_map(|(scope, limit)| {
+            let limit = limit?;
             Some(Budget {
                 scope,
-                key,
-                limit: limit?,
+                key: scope.key(ak, user),
+                limit,
             })
         })
         .collect()

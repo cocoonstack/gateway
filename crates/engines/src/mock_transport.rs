@@ -57,7 +57,9 @@ impl MockTransport {
     fn ok_json(v: Value) -> GResult<UpstreamResponse> {
         Ok(UpstreamResponse {
             status: 200,
-            body: UpstreamBody::Json(bytes::Bytes::from(v.to_string())),
+            body: UpstreamBody::Json(bytes::Bytes::from(
+                serde_json::to_vec(&v).map_err(|e| GatewayError::internal(e.to_string()))?,
+            )),
             headers: HeaderMap::new(),
         })
     }

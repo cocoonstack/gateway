@@ -9,6 +9,16 @@ use std::time::Duration;
 use gw_config::ModerationConf;
 use serde_json::{Value, json};
 
+/// The `ApplyGuardrail` assessment lists that carry an `action` per entity.
+const ASSESSMENT_LISTS: [(&str, &str); 6] = [
+    ("sensitiveInformationPolicy", "piiEntities"),
+    ("sensitiveInformationPolicy", "regexes"),
+    ("wordPolicy", "customWords"),
+    ("wordPolicy", "managedWordLists"),
+    ("topicPolicy", "topics"),
+    ("contentPolicy", "filters"),
+];
+
 /// A moderator's decision on one request's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -46,21 +56,13 @@ pub struct BedrockGuardrail {
     url: String,
     api_key: String,
     source: String,
+    timeout: Duration,
 }
 
 impl BedrockGuardrail {
-    /// The moderator for `conf`, keyed from its `api_key_env`.
-    pub fn new(conf: &ModerationConf) -> Result<Self, String> {
-        Self::with_key(conf, conf.api_key().unwrap_or_default())
-    }
-
-    pub fn with_key(conf: &ModerationConf, api_key: String) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(conf.timeout_seconds))
-            .build()
-            .map_err(|e| format!("moderation client: {e}"))?;
-        Ok(Self {
-            client,
+    fn new(conf: &ModerationConf, api_key: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
             url: format!(
                 "{}/guardrail/{}/version/{}/apply",
                 conf.endpoint.trim_end_matches('/'),
@@ -69,7 +71,8 @@ impl BedrockGuardrail {
             ),
             api_key,
             source: conf.source.clone(),
-        })
+            timeout: Duration::from_secs(conf.timeout_seconds),
+        }
     }
 }
 
@@ -80,9 +83,10 @@ impl Moderator for BedrockGuardrail {
         let resp = self
             .client
             .post(&self.url)
+            .timeout(self.timeout)
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
-            .body(serde_json::to_vec(&body).map_err(|e| format!("guardrail body: {e}"))?)
+            .body(body.to_string())
             .send()
             .await
             .map_err(|e| format!("guardrail request: {e}"))?;
@@ -103,16 +107,15 @@ impl Moderator for BedrockGuardrail {
 }
 
 /// The moderator the config names, else the allow-all default.
-pub fn from_config(conf: Option<&ModerationConf>) -> Result<Arc<dyn Moderator>, String> {
-    match conf {
-        Some(conf) => {
-            if conf.api_key().is_none() {
-                tracing::warn!(var = %conf.api_key_env, "moderation api key env is unset; reviews will fail");
-            }
-            Ok(Arc::new(BedrockGuardrail::new(conf)?))
-        }
-        None => Ok(default_moderator()),
-    }
+pub fn from_config(conf: Option<&ModerationConf>) -> Arc<dyn Moderator> {
+    let Some(conf) = conf else {
+        return default_moderator();
+    };
+    let api_key = conf.api_key().unwrap_or_else(|| {
+        tracing::warn!(var = %conf.api_key_env, "moderation api key env is unset; reviews will fail");
+        String::new()
+    });
+    Arc::new(BedrockGuardrail::new(conf, api_key))
 }
 
 pub fn default_moderator() -> Arc<dyn Moderator> {
@@ -124,49 +127,21 @@ fn guardrail_verdict(text: &str, reply: &Value) -> Verdict {
     if reply["action"] != "GUARDRAIL_INTERVENED" {
         return Verdict::Allow;
     }
-    let mut blocked = Vec::new();
+    let mut blocked: Vec<&str> = Vec::new();
     let mut masked = Vec::new();
-    let assessments = reply["assessments"].as_array();
-    for a in assessments.into_iter().flatten() {
-        let entities = a["sensitiveInformationPolicy"]["piiEntities"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(
-                a["sensitiveInformationPolicy"]["regexes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(
-                a["wordPolicy"]["customWords"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(
-                a["wordPolicy"]["managedWordLists"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(a["topicPolicy"]["topics"].as_array().into_iter().flatten())
-            .chain(
-                a["contentPolicy"]["filters"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            );
-        for e in entities {
-            let label = e["type"].as_str().or(e["name"].as_str()).unwrap_or("word");
-            match e["action"].as_str() {
-                Some("BLOCKED") => blocked.push(label.to_owned()),
-                Some("ANONYMIZED") => {
-                    if let Some(needle) = e["match"].as_str().filter(|m| !m.is_empty()) {
-                        masked.extend(text.match_indices(needle).map(|(i, m)| i..i + m.len()));
+    for a in reply["assessments"].as_array().into_iter().flatten() {
+        for (policy, list) in ASSESSMENT_LISTS {
+            for e in a[policy][list].as_array().into_iter().flatten() {
+                let label = e["name"].as_str().or(e["type"].as_str()).unwrap_or("word");
+                match e["action"].as_str() {
+                    Some("BLOCKED") => blocked.push(label),
+                    Some("ANONYMIZED") => {
+                        if let Some(needle) = e["match"].as_str().filter(|m| !m.is_empty()) {
+                            masked.extend(text.match_indices(needle).map(|(i, m)| i..i + m.len()));
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -183,7 +158,6 @@ fn guardrail_verdict(text: &str, reply: &Value) -> Verdict {
                 .to_owned(),
         )
     } else {
-        masked.sort_by_key(|r| r.start);
         Verdict::Mask(masked)
     }
 }
@@ -200,7 +174,9 @@ mod tests {
             "topicPolicy":{"topics":[{"action":"BLOCKED","name":"crypto-investing","type":"DENY"}]}}]});
         assert_eq!(
             guardrail_verdict("my ssn is 123-45-6789 and forbiddenword", &reply),
-            Verdict::Deny("blocked by guardrail: DENY, US_SOCIAL_SECURITY_NUMBER, word".into())
+            Verdict::Deny(
+                "blocked by guardrail: US_SOCIAL_SECURITY_NUMBER, crypto-investing, word".into()
+            )
         );
     }
 
@@ -213,7 +189,7 @@ mod tests {
                 {"action":"ANONYMIZED","match":"415-555-0134","type":"PHONE"}],"regexes":[]}}]});
         assert_eq!(
             guardrail_verdict(text, &reply),
-            Verdict::Mask(vec![5..20, 29..41, 49..64])
+            Verdict::Mask(vec![5..20, 49..64, 29..41])
         );
         assert_eq!(&text[5..20], "bob@example.com");
         assert_eq!(&text[29..41], "415-555-0134");
@@ -254,8 +230,7 @@ mod tests {
             "guardrail_id": "g1", "guardrail_version": "1", "source": "INPUT"
         }))
         .unwrap();
-        let verdict = BedrockGuardrail::with_key(&conf, "ABSK-test".into())
-            .unwrap()
+        let verdict = BedrockGuardrail::new(&conf, "ABSK-test".into())
             .review("bad word")
             .await
             .unwrap();
