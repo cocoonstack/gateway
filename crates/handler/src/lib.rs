@@ -2419,6 +2419,7 @@ mod tests {
             banned: false,
             suspended_until_epoch_secs: None,
             model_quotas: Default::default(),
+            mcp: Default::default(),
         };
         h.state()
             .auth

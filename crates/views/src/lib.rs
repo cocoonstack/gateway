@@ -42,6 +42,8 @@ use gw_state::{
 };
 use serde_json::{Value, json};
 
+mod mcp;
+
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
 const CONFIG_VERSION_PAGE_DEFAULT: usize = 20;
@@ -64,6 +66,8 @@ pub type ConfigLoader = Arc<dyn Fn() -> ConfigFuture + Send + Sync>;
 pub struct AppState {
     pub handler: OnlineHandler,
     pub offline: OfflineHandler,
+    /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
+    pub mcp: reqwest::Client,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
     /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
@@ -89,6 +93,7 @@ impl AppState {
         Self {
             handler,
             offline,
+            mcp: reqwest::Client::new(),
             loader,
             config_store: None,
         }
@@ -134,6 +139,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/files/{id}", get(files_get).delete(files_delete))
         .route("/v1/files/{id}/content", get(files_content))
         .route("/v1/realtime", get(realtime_ws))
+        .route(
+            "/mcp/{server}",
+            post(mcp::proxy).get(mcp::proxy).delete(mcp::proxy),
+        )
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
         .route("/admin/reload", post(admin_reload))
@@ -1800,6 +1809,7 @@ async fn admin_key_create(
                 })
                 .unwrap_or_default(),
         ),
+        mcp: Default::default(),
     };
     if let Err(e) = s
         .handler
@@ -5620,6 +5630,7 @@ mod tests {
         let app = AppState {
             handler,
             offline,
+            mcp: reqwest::Client::new(),
             loader: None,
             config_store: None,
         };
@@ -5683,6 +5694,7 @@ mod tests {
         let app = AppState {
             handler,
             offline,
+            mcp: reqwest::Client::new(),
             loader: None,
             config_store: None,
         };

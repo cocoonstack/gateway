@@ -38,6 +38,8 @@ pub enum ConfigError {
     EmptyName { kind: &'static str },
     #[error("access key `{ak}` references undeclared tenant `{tenant}`")]
     UnknownTenant { ak: String, tenant: String },
+    #[error("access key `{ak}` references unknown mcp server `{server}`")]
+    UnknownMcpServer { ak: String, server: String },
     #[error("tenant `{tenant}` entitles unknown model `{model}`")]
     UnknownEntitledModel { tenant: String, model: String },
     #[error("`{owner}` sets a daily quota for unknown model `{model}`")]
@@ -95,6 +97,32 @@ pub struct AkConf {
     /// Per-model daily token caps for this key, overriding the tenant defaults.
     #[serde(default)]
     pub model_quotas: HashMap<String, i64>,
+    /// MCP servers this key may reach through `/mcp/{server}`; empty = none.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    /// Per-server tool allowlist; a server absent here exposes every tool.
+    #[serde(default)]
+    pub mcp_tools: HashMap<String, Vec<String>>,
+}
+
+/// An upstream MCP server (Streamable HTTP) proxied at `/mcp/{name}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConf {
+    pub name: String,
+    /// The server's MCP endpoint URL, e.g. `http://tools:3001/mcp`.
+    pub endpoint: String,
+    /// Env var holding a bearer token for the server; empty = none.
+    #[serde(default)]
+    pub api_key_env: String,
+    #[serde(default = "default_mcp_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl McpServerConf {
+    /// The server's bearer token, read from its env var at call time.
+    pub fn api_key(&self) -> Option<String> {
+        token_from_env(&self.api_key_env)
+    }
 }
 
 /// Public model name → dispatch type + demo pricing + per-model governance.
@@ -603,6 +631,9 @@ pub struct GatewayConfig {
     /// Outbound alert webhook (unset = off).
     #[serde(default)]
     pub alerts: AlertsConf,
+    /// MCP servers reachable through `/mcp/{server}` by entitled keys.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConf>,
     /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
     /// default: the audit records the real TCP peer, which a client can't forge.
     /// Enable only when a trusted proxy fronts the gateway and sets those headers.
@@ -924,6 +955,23 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
+        check_unique(
+            "mcp server",
+            self.mcp_servers.iter().map(|m| m.name.as_str()),
+        )?;
+        for k in &self.access_keys {
+            let unknown = k
+                .mcp_servers
+                .iter()
+                .chain(k.mcp_tools.keys())
+                .find(|name| !self.mcp_servers.iter().any(|m| &m.name == *name));
+            if let Some(server) = unknown {
+                return Err(ConfigError::UnknownMcpServer {
+                    ak: k.ak.clone(),
+                    server: server.clone(),
+                });
+            }
+        }
         // health/failover key by name — a duplicate would cool down the wrong account
         check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         // a colon in a tenant name would alias another tenant's `ub:{tenant}:{user}` budget key
@@ -995,6 +1043,10 @@ impl GatewayConfig {
 
     pub fn find_tenant(&self, name: &str) -> Option<&TenantConf> {
         self.tenants.get(*self.tenant_idx.get(name)?)
+    }
+
+    pub fn find_mcp_server(&self, name: &str) -> Option<&McpServerConf> {
+        self.mcp_servers.iter().find(|m| m.name == name)
     }
 
     /// Whether keys may reference `name` as their tenant. A linear scan so it
@@ -1136,6 +1188,10 @@ fn default_availability_min_samples() -> u64 {
 }
 fn default_cooldown_seconds() -> u64 {
     30
+}
+
+fn default_mcp_timeout() -> u64 {
+    60
 }
 
 fn default_alert_dedup_seconds() -> u64 {

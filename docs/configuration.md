@@ -57,6 +57,8 @@ access_keys:
                              # falls back to the request's `x-gw-user` / `user`)
     qps: 100                 # per-key request rate
     daily_token_quota: 1000000
+    mcp_servers: [tools]         # MCP servers this key may reach (default none)
+    mcp_tools: {tools: [search]} # per-server tool allowlist (absent = every tool)
     tokens_per_minute: 600   # optional TPM window limit
     expires_at_epoch_secs: 1767225600  # optional expiry (403 after)
     banned: false            # optional; a banned key 403s but stays listed
@@ -245,6 +247,12 @@ abuse:                         # automatic suspension; omit = off
   tiers:                       # highest tier at or under the day's reject count wins
     - {rejects: 20, suspend_hours: 2}
     - {rejects: 30, suspend_hours: 24}
+
+mcp_servers:                   # Model Context Protocol servers proxied at /mcp/{name}
+  - name: tools
+    endpoint: http://tools.internal:3001/mcp   # the server's Streamable HTTP endpoint
+    api_key_env: TOOLS_TOKEN     # optional bearer token for the server, from the env
+    timeout_seconds: 60
 
 alerts:                        # outbound webhook; omit = off
   webhook_url_env: GW_ALERT_WEBHOOK   # env var naming the URL (secrets stay out of config)
