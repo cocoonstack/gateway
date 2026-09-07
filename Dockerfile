@@ -1,6 +1,6 @@
 # Pinned: successive image builds must embed the same toolchain, not whatever
 # `rust:1` floats to on the day of the build.
-FROM rust:1.98.0@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8 AS builder
+FROM rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p gw-server --locked
