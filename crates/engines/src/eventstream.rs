@@ -85,27 +85,6 @@ pub fn encode_event(event_type: &str, payload: &[u8]) -> Vec<u8> {
     )
 }
 
-fn encode(string_headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
-    let mut headers = Vec::new();
-    for (name, value) in string_headers {
-        headers.push(name.len() as u8);
-        headers.extend_from_slice(name.as_bytes());
-        headers.push(7);
-        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
-        headers.extend_from_slice(value.as_bytes());
-    }
-    let total = 12 + headers.len() + payload.len() + 4;
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&(total as u32).to_be_bytes());
-    out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-    out.extend_from_slice(&crc32(&out).to_be_bytes());
-    out.extend_from_slice(&headers);
-    out.extend_from_slice(payload);
-    let crc = crc32(&out);
-    out.extend_from_slice(&crc.to_be_bytes());
-    out
-}
-
 /// Bedrock's `chunk` payload for a model frame: `{"bytes": base64(frame)}`.
 pub fn chunk_payload(frame: &[u8]) -> Vec<u8> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(frame);
@@ -137,6 +116,27 @@ pub fn to_sse(
         }
         Ok(Bytes::from(out))
     }))
+}
+
+fn encode(string_headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+    let mut headers = Vec::new();
+    for (name, value) in string_headers {
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name.as_bytes());
+        headers.push(7);
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value.as_bytes());
+    }
+    let total = 12 + headers.len() + payload.len() + 4;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    out.extend_from_slice(&headers);
+    out.extend_from_slice(payload);
+    let crc = crc32(&out);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
 }
 
 /// The model frame inside an InvokeModel `chunk`; a Converse event (no `bytes`)

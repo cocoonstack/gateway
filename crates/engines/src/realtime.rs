@@ -20,9 +20,9 @@ pub fn is_client_turn(provider: &str, frame: &Value) -> bool {
 }
 
 /// Visit a realtime frame's text-bearing string leaves with a visitor that may
-/// rewrite them; returns summed hits (see [`skip_scalar`] for what is not text).
+/// rewrite them; returns summed hits (see [`is_skipped_scalar`] for what is not text).
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
-    let text_delta = v["type"].as_str().map(delta_is_text).unwrap_or(false);
+    let text_delta = v["type"].as_str().map(is_text_delta).unwrap_or(false);
     walk(v, text_delta, f)
 }
 
@@ -34,7 +34,7 @@ fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usiz
         Value::Object(o) => o
             .iter_mut()
             .map(|(k, x)| match x {
-                Value::String(_) if skip_scalar(k, text_delta) => 0,
+                Value::String(_) if is_skipped_scalar(k, text_delta) => 0,
                 // identifier lists, never prose
                 _ if k == "modalities" || k == "output_modalities" => 0,
                 _ => walk(x, text_delta, f),
@@ -92,7 +92,7 @@ pub fn gemini_tokens(u: &Value) -> (i64, i64) {
 }
 
 /// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate.
-pub fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
+pub fn is_realtime_turn_started(provider: &str, frame: &Value) -> bool {
     !is_gemini_realtime(provider) && frame["type"] == "response.created"
 }
 
@@ -116,7 +116,7 @@ pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
     let Some(delta) = frame["delta"].as_str() else {
         return (None, 0);
     };
-    if delta_is_text(frame_type) {
+    if is_text_delta(frame_type) {
         (Some(delta), 0)
     } else if frame_type.contains("audio") {
         (None, delta.len().div_ceil(4))
@@ -170,7 +170,7 @@ pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
 
 /// String values that never carry human text (base64 media, protocol ids);
 /// everything else is scanned, fail closed, and config objects still recurse.
-fn skip_scalar(k: &str, text_delta: bool) -> bool {
+fn is_skipped_scalar(k: &str, text_delta: bool) -> bool {
     matches!(
         k,
         "audio"
@@ -192,7 +192,7 @@ fn skip_scalar(k: &str, text_delta: bool) -> bool {
 
 /// Whether a frame's top-level `delta` carries text (audio deltas reuse the key
 /// for base64 a rewrite would corrupt).
-fn delta_is_text(frame_type: &str) -> bool {
+fn is_text_delta(frame_type: &str) -> bool {
     frame_type.contains("text")
         || frame_type.contains("transcript")
         || frame_type.contains("arguments")

@@ -1193,6 +1193,78 @@ impl GatewayConfig {
     }
 }
 
+struct ProviderPreset {
+    endpoint: &'static str,
+    wires: &'static [&'static str],
+    default_model_wire: &'static str,
+}
+
+fn provider_preset(kind: &str) -> Option<ProviderPreset> {
+    Some(match kind {
+        "openai" => ProviderPreset {
+            endpoint: "https://api.openai.com",
+            wires: &[
+                "openai-chat",
+                "embeddings",
+                "image",
+                "tts",
+                "stt",
+                "responses",
+                "completions",
+                "realtime",
+                "moderations",
+                "video",
+            ],
+            default_model_wire: "openai-chat",
+        },
+        "anthropic" => ProviderPreset {
+            endpoint: "https://api.anthropic.com",
+            wires: &["anthropic-messages"],
+            default_model_wire: "anthropic-messages",
+        },
+        "gemini" => ProviderPreset {
+            endpoint: "https://generativelanguage.googleapis.com",
+            wires: &["gemini", "realtime"],
+            default_model_wire: "gemini",
+        },
+        // OpenAI-protocol vendors: same wire shape, different base URL.
+        "deepseek" => ProviderPreset {
+            endpoint: "https://api.deepseek.com",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "openrouter" => ProviderPreset {
+            endpoint: "https://openrouter.ai/api",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "moonshot" => ProviderPreset {
+            endpoint: "https://api.moonshot.cn",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "xai" => ProviderPreset {
+            endpoint: "https://api.x.ai",
+            wires: &["openai-chat", "responses", "image", "video", "realtime"],
+            default_model_wire: "openai-chat",
+        },
+        "siliconflow" => ProviderPreset {
+            endpoint: "https://api.siliconflow.cn",
+            wires: &[
+                "openai-chat",
+                "embeddings",
+                "rerank",
+                "tts",
+                "stt",
+                "image",
+                "video",
+            ],
+            default_model_wire: "openai-chat",
+        },
+        _ => return None,
+    })
+}
+
 /// Cumulative-weight pick over a model's variants by a stable hash, so every
 /// instance maps the same key to the same bucket with no shared state.
 pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
@@ -1334,78 +1406,6 @@ fn check_unique<'a>(
         }
     }
     Ok(())
-}
-
-struct ProviderPreset {
-    endpoint: &'static str,
-    wires: &'static [&'static str],
-    default_model_wire: &'static str,
-}
-
-fn provider_preset(kind: &str) -> Option<ProviderPreset> {
-    Some(match kind {
-        "openai" => ProviderPreset {
-            endpoint: "https://api.openai.com",
-            wires: &[
-                "openai-chat",
-                "embeddings",
-                "image",
-                "tts",
-                "stt",
-                "responses",
-                "completions",
-                "realtime",
-                "moderations",
-                "video",
-            ],
-            default_model_wire: "openai-chat",
-        },
-        "anthropic" => ProviderPreset {
-            endpoint: "https://api.anthropic.com",
-            wires: &["anthropic-messages"],
-            default_model_wire: "anthropic-messages",
-        },
-        "gemini" => ProviderPreset {
-            endpoint: "https://generativelanguage.googleapis.com",
-            wires: &["gemini", "realtime"],
-            default_model_wire: "gemini",
-        },
-        // OpenAI-protocol vendors: same wire shape, different base URL.
-        "deepseek" => ProviderPreset {
-            endpoint: "https://api.deepseek.com",
-            wires: &["openai-chat"],
-            default_model_wire: "openai-chat",
-        },
-        "openrouter" => ProviderPreset {
-            endpoint: "https://openrouter.ai/api",
-            wires: &["openai-chat"],
-            default_model_wire: "openai-chat",
-        },
-        "moonshot" => ProviderPreset {
-            endpoint: "https://api.moonshot.cn",
-            wires: &["openai-chat"],
-            default_model_wire: "openai-chat",
-        },
-        "xai" => ProviderPreset {
-            endpoint: "https://api.x.ai",
-            wires: &["openai-chat", "responses", "image", "video", "realtime"],
-            default_model_wire: "openai-chat",
-        },
-        "siliconflow" => ProviderPreset {
-            endpoint: "https://api.siliconflow.cn",
-            wires: &[
-                "openai-chat",
-                "embeddings",
-                "rerank",
-                "tts",
-                "stt",
-                "image",
-                "video",
-            ],
-            default_model_wire: "openai-chat",
-        },
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

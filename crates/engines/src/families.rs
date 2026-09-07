@@ -489,7 +489,7 @@ impl ModelEngine for AudioEngine {
                 // a JSON body is an error envelope (or a compatible upstream's b64), not audio
                 let status = reply.status;
                 match reply.body {
-                    UpstreamBody::Json(bytes) if status < 400 && !looks_like_json(&bytes) => {
+                    UpstreamBody::Json(bytes) if status < 400 && !is_json_like(&bytes) => {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         (status, object([("audio_b64", b64.into())]))
                     }
@@ -586,7 +586,7 @@ pub fn whole_seconds(v: &Value) -> Option<i64> {
         .filter(|s| *s > 0)
 }
 
-fn looks_like_json(bytes: &[u8]) -> bool {
+fn is_json_like(bytes: &[u8]) -> bool {
     matches!(
         bytes.iter().find(|b| !b.is_ascii_whitespace()),
         Some(b'{' | b'[')

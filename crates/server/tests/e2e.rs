@@ -88,8 +88,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
 
 #[tokio::test]
 async fn admin_reload_is_gated_and_swaps_keys_live() {
-    // an admin-less config keeps the whole admin surface indistinguishable
-    // from a missing route (the shared app() now names an admin token env)
     let no_admin = GatewayConfig::from_yaml(
         "listen: {host: h, port: 0}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a, provider: openai, protocols: [openai-chat]}]\naccess_keys: [{ak: k, product: p, qps: 1, daily_token_quota: 1}]",
     )
@@ -310,7 +308,6 @@ async fn body_bytes(resp: Response) -> Vec<u8> {
         .to_vec()
 }
 
-/// Serve `application` on an ephemeral local port; the bound address.
 async fn serve_app(application: Router) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -674,7 +671,6 @@ fn get_authed(uri: &str) -> Request<Body> {
         .expect("request")
 }
 
-/// Operator read against the global-token-gated /internal/* surface.
 fn internal_get(uri: &str) -> Request<Body> {
     static TOKEN: std::sync::LazyLock<&str> = std::sync::LazyLock::new(|| {
         // SAFETY: written once with a process-constant value; every later
@@ -1340,7 +1336,6 @@ async fn embeddings_images_audio_families() {
 #[tokio::test]
 async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
     let app = app();
-    // batch items at the model's batch_discount
     let resp = app
         .clone()
         .oneshot(post(
@@ -1365,7 +1360,6 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    // the same prompt online, at list price
     let resp = app
         .clone()
         .oneshot(post(
@@ -1376,7 +1370,6 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // long-context tier: a prompt past the threshold bills 2x / 1.5x
     for content in ["hi", "this prompt is long enough to cross the tier"] {
         let resp = app
             .clone()
@@ -1391,7 +1384,6 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    // images bill per image
     let resp = app
         .clone()
         .oneshot(post(
@@ -1836,7 +1828,6 @@ async fn unit_priced_surfaces_bill_characters_and_seconds() {
     let j = body_json(resp).await;
     let rows = j["records"].as_array().unwrap();
     let row = |model: &str| rows.iter().find(|r| r["model"] == model).unwrap();
-    // "read this aloud" = 15 characters × 15 micros; the mock transcribes 5 s × 100 micros
     assert_eq!(row("tts-1")["billed_units"], 15);
     assert_eq!(row("tts-1")["cost_micros"], 225);
     assert_eq!(row("whisper-1")["billed_units"], 5);
@@ -2038,7 +2029,6 @@ async fn chat_non_stream_full_pipeline_bills_the_ledger() {
     assert_eq!(rec["ak"], "ak-demo-123");
     assert_eq!(rec["model"], "gpt-4o");
     assert_eq!(rec["account"], "mock-openai-1");
-    // equal only while gpt-4o sets no token_rate: a weighted ledger total diverges from raw wire usage
     assert_eq!(rec["total_tokens"].as_i64().unwrap(), total);
     assert!(rec["cost_micros"].as_i64().unwrap() > 0);
 }
@@ -5018,7 +5008,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
     for (model, cached) in [
         ("claude-cached", true),
         ("claude-plain", false),
-        ("claude-split", true), // the served variant's knob, not the public name's
+        ("claude-split", true),
     ] {
         let body = json!({"model":model,"max_tokens":32,
             "messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hello"}]});

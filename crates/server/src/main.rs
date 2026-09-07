@@ -14,7 +14,7 @@ use gw_config::GatewayConfig;
 use gw_state::GatewayState;
 use gw_views::AppState;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
@@ -233,8 +233,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Logs to stdout under RUST_LOG; the request span additionally exports over
-/// OTLP when the standard OTEL_EXPORTER_OTLP_* environment names a collector.
+/// Stdout logs under RUST_LOG, plus OTLP span export once OTEL_EXPORTER_OTLP_* names a collector.
 fn init_tracing() -> anyhow::Result<Option<SdkTracerProvider>> {
     let log_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -270,30 +269,11 @@ fn otlp_provider() -> anyhow::Result<Option<SdkTracerProvider>> {
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_resource(resource.build())
-        .with_sampler(sampler_from_env())
         .build();
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
     Ok(Some(provider))
-}
-
-/// OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG, defaulting to parent-based always-on.
-fn sampler_from_env() -> Sampler {
-    let ratio = env::var("OTEL_TRACES_SAMPLER_ARG")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(1.0);
-    match env::var("OTEL_TRACES_SAMPLER").as_deref() {
-        Ok("always_on") => Sampler::AlwaysOn,
-        Ok("always_off") => Sampler::AlwaysOff,
-        Ok("traceidratio") => Sampler::TraceIdRatioBased(ratio),
-        Ok("parentbased_always_off") => Sampler::ParentBased(Box::new(Sampler::AlwaysOff)),
-        Ok("parentbased_traceidratio") => {
-            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio)))
-        }
-        _ => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
-    }
 }
 
 async fn read_source_text(src: Option<&str>) -> Result<Cow<'static, str>, String> {

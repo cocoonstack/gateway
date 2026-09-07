@@ -156,7 +156,7 @@ stripped from the response; the visible turn still serves.
 
 `POST /v1/videos/generations` runs the pipeline like any family (auth, limits,
 routing, a ledger row) and returns the vendor's reply as is. The wire follows
-the serving account's preset kind (else its provider label): `openai` speaks Sora's `/v1/videos`
+the serving account's provider label when it names a dialect, else its preset kind: `openai` speaks Sora's `/v1/videos`
 (`seconds`, `size`, a video object back, the finished clip via
 `GET /v1/videos/{id}/content`), `siliconflow` Wan's `video/submit` +
 `video/status`, `alibaba`/`dashscope` the DashScope task API (async header,
@@ -186,7 +186,7 @@ days.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message, `Mcp-Session-Id`, `MCP-Protocol-Version`, `Accept` and `Last-Event-ID` pass through both ways, the server's own bearer token is attached upstream; JSON and `text/event-stream` replies stream back as the server sends them |
+| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's own bearer token is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; JSON and `text/event-stream` replies stream back as the server sends them; `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded |
 
 The access key rides as usual (`Authorization: Bearer` or `x-api-key`) and
 must be entitled to the server (`access_keys[].mcp_servers`); when the key has
@@ -263,7 +263,7 @@ and admits on `response.create`.
 | GET | `/internal/accounts` | account pool view with health; global admin token only |
 
 `/internal/*` is an operator surface: it answers only to the global admin
-bearer (`admin.token_env`; 404 until that env var is set), and the raw rows
+bearer (`admin.token_env`; 404 while no admin token at all is configured, 403 to a tenant token), and the raw rows
 span every tenant. Keep it off the public load balancer regardless (the sample
 nginx config in [multi-instance](multi-instance.md) restricts it to the
 operator network).

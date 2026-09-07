@@ -25,7 +25,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 
 ```
 client ──► views (auth, parse, protocol normalize)
-       ──► handler (pre plugins: blocklist, then DLP redact)
+       ──► handler (pre plugins: blocklist, moderation, then DLP redact)
        ──► dag: preprocess        resolve model, quota check, cache lookup
               account_select      priority / PTU-first / cooldown-aware selection
               model_access        rate limits, engine call, retry-on-5xx failover
@@ -72,6 +72,8 @@ default, so the whole pipeline is testable offline:
   skipped by every instance.
 - **`Governance`** — rate/quota/TPM counters. In-process by default;
   `RedisGovernance` shares them (including pooled tenant QPS) fleet-wide.
+- **`Moderator`** — the external content review behind `security.moderate`;
+  allow-all by default, AWS Bedrock Guardrails when `moderation:` names one.
 - **config store** — with `storage.postgres_url`, config is versioned
   documents in Postgres (`PUT /admin/config` publishes; a LISTEN/NOTIFY
   change feed reloads every instance).

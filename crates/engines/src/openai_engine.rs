@@ -58,7 +58,7 @@ impl OpenAiEngine {
         let messages = Value::Array(self.wire_messages());
         let param = self.base.param()?;
         let protocol = param.protocol;
-        let reasoning_model = openai_reasoning_model(&param.model_name);
+        let reasoning_model = is_openai_reasoning_model(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), messages);
@@ -424,7 +424,7 @@ fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static,
 }
 
 /// OpenAI's own reasoning families — o-series and GPT-5 onward.
-fn openai_reasoning_model(model: &str) -> bool {
+fn is_openai_reasoning_model(model: &str) -> bool {
     match model.as_bytes() {
         [b'o', minor, ..] => minor.is_ascii_digit(),
         [b'g', b'p', b't', b'-', major, ..] => (b'5'..=b'9').contains(major),

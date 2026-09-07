@@ -35,8 +35,10 @@ on jemalloc as its global allocator.
 | `GW_PORT` | override `listen.port` |
 | `GW_TRANSPORT` | `mock` (zero egress) / `http` (no mock) / unset (auto-route) |
 | `GW_CONTENT_KEY` | 64 hex chars (32 bytes); seals retained content at rest. Without it, `full` retention stores redacted text instead of raw |
-| `GW_ADMIN_TOKEN` | global admin bearer named by the default config's `admin.token_env`; unset leaves `/admin/*` and `/internal/*` answering 404 |
+| `GW_ADMIN_TOKEN` | global admin bearer named by the default config's `admin.token_env`; unset with no tenant `admin_token_env` leaves `/admin/*` and `/internal/*` answering 404; a tenant token alone opens `/admin/*` for its scope |
 | `RUST_LOG` | log level, e.g. `info`, `gw_views=debug` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | either enables the per-request OTLP span export ([Observability](observability.md#traces)) |
+| `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | service name (default `gw`) and sampler of the exported spans (SDK defaults: parent-based, always on) |
 | provider key vars | named by each account's `api_key_env` |
 
 The process drains on SIGINT/SIGTERM (graceful shutdown of in-flight requests).

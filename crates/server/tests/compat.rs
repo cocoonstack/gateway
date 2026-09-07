@@ -53,8 +53,6 @@ fn canonical_openai_parses_into_protocol_structs() {
     assert_eq!(resp.usage.total_tokens, 21);
 }
 
-/// The Anthropic response contract, typed here so a field rename in what the
-/// gateway emits fails this suite (production hand-builds the JSON).
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {

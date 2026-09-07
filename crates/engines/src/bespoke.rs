@@ -167,65 +167,6 @@ impl ModelEngine for AwsEmbedEngine {
     }
 }
 
-fn embedding_row((index, embedding): (usize, Value)) -> Value {
-    let mut row = json!({"object": "embedding", "index": index});
-    row["embedding"] = embedding;
-    row
-}
-
-/// The non-system turns as `{role_key: ai|user, content_key: text}` objects,
-/// moved out of the request (the vendors' flat two-role wires).
-fn simple_turns(
-    base: &mut Base,
-    (ai, user): (&str, &str),
-    (role_key, content_key): (&str, &str),
-) -> Vec<Value> {
-    std::mem::take(&mut base.request.message)
-        .into_iter()
-        .filter(|m| m.role != gw_consts::role::SYSTEM)
-        .map(|m| {
-            let mut turn = Map::with_capacity(2);
-            let role = if m.role == gw_consts::role::AI {
-                ai
-            } else {
-                user
-            };
-            turn.insert(role_key.to_owned(), role.into());
-            turn.insert(content_key.to_owned(), Value::String(m.content));
-            Value::Object(turn)
-        })
-        .collect()
-}
-
-/// The Llama 3/4 chat template for Bedrock's raw prompt; a bare `role: text`
-/// prompt makes the model invent turns until max_gen_len.
-fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
-    let (start, end, eot) = if model.contains("llama4") {
-        ("<|header_start|>", "<|header_end|>", "<|eot|>")
-    } else {
-        ("<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>")
-    };
-    let mut prompt = String::from("<|begin_of_text|>");
-    for m in messages {
-        let role = match m.role.as_str() {
-            gw_consts::role::SYSTEM => "system",
-            gw_consts::role::AI => "assistant",
-            _ => "user",
-        };
-        prompt.push_str(start);
-        prompt.push_str(role);
-        prompt.push_str(end);
-        prompt.push_str("\n\n");
-        prompt.push_str(&m.content);
-        prompt.push_str(eot);
-    }
-    prompt.push_str(start);
-    prompt.push_str("assistant");
-    prompt.push_str(end);
-    prompt.push_str("\n\n");
-    prompt
-}
-
 base_engine!(LlamaEngine);
 
 #[async_trait::async_trait]
@@ -480,6 +421,65 @@ fn dashscope_apply_usage(usage: &Value, resp: &mut GatewayResponse) {
     if let Some(cached) = usage["prompt_tokens_details"]["cached_tokens"].as_i64() {
         resp.read_cached_prompt_tokens = cached.max(0);
     }
+}
+
+fn embedding_row((index, embedding): (usize, Value)) -> Value {
+    let mut row = json!({"object": "embedding", "index": index});
+    row["embedding"] = embedding;
+    row
+}
+
+/// The non-system turns as `{role_key: ai|user, content_key: text}` objects,
+/// moved out of the request (the vendors' flat two-role wires).
+fn simple_turns(
+    base: &mut Base,
+    (ai, user): (&str, &str),
+    (role_key, content_key): (&str, &str),
+) -> Vec<Value> {
+    std::mem::take(&mut base.request.message)
+        .into_iter()
+        .filter(|m| m.role != gw_consts::role::SYSTEM)
+        .map(|m| {
+            let mut turn = Map::with_capacity(2);
+            let role = if m.role == gw_consts::role::AI {
+                ai
+            } else {
+                user
+            };
+            turn.insert(role_key.to_owned(), role.into());
+            turn.insert(content_key.to_owned(), Value::String(m.content));
+            Value::Object(turn)
+        })
+        .collect()
+}
+
+/// The Llama 3/4 chat template for Bedrock's raw prompt; a bare `role: text`
+/// prompt makes the model invent turns until max_gen_len.
+fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
+    let (start, end, eot) = if model.contains("llama4") {
+        ("<|header_start|>", "<|header_end|>", "<|eot|>")
+    } else {
+        ("<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>")
+    };
+    let mut prompt = String::from("<|begin_of_text|>");
+    for m in messages {
+        let role = match m.role.as_str() {
+            gw_consts::role::SYSTEM => "system",
+            gw_consts::role::AI => "assistant",
+            _ => "user",
+        };
+        prompt.push_str(start);
+        prompt.push_str(role);
+        prompt.push_str(end);
+        prompt.push_str("\n\n");
+        prompt.push_str(&m.content);
+        prompt.push_str(eot);
+    }
+    prompt.push_str(start);
+    prompt.push_str("assistant");
+    prompt.push_str(end);
+    prompt.push_str("\n\n");
+    prompt
 }
 
 #[cfg(test)]

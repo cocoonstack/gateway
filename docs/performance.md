@@ -62,6 +62,32 @@ speed sit orders of magnitude below that; the gateway is not the ceiling.
   in-process benchmark is a manual diagnostic rather than a CI merge gate
   (see [Development](development.md)).
 
+## Against other gateways
+
+Same host (a 384-thread Linux box, Debian 13), same load generator, same
+upstream — a second gateway instance in mock mode reached over HTTP, so every
+arm pays a real HTTP hop — same 90-byte chat body at 64 concurrency for 20 s,
+arms interleaved over three rounds with the order swapped, each gateway on
+its shipped defaults (LiteLLM 1.100.0 proxy with 8 workers, Bifrost 2.0.0 from
+its binary release, this gateway from `cargo build --release`):
+
+| Gateway | Requests/s (3 rounds) | p50 | p99 |
+|---|---:|---:|---:|
+| this gateway (Rust) | 104,800 / 103,000 / 117,600 | 0.50–0.52 ms | 0.79–0.91 ms |
+| Bifrost (Go) | 17,900 / 19,500 / 21,500 | 1.32–1.44 ms | 21.7–25.7 ms |
+| LiteLLM (Python) | 1,770 / 1,920 / 1,770 | 19–34 ms | 45–162 ms |
+
+Every run was 100 % HTTP 200. The numbers measure each gateway's own overhead
+in front of an instant upstream; a real vendor adds the same generation time
+to all three.
+
+The feature rounds are gated the same way: the night that added the OTLP span,
+cost budgets, the guardrail moderator and the MCP proxy was measured A/B on
+that host (before vs after, interleaved, mock upstream, 256 concurrency):
+small chat 219k → 217k requests/s, 57 KB chat 157k → 191k, streamed
+`/v1/messages` 5.6k → 5.7k — no regression; the unconfigured features cost
+nothing per request by construction.
+
 ## Reproduce
 
 ```bash

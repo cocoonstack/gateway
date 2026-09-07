@@ -7,7 +7,6 @@ use gw_config::GatewayConfig;
 use gw_state::GatewayState;
 use gw_views::AppState;
 
-/// The composed router over the embedded default config and the mock transport.
 #[allow(clippy::expect_used)]
 pub fn app() -> Router {
     let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
