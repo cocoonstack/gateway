@@ -46,6 +46,8 @@ pub enum ConfigError {
     UnknownQuotaModel { owner: String, model: String },
     #[error("tenant `{tenant}` fallback model `{model}` is unknown or not entitled")]
     BadFallbackModel { tenant: String, model: String },
+    #[error("model `{model}` fallback_models: {reason}")]
+    BadFallbackChain { model: String, reason: &'static str },
     #[error("`{owner}` sets a negative price")]
     NegativePrice { owner: String },
     #[error("model `{model}` token_rate `{field}` must be finite and >= 0")]
@@ -168,6 +170,11 @@ pub struct ModelConf {
     /// at the cache-read rate. Pair with `token_rate`.
     #[serde(default)]
     pub prompt_cache: bool,
+    /// Models tried in order when this one fails upstream (5xx, connection
+    /// failure, or a vendor 429) before any byte reached the client; the
+    /// caller's tenant must be entitled to the one served.
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     /// Weighted routing split across other declared models (canary/gray);
     /// empty = this name serves itself. A self-referencing entry keeps a
     /// share on this model. Once routed, the variant's own qpm/cache/
@@ -963,6 +970,23 @@ impl GatewayConfig {
                 || !matches!(m.source.as_str(), "INPUT" | "OUTPUT"))
         {
             return Err(ConfigError::Moderation);
+        }
+        for m in &self.models {
+            let reason = if m.fallback_models.iter().any(|f| f == &m.name) {
+                "a model cannot fall back to itself"
+            } else if m.fallback_models.iter().any(|f| !self.model_exists(f)) {
+                "unknown model"
+            } else if (1..m.fallback_models.len())
+                .any(|i| m.fallback_models[..i].contains(&m.fallback_models[i]))
+            {
+                "duplicate entry"
+            } else {
+                continue;
+            };
+            return Err(ConfigError::BadFallbackChain {
+                model: m.name.clone(),
+                reason,
+            });
         }
         for m in &self.models {
             if m.qpm.is_some_and(|v| v < 0) {

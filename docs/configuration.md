@@ -128,6 +128,7 @@ models:
     long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
     batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price; must be finite and in (0.0, 1.0]
     prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
+    fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / connection failure / vendor 429
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
       - {model: gpt-4o-next, weight: 10}
@@ -312,8 +313,9 @@ trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unf
 `gateway_upstream_connect_retries_total` (account),
 `gateway_upstream_status_retries_total` (account, status),
 `gateway_thinking_signature_review_total` (result) and
-`gateway_thinking_signature_cache_events_total` (event) and
-`gateway_mcp_requests_total` (server, method, result). One structured access
+`gateway_thinking_signature_cache_events_total` (event),
+`gateway_mcp_requests_total` (server, method, result) and
+`gateway_model_fallbacks_total` (from, to). One structured access
 log line per successfully served request goes to stdout. Setting
 `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) exports
 one span per request over OTLP/HTTP, sampled per `OTEL_TRACES_SAMPLER`; see
