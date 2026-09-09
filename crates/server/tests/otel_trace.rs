@@ -34,7 +34,7 @@ async fn request_span_exports_route_pipeline_fields_and_the_caller_context() {
     tracing::subscriber::set_global_default(subscriber).expect("first subscriber in this process");
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+    let cfg = Arc::new(GatewayConfig::embedded_default().expect("config"));
     let state = Arc::new(GatewayState::from_config(&cfg));
     let app = gw_views::app(AppState::new(
         cfg,
@@ -54,14 +54,14 @@ async fn request_span_exports_route_pipeline_fields_and_the_caller_context() {
         .body(Body::from(
             r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
         ))
-        .unwrap();
+        .expect("request");
     let resp = app.clone().oneshot(chat).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let miss = Request::builder()
         .uri("/v1/nothing")
         .header("authorization", "Bearer ak-demo-123")
         .body(Body::empty())
-        .unwrap();
+        .expect("request");
     assert_eq!(
         app.oneshot(miss).await.unwrap().status(),
         StatusCode::NOT_FOUND

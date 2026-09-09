@@ -115,7 +115,7 @@ async fn live_chat_response_matches_canonical_key_sets() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let ours = body_json(resp).await;
-    let canon: Value = serde_json::from_str(OPENAI_CHAT_CANONICAL).unwrap();
+    let canon: Value = serde_json::from_str(OPENAI_CHAT_CANONICAL).expect("canonical parses");
 
     assert_eq!(keys(&ours), keys(&canon), "top-level keys diverge");
     assert_eq!(
@@ -146,7 +146,7 @@ async fn live_messages_response_matches_canonical_key_sets() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let ours = body_json(resp).await;
-    let canon: Value = serde_json::from_str(ANTHROPIC_MSG_CANONICAL).unwrap();
+    let canon: Value = serde_json::from_str(ANTHROPIC_MSG_CANONICAL).expect("canonical parses");
 
     assert_eq!(keys(&ours), keys(&canon), "top-level keys diverge");
     assert_eq!(

@@ -40,8 +40,7 @@ async fn spawn_vendor() -> String {
                     );
                     axum::response::Response::builder()
                         .header("content-type", "text/event-stream")
-                        .body(axum::body::Body::from(sse))
-                        .unwrap()
+                        .body(axum::body::Body::from(sse)).expect("response")
                 } else {
                     let json = json!({
                         "id":"vendor-1","object":"chat.completion","created":1,"model":body["model"],
@@ -77,10 +76,12 @@ async fn spawn_vendor() -> String {
                     .unwrap()
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app).await.expect("serve");
     });
     format!("http://{addr}")
 }
@@ -129,7 +130,7 @@ async fn full_pipeline_over_real_http() {
         .body(Body::from(
             r#"{"model":"gpt-live","messages":[{"role":"user","content":"is this live?"}]}"#,
         ))
-        .unwrap();
+        .expect("response");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
@@ -150,7 +151,7 @@ async fn full_pipeline_over_real_http() {
                 .uri("/internal/ledger")
                 .header("authorization", "Bearer live-operator")
                 .body(Body::empty())
-                .unwrap(),
+                .expect("response"),
         )
         .await
         .unwrap();
@@ -172,8 +173,7 @@ async fn streaming_pipeline_over_real_http() {
         .header("authorization", "Bearer ak-live")
         .body(Body::from(
             r#"{"model":"gpt-live","stream":true,"messages":[{"role":"user","content":"stream live"}]}"#,
-        ))
-        .unwrap();
+        )).expect("response");
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let ct = resp
@@ -219,8 +219,7 @@ async fn claude_messages_over_real_http() {
         .header("authorization", "Bearer ak-live")
         .body(Body::from(
             r#"{"model":"claude-live","max_tokens":64,"messages":[{"role":"user","content":"is claude live?"}]}"#,
-        ))
-        .unwrap();
+        )).expect("response");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
@@ -237,7 +236,7 @@ async fn claude_messages_over_real_http() {
                 .uri("/internal/ledger")
                 .header("authorization", "Bearer live-operator")
                 .body(Body::empty())
-                .unwrap(),
+                .expect("response"),
         )
         .await
         .unwrap();
@@ -259,7 +258,7 @@ async fn auth_and_limits_still_apply_over_real_http() {
             .body(Body::from(
                 r#"{"model":"gpt-live","messages":[{"role":"user","content":"x"}]}"#,
             ))
-            .unwrap()
+            .expect("response")
     };
     let resp = app.clone().oneshot(chat("wrong")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

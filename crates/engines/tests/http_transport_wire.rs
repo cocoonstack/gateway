@@ -18,10 +18,12 @@ use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use serde_json::{Value, json};
 
 async fn serve_router(app: Router) -> std::net::SocketAddr {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app).await.expect("serve");
     });
     addr
 }
@@ -46,8 +48,7 @@ async fn spawn_vendor() -> String {
                 );
                 axum::response::Response::builder()
                     .header("content-type", "text/event-stream")
-                    .body(axum::body::Body::from(sse))
-                    .unwrap()
+                    .body(axum::body::Body::from(sse)).expect("response")
             } else {
                 let payload = json!({
                     "id":"srv-1","object":"chat.completion","model":"srv",
@@ -68,7 +69,7 @@ async fn spawn_vendor() -> String {
 #[tokio::test]
 async fn http_transport_json_over_real_socket() {
     let base = spawn_vendor().await;
-    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let transport = HttpTransport::new(Duration::from_secs(5)).expect("transport");
     let req = UpstreamRequest {
         protocol: Protocol::OpenaiChat,
         method: "POST",
@@ -110,7 +111,7 @@ async fn spawn_stalled_json_vendor() -> String {
             axum::response::Response::builder()
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from_stream(body))
-                .unwrap()
+                .expect("response")
         }),
     );
     let addr = serve_router(app).await;
@@ -119,7 +120,7 @@ async fn spawn_stalled_json_vendor() -> String {
 
 #[tokio::test]
 async fn non_stream_body_timeout_classifies_as_model_timeout() {
-    let transport = HttpTransport::new(Duration::from_millis(300)).unwrap();
+    let transport = HttpTransport::new(Duration::from_millis(300)).expect("transport");
     let err = transport
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
@@ -153,7 +154,7 @@ async fn spawn_breaking_json_vendor() -> String {
             axum::response::Response::builder()
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from_stream(body))
-                .unwrap()
+                .expect("response")
         }),
     );
     let addr = serve_router(app).await;
@@ -162,7 +163,7 @@ async fn spawn_breaking_json_vendor() -> String {
 
 #[tokio::test]
 async fn non_stream_body_break_classifies_as_model_error() {
-    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let transport = HttpTransport::new(Duration::from_secs(5)).expect("transport");
     let err = transport
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
@@ -187,7 +188,7 @@ async fn non_stream_body_break_classifies_as_model_error() {
 #[tokio::test]
 async fn http_transport_sse_over_real_socket() {
     let base = spawn_vendor().await;
-    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let transport = HttpTransport::new(Duration::from_secs(5)).expect("transport");
     let req = UpstreamRequest {
         protocol: Protocol::OpenaiChat,
         method: "POST",
@@ -215,7 +216,7 @@ async fn http_transport_sse_over_real_socket() {
 #[tokio::test]
 async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
     let base = spawn_vendor().await;
-    let transport = DispatchTransport::new(Duration::from_secs(5)).unwrap();
+    let transport = DispatchTransport::new(Duration::from_secs(5)).expect("transport");
 
     let req = |url: String| UpstreamRequest {
         protocol: Protocol::OpenaiChat,
@@ -261,7 +262,7 @@ async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
 async fn engine_through_real_http_transport_end_to_end() {
     let base = spawn_vendor().await;
     let transport: gw_engines::SharedTransport =
-        Arc::new(HttpTransport::new(Duration::from_secs(5)).unwrap());
+        Arc::new(HttpTransport::new(Duration::from_secs(5)).expect("transport"));
 
     let account = gw_models::Account {
         name: "real-local".into(),
@@ -297,7 +298,8 @@ async fn per_account_policy_and_connect_retry() {
             connect_retries: 2,
         },
     );
-    let transport = HttpTransport::with_policies(UpstreamPolicy::default(), per_account).unwrap();
+    let transport =
+        HttpTransport::with_policies(UpstreamPolicy::default(), per_account).expect("transport");
     assert_eq!(transport.policy_for("tight").connect_retries, 2);
     assert_eq!(transport.policy_for("other").connect_retries, 1);
 
@@ -322,8 +324,8 @@ async fn per_account_policy_and_connect_retry() {
     );
 
     let closed = std::iter::repeat_with(|| {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr")
     })
     .find(|addr| std::net::TcpStream::connect_timeout(addr, Duration::from_millis(50)).is_err())
     .unwrap();
@@ -368,7 +370,7 @@ async fn spawn_paced_vendor(frames: usize, gap: Duration) -> String {
             axum::response::Response::builder()
                 .header("content-type", "text/event-stream")
                 .body(axum::body::Body::from_stream(sse))
-                .unwrap()
+                .expect("response")
         }),
     );
     let addr = serve_router(app).await;
@@ -391,7 +393,7 @@ fn paced_req(url: String) -> UpstreamRequest {
 #[tokio::test]
 async fn slow_stream_outlives_the_total_policy_timeout() {
     let url = spawn_paced_vendor(5, Duration::from_millis(300)).await;
-    let transport = HttpTransport::new(Duration::from_secs(1)).unwrap();
+    let transport = HttpTransport::new(Duration::from_secs(1)).expect("transport");
     let resp = transport.send(paced_req(url)).await.unwrap();
     let resp = resp
         .buffered()
@@ -410,7 +412,7 @@ async fn slow_stream_outlives_the_total_policy_timeout() {
 #[tokio::test]
 async fn stalled_stream_errors_at_the_idle_gap_instead_of_hanging() {
     let url = spawn_paced_vendor(2, Duration::from_secs(20)).await;
-    let transport = HttpTransport::new(Duration::from_millis(300)).unwrap();
+    let transport = HttpTransport::new(Duration::from_millis(300)).expect("transport");
     let started = std::time::Instant::now();
     let err = match transport.send(paced_req(url)).await {
         Ok(resp) => resp
@@ -604,12 +606,11 @@ async fn an_error_status_under_an_sse_content_type_is_a_body_not_a_stream() {
                 .header("content-type", "text/event-stream")
                 .body(axum::body::Body::from(
                     r#"{"error":{"code":404,"message":"models/nope is not found","status":"NOT_FOUND"}}"#,
-                ))
-                .unwrap()
+                )).expect("response")
         }),
     );
     let addr = serve_router(app).await;
-    let transport = HttpTransport::new(Duration::from_secs(5)).unwrap();
+    let transport = HttpTransport::new(Duration::from_secs(5)).expect("transport");
     let resp = transport
         .send(UpstreamRequest {
             protocol: Protocol::Gemini,
