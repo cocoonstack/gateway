@@ -448,21 +448,19 @@ enum Moderation {
 }
 
 struct TerminalSubject {
+    ak: Arc<AkInfo>,
     request_id: String,
-    ak: String,
     user_id: String,
-    tenant: String,
 }
 
 impl TerminalSubject {
-    fn new(ak: &AkInfo, request: &GatewayRequest) -> Self {
+    fn new(ak: &Arc<AkInfo>, request: &GatewayRequest) -> Self {
         Self {
+            ak: Arc::clone(ak),
             request_id: request.request_id.clone(),
-            ak: ak.ak.clone(),
             user_id: ak
                 .attributed_user(request.user_id.as_deref().unwrap_or_default())
                 .to_owned(),
-            tenant: ak.tenant.clone(),
         }
     }
 }
@@ -673,9 +671,9 @@ async fn persist_terminal(
     let record = gw_state::ContentRecord {
         created_at_epoch_secs: now,
         request_id: subject.request_id.clone(),
-        ak: subject.ak.clone(),
+        ak: subject.ak.ak.clone(),
         user_id: subject.user_id.clone(),
-        tenant: subject.tenant.clone(),
+        tenant: subject.ak.tenant.clone(),
         kind: "terminal".to_owned(),
         content: body.to_string(),
         sealed: false,

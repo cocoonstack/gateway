@@ -331,7 +331,7 @@ impl DashScopeEngine {
             "dashscope",
             reply.body,
             self.base.request.stream_tx.clone(),
-            |v| dashscope_apply_frame(&v, status, &mut resp, &mut full),
+            |v| dashscope_apply_frame(v, status, &mut resp, &mut full),
         )
         .await?;
         resp.message = full;
@@ -372,25 +372,25 @@ impl ModelEngine for DashScopeEngine {
 /// Apply one DashScope SSE frame: running frames carry the literal "null"
 /// finish_reason and cumulative usage (last frame wins).
 fn dashscope_apply_frame(
-    v: &Value,
+    mut v: Value,
     status: u16,
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
-    if let Some(err) = crate::engine::vendor_error(status, v) {
+    if let Some(err) = crate::engine::vendor_error(status, &v) {
         return Err(err);
     }
     let mut chunks = Vec::new();
-    let choice = &v["output"]["choices"][0];
-    if let Some(t) = choice["message"]["content"].as_str()
+    if let Some(t) = crate::engine::take_string(&mut v, "/output/choices/0/message/content")
         && !t.is_empty()
     {
-        full.push_str(t);
+        full.push_str(&t);
         chunks.push(StreamChunk {
-            delta: t.to_owned(),
+            delta: t,
             ..Default::default()
         });
     }
+    let choice = &v["output"]["choices"][0];
     if let Some(fr) = choice["finish_reason"].as_str()
         && !fr.is_empty()
         && fr != "null"

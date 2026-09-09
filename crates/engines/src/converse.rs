@@ -61,7 +61,9 @@ impl Events {
                         json!({"type": "text", "text": ""}),
                         typed("text_delta", "text", text.take()),
                     )
-                } else if let Some(input) = delta["toolUse"].get_mut("input") {
+                } else if let Some(input) =
+                    delta.get_mut("toolUse").and_then(|t| t.get_mut("input"))
+                {
                     (
                         Value::Null,
                         typed("input_json_delta", "partial_json", input.take()),
@@ -198,8 +200,13 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
 
 /// A buffered Converse reply as a Messages reply.
 pub(crate) fn reply(mut v: Value, model: &str) -> Value {
-    let content: Vec<Value> = match v["output"]["message"]["content"].take() {
-        Value::Array(blocks) => blocks.into_iter().filter_map(anthropic_block).collect(),
+    let content: Vec<Value> = match v
+        .get_mut("output")
+        .and_then(|o| o.get_mut("message"))
+        .and_then(|m| m.get_mut("content"))
+        .map(Value::take)
+    {
+        Some(Value::Array(blocks)) => blocks.into_iter().filter_map(anthropic_block).collect(),
         _ => Vec::new(),
     };
     let usage = usage(&mut v["usage"]);
@@ -254,7 +261,13 @@ fn content_block(mut block: Value) -> Vec<Value> {
                 .unwrap_or("png");
             let image = object([
                 ("format", format.into()),
-                ("source", object([("bytes", source["data"].take())])),
+                (
+                    "source",
+                    object([(
+                        "bytes",
+                        source.get_mut("data").map(Value::take).unwrap_or_default(),
+                    )]),
+                ),
             ]);
             object([("image", image)])
         }
@@ -313,7 +326,10 @@ fn content_block(mut block: Value) -> Vec<Value> {
 fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
     let cache_control = tool.get_mut("cache_control").map(Value::take);
     let mut spec = Map::with_capacity(4);
-    spec.insert("name".into(), tool["name"].take());
+    spec.insert(
+        "name".into(),
+        tool.get_mut("name").map(Value::take).unwrap_or_default(),
+    );
     if let Some(d) = tool.get_mut("description").filter(|d| !d.is_null()) {
         spec.insert("description".into(), d.take());
     }

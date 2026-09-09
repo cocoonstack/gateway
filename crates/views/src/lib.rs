@@ -339,7 +339,7 @@ fn rt_error_frame(
 }
 
 /// The AK carried as `gw-api-key.<ak>` in `Sec-WebSocket-Protocol`, the one header a browser can set.
-fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
+fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("sec-websocket-protocol")?
         .to_str()
@@ -347,7 +347,6 @@ fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
         .split(',')
         .map(str::trim)
         .find_map(|p| p.strip_prefix("gw-api-key."))
-        .map(str::to_owned)
 }
 
 /// GET /v1/realtime (WebSocket upgrade): bridge to the vendor's socket, or the mock for an endpoint-less account.
@@ -363,7 +362,7 @@ async fn realtime_ws(
         Ok(ak) => ak,
         Err((st, msg)) => {
             let sub = match ws_subprotocol_ak(&headers) {
-                Some(k) => snap.state.auth.authenticate(&k).await,
+                Some(k) => snap.state.auth.authenticate(k).await,
                 None => None,
             };
             match sub {
@@ -2540,7 +2539,9 @@ async fn admin_content_get(
             row
         })
         .collect();
-    Json(json!({ "request_id": request_id, "entries": entries })).into_response()
+    let mut out = json!({ "request_id": request_id });
+    out["entries"] = Value::Array(entries);
+    Json(out).into_response()
 }
 
 /// GET /admin/audit/content?user=&limit=&include= — one end user's retained rows,
@@ -3281,10 +3282,8 @@ fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::Stre
 /// the raw pre-redaction deltas, so no unmasked text ever leaves.
 fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let resp = &mut outcome.response;
-    if resp.anthropic_content.is_some() {
-        let chunks = gw_engines::anthropic_native_chunks(resp, None);
-        resp.anthropic_content = None;
-        return chunks;
+    if let Some(content) = resp.anthropic_content.take() {
+        return gw_engines::anthropic_native_chunks(resp, content, None);
     }
     let mut chunks = text_chunks(resp);
     if let Some(tc) = resp.tool_calls.take() {
@@ -3597,15 +3596,15 @@ fn messages_stream_response(
 
         /// The wire pattern clients expect for a tool_use block: empty `input`
         /// in the start frame, the arguments as one input_json_delta, stop.
-        fn emit_tool_block(&mut self, block: &Value) {
+        fn emit_tool_block(&mut self, mut block: Value) {
             self.close_block(BlockKind::Text);
             let idx = self.next_idx;
             self.next_idx += 1;
-            self.queue.push_back(Self::ev(
-                "content_block_start",
-                json!({"type":"content_block_start","index":idx,
-                       "content_block":{"type":"tool_use","id":block["id"],"name":block["name"],"input":{}}}),
-            ));
+            let mut start = json!({"type":"content_block_start","index":idx,
+                   "content_block":{"type":"tool_use","input":{}}});
+            start["content_block"]["id"] = block["id"].take();
+            start["content_block"]["name"] = block["name"].take();
+            self.queue.push_back(Self::ev("content_block_start", start));
             self.queue.push_back(Self::ev(
                 "content_block_delta",
                 json!({"type":"content_block_delta","index":idx,
@@ -3626,7 +3625,7 @@ fn messages_stream_response(
             self.ensure_message_start();
             if let Some(frags) = self.tool_frags.take() {
                 for block in anthropic_tool_blocks(Some(frags)) {
-                    self.emit_tool_block(&block);
+                    self.emit_tool_block(block);
                 }
             }
             self.close_block(BlockKind::Text);
@@ -3707,7 +3706,7 @@ fn messages_stream_response(
                             .unwrap_or(false);
                         if native {
                             for block in anthropic_tool_blocks(Some(tc)) {
-                                self.emit_tool_block(&block);
+                                self.emit_tool_block(block);
                             }
                         } else {
                             gw_engines::merge_tool_call_fragments(&mut self.tool_frags, &tc);
@@ -4781,7 +4780,7 @@ async fn batches_get(
 ) -> Response {
     let found = s.handler.state().store.batch_get(&id).await;
     match tenant_owned(found, |j| &j.tenant, &ak.tenant, "batch", &id) {
-        Ok(job) => (StatusCode::OK, Json(json!(job))).into_response(),
+        Ok(job) => (StatusCode::OK, Json(job)).into_response(),
         Err(resp) => resp,
     }
 }

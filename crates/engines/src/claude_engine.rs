@@ -267,7 +267,13 @@ impl ClaudeEngine {
         };
         let mut outcome = EngineOutcome::with_status(resp, status);
         if self.base.request.stream && self.base.request.preserve_anthropic_wire {
-            outcome.chunks = anthropic_native_chunks(&outcome.response, self.base.model_override());
+            let content = outcome
+                .response
+                .anthropic_content
+                .clone()
+                .unwrap_or(Value::Null);
+            outcome.chunks =
+                anthropic_native_chunks(&outcome.response, content, self.base.model_override());
         }
         Ok(outcome)
     }
@@ -591,6 +597,7 @@ impl<'a> SseState<'a> {
 /// upstreams ignore `stream:true`), so thinking proof survives the streaming surface.
 pub fn anthropic_native_chunks(
     response: &GatewayResponse,
+    content: Value,
     model_override: Option<&str>,
 ) -> Vec<StreamChunk> {
     let stream_model = model_override.unwrap_or(&response.model);
@@ -612,53 +619,52 @@ pub fn anthropic_native_chunks(
             "usage":start_usage
         }
     })];
-    if let Some(blocks) = response
-        .anthropic_content
-        .as_ref()
-        .and_then(Value::as_array)
-    {
-        for (index, block) in blocks.iter().enumerate() {
-            let mut start = block.clone();
+    if let Value::Array(blocks) = content {
+        for (index, mut start) in blocks.into_iter().enumerate() {
             let mut deltas = Vec::new();
-            match block.get("type").and_then(Value::as_str) {
-                Some("thinking") => {
-                    if let Some(object) = start.as_object_mut() {
-                        object.insert("thinking".to_owned(), "".into());
-                        object.insert("signature".to_owned(), "".into());
-                    }
-                    if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
-                        && !thinking.is_empty()
-                    {
-                        deltas.push(json!({"type":"thinking_delta","thinking":thinking}));
-                    }
-                    if let Some(signature) = block.get("signature").and_then(Value::as_str)
-                        && !signature.is_empty()
-                    {
-                        deltas.push(json!({"type":"signature_delta","signature":signature}));
-                    }
+            if start["type"] == "thinking" {
+                if let Some(Value::String(thinking)) = start.get_mut("thinking").map(Value::take)
+                    && !thinking.is_empty()
+                {
+                    deltas.push(object([
+                        ("type", "thinking_delta".into()),
+                        ("thinking", Value::String(thinking)),
+                    ]));
                 }
-                Some("text") => {
-                    if let Some(object) = start.as_object_mut() {
-                        object.insert("text".to_owned(), "".into());
-                    }
-                    if let Some(text) = block.get("text").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        deltas.push(json!({"type":"text_delta","text":text}));
-                    }
+                if let Some(Value::String(signature)) = start.get_mut("signature").map(Value::take)
+                    && !signature.is_empty()
+                {
+                    deltas.push(object([
+                        ("type", "signature_delta".into()),
+                        ("signature", Value::String(signature)),
+                    ]));
                 }
-                Some("tool_use") => {
-                    if let Some(object) = start.as_object_mut() {
-                        object.insert("input".to_owned(), json!({}));
-                    }
-                    if let Some(input) = block.get("input") {
-                        deltas.push(object([
-                            ("type", "input_json_delta".into()),
-                            ("partial_json", input.to_string().into()),
-                        ]));
-                    }
+                if let Some(object) = start.as_object_mut() {
+                    object.insert("thinking".to_owned(), "".into());
+                    object.insert("signature".to_owned(), "".into());
                 }
-                _ => {}
+            } else if start["type"] == "text" {
+                if let Some(Value::String(text)) = start.get_mut("text").map(Value::take)
+                    && !text.is_empty()
+                {
+                    deltas.push(object([
+                        ("type", "text_delta".into()),
+                        ("text", Value::String(text)),
+                    ]));
+                }
+                if let Some(object) = start.as_object_mut() {
+                    object.insert("text".to_owned(), "".into());
+                }
+            } else if start["type"] == "tool_use" {
+                if let Some(input) = start.get_mut("input").map(Value::take) {
+                    deltas.push(object([
+                        ("type", "input_json_delta".into()),
+                        ("partial_json", input.to_string().into()),
+                    ]));
+                }
+                if let Some(object) = start.as_object_mut() {
+                    object.insert("input".to_owned(), json!({}));
+                }
             }
             // built by hand: json! would deep-copy the moved blocks
             let mut event = Map::with_capacity(3);
@@ -1309,7 +1315,8 @@ mod tests {
             anthropic_content: Some(json!([{"type":"text","text":"answer"}])),
             ..Default::default()
         };
-        let chunks = anthropic_native_chunks(&response, None);
+        let content = response.anthropic_content.clone().unwrap_or(Value::Null);
+        let chunks = anthropic_native_chunks(&response, content, None);
         let events: Vec<_> = chunks
             .iter()
             .filter_map(|chunk| chunk.native_event.as_ref())
