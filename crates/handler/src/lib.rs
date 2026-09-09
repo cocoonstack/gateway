@@ -256,12 +256,16 @@ impl OnlineHandler {
             deferred.push(security_event(&ctx, "dlp", "redact", redacted as i64));
         }
 
-        // a panicking node must refund too; the refund reads only whole-written ctx fields
-        let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| Err(GatewayError::internal("pipeline panicked")));
-        if let Err(e) = ran {
+        let mut tried = 0;
+        loop {
+            // a panicking node must refund too; the refund reads only whole-written ctx fields
+            let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(GatewayError::internal("pipeline panicked")));
+            let Err(e) = ran else {
+                break;
+            };
             // a failed pipeline refunds its reservations whole, on the reserve's day bucket
             ctx.state
                 .governance
@@ -272,6 +276,14 @@ impl OnlineHandler {
                     ctx.quota_at,
                 )
                 .await;
+            if let Some((i, next)) = fallback_after(&e)
+                .then(|| next_fallback(&snap.cfg, &ctx, tried))
+                .flatten()
+            {
+                tried = i + 1;
+                switch_model(&mut ctx, next, &e.message);
+                continue;
+            }
             if e.code == gw_consts::ErrCode::STOP_LIMIT_MSG {
                 note_abuse(&ctx).await;
             }
@@ -543,6 +555,48 @@ async fn note_abuse(ctx: &DagContext) {
     ctx.state
         .alerts
         .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
+}
+
+/// Whether a pipeline error is the upstream's fault: a 5xx (vendor or
+/// connection failure) or a vendor 429; gateway-side denials never fall back.
+fn fallback_after(e: &GatewayError) -> bool {
+    e.http_status >= 500 || e.original_status() == Some(429)
+}
+
+/// The next entry of the requested model's fallback chain past `tried` that the caller's tenant may use.
+fn next_fallback<'c>(
+    cfg: &'c GatewayConfig,
+    ctx: &DagContext,
+    tried: usize,
+) -> Option<(usize, &'c str)> {
+    let param = ctx.request.model_param_v2.as_ref()?;
+    let requested = param.fallback_from.as_deref().unwrap_or(&param.model_name);
+    cfg.find_model(requested)?
+        .fallback_models
+        .iter()
+        .enumerate()
+        .skip(tried)
+        .find(|(_, m)| cfg.tenant_allows_model(&ctx.ak.tenant, m))
+        .map(|(i, m)| (i, m.as_str()))
+}
+
+/// Retarget the request at `next` and clear what the failed run left behind, so the pipeline can run again.
+fn switch_model(ctx: &mut DagContext, next: &str, why: &str) {
+    let Some(param) = ctx.request.model_param_v2.as_mut() else {
+        return;
+    };
+    let from = std::mem::replace(&mut param.model_name, next.to_owned());
+    if param.fallback_from.is_none() {
+        param.fallback_from = Some(from.clone());
+    }
+    ctx.decide("fallback", format!("{from} -> {next}: {why}"));
+    metrics::counter!("gateway_model_fallbacks_total", "from" => from, "to" => next.to_owned())
+        .increment(1);
+    ctx.outcome = None;
+    ctx.cache_hit = false;
+    ctx.cache_key = None;
+    ctx.model_quota_key = None;
+    ctx.request.account = None;
 }
 
 /// Record a moderation denial; event emission stays at the call sites.
@@ -962,6 +1016,155 @@ mod tests {
             message: vec![ChatMsg::text("user", content)],
             model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, name)),
             ..Default::default()
+        }
+    }
+
+    async fn vendor_by_model() -> (String, Arc<std::sync::atomic::AtomicU32>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 16384];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                seen.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if request.contains(r#""model":"broken""#) {
+                    (503, r#"{"error":{"message":"vendor down"}}"#)
+                } else if request.contains(r#""model":"throttled""#) {
+                    (429, r#"{"error":{"message":"rate limited"}}"#)
+                } else {
+                    (
+                        200,
+                        r#"{"model":"served","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    async fn fallback_handler(endpoint: &str, tenants: &str) -> OnlineHandler {
+        let yaml = format!(
+            "listen: {{host: h, port: 1}}\n{tenants}\naccess_keys: [{{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}}]\nmodels: [{{name: broken, protocol: openai-chat, fallback_models: [throttled, healthy]}}, {{name: throttled, protocol: openai-chat}}, {{name: healthy, protocol: openai-chat}}]\naccounts: [{{name: a1, provider: p, endpoint: '{endpoint}', protocols: [openai-chat], connect_retries: 1, retry_status: []}}]"
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(
+                gw_engines::http_transport::HttpTransport::new(std::time::Duration::from_secs(5))
+                    .unwrap(),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn upstream_failures_fall_back_along_the_chain() {
+        let (endpoint, hits) = vendor_by_model().await;
+        let h = fallback_handler(&endpoint, "tenants: [{name: t1}]").await;
+        let ak = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("broken", "hi"), ak).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let outcome = ctx.outcome.as_ref().unwrap();
+        assert_eq!(
+            outcome.response.model, "broken",
+            "the caller sees the requested name"
+        );
+        let trail = ctx.decisions_line();
+        assert!(
+            trail.contains("fallback: broken -> throttled: vendor down")
+                && trail.contains("fallback: throttled -> healthy: rate limited"),
+            "{trail}"
+        );
+        assert!(
+            trail.contains("resolve_model: healthy -> openai-chat"),
+            "{trail}"
+        );
+        let (_, rows) = h.state().store.ledger_snapshot(10).await.unwrap();
+        assert_eq!(
+            (rows[0].model.as_str(), rows[0].served_model.as_str()),
+            ("broken", "healthy")
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_skips_unentitled_models_and_gateway_denials_never_fall_back() {
+        let (endpoint, hits) = vendor_by_model().await;
+        let h = fallback_handler(
+            &endpoint,
+            "tenants: [{name: t1, models: [broken, healthy]}]",
+        )
+        .await;
+        let ak = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("broken", "hi"), ak).await.unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "throttled is skipped unserved"
+        );
+        assert!(
+            ctx.decisions_line()
+                .contains("fallback: broken -> healthy: vendor down"),
+            "{}",
+            ctx.decisions_line()
+        );
+
+        let ak = h.state().auth.authenticate("k1").await.unwrap();
+        let err = h
+            .run(chat_req("throttled", "hi"), ak)
+            .await
+            .err()
+            .expect("an unentitled model is a gateway denial");
+        assert_eq!(err.http_status, 403);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a gateway denial reaches no vendor"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_chain_reports_the_last_upstream_error() {
+        let (endpoint, hits) = vendor_by_model().await;
+        let h = fallback_handler(
+            &endpoint,
+            "tenants: [{name: t1, models: [broken, throttled]}]",
+        )
+        .await;
+        let ak = h.state().auth.authenticate("k1").await.unwrap();
+        let err = h
+            .run(chat_req("broken", "hi"), ak)
+            .await
+            .err()
+            .expect("the chain ends in the throttled vendor");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(err.original_status(), Some(429));
+        assert!(err.message.contains("rate limited"), "{}", err.message);
+    }
+
+    #[test]
+    fn config_rejects_a_broken_fallback_chain() {
+        for (chain, reason) in [
+            ("[a]", "itself"),
+            ("[ghost]", "unknown"),
+            ("[b, b]", "duplicate"),
+        ] {
+            let yaml = format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: a, protocol: openai-chat, fallback_models: {chain}}}, {{name: b, protocol: openai-chat}}]"
+            );
+            let err = GatewayConfig::from_yaml(&yaml).unwrap_err().to_string();
+            assert!(err.contains(reason), "{chain}: {err}");
         }
     }
 

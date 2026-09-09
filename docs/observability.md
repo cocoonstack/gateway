@@ -17,6 +17,7 @@
 | `gateway_thinking_signature_review_total` | counter | `result` (match/mismatch/miss/no_evidence) |
 | `gateway_thinking_signature_cache_events_total` | counter | `event` |
 | `gateway_mcp_requests_total` | counter | `server`, `method`, `result` |
+| `gateway_model_fallbacks_total` | counter | `from`, `to` |
 
 `gateway_requests_total` is recorded by router middleware, so every response —
 including error statuses and the realtime WebSocket upgrade — is counted, which

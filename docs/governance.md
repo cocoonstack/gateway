@@ -32,6 +32,26 @@ failing (the response echoes the requested model name; the ledger records both
 requested and served). The per-key daily cap stays the hard backstop, and
 unconfigured (key, model) pairs never touch a counter.
 
+## Model fallback
+
+A model may name `fallback_models`, tried in order when the request fails
+upstream — a vendor 5xx, a connection failure, or a vendor `429` — after the
+account-level failover within the model is exhausted, and only while no byte
+has reached the client (a failure after a stream has begun stays a failure).
+Gateway-side denials (quotas, rate limits, entitlement, bad requests) never
+fall back. Each hop re-runs the pipeline for the next model: entitlement,
+quota reservation and account selection apply to the model actually served,
+a fallback the caller's tenant is not entitled to is skipped, the response
+echoes the requested name, the ledger records both requested and served
+(`served_model`), the decision trail carries `fallback: <from> -> <to>: <why>`,
+and `gateway_model_fallbacks_total{from, to}` counts the hops. A chain does
+not recurse: only the requested model's list applies.
+
+```yaml
+models:
+  - {name: gpt-4o, protocol: openai-chat, fallback_models: [gpt-4o-mini, claude-haiku]}
+```
+
 ## Limits
 
 | Limit | Scope | Config |
