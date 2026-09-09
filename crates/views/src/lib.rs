@@ -147,13 +147,13 @@ impl AppState {
 /// The MCP proxy's client: no redirects, so a server or token endpoint cannot
 /// steer a credentialed request elsewhere.
 fn mcp_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    #[allow(clippy::expect_used)]
+    // build fails only when TLS cannot initialize, where Client::new panics too
+    let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "mcp client fell back to the default client");
-            reqwest::Client::new()
-        })
+        .expect("mcp client builds");
+    client
 }
 
 fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
@@ -799,18 +799,16 @@ async fn realtime_session(
                     }
                     turn.record_text(delta);
                 }
-                if socket
+                let sent = socket
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
                     .await
-                    .is_err()
-                {
-                    bill_realtime_turn(&turn.admit, &rtm, mt, &account, turn_tokens(it, ot), false)
-                        .await;
-                    return;
-                }
+                    .is_ok();
                 bill_realtime_turn(&turn.admit, &rtm, mt, &account, turn_tokens(it, ot), false)
                     .await;
+                if !sent {
+                    return;
+                }
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -1052,24 +1050,11 @@ async fn realtime_bridge(
                                 v["usageMetadata"] = u;
                             }
                             // turn boundary: settle the admitted turn; an ungated one bills unreserved
-                            match pending.take() {
-                                Some(turn) if it.saturating_add(ot) > 0 => {
-                                    bill_realtime_turn(
-                                        &turn.admit,
-                                        &rtm,
-                                        mt,
-                                        &account.name,
-                                        gw_models::TokenInput {
-                                            prompt: it,
-                                            completion: ot,
-                                            ..turn_audio(account.wire_kind(), &v)
-                                        },
-                                        false,
-                                    )
-                                    .await
-                                }
+                            let admit = match pending.take() {
+                                Some(turn) if it.saturating_add(ot) > 0 => Some(turn.admit),
                                 Some(turn) => {
-                                    settle_realtime_abort(turn, &rtm, mt, &account.name).await
+                                    settle_realtime_abort(turn, &rtm, mt, &account.name).await;
+                                    None
                                 }
                                 None if it.saturating_add(ot) > 0 => {
                                     // re-authenticate so billing uses the key's current identity
@@ -1081,7 +1066,7 @@ async fn realtime_bridge(
                                         .await
                                         .unwrap_or_else(|| ak.clone());
                                     let user = billed.attributed_user(&hint).to_owned();
-                                    let unreserved = RealtimeAdmit {
+                                    Some(RealtimeAdmit {
                                         ak: billed,
                                         user,
                                         reserved: 0,
@@ -1089,22 +1074,24 @@ async fn realtime_bridge(
                                         at: gw_state::epoch_secs(),
                                         request_id: gw_handler::new_request_id(),
                                         snap,
-                                    };
-                                    bill_realtime_turn(
-                                        &unreserved,
-                                        &rtm,
-                                        mt,
-                                        &account.name,
-                                        gw_models::TokenInput {
-                                            prompt: it,
-                                            completion: ot,
-                                            ..turn_audio(account.wire_kind(), &v)
-                                        },
-                                        false,
-                                    )
-                                    .await
+                                    })
                                 }
-                                None => {}
+                                None => None,
+                            };
+                            if let Some(admit) = admit {
+                                bill_realtime_turn(
+                                    &admit,
+                                    &rtm,
+                                    mt,
+                                    &account.name,
+                                    gw_models::TokenInput {
+                                        prompt: it,
+                                        completion: ot,
+                                        ..turn_audio(account.wire_kind(), &v)
+                                    },
+                                    false,
+                                )
+                                .await;
                             }
                             recognized += 1;
                             turn_ended = true;
@@ -3294,18 +3281,9 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
     if let Some(content) = resp.anthropic_content.take() {
         return gw_engines::anthropic_native_chunks(resp, content, None);
     }
-    let mut chunks = text_chunks(resp);
-    if let Some(tc) = resp.tool_calls.take() {
-        chunks.push(gw_engines::StreamChunk {
-            tool_calls: Some(tc),
-            ..Default::default()
-        });
-    }
-    chunks.push(gw_engines::StreamChunk {
-        finish_reason: Some(take_finish(resp)),
-        ..Default::default()
-    });
-    chunks
+    // the raw pre-redaction deltas are never replayed: synth_chunks rebuilds from the redacted text
+    outcome.chunks.clear();
+    synth_chunks(outcome)
 }
 
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {

@@ -127,13 +127,12 @@ impl OnlineHandler {
         );
         ctx.billing_deferred = dlp && ctx.request.is_online && ctx.request.stream;
         // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
-        let rows: Vec<gw_state::SecurityEvent> = scan
-            .hits
-            .iter()
-            .map(|hit| security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count))
-            .collect();
+        deferred.extend(
+            scan.hits
+                .iter()
+                .map(|hit| security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count)),
+        );
         if let Some(block) = scan.block {
-            deferred.extend(rows);
             ctx.decide(
                 "security_check",
                 format!("blocked (code {})", block.err_code),
@@ -141,7 +140,6 @@ impl OnlineHandler {
             ctx.outcome = Some(content_filter_outcome(block));
             return Ok(ctx);
         }
-        deferred.extend(rows);
 
         // pre-DLP text, computed once for moderation and the retained prompt
         let inbound =

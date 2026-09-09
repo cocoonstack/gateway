@@ -13,8 +13,7 @@ pub mod usage;
 
 pub use block::Block;
 pub use cost::{
-    TokenInput, TokenRate, cost_micros, long_context_scale, weighted_completion, weighted_pair,
-    weighted_prompt,
+    TokenInput, TokenRate, cost_micros, long_context_scale, weighted_completion, weighted_prompt,
 };
 pub use error::{GResult, GatewayError};
 pub use params::{

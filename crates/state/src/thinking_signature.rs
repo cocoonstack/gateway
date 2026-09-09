@@ -739,7 +739,6 @@ impl ThinkingStreamCapture {
             }
         }
         self.audit.remember_sequence(&self.context, &sequence);
-        drop(sequence);
         self.blocks.clear();
         self.captured_bytes = 0;
         self.registered = true;

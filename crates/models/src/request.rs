@@ -84,12 +84,7 @@ impl GatewayRequest {
                             .and_then(serde_json::Value::as_bool)
                             == Some(true)
                 });
-            let replay = param
-                .raw
-                .get("input")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"));
-            return reasoning || replay;
+            return reasoning || replays_responses_reasoning(param);
         }
         matches!(
             param
@@ -113,14 +108,10 @@ impl GatewayRequest {
     /// protected block, or a Responses `input` reasoning item. A bare reasoning
     /// request that has produced nothing yet does not, so it may still fall back.
     pub fn replays_reasoning_output(&self) -> bool {
-        let responses_input_replay = self
-            .model_param_v2
+        self.model_param_v2
             .as_ref()
             .filter(|p| p.protocol == gw_consts::Protocol::Responses)
-            .and_then(|p| p.raw.get("input"))
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"));
-        responses_input_replay
+            .is_some_and(replays_responses_reasoning)
             || self.message.iter().any(|m| {
                 m.reasoning_details.is_some()
                     || m.parts
@@ -129,6 +120,15 @@ impl GatewayRequest {
                         .is_some_and(|blocks| blocks.iter().any(is_protected_anthropic_block))
             })
     }
+}
+
+/// Whether a Responses `input` carries a reasoning item from an earlier turn.
+fn replays_responses_reasoning(param: &ModelParamV2) -> bool {
+    param
+        .raw
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"))
 }
 
 /// One queued batch item: messages plus the end-user attribution, persisted so

@@ -322,7 +322,7 @@ async fn shutdown_signal() {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(e) => tracing::error!("install SIGTERM handler: {e}"),
+            Err(e) => tracing::error!(error = %e, "install SIGTERM handler failed"),
         }
     };
     #[cfg(not(unix))]

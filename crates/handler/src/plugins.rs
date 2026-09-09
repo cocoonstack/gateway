@@ -40,12 +40,11 @@ impl<'a> ScanCounts<'a> {
         }
     }
 
-    fn visit(&mut self, s: &str) -> usize {
+    fn visit(&mut self, s: &str) {
         self.blocklist += i64::from(is_blocklisted(self.sec, s));
         for (i, r) in self.sec.regexes.iter().enumerate() {
             self.regex[i] += r.re.find_iter(s).count() as i64;
         }
-        0
     }
 
     /// Fold the counts into a [`ScanOutcome`]; any block-action hit denies.
@@ -200,7 +199,10 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
         return ScanOutcome::default();
     }
     let mut counts = ScanCounts::new(sec);
-    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| counts.visit(s));
+    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| {
+        counts.visit(s);
+        0
+    });
     counts.outcome()
 }
 
@@ -678,26 +680,29 @@ fn walk_native_event(
     fragments: &mut EventFragments,
     f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
-    if event["type"] == "message_start" {
-        let mut hits = walk_object_excluding(event, &["message"], f);
-        if let Some(message) = event.get_mut("message") {
-            hits += walk_object_excluding(message, &["content"], f);
-            if let Some(content) = message.get_mut("content") {
-                hits += walk_part_text(content, SignedThinking::Prose, &mut |s, _| f(s));
+    match event["type"].as_str() {
+        Some("message_start") => {
+            let mut hits = walk_object_excluding(event, &["message"], f);
+            if let Some(message) = event.get_mut("message") {
+                hits += walk_object_excluding(message, &["content"], f);
+                if let Some(content) = message.get_mut("content") {
+                    hits += walk_part_text(content, SignedThinking::Prose, &mut |s, _| f(s));
+                }
             }
+            return hits;
         }
-        return hits;
-    }
-    if event["type"] == "content_block_start" {
-        let mut hits = walk_object_excluding(event, &["content_block"], f);
-        if let Some(block) = event.get_mut("content_block") {
-            hits += if block.as_object().is_some_and(is_signed_thinking_block) {
-                walk_signed_prose(block, &mut |s, _| f(s))
-            } else {
-                walk_part_value(block, f)
-            };
+        Some("content_block_start") => {
+            let mut hits = walk_object_excluding(event, &["content_block"], f);
+            if let Some(block) = event.get_mut("content_block") {
+                hits += if block.as_object().is_some_and(is_signed_thinking_block) {
+                    walk_signed_prose(block, &mut |s, _| f(s))
+                } else {
+                    walk_part_value(block, f)
+                };
+            }
+            return hits;
         }
-        return hits;
+        _ => {}
     }
     if event["type"] == "content_block_delta" && event.get("delta").is_some() {
         let opaque_key: Option<&'static str> = match event["delta"]["type"].as_str() {

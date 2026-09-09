@@ -25,20 +25,16 @@ impl OfflineHandler {
         &self,
         ak: Arc<AkInfo>,
         model: String,
-        items: Vec<BatchItem>,
+        mut items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
         if store.distributes_batches() {
             // persist the EFFECTIVE user: execution, billing and erasure key on one identity
-            let items: Vec<BatchItem> = items
-                .into_iter()
-                .map(|mut i| {
-                    if let Some(owner) = ak.owner_override() {
-                        i.user = owner.to_owned();
-                    }
-                    i
-                })
-                .collect();
+            if let Some(owner) = ak.owner_override() {
+                for item in &mut items {
+                    item.user = owner.to_owned();
+                }
+            }
             // atomic: the job becomes claimable only once all items are saved
             store
                 .batch_enqueue(&ak.ak, &ak.tenant, &model, &items)

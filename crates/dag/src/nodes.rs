@@ -123,12 +123,7 @@ impl DagNode for TenantEntitlement {
         "tenant_entitlement"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let name = ctx
-            .request
-            .model_param_v2
-            .as_ref()
-            .map(|p| p.model_name.as_str())
-            .unwrap_or_default();
+        let name = &ctx.model_param()?.model_name;
         if !ctx.cfg.tenant_allows_model(&ctx.ak.tenant, name) {
             return Err(GatewayError::new(
                 ErrCode::PERMISSION_CHECK,
@@ -154,9 +149,7 @@ impl DagNode for VariantSelect {
         "variant_select"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(param) = ctx.request.model_param_v2.as_ref() else {
-            return Ok(());
-        };
+        let param = ctx.model_param()?;
         if param.fallback_from.is_some() {
             return Ok(());
         }
@@ -197,9 +190,7 @@ impl DagNode for CacheLookup {
         "cache_lookup"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(param) = ctx.request.model_param_v2.as_ref() else {
-            return Ok(());
-        };
+        let param = ctx.model_param()?;
         // batch items bypass: a free (unbilled) hit would break their per-item billing
         if !ctx.request.buffered_online() {
             return Ok(());
@@ -388,12 +379,7 @@ impl DagNode for ModelQpmLimit {
         "model_qpm"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        // fail loud: silently skipping would waive the limit on a broken plan
-        let param = ctx
-            .request
-            .model_param_v2
-            .as_ref()
-            .ok_or_else(|| GatewayError::internal("model_qpm before resolve_model"))?;
+        let param = ctx.model_param()?;
         admission::check_model_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &param.model_name)
             .await
             .map_err(limit_denied)
@@ -702,8 +688,15 @@ impl BillTokens {
     /// paths without a usage payload (estimates, malformed usage) must price
     /// identically to the happy path or a cut stream changes effective pricing.
     fn weighted(prompt: i64, completion: i64, rate: &gw_models::TokenRate) -> Self {
-        let (billable_prompt, billable_completion) =
-            gw_models::weighted_pair(prompt, completion, rate);
+        let input = gw_models::TokenInput {
+            prompt,
+            completion,
+            ..Default::default()
+        };
+        let (billable_prompt, billable_completion) = (
+            gw_models::weighted_prompt(&input, rate),
+            gw_models::weighted_completion(&input, rate),
+        );
         Self {
             prompt,
             completion,
@@ -759,6 +752,7 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
         return Ok(());
     }
     ctx.billing_deferred = false;
+    // a request blocked before quota_check reserved nothing and bills nothing
     if ctx.quota_reserved.is_none() && ctx.tpm_reserved.is_none() {
         return Ok(());
     }
