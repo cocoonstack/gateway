@@ -187,7 +187,7 @@ days.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's static bearer or an OAuth access token the gateway fetched (nothing when the server declares neither) is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; replies stream back as the server sends them unless the key's tool allowlist filters a `tools/list` or the tenant's `security.moderate` reviews a result, which buffer the reply whole (up to `max_reply_bytes`); `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded in time and counted against `max_live_streams_per_key` |
+| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's static bearer or an OAuth access token the gateway fetched (nothing when the server declares neither) is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; replies stream back as the server sends them unless the key's tool allowlist filters a `tools/list` or the tenant's `security.moderate` reviews a result, which buffer the reply whole (up to `max_reply_bytes`); `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded in time and counted against `max_live_streams_per_key` (and refused for a tenant under `security.moderate`) |
 
 The access key rides as usual (`Authorization: Bearer` or `x-api-key`); a
 server the key is not entitled to (`access_keys[].mcp_servers`) answers like an
@@ -202,12 +202,14 @@ is bound to the key that first received it; another key presenting it gets
 `404`. When the key's tenant sets `security.moderate`, a served `tools/call`,
 `resources/read` or `prompts/get` result is buffered (up to the server's
 `max_reply_bytes`) and every prose field of it reviewed by the configured
-moderator before it reaches the client: a mask rewrites the text in place, a
-denial — or a reply the gateway could not parse — replaces the whole reply with
-one JSON-RPC error (`-32001`, the moderator's reason), and either lands as a
-`mcp` security event (`rule = moderation`, `action = mask` / `block`). The GET
-listen stream is not reviewed, and for a reviewed tenant `Last-Event-ID` is
-not forwarded, so a result cannot replay through it; listen streams count
+moderator before it reaches the client — regardless of the reply's HTTP status,
+and including a JSON-RPC error's own message. A mask rewrites the text in
+place, a denial — or a reply the gateway could not parse — replaces the whole
+reply with one JSON-RPC error (`-32001`, the moderator's reason), and either
+lands as a `mcp` security event (`rule = moderation`, `action = mask` /
+`block`). Because the GET listen stream carries server-pushed content the proxy
+cannot review, a reviewed tenant may not open one (`403`); other tenants may,
+and for them `Last-Event-ID` is still not forwarded. Listen streams count
 against `max_live_streams_per_key`. JSON-RPC batches are refused (400); the
 key's QPS and the tenant's pooled QPS apply. A server declared with `oauth` is
 called with an access token the gateway fetches from the server's token

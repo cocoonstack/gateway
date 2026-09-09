@@ -277,9 +277,10 @@ impl OnlineHandler {
                 )
                 .await;
             // signed thinking replays only against the model that produced it
-            if let Some((i, next)) = (is_upstream_fault(&e) && !ctx.request.pins_reasoning_route())
-                .then(|| next_fallback(&snap.cfg, &ctx, tried))
-                .flatten()
+            if let Some((i, next)) = (is_upstream_fault(&e)
+                && !ctx.request.replays_reasoning_output())
+            .then(|| next_fallback(&snap.cfg, &ctx, tried))
+            .flatten()
             {
                 tried = i + 1;
                 switch_model(&mut ctx, next, &e.message);

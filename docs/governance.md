@@ -124,7 +124,7 @@ the key's `owner`) before the call is forwarded, and
 `gateway_mcp_requests_total{server, method, result}` counts the traffic. An
 `Mcp-Session-Id` is bound to the key that first received it, so one customer
 cannot resume or end another's session; the key's QPS and the tenant's pooled
-QPS apply, and GET listen streams count against `max_live_streams_per_key`. Keys created through the admin API carry no MCP
+QPS apply, and GET listen streams count against `max_live_streams_per_key` (a tenant under `security.moderate` may not open one). Keys created through the admin API carry no MCP
 entitlement; the servers' own credentials stay in the gateway's environment
 (`mcp_servers[].api_key_env`), so an agent never holds them.
 

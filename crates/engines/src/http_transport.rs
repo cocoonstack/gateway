@@ -171,6 +171,7 @@ impl Transport for HttpTransport {
                     } else {
                         "upstream request failed"
                     };
+                    tracing::warn!(account = %req.account, error = %e, what);
                     return Err(
                         GatewayError::new(upstream_fault_code(e.is_timeout()), 502, what)
                             .with_source(e),

@@ -1106,6 +1106,12 @@ impl GatewayConfig {
             self.mcp_servers.iter().map(|m| m.name.as_str()),
         )?;
         for m in &self.mcp_servers {
+            if m.max_reply_bytes == 0 {
+                return Err(ConfigError::BadMcpServer {
+                    server: m.name.clone(),
+                    reason: "max_reply_bytes must be greater than 0",
+                });
+            }
             let Some(o) = &m.oauth else {
                 continue;
             };

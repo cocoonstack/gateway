@@ -105,7 +105,22 @@ impl GatewayRequest {
     /// replays only against the model that produced it, so the request that
     /// engages reasoning and the continuation carrying its output both pin.
     pub fn pins_reasoning_route(&self) -> bool {
-        self.reasoning_engaged()
+        self.reasoning_engaged() || self.replays_reasoning_output()
+    }
+
+    /// Whether this request carries reasoning output that must replay against
+    /// the model that produced it: prior signed thinking, an Anthropic
+    /// protected block, or a Responses `input` reasoning item. A bare reasoning
+    /// request that has produced nothing yet does not, so it may still fall back.
+    pub fn replays_reasoning_output(&self) -> bool {
+        let responses_input_replay = self
+            .model_param_v2
+            .as_ref()
+            .filter(|p| p.protocol == gw_consts::Protocol::Responses)
+            .and_then(|p| p.raw.get("input"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"));
+        responses_input_replay
             || self.message.iter().any(|m| {
                 m.reasoning_details.is_some()
                     || m.parts

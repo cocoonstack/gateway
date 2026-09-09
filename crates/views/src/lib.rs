@@ -1327,14 +1327,24 @@ fn user_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-gw-user")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
+        .map(cap_user_hint)
         .filter(|s| !s.is_empty())
 }
 
 /// The REST attribution precedence: `x-gw-user` header, else the dialect's own
 /// user field (batch items invert it — per-item `user` first).
 fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
-    user_header(headers).or_else(|| field.as_str().map(str::to_owned))
+    user_header(headers).or_else(|| field.as_str().map(cap_user_hint))
+}
+
+/// Bound an attribution hint at `USER_HINT_MAX_BYTES`: it keys governance
+/// counters, so an unbounded value from any surface would grow the keyspace.
+fn cap_user_hint(s: &str) -> String {
+    let mut end = s.len().min(USER_HINT_MAX_BYTES);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -1906,9 +1916,12 @@ async fn admin_key_create(
     if !s.handler.cfg().is_known_tenant(tenant) {
         return error_response(400, format!("unknown tenant `{tenant}`"));
     }
-    if let Err(r) = scoped_key(&s, &scope, ak).await {
-        return r;
-    }
+    let existing = match scoped_key(&s, &scope, ak).await {
+        Ok(found) => found,
+        Err(r) => return r,
+    };
+    // a platform sanction on an existing key survives a tenant re-create
+    let tenant_scoped = matches!(scope, AdminScope::Tenant(_));
     let info = AkInfo {
         ak_id: gw_state::access_key_fingerprint(ak).into(),
         ak: ak.to_owned(),
@@ -1919,8 +1932,12 @@ async fn admin_key_create(
         daily_token_quota: body["daily_token_quota"].as_i64().unwrap_or(0),
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
         expires_at_epoch_secs: body["expires_at_epoch_secs"].as_i64(),
-        banned: body["banned"].as_bool().unwrap_or(false),
-        suspended_until_epoch_secs: None,
+        banned: body["banned"].as_bool().unwrap_or(false)
+            || (tenant_scoped && existing.as_ref().is_some_and(|e| e.banned)),
+        suspended_until_epoch_secs: existing
+            .as_ref()
+            .filter(|_| tenant_scoped)
+            .and_then(|e| e.suspended_until_epoch_secs),
         model_quotas: Arc::new(
             body["model_quotas"]
                 .as_object()
@@ -1983,7 +2000,7 @@ async fn admin_key_patch(
         banned: body["banned"].as_bool(),
         suspended_until_epoch_secs: tri("suspended_until_epoch_secs"),
     };
-    // a ban or an abuse suspension is a platform sanction; a tenant may add one, never lift one
+    // platform sanctions: a tenant may add a ban but not lift one, and may not set or clear a suspension
     if matches!(scope, AdminScope::Tenant(_))
         && (patch.banned == Some(false) || patch.suspended_until_epoch_secs.is_some())
     {
@@ -4620,13 +4637,8 @@ async fn batches_submit(
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
     let hint = user_header(&headers);
-    let item_user = |v: &Value| {
-        v["user"]
-            .as_str()
-            .or(hint.as_deref())
-            .unwrap_or_default()
-            .to_owned()
-    };
+    let item_user =
+        |v: &Value| cap_user_hint(v["user"].as_str().or(hint.as_deref()).unwrap_or_default());
 
     if let Some(file_id) = body["input_file_id"].as_str() {
         let found = s.handler.state().store.file_get(file_id).await;

@@ -29,8 +29,9 @@ const FORWARDED_HEADERS: [&str; 5] = [
 const RETURNED_HEADERS: [&str; 2] = ["content-type", "mcp-session-id"];
 /// Methods whose results carry prose an agent reads; reviewed under `security.moderate`.
 const REVIEWED_METHODS: [&str; 3] = ["tools/call", "resources/read", "prompts/get"];
-/// Result fields that carry identifiers or binary, never prose.
-const OPAQUE_KEYS: [&str; 5] = ["blob", "mimeType", "name", "type", "uri"];
+/// Result fields that carry base64 binary, never prose: skipped so the review
+/// neither reads nor rewrites an image, audio clip or blob resource.
+const OPAQUE_KEYS: [&str; 2] = ["blob", "data"];
 const JSONRPC_TOOL_DENIED: i64 = -32000;
 const JSONRPC_RESULT_BLOCKED: i64 = -32001;
 const UNREVIEWABLE: &str = "the result could not be reviewed";
@@ -86,6 +87,14 @@ pub(crate) async fn proxy(
     {
         return error_response(404, "unknown mcp session");
     }
+    let sec = snap.cfg.security_for(&ak.tenant);
+    // a listen stream carries server-pushed content the proxy cannot review
+    if method == Method::GET && sec.moderate {
+        return error_response(
+            403,
+            "mcp listen streams are unavailable under content review",
+        );
+    }
     let call = if method == Method::POST {
         match parse_call(&body) {
             Ok(call) => call,
@@ -136,7 +145,6 @@ pub(crate) async fn proxy(
         )
         .await;
     }
-    let sec = snap.cfg.security_for(&ak.tenant);
     // a reviewed tenant gets no stream resumption: a replayed result would skip the review
     let resumable = !sec.moderate;
     let mut sent = send(&s, conf, &method, &headers, &body, resumable).await;
@@ -170,9 +178,8 @@ pub(crate) async fn proxy(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/event-stream"));
-    let filtered = status.is_success() && call.method == "tools/list" && allowed.is_some();
-    let reviewed =
-        status.is_success() && sec.moderate && REVIEWED_METHODS.contains(&call.method.as_str());
+    let filtered = call.method == "tools/list" && allowed.is_some();
+    let reviewed = sec.moderate && REVIEWED_METHODS.contains(&call.method.as_str());
     if !filtered && !reviewed {
         let stream = reply.bytes_stream().map(move |chunk| {
             let _held = &stream_guard;
@@ -366,6 +373,8 @@ fn review_slots(seg: &mut Segment) -> Vec<&mut String> {
     if let Segment::Message(msg) = seg {
         let root = if msg.get("result").is_some() {
             msg.get_mut("result")
+        } else if msg.get("error").is_some() {
+            msg.get_mut("error")
         } else {
             msg.get_mut("params")
         };
@@ -1046,6 +1055,95 @@ mod tests {
             mods,
             vec![("block", 1), ("mask", 1), ("mask", 4), ("mask", 4)]
         );
+    }
+
+    async fn tricky(axum::Json(req): axum::Json<Value>) -> Response {
+        let id = req["id"].clone();
+        let reply = match req["params"]["name"].as_str() {
+            Some("err_status") => {
+                let body = json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"leak bob@example.com"}]}});
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    mcp_headers(),
+                    axum::Json(body),
+                )
+                    .into_response();
+            }
+            Some("err_body") => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":"see bob@example.com"}})
+            }
+            _ => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"name":"contact bob@example.com"}}})
+            }
+        };
+        (StatusCode::OK, mcp_headers(), axum::Json(reply)).into_response()
+    }
+
+    fn mcp_headers() -> HeaderMap {
+        let mut out = HeaderMap::new();
+        out.insert("mcp-session-id", "sess-1".parse().unwrap());
+        out
+    }
+
+    async fn spawn_tricky() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/mcp", post(tricky));
+        tokio::spawn(axum::serve(listener, app).into_future());
+        format!("http://{addr}")
+    }
+
+    async fn call_tool(app: &Router, name: &str) -> Value {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"{name}","arguments":{{}}}}}}"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(rpc("k-mod", "tools", &body, "application/json"))
+            .await
+            .unwrap();
+        serde_json::from_str(&text(resp).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn review_covers_error_status_error_body_and_structured_prose() {
+        let (app, _) = reviewed_app(&format!("{}/mcp", spawn_tricky().await)).await;
+
+        let v = call_tool(&app, "err_status").await;
+        assert_eq!(
+            v["result"]["content"][0]["text"], "leak [MASKED]",
+            "a non-2xx reply is still reviewed: {v}"
+        );
+
+        let v = call_tool(&app, "err_body").await;
+        assert_eq!(
+            v["error"]["message"], "see [MASKED]",
+            "a JSON-RPC error's prose is reviewed: {v}"
+        );
+
+        let v = call_tool(&app, "structured").await;
+        assert_eq!(
+            v["result"]["structuredContent"]["name"], "contact [MASKED]",
+            "structured prose under any key is reviewed: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviewed_tenant_cannot_open_a_listen_stream() {
+        let (app, _) = reviewed_app(&spawn_stub().await).await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/mcp/tools")
+                    .header("authorization", "Bearer k-mod")
+                    .header("accept", "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

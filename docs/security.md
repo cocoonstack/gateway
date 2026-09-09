@@ -63,8 +63,11 @@ response, log line, audit row or trace.
   recognizers, secret detection, DLP redaction of emails and phone numbers in
   both directions (a redacted stream is buffered and replayed so no unmasked
   span leaves), and an external moderator (`moderation:`, AWS Bedrock
-  Guardrails) over inbound text and — for the MCP proxy — over tool results.
-  Signed thinking blocks are never rewritten; a mask that would land in one
+  Guardrails) over inbound text and — for the MCP proxy — over tool results
+  (`tools/call`, `resources/read`, `prompts/get`), reviewed whatever the
+  reply's HTTP status and including a JSON-RPC error's message; a tenant under
+  review cannot open an MCP listen stream, whose server-pushed content the
+  proxy cannot review. Signed thinking blocks are never rewritten; a mask that would land in one
   fails the request instead.
 - A tenant admin may ban its own keys but can neither lift a ban nor change an
   abuse suspension: those are platform sanctions the global token owns.
@@ -124,8 +127,18 @@ review, unbound MCP session ids, tool calls audited only after the upstream
 answered, a `tools/call` without a string tool name skipping every gate,
 realtime sessions and listen streams with no per-key cap, in-process monthly
 counters keyed by `x-gw-user` never evicted, a tenant token lifting bans and
-suspensions, raw access keys in denial messages, admin listings without a page
-ceiling, and MCP server names probe-able through 404-vs-403.
+suspensions — through the key-create route as well as PATCH — raw access keys
+in denial messages, admin listings without a page ceiling, and MCP server names
+probe-able through 404-vs-403. A second pass over the same surface fixed:
+results escaping review on a non-2xx status or when carried as a JSON-RPC
+error; prose in structured tool output under identifier-named keys, while
+base64 image and blob payloads are left untouched; the attribution hint
+uncapped on the realtime subprotocol path and in request and batch bodies; the
+whole fallback chain disabled for any reasoning request rather than only one
+replaying reasoning output; a listen stream handing unreviewed server-pushed
+content to a tenant under review; a zero `max_reply_bytes` refusing every
+reply and a zero token lifetime defeating the token cache; and one server's
+slow token endpoint stalling another server's first token fetch.
 
 Accepted as is, with the reason: the ledger, security-event and retained-
 content tables store the access key itself (the ledger joins usage by it;
@@ -137,4 +150,9 @@ config reload can race one in-flight token fetch for at most one token
 lifetime; duplicate JSON keys parse last-wins here and possibly first-wins on
 a non-compliant upstream (a compliant server behaves identically); the
 cross-tenant key guard reads a two-second key cache before mutating, which
-would need a key to change tenant inside that window.
+would need a key to change tenant inside that window; MCP session binding is
+enforced per instance, so a multi-instance deployment must route a session's
+requests to the instance that opened it (sticky by `Mcp-Session-Id`), which
+Streamable HTTP already assumes; a server that returns one constant session id
+locks its session to the first key to use it (a conformant server mints a
+unique id per session).

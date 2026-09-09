@@ -272,7 +272,7 @@ mcp_servers:                   # Model Context Protocol servers proxied at /mcp/
     endpoint: http://tools.internal:3001/mcp   # the server's Streamable HTTP endpoint
     api_key_env: TOOLS_TOKEN     # optional bearer token for the server, from the env
     timeout_seconds: 60
-    max_reply_bytes: 16777216    # largest reply buffered for allowlist filtering or result review
+    max_reply_bytes: 16777216    # largest reply buffered for allowlist filtering or result review; must be > 0
   - name: crm
     endpoint: https://mcp.crm.example/mcp
     oauth:                       # exclusive with api_key_env: the gateway fetches the bearer itself
