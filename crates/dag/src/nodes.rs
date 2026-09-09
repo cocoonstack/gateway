@@ -452,10 +452,10 @@ impl DagNode for CallEngine {
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let mut engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
-        let started = std::time::Instant::now();
+        let started = latency_clock(ctx);
         match engine.run().await {
             Ok(outcome) => {
-                note_engine_outcome(ctx, &outcome, started.elapsed()).await;
+                note_engine_outcome(ctx, &outcome, started).await;
                 ctx.decide(
                     "call_engine",
                     format!(
@@ -511,10 +511,10 @@ impl DagNode for CallEngine {
                 );
                 ctx.request.account = Some(next.clone());
                 let mut retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
-                let started = std::time::Instant::now();
+                let started = latency_clock(ctx);
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        note_engine_outcome(ctx, &outcome, started.elapsed()).await;
+                        note_engine_outcome(ctx, &outcome, started).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
@@ -533,10 +533,18 @@ impl DagNode for CallEngine {
     }
 }
 
+/// The call timer for the latency ranker; `None` when latency routing is off, so the default pays nothing.
+fn latency_clock(ctx: &DagContext) -> Option<std::time::Instant> {
+    ctx.cfg
+        .stability
+        .latency_routing
+        .then(std::time::Instant::now)
+}
+
 async fn note_engine_outcome(
     ctx: &mut DagContext,
     outcome: &gw_engines::EngineOutcome,
-    elapsed: std::time::Duration,
+    started: Option<std::time::Instant>,
 ) {
     if outcome.terminal_error.is_some() {
         ctx.state
@@ -556,8 +564,8 @@ async fn note_engine_outcome(
         .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
     if let Some(account) = ctx.request.account.as_ref() {
         ctx.state.health.record_success(&account.name).await;
-        if ctx.cfg.stability.latency_routing {
-            ctx.state.latency.record(&account.name, elapsed);
+        if let Some(started) = started {
+            ctx.state.latency.record(&account.name, started.elapsed());
         }
     }
 }
