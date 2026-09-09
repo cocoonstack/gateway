@@ -229,11 +229,13 @@ pub struct ModelConf {
     /// capacity.
     #[serde(default)]
     pub variants: Vec<VariantConf>,
+    #[serde(skip)]
+    kind: Option<Protocol>,
 }
 
 impl ModelConf {
     pub fn protocol(&self) -> Option<Protocol> {
-        Protocol::from_wire(&self.protocol)
+        self.kind
     }
 }
 
@@ -872,6 +874,9 @@ impl GatewayConfig {
             if let Some(sec) = t.security.as_mut() {
                 compile_security(sec);
             }
+        }
+        for m in &mut self.models {
+            m.kind = Protocol::from_wire(&m.protocol);
         }
         Ok(())
     }

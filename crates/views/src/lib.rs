@@ -73,8 +73,20 @@ pub type ConfigFuture =
 /// Reloads config from its source (file or the Postgres config store).
 pub type ConfigLoader = Arc<dyn Fn() -> ConfigFuture + Send + Sync>;
 
+/// Handler state behind one Arc: axum clones it twice per request.
 #[derive(Clone)]
-pub struct AppState {
+pub struct AppState(Arc<AppInner>);
+
+impl std::ops::Deref for AppState {
+    type Target = AppInner;
+
+    fn deref(&self) -> &AppInner {
+        &self.0
+    }
+}
+
+#[derive(Clone)]
+pub struct AppInner {
     pub handler: OnlineHandler,
     pub offline: OfflineHandler,
     /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
@@ -105,7 +117,7 @@ impl AppState {
     ) -> Self {
         let handler = OnlineHandler::new(config, transport);
         let offline = OfflineHandler::new(handler.clone());
-        Self {
+        Self(Arc::new(AppInner {
             handler,
             offline,
             mcp: mcp_client(),
@@ -113,12 +125,12 @@ impl AppState {
             mcp_sessions: mcp_sessions(),
             loader,
             config_store: None,
-        }
+        }))
     }
 
     /// Attach the fleet config store (enables `PUT /admin/config`).
     pub fn with_config_store(mut self, store: Arc<gw_state::PostgresConfigStore>) -> Self {
-        self.config_store = Some(store);
+        Arc::make_mut(&mut self.0).config_store = Some(store);
         self
     }
 
@@ -1283,12 +1295,9 @@ async fn list_models(State(s): State<AppState>, Authed(ak): Authed) -> Response 
 /// tenant and carry the operator's vendor-cost margin basis.
 async fn ledger(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    _: GlobalAdmin,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
@@ -1298,10 +1307,7 @@ async fn ledger(
 
 /// Account pool view (name/provider/tier/priority/served model family).
 /// Global-token only: account names and health are operator internals.
-async fn accounts(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
+async fn accounts(State(s): State<AppState>, _: GlobalAdmin) -> Response {
     let cfg = s.handler.cfg();
     let health = &s.handler.state().health;
     let mut data: Vec<Value> = Vec::with_capacity(cfg.accounts.len());
@@ -1332,8 +1338,8 @@ fn user_header(headers: &HeaderMap) -> Option<String> {
 
 /// The REST attribution precedence: `x-gw-user` header, else the dialect's own
 /// user field (batch items invert it — per-item `user` first).
-fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
-    user_header(headers).or_else(|| field.as_str().map(cap_user_hint))
+fn user_hint(hint: Option<String>, field: &Value) -> Option<String> {
+    hint.or_else(|| field.as_str().map(cap_user_hint))
 }
 
 /// Bound an attribution hint at `USER_HINT_MAX_BYTES`: it keys governance
@@ -1408,6 +1414,34 @@ impl axum::extract::FromRequestParts<AppState> for Authed {
             Ok(ak) => Ok(Authed(ak)),
             Err((st, msg)) => Err(error_response(st, msg)),
         }
+    }
+}
+
+/// The `x-gw-user` attribution hint, read without cloning the header map.
+pub struct UserHint(pub Option<String>);
+
+impl axum::extract::FromRequestParts<AppState> for UserHint {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(UserHint(user_header(&parts.headers)))
+    }
+}
+
+/// Proof of the global admin token; runs before any body extractor.
+pub struct GlobalAdmin;
+
+impl axum::extract::FromRequestParts<AppState> for GlobalAdmin {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        s: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_global_admin(s, &parts.headers).map(|()| GlobalAdmin)
     }
 }
 
@@ -1854,12 +1888,9 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// governance, store, health, and cache are preserved.
 async fn admin_reload(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    _: GlobalAdmin,
     AuditSourceIp(source): AuditSourceIp,
 ) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
     match s.reload().await {
         Ok(()) => {
             let cfg = s.handler.cfg();
@@ -2044,10 +2075,7 @@ async fn admin_key_delete(
 }
 
 /// GET /admin/config — the current fleet config document. Global admin only.
-async fn admin_config_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
+async fn admin_config_get(State(s): State<AppState>, _: GlobalAdmin) -> Response {
     let store = match require_config_store(&s) {
         Ok(v) => v,
         Err(r) => return r,
@@ -2064,14 +2092,7 @@ async fn admin_config_get(State(s): State<AppState>, headers: HeaderMap) -> Resp
 }
 
 /// POST /admin/config/validate — parse and validate without publishing.
-async fn admin_config_validate(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
+async fn admin_config_validate(_: GlobalAdmin, body: String) -> Response {
     match GatewayConfig::from_yaml(&body) {
         Ok(cfg) => Json(json!({
             "valid": true,
@@ -2089,12 +2110,9 @@ async fn admin_config_validate(
 /// GET /admin/config/versions — retained config heads, newest first.
 async fn admin_config_versions(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    _: GlobalAdmin,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
     let store = match require_config_store(&s) {
         Ok(v) => v,
         Err(r) => return r,
@@ -2110,14 +2128,11 @@ async fn admin_config_versions(
 /// this instance; peers converge via the store's change feed. Global admin only.
 async fn admin_config_put(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    _: GlobalAdmin,
     AuditSourceIp(source): AuditSourceIp,
     Query(q): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
     let store = match require_config_store(&s) {
         Ok(v) => v,
         Err(r) => return r,
@@ -2176,13 +2191,10 @@ async fn admin_config_put(
 /// as a new head and reload this instance. Global admin only.
 async fn admin_config_rollback(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    _: GlobalAdmin,
     AuditSourceIp(source): AuditSourceIp,
     Path(source_id): Path<i64>,
 ) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
     let store = match require_config_store(&s) {
         Ok(v) => v,
         Err(r) => return r,
@@ -2486,12 +2498,9 @@ async fn admin_security_events(
 /// Global admin only (the trail spans all tenants).
 async fn admin_audit_ops(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    _: GlobalAdmin,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_global_admin(&s, &headers) {
-        return r;
-    }
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.admin_audit_list(limit).await {
         Ok(entries) => Json(json!({ "entries": entries })).into_response(),
@@ -2833,7 +2842,7 @@ fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Bo
 /// POST /v1/chat/completions (OpenAI-compatible surface)
 async fn chat_completions(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(body): ApiJson<ChatCompletionRequest>,
 ) -> Response {
@@ -2884,7 +2893,7 @@ async fn chat_completions(
     );
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra);
-    let user_id = user_hint(&headers, &param.raw["user"]);
+    let user_id = user_hint(hint, &param.raw["user"]);
 
     let request = GatewayRequest {
         is_online: true,
@@ -3379,7 +3388,7 @@ async fn messages(
         body.extra.insert("system".into(), blocks);
     }
     param.raw = Value::Object(body.extra);
-    let user_id = user_hint(&headers, &param.raw["metadata"]["user_id"]);
+    let user_id = user_hint(user_header(&headers), &param.raw["metadata"]["user_id"]);
 
     let request = GatewayRequest {
         is_online: true,
@@ -3830,7 +3839,7 @@ fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) 
 /// as a single user message to CompletionsEngine.
 async fn completions(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -3861,7 +3870,7 @@ async fn completions(
         gw_consts::Protocol::Completions,
         typed,
         vec![ChatMsg::text("user", prompt)],
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
     )
     .await
     {
@@ -3901,7 +3910,7 @@ async fn completions(
 /// through ResponsesEngine and its native response is returned as-is.
 async fn responses(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
@@ -3914,7 +3923,7 @@ async fn responses(
         return error_response(400, "input is required");
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let user_id = user_hint(&headers, &body["user"]);
+    let user_id = user_hint(hint, &body["user"]);
     let stream_model = stream.then(|| model.clone());
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model);
     param.raw = body;
@@ -4069,7 +4078,7 @@ fn responses_stream_response(
 /// POST /v1/embeddings (OpenAI-compatible surface)
 async fn embeddings(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4089,7 +4098,7 @@ async fn embeddings(
         model,
         gw_consts::Protocol::Embeddings,
         typed,
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
         "embeddings",
         "embeddings",
         started,
@@ -4100,7 +4109,7 @@ async fn embeddings(
 /// POST /v1/images/generations (OpenAI-compatible image generation surface)
 async fn images_generations(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4122,7 +4131,7 @@ async fn images_generations(
         model,
         gw_consts::Protocol::Image,
         typed,
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
         "images",
         "image",
         started,
@@ -4134,7 +4143,7 @@ async fn images_generations(
 /// routes to the edit endpoint; the image arrives as base64 JSON.
 async fn images_edits(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4158,7 +4167,7 @@ async fn images_edits(
         model,
         gw_consts::Protocol::Image,
         typed,
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
         "images_edits",
         "image",
         started,
@@ -4169,7 +4178,7 @@ async fn images_edits(
 /// POST /v1/videos/generations — a `request_id` reply is remembered for the poll to bill.
 async fn videos_generations(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4186,7 +4195,7 @@ async fn videos_generations(
         aspect_ratio: gw_engines::engine::take_string(&mut body, "/aspect_ratio"),
         image: body.get_mut("image").map(Value::take),
     });
-    let user = user_hint(&headers, &body["user"]);
+    let user = user_hint(hint, &body["user"]);
     let mut ctx = match run_family(
         &s,
         ak,
@@ -4384,7 +4393,7 @@ async fn videos_content(
 /// POST /v1/audio/speech (TTS, returns audio bytes; OpenAI-compatible surface)
 async fn audio_speech(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4415,7 +4424,7 @@ async fn audio_speech(
         gw_consts::Protocol::Tts,
         typed,
         vec![],
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
     )
     .await
     {
@@ -4487,7 +4496,7 @@ async fn audio_transcribe(
         gw_consts::Protocol::Stt,
         typed,
         vec![],
-        user_hint(&headers, &body["user"]),
+        user_hint(user_header(&headers), &body["user"]),
     )
     .await
     {
@@ -4520,7 +4529,7 @@ async fn audio_transcribe(
 /// an array of strings.
 async fn moderations(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4537,7 +4546,7 @@ async fn moderations(
         model,
         gw_consts::Protocol::Moderations,
         typed,
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
         "moderations",
         "moderations",
         started,
@@ -4548,7 +4557,7 @@ async fn moderations(
 /// POST /v1/search — web search as a routed backend: `{model, query, count?}`.
 async fn search(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4568,7 +4577,7 @@ async fn search(
         model,
         gw_consts::Protocol::Search,
         typed,
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
         "search",
         "search",
         started,
@@ -4579,7 +4588,7 @@ async fn search(
 /// POST /v1/rerank — Cohere/Jina-compatible: `{model, query, documents, top_n?}`.
 async fn rerank(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
@@ -4601,7 +4610,7 @@ async fn rerank(
         model,
         gw_consts::Protocol::Rerank,
         typed,
-        user_hint(&headers, &body["user"]),
+        user_hint(hint, &body["user"]),
         "rerank",
         "rerank",
         started,
@@ -5770,7 +5779,7 @@ mod tests {
         )
         .with_moderator(Arc::new(DenyModerator));
         let offline = OfflineHandler::new(handler.clone());
-        let app = AppState {
+        let app = AppState(Arc::new(AppInner {
             handler,
             offline,
             mcp: mcp_client(),
@@ -5778,7 +5787,7 @@ mod tests {
             mcp_sessions: mcp_sessions(),
             loader: None,
             config_store: None,
-        };
+        }));
         let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
         let cfg = app.handler.cfg();
         let sec = cfg.security_for(&ak.tenant);
@@ -5836,7 +5845,7 @@ mod tests {
         )
         .with_moderator(Arc::new(FrameMaskModerator));
         let offline = OfflineHandler::new(handler.clone());
-        let app = AppState {
+        let app = AppState(Arc::new(AppInner {
             handler,
             offline,
             mcp: mcp_client(),
@@ -5844,7 +5853,7 @@ mod tests {
             mcp_sessions: mcp_sessions(),
             loader: None,
             config_store: None,
-        };
+        }));
         let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
         let mut frame = json!({"type":"input_text","text":"tell secret now"});
         assert_eq!(rt_inbound_policy(&app, &ak, "", &mut frame).await, Ok(0));

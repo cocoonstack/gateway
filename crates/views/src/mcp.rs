@@ -959,10 +959,9 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::from_yaml(&app_yaml(base)).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let app_state = AppState::new(cfg, state.clone(), Arc::new(gw_engines::MockTransport));
-        let app_state = AppState {
-            handler: app_state.handler.with_moderator(Arc::new(EmailMasker)),
-            ..app_state
-        };
+        let mut inner = (*app_state.0).clone();
+        inner.handler = inner.handler.with_moderator(Arc::new(EmailMasker));
+        let app_state = AppState(Arc::new(inner));
         (crate::app(app_state), state)
     }
 
