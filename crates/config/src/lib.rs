@@ -390,6 +390,9 @@ pub struct SecurityConf {
     /// Blocklist terms; normalized to lower-case (empties dropped) at load.
     #[serde(default)]
     pub blocklist: Vec<String>,
+    /// The blocklist as one automaton; `None` when the list is empty.
+    #[serde(skip)]
+    pub blocklist_matcher: Option<aho_corasick::AhoCorasick>,
     /// What a blocklist hit does (default: block).
     #[serde(default)]
     pub blocklist_action: Action,
@@ -415,6 +418,12 @@ pub struct SecurityConf {
 }
 
 impl SecurityConf {
+    /// The policy as load leaves it: blocklist lower-cased and compiled, regexes built.
+    pub fn compiled(mut self) -> Self {
+        compile_security(&mut self);
+        self
+    }
+
     /// Whether responses must be redacted before leaving — the one predicate
     /// the outbound-DLP masking AND the stream-buffering boundary share, so a
     /// secrets-only tenant can't stream raw deltas past the masking.
@@ -1482,6 +1491,19 @@ fn compile_security(sec: &mut SecurityConf) {
         .filter(|w| !w.is_empty())
         .map(|w| w.to_lowercase())
         .collect();
+    sec.blocklist_matcher = (!sec.blocklist.is_empty())
+        .then(|| {
+            aho_corasick::AhoCorasickBuilder::new()
+                .ascii_case_insensitive(true)
+                .build(&sec.blocklist)
+        })
+        .and_then(|built| match built {
+            Ok(matcher) => Some(matcher),
+            Err(e) => {
+                tracing::error!(error = %e, "blocklist did not compile; the list is ignored");
+                None
+            }
+        });
     sec.regexes = sec
         .regex_rules
         .iter()

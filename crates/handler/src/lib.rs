@@ -2634,6 +2634,7 @@ mod tests {
         let mut cfg = GatewayConfig::embedded_default().unwrap();
         cfg.security.dlp_redact = true;
         cfg.security.blocklist = vec!["example.com".into()];
+        cfg.security = std::mem::take(&mut cfg.security).compiled();
         let cfg = Arc::new(cfg);
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(

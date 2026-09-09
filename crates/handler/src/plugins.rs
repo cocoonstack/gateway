@@ -286,25 +286,14 @@ pub fn apply_mask_spans_frame(
 
 /// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.
 fn is_blocklisted(sec: &SecurityConf, text: &str) -> bool {
-    if sec.blocklist.is_empty() {
+    let Some(matcher) = &sec.blocklist_matcher else {
         return false;
-    }
+    };
     if text.is_ascii() {
-        return sec
-            .blocklist
-            .iter()
-            .any(|w| contains_ignore_ascii_case(text, w));
+        matcher.is_match(text)
+    } else {
+        matcher.is_match(&text.to_lowercase())
     }
-    let lower = text.to_lowercase();
-    sec.blocklist.iter().any(|w| lower.contains(w))
-}
-
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
-    if n.is_empty() || n.len() > h.len() {
-        return false;
-    }
-    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// Walk every string leaf of a JSON value with a rewriting visitor; returns summed hits.
@@ -1041,6 +1030,7 @@ mod tests {
             dlp_redact: true,
             ..Default::default()
         }
+        .compiled()
     }
 
     #[test]
@@ -1065,7 +1055,8 @@ mod tests {
             blocklist: vec!["forbiddenword".into(), "禁词".into()],
             dlp_redact: false,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
             ..Default::default()
@@ -1133,7 +1124,8 @@ mod tests {
             blocklist: vec!["watch".into()],
             blocklist_action: Action::Flag,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut frame = serde_json::json!({"type":"input_text","text":"please watch this"});
         let (out, text, _) = realtime_frame_scan(&s2, &mut frame, false);
         assert!(out.block.is_none(), "flag does not block realtime");
@@ -1148,7 +1140,8 @@ mod tests {
             blocklist_action: Action::Flag,
             detect_secrets: true,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut frame = serde_json::json!({
             "type":"input_text","text":"key sk-abcdefghijklmnopqrstuvwxyz012345"
         });
@@ -1421,7 +1414,8 @@ mod tests {
             blocklist: vec!["watchword".into()],
             blocklist_action: Action::Flag,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "contains watchword here")],
             ..Default::default()
