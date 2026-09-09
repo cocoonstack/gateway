@@ -512,12 +512,9 @@ impl AccountPool {
             // the rotating start keeps ties (unknown or equal latency) round-robin
             Some(latency) => (0..top.len())
                 .map(|k| (start + k) % top.len())
-                .min_by(|&a, &b| {
-                    latency
-                        .rank(&top[a].name)
-                        .total_cmp(&latency.rank(&top[b].name))
-                })
-                .unwrap_or(start),
+                .map(|i| (latency.rank(&top[i].name), i))
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map_or(start, |(_, i)| i),
             None => start,
         };
         Some(Arc::clone(top[idx]))

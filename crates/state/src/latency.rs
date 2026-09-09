@@ -2,6 +2,7 @@
 //! accounts by under `stability.latency_routing`. Each instance learns its own
 //! view; an unknown or stale account ranks first so it gets sampled.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -11,10 +12,10 @@ const STALE_AFTER: Duration = Duration::from_secs(60);
 // weight of the newest sample
 const ALPHA: f64 = 0.2;
 
-/// Exponentially weighted call latency per account, in milliseconds.
+/// Exponentially weighted call latency per account, in milliseconds; a clone shares the samples.
 #[derive(Debug, Default, Clone)]
 pub struct Latency {
-    samples: DashMap<String, (f64, Instant)>,
+    samples: Arc<DashMap<String, (f64, Instant)>>,
 }
 
 impl Latency {
