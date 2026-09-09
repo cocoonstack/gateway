@@ -124,7 +124,7 @@ impl PostgresConfigStore {
         Ok(tx)
     }
 
-    // NOTIFY is transactional: peers hear the id only after the commit
+    // a NOTIFY is transactional: peers hear the id only after the commit
     async fn insert_notify(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         yaml: &str,

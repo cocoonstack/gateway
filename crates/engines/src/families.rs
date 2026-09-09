@@ -68,7 +68,7 @@ impl VertexEngine {
     }
 
     fn build_body(&self) -> Value {
-        // Gemini has no system role: system turns go to systemInstruction, never contents
+        // there is no system role on Gemini: system turns go to systemInstruction, never contents
         let contents: Vec<Value> = self
             .base
             .request
@@ -673,7 +673,7 @@ impl ModelEngine for VideoEngine {
         let dialect = video_dialect(self.base.provider(), self.base.wire_kind());
         let model = self.base.model_name()?;
         let mut body = Map::new();
-        // Kling names the field model_name and takes no inline image on this path
+        // the field is model_name on Kling, which takes no inline image on this path
         if dialect == VideoDialect::Kling {
             if p.image.is_some() {
                 return Err(GatewayError::bad_request(
@@ -742,7 +742,7 @@ impl ModelEngine for VideoEngine {
                 vec![
                     ("duration", p.duration_seconds.map(|d| d.to_string().into())),
                     ("aspect_ratio", p.aspect_ratio.map(Value::from)),
-                    // Kling has quality modes, not resolutions: 1080p rides mode=pro
+                    // quality modes replace resolutions on Kling: 1080p rides mode=pro
                     (
                         "mode",
                         p.resolution.map(|r| {

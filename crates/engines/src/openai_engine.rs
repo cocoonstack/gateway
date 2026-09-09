@@ -28,7 +28,7 @@ impl OpenAiEngine {
                 parts => {
                     let mut msg = Map::new();
                     msg.insert("role".into(), m.role.into());
-                    // OpenAI: assistant tool-call turns carry content: null
+                    // assistant tool-call turns carry content: null on the OpenAI wire
                     let content = match (parts, m.content) {
                         (Some(parts), _) => parts,
                         (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,

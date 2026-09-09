@@ -128,7 +128,6 @@ pub fn estimate_prompt_tokens(
         if let Some(id) = &msg.tool_call_id {
             num += enc.encode_len(id);
         }
-        // assistant tool_calls: each call adds overhead (+3) plus encoded name and args.
         if let Some(Value::Array(calls)) = &msg.tool_calls {
             for call in calls {
                 num += 3;

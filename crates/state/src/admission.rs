@@ -130,7 +130,7 @@ impl BillingLedger {
         let (queue, mut pending) = mpsc::channel::<LedgerWrite>(LEDGER_QUEUE_CAPACITY);
         let deferred = store.deferred_ledger_writes();
         let worker_store = store.clone();
-        // The bounded worker owns accepted rows through caller cancellation.
+        // the bounded worker owns accepted rows through caller cancellation
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(LEDGER_BATCH_MAX);
             let mut row_acks = Vec::with_capacity(LEDGER_BATCH_MAX);

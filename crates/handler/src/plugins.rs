@@ -715,7 +715,7 @@ fn walk_native_event(
         }
         return hits;
     }
-    // Responses deltas join per output item so a pattern split across frames still matches
+    // deltas join per output item so a pattern split across frames still matches
     if let Some(index) = event["output_index"].as_u64()
         && let Some(text) = event["delta"].as_str()
     {

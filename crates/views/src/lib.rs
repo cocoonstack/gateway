@@ -862,7 +862,7 @@ async fn realtime_bridge(
         .replacen("http://", "ws://", 1);
     let key = account.api_key().unwrap_or_else(|| "mock".to_owned());
     let gemini = gw_engines::realtime::is_gemini_realtime(account.wire_kind());
-    // Gemini's Live socket is one bidi RPC authed by key; the model rides the setup frame
+    // a Gemini Live socket is one bidi RPC authed by key; the model rides the setup frame
     let url = if gemini {
         format!(
             "{ws_base}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={key}"
@@ -909,7 +909,7 @@ async fn realtime_bridge(
     let mut pending: Option<RealtimeTurn> = None;
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
-    // Gemini sends cumulative usage on any server frame; the latest settles a bare turnComplete
+    // cumulative usage may arrive on any server frame; the latest settles a bare turnComplete
     let mut usage_snapshot: Option<Value> = None;
     // outbound DLP redactions summed within a turn, recorded once at its boundary
     let mut out_redacted = 0i64;
@@ -3312,7 +3312,7 @@ fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
         tokens = tokens.saturating_add(encoder.encode_len(&tool_calls.to_string()) as i64);
     }
     if let Some(event) = &chunk.native_event {
-        // Anthropic deltas are objects keyed by kind; Responses deltas are strings
+        // deltas are objects keyed by kind on Anthropic and strings on Responses
         if let Some(value) = event["delta"].as_str() {
             tokens = tokens.saturating_add(encoder.encode_len(value) as i64);
         }

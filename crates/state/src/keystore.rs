@@ -153,7 +153,7 @@ impl KeyStore for PostgresKeyStore {
     }
 
     async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>> {
-        // FOR UPDATE: concurrent patches serialize instead of clobbering fields
+        // concurrent patches serialize under FOR UPDATE instead of clobbering fields
         let mut tx = self
             .pool
             .begin()

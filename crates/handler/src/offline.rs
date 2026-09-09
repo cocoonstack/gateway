@@ -180,7 +180,7 @@ impl OfflineHandler {
                 Ok(Err(e)) => failed_item(index, e.to_string(), user),
                 Err(join_err) => failed_item(index, format!("item task failed: {join_err}"), user),
             };
-            // if we lost the claim mid-run, don't persist — the new owner is authoritative
+            // a claim lost mid-run is not persisted: the new owner is authoritative
             if lost.load(Relaxed) {
                 break;
             }

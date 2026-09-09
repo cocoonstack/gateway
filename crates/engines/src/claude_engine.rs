@@ -44,7 +44,7 @@ impl ClaudeEngine {
             } else {
                 "user"
             };
-            // Claude wants replayed thinking blocks ahead of the tool_use they produced
+            // replayed thinking blocks go ahead of the tool_use they produced, as Claude expects
             let thinking: Vec<Value> = match m.reasoning_details {
                 Some(Value::Array(details)) => details
                     .into_iter()
@@ -142,7 +142,7 @@ impl ClaudeEngine {
             if let Some(tc) = p.tool_choice {
                 body.insert("tool_choice".into(), normalize_tool_choice_anthropic(tc));
             }
-            // Anthropic takes `stop_sequences` (array); OpenAI's `stop` may be a string
+            // `stop_sequences` is an array here; OpenAI's `stop` may be a string
             if let Some(stop) = p.stop {
                 let stop = match stop {
                     Value::String(_) => Value::Array(vec![stop]),
@@ -186,7 +186,7 @@ impl ClaudeEngine {
         let mut headers = vec![
             ("content-type", "application/json".into()),
             ("x-api-key", self.base.api_key()),
-            // Anthropic API mandates this header; a real call 400s without it.
+            // the API mandates this header; a real call 400s without it
             ("anthropic-version", "2023-06-01".into()),
         ];
         if let Some(betas) = self.base.request.anthropic_beta.take() {

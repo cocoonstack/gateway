@@ -52,7 +52,7 @@ pub(crate) fn aws_headers(
         ("host", host.into()),
         ("x-amz-date", amz_date.into()),
         ("authorization", authorization),
-        // InvokeModel requires accept; content-type is unsigned and added by the caller
+        // the InvokeModel call requires accept; content-type is unsigned and added by the caller
         ("accept", "application/json".into()),
     ]
 }

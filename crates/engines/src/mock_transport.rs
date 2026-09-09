@@ -11,8 +11,7 @@ use crate::transport::{
     HeaderMap, MOCK_B64, MOCK_CREATED, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
 };
 
-/// Deterministic fake vendor: parses the engine-built body and answers in the
-/// vendor's wire shape; an account named "…down…" gets a 503 (the failover trigger).
+/// Deterministic fake vendor: parses the engine-built body and answers in the vendor's wire shape.
 #[derive(Debug, Default)]
 pub struct MockTransport;
 

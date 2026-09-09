@@ -27,7 +27,7 @@ pub struct SigV4Params<'a> {
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    // HMAC-SHA256 accepts any key length (RFC 2104), so this cannot fire
+    // any key length is valid for HMAC-SHA256 (RFC 2104), so this cannot fire
     #[allow(clippy::expect_used)]
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(data);

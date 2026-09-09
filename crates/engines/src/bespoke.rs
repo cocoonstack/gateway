@@ -306,7 +306,7 @@ impl DashScopeEngine {
     fn headers(&self, stream: bool) -> Headers {
         let mut h = self.base.bearer_headers();
         if stream {
-            // DashScope streams only when this header is present
+            // streaming needs this DashScope header
             h.push(("X-DashScope-SSE", "enable".into()));
         }
         h

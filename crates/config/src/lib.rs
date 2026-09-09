@@ -1344,7 +1344,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
             wires: &["gemini", "realtime"],
             default_model_wire: "gemini",
         },
-        // OpenAI-protocol vendors: same wire shape, different base URL.
+        // vendors on the OpenAI protocol share the wire shape and differ by base URL
         "deepseek" => ProviderPreset {
             endpoint: "https://api.deepseek.com",
             wires: &["openai-chat"],

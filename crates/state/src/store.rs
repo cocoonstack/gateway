@@ -1804,7 +1804,7 @@ macro_rules! sql_store_impl {
                 if rows.is_empty() {
                     return Ok(());
                 }
-                // QueryBuilder numbers the placeholders per dialect, so no dialect_sql! here
+                // the QueryBuilder numbers placeholders per dialect, so no dialect_sql! here
                 let mut qb = sqlx::QueryBuilder::new(
                     "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
                      account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
