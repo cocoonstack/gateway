@@ -39,6 +39,9 @@ const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 /// trailing replica lands a row in a rolled minute — a rolled minute's source
 /// set can only shrink, which keeps the max-upsert sound.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
+/// In-process rollup retention: the monthly-budget window, then a bucket cap.
+const ROLLUP_RETENTION_SECS: i64 = 62 * 86_400;
+const ROLLUP_MAX_BUCKETS: usize = 1_000_000;
 
 /// Postgres advisory-lock key serializing the fleet's rollup: one replica
 /// advances per tick (the upsert is idempotent; the lock only avoids repeated scans).
@@ -769,6 +772,7 @@ pub struct MemoryStore {
     /// Minute buckets keyed by (minute, tenant, user, model); see
     /// [`Store::usage_rollup_advance`].
     rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
+    rollup_max_buckets: Option<usize>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<MemoryContent>,
@@ -788,6 +792,13 @@ impl MemoryStore {
     pub fn with_ledger_cap(max_rows: usize) -> Self {
         Self {
             ledger_max_rows: max_rows,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_rollup_cap(max_buckets: usize) -> Self {
+        Self {
+            rollup_max_buckets: Some(max_buckets),
             ..Self::default()
         }
     }
@@ -990,6 +1001,13 @@ impl Store for MemoryStore {
         let written = fresh.len() as u64;
         for (k, v) in fresh {
             rollup.entry(k).and_modify(|e| e.keep_max(&v)).or_insert(v);
+        }
+        let floor = bucket_floor(now - ROLLUP_RETENTION_SECS);
+        let kept = rollup.split_off(&(floor, String::new(), String::new(), String::new()));
+        *rollup = kept;
+        let cap = self.rollup_max_buckets.unwrap_or(ROLLUP_MAX_BUCKETS);
+        while rollup.len() > cap {
+            rollup.pop_first();
         }
         Ok(written)
     }
@@ -4074,6 +4092,38 @@ mod tests {
         );
         let (total, _) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 2, "the cap holds after the prune");
+    }
+
+    #[tokio::test]
+    async fn memory_rollup_keeps_the_retention_window_and_caps_buckets() {
+        let now = 100 * 86_400;
+        let store = MemoryStore::default();
+        let mut old = record("m1");
+        old.created_at_epoch_secs = now - ROLLUP_RETENTION_SECS - 3_600;
+        let mut fresh = record("m1");
+        fresh.created_at_epoch_secs = now - 3_600;
+        for r in [&old, &fresh] {
+            store.ledger_add(r).await.unwrap();
+        }
+        store.usage_rollup_advance(now).await.unwrap();
+        let minutes: Vec<i64> = lock(&store.rollup).keys().map(|k| k.0).collect();
+        assert_eq!(minutes, vec![bucket_floor(fresh.created_at_epoch_secs)]);
+
+        let store = MemoryStore::with_rollup_cap(2);
+        for i in 1..=3 {
+            let mut r = record("m1");
+            r.request_id = format!("req-{i}");
+            r.created_at_epoch_secs = now - i * 3_600;
+            store.ledger_add(&r).await.unwrap();
+        }
+        store.usage_rollup_advance(now).await.unwrap();
+        let minutes: Vec<i64> = lock(&store.rollup).keys().map(|k| k.0).collect();
+        assert_eq!(minutes.len(), 2, "the cap holds");
+        assert_eq!(
+            minutes[0],
+            bucket_floor(now - 2 * 3_600),
+            "the oldest minute is the one dropped"
+        );
     }
 
     #[tokio::test]
