@@ -445,6 +445,9 @@ pub struct StabilityConf {
     /// Window error rate at or above which a model reports `unavailable`.
     #[serde(default = "default_unavailable_error_rate")]
     pub unavailable_error_rate: f64,
+    /// Rank same-priority accounts by their observed call latency (per instance) instead of round-robin.
+    #[serde(default)]
+    pub latency_routing: bool,
     /// Below this many window samples the verdict is `no_data`.
     #[serde(default = "default_availability_min_samples")]
     pub availability_min_samples: u64,
@@ -458,6 +461,7 @@ impl Default for StabilityConf {
             availability_window_minutes: default_availability_window_minutes(),
             unstable_error_rate: default_unstable_error_rate(),
             unavailable_error_rate: default_unavailable_error_rate(),
+            latency_routing: false,
             availability_min_samples: default_availability_min_samples(),
         }
     }
