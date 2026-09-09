@@ -276,9 +276,11 @@ impl OnlineHandler {
                     ctx.quota_at,
                 )
                 .await;
-            if let Some((i, next)) = fallback_after(&e)
-                .then(|| next_fallback(&snap.cfg, &ctx, tried))
-                .flatten()
+            // signed thinking replays only against the model that produced it
+            if let Some((i, next)) = (is_upstream_fault(&e)
+                && !ctx.request.replays_reasoning_output())
+            .then(|| next_fallback(&snap.cfg, &ctx, tried))
+            .flatten()
             {
                 tried = i + 1;
                 switch_model(&mut ctx, next, &e.message);
@@ -557,10 +559,13 @@ async fn note_abuse(ctx: &DagContext) {
         .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
 }
 
-/// Whether a pipeline error is the upstream's fault: a 5xx (vendor or
-/// connection failure) or a vendor 429; gateway-side denials never fall back.
-fn fallback_after(e: &GatewayError) -> bool {
-    e.http_status >= 500 || e.original_status() == Some(429)
+/// Whether a pipeline error came from upstream: a vendor 5xx or 429, or a
+/// 502/503 the gateway raised for a connection failure or an exhausted pool.
+fn is_upstream_fault(e: &GatewayError) -> bool {
+    match e.original_status() {
+        Some(status) => status >= 500 || status == 429,
+        None => e.http_status >= 502,
+    }
 }
 
 /// The next entry of the requested model's fallback chain past `tried` that the caller's tenant may use.
@@ -1021,7 +1026,9 @@ mod tests {
 
     async fn vendor_by_model() -> (String, Arc<std::sync::atomic::AtomicU32>) {
         use std::sync::atomic::{AtomicU32, Ordering};
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let hits = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&hits);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

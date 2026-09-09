@@ -25,10 +25,11 @@ shape, so its SDKs can dispatch on it (`code` is additive):
 {"type": "error", "error": {"type": "rate_limit_error", "code": "throttling_exception", "message": "..."}}
 ```
 
-A terminal upstream failure (failover exhausted) is `424` with
+A terminal upstream failure (account failover and the model's
+`fallback_models` chain exhausted) is `424` with
 `code: "model_error_exception"`, plus `original_status_code` (when the
-upstream returned a status) and `resource_name` (the requested model) inside
-the error object. Retry on 408/429/500/503 with backoff (honor
+last upstream tried returned a status) and `resource_name` (the requested
+model) inside the error object. Retry on 408/429/500/503 with backoff (honor
 `retry-after`); never on the rest. Mid-stream failures arrive as a terminal
 SSE error frame carrying the same `code` field.
 
@@ -186,23 +187,35 @@ days.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's own bearer token is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; JSON and `text/event-stream` replies stream back as the server sends them; `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded |
+| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's static bearer or an OAuth access token the gateway fetched (nothing when the server declares neither) is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; replies stream back as the server sends them unless the key's tool allowlist filters a `tools/list` or the tenant's `security.moderate` reviews a result, which buffer the reply whole (up to `max_reply_bytes`); `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded in time and counted against `max_live_streams_per_key` (and refused for a tenant under `security.moderate`) |
 
-The access key rides as usual (`Authorization: Bearer` or `x-api-key`) and
-must be entitled to the server (`access_keys[].mcp_servers`); when the key has
-an allowlist for that server (`access_keys[].mcp_tools`), `tools/list` results
-are filtered to it and a `tools/call` outside it answers a JSON-RPC error
-(`-32000`) without reaching the server. Every `tools/call` — served or denied —
-is a `mcp` security event (`rule = mcp:<server>`, `action = call:<tool>` /
-`deny:<tool>`). When the key's tenant sets `security.moderate`, a served
-`tools/call` result is buffered and its text content reviewed by the
-configured moderator before it reaches the client: a mask rewrites the text
-in place, a denial replaces the result with a JSON-RPC error (`-32001`, the
-moderator's reason), and either lands as a `mcp` security event
-(`rule = moderation`, `action = mask` / `block`). JSON-RPC batches are refused
-(400); the key's QPS applies. A server declared with `oauth` is called with an
-access token the gateway fetches from the server's token endpoint; a `401`
-from the server fetches a fresh token and retries the call once.
+The access key rides as usual (`Authorization: Bearer` or `x-api-key`); a
+server the key is not entitled to (`access_keys[].mcp_servers`) answers like an
+unknown one (`404`), so server names cannot be probed. When the key has an
+allowlist for that server (`access_keys[].mcp_tools`), `tools/list` results are
+filtered to it and a `tools/call` outside it answers a JSON-RPC error (`-32000`)
+without reaching the server; a `tools/call` without a string `params.name` is
+a `400`. Every `tools/call` — served or denied — is a `mcp` security event
+(`rule = mcp:<server>`, `action = call:<tool>` / `deny:<tool>`), written before
+the call is forwarded so a dropped connection cannot erase it. `Mcp-Session-Id`
+is bound to the key that first received it; another key presenting it gets
+`404`. When the key's tenant sets `security.moderate`, a served `tools/call`,
+`resources/read` or `prompts/get` result is buffered (up to the server's
+`max_reply_bytes`) and every prose field of it reviewed by the configured
+moderator before it reaches the client — regardless of the reply's HTTP status,
+and including a JSON-RPC error's own message. A mask rewrites the text in
+place, a denial — or a reply the gateway could not parse — replaces the whole
+reply with one JSON-RPC error (`-32001`, the moderator's reason), and either
+lands as a `mcp` security event (`rule = moderation`, `action = mask` /
+`block`). Because the GET listen stream carries server-pushed content the proxy
+cannot review, a reviewed tenant may not open one (`403`); other tenants may,
+and for them `Last-Event-ID` is still not forwarded. Listen streams count
+against `max_live_streams_per_key`. JSON-RPC batches are refused (400); the
+key's QPS and the tenant's pooled QPS apply. A server declared with `oauth` is
+called with an access token the gateway fetches from the server's token
+endpoint; a `401` from the server fetches a fresh token and retries the call
+once. Upstream failures answer a generic `502`; the server's endpoint and the
+identity provider's error text stay in the gateway log.
 
 ## Batch & files
 
@@ -233,7 +246,9 @@ is rejected the same way.
 `Authorization: Bearer <ak>` header, or — for browser clients that cannot set
 headers — a `gw-api-key.<ak>` entry in the `Sec-WebSocket-Protocol` list.
 
-The session is refused at accept if the tenant is not entitled to the model.
+The session is refused at accept if the tenant is not entitled to the model,
+or with `429` when the key already holds `max_live_streams_per_key` realtime
+sessions and MCP listen streams.
 A realtime model bound to an account with a real `endpoint` bridges the session
 to that vendor's realtime WebSocket: a transparent relay, with the gateway
 enforcing the same governance chain as the REST path per generation — tenant and
@@ -292,9 +307,9 @@ regardless.
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed; `?expected_version=` publishes only while that is still the head — a moved head answers 409 (global token; needs `storage.postgres_url`) |
 | GET | `/admin/config/versions` | retained config versions, newest first; `?limit=` (default 20) (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/versions/{id}/rollback` | republish a retained document as a new head and reload (global token; needs `storage.postgres_url`) |
-| GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's); `?ak=` exact lookup answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
+| GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200, every listing caps `limit` at 10 000; a tenant token sees only its own tenant's); `?ak=` exact lookup answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
-| PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` / `suspended_until_epoch_secs` (null lifts an abuse suspension early) |
+| PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` / `suspended_until_epoch_secs` (null lifts an abuse suspension early); a tenant token may set `banned: true` but can neither lift a ban nor touch `suspended_until_epoch_secs` (403) |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 (operator-only margin basis) |

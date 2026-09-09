@@ -24,6 +24,7 @@ pub mod health;
 pub mod keystore;
 pub mod latency;
 pub mod store;
+pub mod streams;
 pub mod thinking_signature;
 
 pub use alerts::{AlertBus, AlertEvent};
@@ -390,6 +391,12 @@ impl QuotaStore {
 
     pub fn reset_all(&self) {
         self.used.clear();
+    }
+
+    /// Drop every counter whose key starts with none of `prefixes`.
+    pub fn retain_prefixed(&self, prefixes: &[String]) {
+        self.used
+            .retain(|k, _| prefixes.iter().any(|p| k.starts_with(p.as_str())));
     }
 }
 
@@ -761,6 +768,8 @@ pub struct GatewayState {
     pub thinking_signatures: ThinkingSignatureAudit,
     /// Per-account call latency for `stability.latency_routing`; per instance.
     pub latency: latency::Latency,
+    /// Open long-lived streams per key, for `max_live_streams_per_key`.
+    pub streams: Arc<streams::LiveStreams>,
 }
 
 impl Default for GatewayState {
@@ -778,6 +787,7 @@ impl Default for GatewayState {
             alerts: Arc::new(alerts::AlertBus::default()),
             thinking_signatures: ThinkingSignatureAudit::new(),
             latency: latency::Latency::default(),
+            streams: Arc::default(),
         }
     }
 }
@@ -896,6 +906,7 @@ impl GatewayState {
             alerts: prev.alerts.clone(),
             thinking_signatures: prev.thinking_signatures.clone(),
             latency: prev.latency.clone(),
+            streams: prev.streams.clone(),
         })
     }
 }

@@ -14,6 +14,9 @@ shared, what stays local, and what the LB needs to do.
 | Billing ledger / files / batches / video jobs (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres (a video poll may land on any instance; the settle claim is one atomic row update); SQLite stays per-node |
 | Request cache | in-process (moka), or Redis with `shared_cache: true` | ⚠️ per-instance by default; fleet-shared when `shared_cache` is set |
 | Thinking-signature audit | in-process only | ⚠️ per-instance; a continuation landing on another instance finds no anchor and fails open (forwarded, not rejected) |
+| Monthly cost counters (`Governance`) | Redis (`storage.redis_url`) | ✅ when Redis is set (62-day keys); in-process they are swept at the daily reset |
+| Per-account latency (`stability.latency_routing`) | in-process only | ⚠️ per-instance; each instance ranks on its own samples, so a cold instance re-probes accounts the rest already measured |
+| MCP OAuth tokens, session binding, live-stream counts | in-process only | ⚠️ per-instance: up to N token fetches per server; a session id is bound on the instance that first saw it, so pin a key to one instance at the balancer to keep the binding fleet-wide |
 
 **A correct fleet = one Postgres (`storage.postgres_url`) + one Redis
 (`storage.redis_url`) shared by every instance.** Without them each instance

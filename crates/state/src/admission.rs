@@ -77,7 +77,7 @@ enum BudgetScope {
 }
 
 impl BudgetScope {
-    fn per_user(self) -> bool {
+    fn is_per_user(self) -> bool {
         matches!(self, Self::UserTokens | Self::UserCost)
     }
 
@@ -91,14 +91,7 @@ impl BudgetScope {
 
     /// The governance counter: user scopes carry the tenant, month counters their calendar month.
     fn key(self, month: Option<(i64, u32)>, ak: &AkInfo, user: &str) -> String {
-        let tag;
-        let prefix = match month {
-            Some((y, m)) => {
-                tag = format!("m:{y}{m:02}:");
-                tag.as_str()
-            }
-            None => "",
-        };
+        let prefix = month.map_or(String::new(), month_prefix);
         match self {
             Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
             Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
@@ -404,7 +397,7 @@ pub async fn check_tenant_rate(
 /// Per-AK QPS.
 pub async fn check_ak_rate(gov: &dyn Governance, ak: &AkInfo) -> Result<(), String> {
     admit(gov.rate_allow(&ak.ak, ak.qps).await, || {
-        format!("rate limit exceeded for ak {} (qps {})", ak.ak, ak.qps)
+        format!("rate limit exceeded for key {} (qps {})", ak.ak_id, ak.qps)
     })
 }
 
@@ -450,7 +443,7 @@ pub async fn reserve_daily(
     admit(
         gov.quota_reserve(&ak.ak, amount, ak.daily_token_quota, at)
             .await,
-        || format!("daily token quota exhausted for ak {}", ak.ak),
+        || format!("daily token quota exhausted for key {}", ak.ak_id),
     )
 }
 
@@ -470,8 +463,8 @@ pub async fn reserve_tpm(
         Ok(Some(amount))
     } else {
         Err(format!(
-            "token-per-minute limit exceeded for ak {} (tpm {tpm})",
-            ak.ak
+            "token-per-minute limit exceeded for key {} (tpm {tpm})",
+            ak.ak_id
         ))
     }
 }
@@ -583,7 +576,7 @@ async fn budgets(
         let Some(mut limit) = limit else {
             continue;
         };
-        if scope.per_user() && user.is_empty() {
+        if scope.is_per_user() && user.is_empty() {
             continue;
         }
         let key = match window {
@@ -620,6 +613,16 @@ fn civil_month(epoch_secs: i64) -> (i64, u32) {
 
 fn previous_month((y, m): (i64, u32)) -> (i64, u32) {
     if m == 1 { (y - 1, 12) } else { (y, m - 1) }
+}
+
+fn month_prefix((y, m): (i64, u32)) -> String {
+    format!("m:{y}{m:02}:")
+}
+
+/// The counter prefixes of the current and previous month: everything the rollover still reads.
+pub fn month_prefixes() -> [String; 2] {
+    let month = civil_month(crate::epoch_secs());
+    [month_prefix(month), month_prefix(previous_month(month))]
 }
 
 #[cfg(test)]

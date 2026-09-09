@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::mem::take;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -58,6 +58,11 @@ const STREAM_CHANNEL_CAP: usize = 64;
 /// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
 pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
+const ADMIN_PAGE_MAX: usize = 10_000;
+/// Longest `x-gw-user` accepted: the hint keys governance counters.
+const USER_HINT_MAX_BYTES: usize = 256;
+const MCP_SESSION_CAP: u64 = 100_000;
+const MCP_SESSION_TTL: Duration = Duration::from_secs(24 * 3_600);
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
 
@@ -76,6 +81,8 @@ pub struct AppState {
     pub mcp: reqwest::Client,
     /// Upstream MCP credentials, OAuth tokens cached per server.
     pub mcp_auth: Arc<mcp_auth::McpAuth>,
+    /// MCP session id → the fingerprint of the key that opened it.
+    pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
     /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
@@ -101,8 +108,9 @@ impl AppState {
         Self {
             handler,
             offline,
-            mcp: reqwest::Client::new(),
+            mcp: mcp_client(),
             mcp_auth: Arc::default(),
+            mcp_sessions: mcp_sessions(),
             loader,
             config_store: None,
         }
@@ -122,6 +130,25 @@ impl AppState {
         self.mcp_auth.clear();
         Ok(())
     }
+}
+
+/// The MCP proxy's client: no redirects, so a server or token endpoint cannot
+/// steer a credentialed request elsewhere.
+fn mcp_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "mcp client fell back to the default client");
+            reqwest::Client::new()
+        })
+}
+
+fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
+    moka::sync::Cache::builder()
+        .max_capacity(MCP_SESSION_CAP)
+        .time_to_live(MCP_SESSION_TTL)
+        .build()
 }
 
 pub fn app(state: AppState) -> Router {
@@ -348,6 +375,13 @@ async fn realtime_ws(
             }
         }
     };
+    let Some(stream_guard) = snap
+        .state
+        .streams
+        .open(&ak.ak, snap.cfg.max_live_streams_per_key)
+    else {
+        return error_response(429, "too many open realtime sessions for this key");
+    };
     let Some(model) = q.remove("model") else {
         return error_response(400, "model query param is required");
     };
@@ -414,13 +448,14 @@ async fn realtime_ws(
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
-    if account.endpoint.is_empty() {
-        ws.on_upgrade(move |socket| {
-            realtime_session(socket, s, ak, m, mt, account.name.clone(), hint)
-        })
-    } else {
-        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, m, mt, account, hint))
-    }
+    ws.on_upgrade(move |socket| async move {
+        let _held = stream_guard;
+        if account.endpoint.is_empty() {
+            realtime_session(socket, s, ak, m, mt, account.name.clone(), hint).await
+        } else {
+            realtime_bridge(socket, s, ak, m, mt, account, hint).await
+        }
+    })
 }
 
 /// A realtime session's model identity: entitlement judges `requested`, pricing and routing follow `served`.
@@ -499,7 +534,7 @@ async fn realtime_gate(
         _ => {
             return Err((
                 ErrClass::AccessDenied,
-                format!("access key {} is no longer valid", ak.ak),
+                format!("access key {} is no longer valid", ak.ak_id),
             ));
         }
     };
@@ -1255,7 +1290,7 @@ async fn ledger(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
         Err(e) => gateway_error(e),
@@ -1292,14 +1327,24 @@ fn user_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-gw-user")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
+        .map(cap_user_hint)
         .filter(|s| !s.is_empty())
 }
 
 /// The REST attribution precedence: `x-gw-user` header, else the dialect's own
 /// user field (batch items invert it — per-item `user` first).
 fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
-    user_header(headers).or_else(|| field.as_str().map(str::to_owned))
+    user_header(headers).or_else(|| field.as_str().map(cap_user_hint))
+}
+
+/// Bound an attribution hint at `USER_HINT_MAX_BYTES`: it keys governance
+/// counters, so an unbounded value from any surface would grow the keyspace.
+fn cap_user_hint(s: &str) -> String {
+    let mut end = s.len().min(USER_HINT_MAX_BYTES);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -1319,6 +1364,12 @@ async fn authenticate(
             "missing api key (Authorization: Bearer <ak> or x-api-key)",
         ));
     };
+    if headers
+        .get("x-gw-user")
+        .is_some_and(|v| v.len() > USER_HINT_MAX_BYTES)
+    {
+        return Err((400, "x-gw-user exceeds 256 bytes"));
+    }
     let info = s
         .handler
         .state()
@@ -1865,9 +1916,12 @@ async fn admin_key_create(
     if !s.handler.cfg().is_known_tenant(tenant) {
         return error_response(400, format!("unknown tenant `{tenant}`"));
     }
-    if let Err(r) = scoped_key(&s, &scope, ak).await {
-        return r;
-    }
+    let existing = match scoped_key(&s, &scope, ak).await {
+        Ok(found) => found,
+        Err(r) => return r,
+    };
+    // a platform sanction on an existing key survives a tenant re-create
+    let tenant_scoped = matches!(scope, AdminScope::Tenant(_));
     let info = AkInfo {
         ak_id: gw_state::access_key_fingerprint(ak).into(),
         ak: ak.to_owned(),
@@ -1878,8 +1932,12 @@ async fn admin_key_create(
         daily_token_quota: body["daily_token_quota"].as_i64().unwrap_or(0),
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
         expires_at_epoch_secs: body["expires_at_epoch_secs"].as_i64(),
-        banned: body["banned"].as_bool().unwrap_or(false),
-        suspended_until_epoch_secs: None,
+        banned: body["banned"].as_bool().unwrap_or(false)
+            || (tenant_scoped && existing.as_ref().is_some_and(|e| e.banned)),
+        suspended_until_epoch_secs: existing
+            .as_ref()
+            .filter(|_| tenant_scoped)
+            .and_then(|e| e.suspended_until_epoch_secs),
         model_quotas: Arc::new(
             body["model_quotas"]
                 .as_object()
@@ -1942,6 +2000,15 @@ async fn admin_key_patch(
         banned: body["banned"].as_bool(),
         suspended_until_epoch_secs: tri("suspended_until_epoch_secs"),
     };
+    // platform sanctions: a tenant may add a ban but not lift one, and may not set or clear a suspension
+    if matches!(scope, AdminScope::Tenant(_))
+        && (patch.banned == Some(false) || patch.suspended_until_epoch_secs.is_some())
+    {
+        return error_response(
+            403,
+            "lifting a ban or changing a suspension requires the global admin token",
+        );
+    }
     let patched = s.handler.state().auth.patch(&ak, &patch).await;
     match patched {
         Err(e) => gateway_error(e),
@@ -2033,7 +2100,7 @@ async fn admin_config_versions(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match store.list_versions(limit).await {
         Ok(versions) => Json(json!({ "versions": versions })).into_response(),
         Err(e) => gateway_error(e),
@@ -2193,7 +2260,7 @@ async fn admin_key_list(
         return Json(resp).into_response();
     }
     let offset = q_num(&q, "offset", 0);
-    let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     // the scope filters in the store before paging, or a tenant admin's page could come back empty
     let tenant = scope.tenant_filter(&q);
     let listed = match s.handler.state().auth.list(tenant, offset, limit).await {
@@ -2409,7 +2476,7 @@ async fn admin_security_events(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let tenant = scope.tenant_filter(&q);
-    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.security_events(tenant, limit).await {
         Ok(events) => Json(json!({ "events": events })).into_response(),
         Err(e) => gateway_error(e),
@@ -2426,7 +2493,7 @@ async fn admin_audit_ops(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.admin_audit_list(limit).await {
         Ok(entries) => Json(json!({ "entries": entries })).into_response(),
         Err(e) => gateway_error(e),
@@ -4570,13 +4637,8 @@ async fn batches_submit(
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
     let hint = user_header(&headers);
-    let item_user = |v: &Value| {
-        v["user"]
-            .as_str()
-            .or(hint.as_deref())
-            .unwrap_or_default()
-            .to_owned()
-    };
+    let item_user =
+        |v: &Value| cap_user_hint(v["user"].as_str().or(hint.as_deref()).unwrap_or_default());
 
     if let Some(file_id) = body["input_file_id"].as_str() {
         let found = s.handler.state().store.file_get(file_id).await;
@@ -5715,8 +5777,9 @@ mod tests {
         let app = AppState {
             handler,
             offline,
-            mcp: reqwest::Client::new(),
+            mcp: mcp_client(),
             mcp_auth: Arc::default(),
+            mcp_sessions: mcp_sessions(),
             loader: None,
             config_store: None,
         };
@@ -5780,8 +5843,9 @@ mod tests {
         let app = AppState {
             handler,
             offline,
-            mcp: reqwest::Client::new(),
+            mcp: mcp_client(),
             mcp_auth: Arc::default(),
+            mcp_sessions: mcp_sessions(),
             loader: None,
             config_store: None,
         };

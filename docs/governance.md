@@ -29,23 +29,31 @@ from `GET /v1/models`), per-model daily-token quota defaults (each key metered
 separately against the same value; per-key `model_quotas` override), and an
 optional `fallback_model` — an over-quota request degrades to it instead of
 failing (the response echoes the requested model name; the ledger records both
-requested and served). The per-key daily cap stays the hard backstop, and
+requested and served; a model's own `fallback_models` chain for upstream
+failures is a separate mechanism, below). The per-key daily cap stays the hard backstop, and
 unconfigured (key, model) pairs never touch a counter.
 
 ## Model fallback
 
 A model may name `fallback_models`, tried in order when the request fails
-upstream — a vendor 5xx, a connection failure, or a vendor `429` — after the
-account-level failover within the model is exhausted, and only while no byte
-has reached the client (a failure after a stream has begun stays a failure).
-Gateway-side denials (quotas, rate limits, entitlement, bad requests) never
-fall back. Each hop re-runs the pipeline for the next model: entitlement,
-quota reservation and account selection apply to the model actually served,
-a fallback the caller's tenant is not entitled to is skipped, the response
-echoes the requested name, the ledger records both requested and served
-(`served_model`), the decision trail carries `fallback: <from> -> <to>: <why>`,
-and `gateway_model_fallbacks_total{from, to}` counts the hops. A chain does
-not recurse: only the requested model's list applies.
+upstream — a vendor 5xx or `429`, a connection failure, or no healthy account
+left for the model (`503`) — after the account-level failover within the model
+is exhausted, and only while no byte has reached the client (a failure after a
+stream has begun stays a failure). Gateway-side denials (quotas, rate limits,
+entitlement, bad requests) and gateway-internal errors never fall back, and a
+request carrying signed thinking stays pinned to its model (a signature only
+replays against the model that produced it). Each hop re-runs the pipeline for
+the next model: entitlement, quota reservation and account selection apply to
+the model actually served, a fallback the caller's tenant is not entitled to
+is skipped, the response echoes the requested name, the ledger records both
+requested and served (`served_model`), the decision trail carries
+`fallback: <from> -> <to>: <why>`, and `gateway_model_fallbacks_total{from, to}`
+counts the hops. A chain does not recurse: only the requested model's list
+applies. The chain covers the REST surfaces and batch items; a realtime
+session never switches models. It is distinct from a tenant's `fallback_model`
+above, which is a single swap the gateway makes on its own over-quota or
+moderation decision. A chain naming the model itself, an unknown model or a
+duplicate entry is rejected at load.
 
 ```yaml
 models:
@@ -108,11 +116,15 @@ delivered text. A disconnect *before* any bytes are sent bills nothing.
 `mcp_servers`. A key reaches only the servers named in its `mcp_servers`
 entitlement, and `mcp_tools` narrows a server to an allowlist: `tools/list` is
 filtered to it before the client sees the catalog, and a `tools/call` for any
-other tool is answered with a JSON-RPC error inside the gateway. Every tool
-call and every denial lands in the security-event stream (`surface = mcp`,
+other tool is answered with a JSON-RPC error inside the gateway. A server the
+key is not entitled to answers `404` like an unknown one. Every tool call and
+every denial lands in the security-event stream (`surface = mcp`,
 `rule = mcp:<server>`, `action = call:<tool>` or `deny:<tool>`, attributed to
-the key's `owner`), and `gateway_mcp_requests_total{server, method, result}`
-counts the traffic. Keys created through the admin API carry no MCP
+the key's `owner`) before the call is forwarded, and
+`gateway_mcp_requests_total{server, method, result}` counts the traffic. An
+`Mcp-Session-Id` is bound to the key that first received it, so one customer
+cannot resume or end another's session; the key's QPS and the tenant's pooled
+QPS apply, and GET listen streams count against `max_live_streams_per_key` (a tenant under `security.moderate` may not open one). Keys created through the admin API carry no MCP
 entitlement; the servers' own credentials stay in the gateway's environment
 (`mcp_servers[].api_key_env`), so an agent never holds them.
 
@@ -124,17 +136,22 @@ before its `expires_in`, and on a `401` from the server fetches a fresh token
 and retries the call once. Tokens are dropped on config reload. The client
 secret and refresh-token seed are read from the environment at fetch time.
 
-A tenant whose `security.moderate` is on has every served `tools/call` result
-reviewed by the moderator behind `moderation:` — the same review the chat and
-realtime surfaces apply to inbound text, now over the result's text content
-(`result.content[].text`, joined by newlines; other content types pass
-untouched). A mask rewrites the text in place (`[MASKED]`), a denial replaces
-the result with a JSON-RPC error `-32001` carrying the moderator's reason, and
-a moderator failure follows `moderation_fail_open`. Results are buffered for
-the review, so a reviewed tenant trades streaming of tool results for the
-guarantee that no unreviewed text reaches the agent; both outcomes are `mcp`
-security events with `rule = moderation` and `action = mask` (hits = spans) or
-`block`. Tenants without `moderate` stream results as before.
+A tenant whose `security.moderate` is on has every served `tools/call`,
+`resources/read` and `prompts/get` result reviewed by the moderator behind
+`moderation:` — the same review the chat and realtime surfaces apply to
+inbound text, here over every prose field of the result (string values under
+`result`, joined by newlines; `blob`, `mimeType`, `name`, `type` and `uri`
+fields are identifiers or binary and pass untouched). The reply is buffered
+for the review, up to the server's `max_reply_bytes`. A mask rewrites the text
+in place (`[MASKED]`); a denial, a degrade verdict, a mask that matches
+nothing, or a reply the gateway cannot parse replaces the whole reply with one
+JSON-RPC error `-32001` carrying the reason, so nothing unreviewed leaves; a
+moderator failure follows `moderation_fail_open`. The GET listen stream carries
+server notifications and is not reviewed; for a reviewed tenant
+`Last-Event-ID` is not forwarded, so a result cannot replay through it. Both
+outcomes are `mcp` security events with `rule = moderation` and
+`action = mask` (hits = spans) or `block`. Tenants without `moderate` stream
+results as before.
 
 ```yaml
 mcp_servers:
@@ -220,13 +237,16 @@ and a response-cache hit, which bills nothing, counts nothing.
 The monthly counterparts — `monthly_cost_quota_micros`,
 `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` — meter the
 same charged cost over the UTC calendar month and can be set alongside the
-daily caps. With `monthly_cost_rollover: true` a month's cap grows by whatever
-the previous month left unspent, at most one further month's cap; the carry is
-computed from the previous month's own cap, so it never compounds. Monthly
-counters live outside the daily reset (in Redis, `gw:counter:m:<yyyymm>:…`
-with a 62-day TTL) and the rollover read costs one counter read per configured
-scope per request; without it the monthly check is the same single read as the
-daily one.
+daily caps. With `monthly_cost_rollover: true` a month's cap grows by the current
+cap minus the previous month's recorded spend, at most one further cap — a
+month with no recorded spend (the first month, or a flushed Redis) carries a
+whole cap; the carry never compounds, and a cap changed between months applies
+to the carry retroactively. Monthly counters live outside the daily reset: in
+Redis under `gw:counter:m:<yyyymm>:…` with a 62-day TTL, in-process swept at
+the daily reset down to the current and previous month. Rollover costs one
+extra counter read per configured monthly scope at admission and one at
+settlement; without it the monthly check is the same single read as the daily
+one.
 Keys without a tenant take a declared `default` tenant's budgets. Reaching any
 budget raises a `budget_exhausted` alert on the webhook — subject
 `tenant:<name>`, `key:<fingerprint>` or `user:<tenant>/<id>`, detail the
