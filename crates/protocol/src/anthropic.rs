@@ -81,7 +81,11 @@ pub fn image_url_to_image(mut part: Value) -> Value {
     if part["type"] != "image_url" {
         return part;
     }
-    let url = match part["image_url"].get_mut("url").map(Value::take) {
+    let url = match part
+        .get_mut("image_url")
+        .and_then(|v| v.get_mut("url"))
+        .map(Value::take)
+    {
         Some(Value::String(url)) => url,
         _ => return part,
     };
@@ -105,7 +109,7 @@ pub fn image_to_image_url(mut block: Value) -> Value {
     if block["type"] != "image" {
         return block;
     }
-    let mut source = block["source"].take();
+    let mut source = block.get_mut("source").map(Value::take).unwrap_or_default();
     let url = match source["type"].as_str() {
         Some("base64") => format!(
             "data:{};base64,{}",

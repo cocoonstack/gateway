@@ -39,6 +39,9 @@ const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 /// trailing replica lands a row in a rolled minute — a rolled minute's source
 /// set can only shrink, which keeps the max-upsert sound.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
+/// In-process rollup retention: the monthly-budget window, then a bucket cap.
+const ROLLUP_RETENTION_SECS: i64 = 62 * 86_400;
+const ROLLUP_MAX_BUCKETS: usize = 1_000_000;
 
 /// Postgres advisory-lock key serializing the fleet's rollup: one replica
 /// advances per tick (the upsert is idempotent; the lock only avoids repeated scans).
@@ -50,6 +53,8 @@ const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60
 
 /// A put prunes async video jobs older than this (vendor results expire far sooner).
 const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+/// Rows per batch_items INSERT: four binds each under the 65535-parameter limit.
+const BATCH_ITEM_CHUNK: usize = 16_000;
 
 // store pool size when storage.postgres_max_connections is unset
 const PG_MAX_CONNECTIONS: u32 = 10;
@@ -275,9 +280,7 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         }
     };
     let (vendor, vendor_unit) = cfg
-        .accounts
-        .iter()
-        .find(|a| a.name == b.account)
+        .find_account(b.account)
         .map(|a| {
             (
                 (
@@ -525,7 +528,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         Ok(())
     }
     /// Whether rows may batch off the request path; in-process backends stay synchronous.
-    fn deferred_ledger_writes(&self) -> bool {
+    fn defers_ledger_writes(&self) -> bool {
         false
     }
     /// Total count plus the most recent `limit` records in chronological order;
@@ -667,7 +670,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 
     /// Whether this backend runs a fleet work queue; local backends execute on
     /// the submitting instance.
-    fn distributed_batches(&self) -> bool {
+    fn distributes_batches(&self) -> bool {
         false
     }
     /// Atomically enqueue a batch and its items so a partial save never leaves
@@ -769,6 +772,7 @@ pub struct MemoryStore {
     /// Minute buckets keyed by (minute, tenant, user, model); see
     /// [`Store::usage_rollup_advance`].
     rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
+    rollup_max_buckets: Option<usize>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<MemoryContent>,
@@ -788,6 +792,13 @@ impl MemoryStore {
     pub fn with_ledger_cap(max_rows: usize) -> Self {
         Self {
             ledger_max_rows: max_rows,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_rollup_cap(max_buckets: usize) -> Self {
+        Self {
+            rollup_max_buckets: Some(max_buckets),
             ..Self::default()
         }
     }
@@ -814,13 +825,13 @@ impl Store for MemoryStore {
             ));
         }
         // watermark first: rollup-then-records is the lock order advance uses
-        let watermark = rollup_watermark(&lock(&self.rollup));
+        let watermark = (self.ledger_max_rows > 0).then(|| rollup_watermark(&lock(&self.rollup)));
         let mut ledger = lock(&self.ledger);
         if !ledger.request_ids.insert(r.request_id.clone()) {
             return Ok(());
         }
         ledger.rows.push(r.clone());
-        if self.ledger_max_rows > 0
+        if let Some(watermark) = watermark
             && ledger.rows.len() > self.ledger_max_rows
             && self
                 .prune_seq
@@ -990,6 +1001,13 @@ impl Store for MemoryStore {
         let written = fresh.len() as u64;
         for (k, v) in fresh {
             rollup.entry(k).and_modify(|e| e.keep_max(&v)).or_insert(v);
+        }
+        let floor = bucket_floor(now - ROLLUP_RETENTION_SECS);
+        let kept = rollup.split_off(&(floor, String::new(), String::new(), String::new()));
+        *rollup = kept;
+        let cap = self.rollup_max_buckets.unwrap_or(ROLLUP_MAX_BUCKETS);
+        while rollup.len() > cap {
+            rollup.pop_first();
         }
         Ok(written)
     }
@@ -1367,6 +1385,7 @@ impl SqliteStore {
                 served_model TEXT NOT NULL, account TEXT NOT NULL,
                 unit_price_micros INTEGER NOT NULL, created_at_epoch_secs INTEGER NOT NULL,
                 billed INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS video_jobs_created_idx ON video_jobs (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -1804,7 +1823,7 @@ macro_rules! sql_store_impl {
                 if rows.is_empty() {
                     return Ok(());
                 }
-                // QueryBuilder numbers the placeholders per dialect, so no dialect_sql! here
+                // the QueryBuilder numbers placeholders per dialect, so no dialect_sql! here
                 let mut qb = sqlx::QueryBuilder::new(
                     "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
                      account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
@@ -1839,7 +1858,7 @@ macro_rules! sql_store_impl {
                 Ok(())
             }
 
-            fn deferred_ledger_writes(&self) -> bool {
+            fn defers_ledger_writes(&self) -> bool {
                 true
             }
 
@@ -2410,6 +2429,7 @@ impl PostgresStore {
                 served_model TEXT NOT NULL, account TEXT NOT NULL,
                 unit_price_micros BIGINT NOT NULL, created_at_epoch_secs BIGINT NOT NULL,
                 billed INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS video_jobs_created_idx ON video_jobs (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -2717,7 +2737,7 @@ sql_store_impl!(PostgresStore, postgres, {
         Ok(Some(done))
     }
 
-    fn distributed_batches(&self) -> bool {
+    fn distributes_batches(&self) -> bool {
         true
     }
 
@@ -2743,18 +2763,21 @@ sql_store_impl!(PostgresStore, postgres, {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("insert batch", e))?;
-        for (idx, item) in items.iter().enumerate() {
-            let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
-            sqlx::query(
-                "INSERT INTO batch_items (batch_id, idx, messages, user_id) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(&id)
-            .bind(idx as i64)
-            .bind(json)
-            .bind(&item.user)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| crate::sqlx_err("save batch item", e))?;
+        for (chunk, items) in items.chunks(BATCH_ITEM_CHUNK).enumerate() {
+            let mut qb = sqlx::QueryBuilder::new(
+                "INSERT INTO batch_items (batch_id, idx, messages, user_id) ",
+            );
+            qb.push_values(items.iter().enumerate(), |mut v, (i, item)| {
+                let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
+                v.push_bind(&id)
+                    .push_bind((chunk * BATCH_ITEM_CHUNK + i) as i64)
+                    .push_bind(json)
+                    .push_bind(&item.user);
+            });
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| crate::sqlx_err("save batch items", e))?;
         }
         tx.commit()
             .await
@@ -4072,6 +4095,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_rollup_keeps_the_retention_window_and_caps_buckets() {
+        let now = 100 * 86_400;
+        let store = MemoryStore::default();
+        let mut old = record("m1");
+        old.created_at_epoch_secs = now - ROLLUP_RETENTION_SECS - 3_600;
+        let mut fresh = record("m1");
+        fresh.created_at_epoch_secs = now - 3_600;
+        for r in [&old, &fresh] {
+            store.ledger_add(r).await.unwrap();
+        }
+        store.usage_rollup_advance(now).await.unwrap();
+        let minutes: Vec<i64> = lock(&store.rollup).keys().map(|k| k.0).collect();
+        assert_eq!(minutes, vec![bucket_floor(fresh.created_at_epoch_secs)]);
+
+        let store = MemoryStore::with_rollup_cap(2);
+        for i in 1..=3 {
+            let mut r = record("m1");
+            r.request_id = format!("req-{i}");
+            r.created_at_epoch_secs = now - i * 3_600;
+            store.ledger_add(&r).await.unwrap();
+        }
+        store.usage_rollup_advance(now).await.unwrap();
+        let minutes: Vec<i64> = lock(&store.rollup).keys().map(|k| k.0).collect();
+        assert_eq!(minutes.len(), 2, "the cap holds");
+        assert_eq!(
+            minutes[0],
+            bucket_floor(now - 2 * 3_600),
+            "the oldest minute is the one dropped"
+        );
+    }
+
+    #[tokio::test]
     async fn ledger_batch_insert_is_multi_row_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(dir.path().join("b.db").to_str().unwrap())
@@ -4268,7 +4323,7 @@ mod tests {
         );
         assert_eq!(got.status, BatchStatus::Failed);
 
-        assert!(store.distributed_batches());
+        assert!(store.distributes_batches());
         let qmsgs = vec![
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "one")],

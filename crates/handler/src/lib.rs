@@ -127,13 +127,12 @@ impl OnlineHandler {
         );
         ctx.billing_deferred = dlp && ctx.request.is_online && ctx.request.stream;
         // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
-        let rows: Vec<gw_state::SecurityEvent> = scan
-            .hits
-            .iter()
-            .map(|hit| security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count))
-            .collect();
+        deferred.extend(
+            scan.hits
+                .iter()
+                .map(|hit| security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count)),
+        );
         if let Some(block) = scan.block {
-            deferred.extend(rows);
             ctx.decide(
                 "security_check",
                 format!("blocked (code {})", block.err_code),
@@ -141,7 +140,6 @@ impl OnlineHandler {
             ctx.outcome = Some(content_filter_outcome(block));
             return Ok(ctx);
         }
-        deferred.extend(rows);
 
         // pre-DLP text, computed once for moderation and the retained prompt
         let inbound =
@@ -258,6 +256,8 @@ impl OnlineHandler {
 
         let mut tried = 0;
         loop {
+            ctx.fallback_ahead = !ctx.request.replays_reasoning_output()
+                && next_fallback(&snap.cfg, &ctx, tried).is_some();
             // a panicking node must refund too; the refund reads only whole-written ctx fields
             let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
                 .catch_unwind()
@@ -305,7 +305,7 @@ impl OnlineHandler {
 
         // raw response pre-outbound-DLP, only when full retention can store it (key present)
         let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
-            && gw_state::sealing_available();
+            && gw_state::can_seal();
         let raw_response = capture_raw
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
@@ -448,21 +448,19 @@ enum Moderation {
 }
 
 struct TerminalSubject {
+    ak: Arc<AkInfo>,
     request_id: String,
-    ak: String,
     user_id: String,
-    tenant: String,
 }
 
 impl TerminalSubject {
-    fn new(ak: &AkInfo, request: &GatewayRequest) -> Self {
+    fn new(ak: &Arc<AkInfo>, request: &GatewayRequest) -> Self {
         Self {
+            ak: Arc::clone(ak),
             request_id: request.request_id.clone(),
-            ak: ak.ak.clone(),
             user_id: ak
                 .attributed_user(request.user_id.as_deref().unwrap_or_default())
                 .to_owned(),
-            tenant: ak.tenant.clone(),
         }
     }
 }
@@ -673,9 +671,9 @@ async fn persist_terminal(
     let record = gw_state::ContentRecord {
         created_at_epoch_secs: now,
         request_id: subject.request_id.clone(),
-        ak: subject.ak.clone(),
+        ak: subject.ak.ak.clone(),
         user_id: subject.user_id.clone(),
-        tenant: subject.tenant.clone(),
+        tenant: subject.ak.tenant.clone(),
         kind: "terminal".to_owned(),
         content: body.to_string(),
         sealed: false,
@@ -817,9 +815,10 @@ async fn persist_content(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, ModelParamV2};
+
+    use super::*;
 
     fn handler() -> OnlineHandler {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
@@ -1138,6 +1137,26 @@ mod tests {
             hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "a gateway denial reaches no vendor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_fallback_samples_one_success_for_the_requested_model() {
+        let (endpoint, _) = vendor_by_model().await;
+        let h = fallback_handler(
+            &endpoint,
+            "tenants: [{name: t1, models: [broken, healthy]}]",
+        )
+        .await;
+        let ak = h.state().auth.authenticate("k1").await.unwrap();
+        h.run(chat_req("broken", "hi"), ak).await.unwrap();
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(
+            avail.window("broken", minute - 5, minute).await,
+            (1, 0),
+            "the client saw one success; the failed first attempt is not a sample"
         );
     }
 
@@ -2637,6 +2656,7 @@ mod tests {
         let mut cfg = GatewayConfig::embedded_default().unwrap();
         cfg.security.dlp_redact = true;
         cfg.security.blocklist = vec!["example.com".into()];
+        cfg.security = std::mem::take(&mut cfg.security).compiled();
         let cfg = Arc::new(cfg);
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(
@@ -2932,7 +2952,7 @@ mod tests {
         let submitter = OfflineHandler::new(online.clone());
         let ak = state.auth.authenticate("ak-demo-123").await.unwrap();
 
-        assert!(state.store.distributed_batches());
+        assert!(state.store.distributes_batches());
         let job = submitter
             .submit(
                 ak,

@@ -258,7 +258,9 @@ watermark or the trailing 20-minute window, whichever reaches further back —
 the first run rolls a pre-existing ledger whole, and a stalled task catches up
 on its own. Buckets only ever grow (a recompute over a partially pruned ledger
 keeps the more complete aggregate), and on Postgres a fleet elects one replica
-per pass via an advisory lock. Usage queries are served from those buckets plus
+per pass via an advisory lock. The in-process store keeps buckets for 62 days
+and at most one million of them, dropping the oldest minutes first; Postgres
+keeps them until an operator prunes the table. Usage queries are served from those buckets plus
 the raw ledger tail, so per-user cost stays correct after
 `storage.ledger_max_rows` prunes old billing rows. `since`/`until` bounds are
 minute-aligned, so a repeated query returns the same result whether a minute is

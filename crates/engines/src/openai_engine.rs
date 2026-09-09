@@ -28,7 +28,7 @@ impl OpenAiEngine {
                 parts => {
                     let mut msg = Map::new();
                     msg.insert("role".into(), m.role.into());
-                    // OpenAI: assistant tool-call turns carry content: null
+                    // assistant tool-call turns carry content: null on the OpenAI wire
                     let content = match (parts, m.content) {
                         (Some(parts), _) => parts,
                         (None, c) if c.is_empty() && m.tool_calls.is_some() => Value::Null,
@@ -110,11 +110,9 @@ impl OpenAiEngine {
                 let mut system = Map::with_capacity(2);
                 system.insert("role".into(), "system".into());
                 system.insert("content".into(), Value::String(s));
-                let mut msgs = vec![Value::Object(system)];
-                if let Some(Value::Array(existing)) = body.remove("messages") {
-                    msgs.extend(existing);
+                if let Some(Value::Array(msgs)) = body.get_mut("messages") {
+                    msgs.insert(0, Value::Object(system));
                 }
-                body.insert("messages".into(), Value::Array(msgs));
             }
         }
         let raw = self.base.take_raw();
@@ -278,7 +276,6 @@ fn apply_sse_event(
             full.push_str(&text);
             chunks.push(StreamChunk {
                 delta: text,
-                finish_reason: None,
                 ..Default::default()
             });
         }
@@ -313,7 +310,6 @@ fn apply_sse_event(
         }
         resp.finish_reason = fr.to_owned();
         chunks.push(StreamChunk {
-            delta: String::new(),
             finish_reason: Some(fr.to_owned()),
             ..Default::default()
         });

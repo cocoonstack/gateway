@@ -140,7 +140,6 @@ impl Governance for MemoryGovernance {
 
 /// Redis-backed governance for multi-replica deployments. Keys are namespaced
 /// under `gw:`; windows use INCR + EXPIRE so they self-expire.
-#[derive(Clone)]
 pub struct RedisGovernance {
     conn: redis::aio::ConnectionManager,
 }

@@ -131,7 +131,7 @@ where
                             } else {
                                 out.aborted = true;
                             }
-                            out.streamed_live = tx.is_some();
+                            out.streamed_live = true;
                             return Ok(out);
                         }
                         Err(e) => return Err(e),

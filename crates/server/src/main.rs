@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
         None => cfg,
     };
 
-    // GW_HOST / GW_PORT win over the config file (GW_HOST=0.0.0.0 for containers).
+    // the GW_HOST / GW_PORT env vars win over the config file (GW_HOST=0.0.0.0 for containers)
     let host = env::var("GW_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
     let port = env::var("GW_PORT")
         .ok()
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let purge_task = gw_task::spawn_content_purge(state.clone(), gw_task::PURGE_PERIOD);
     let rollup_task = gw_task::spawn_usage_rollup(state.clone(), gw_task::ROLLUP_PERIOD);
     let avail_task = gw_task::spawn_avail_flush(state.clone(), gw_task::AVAIL_FLUSH_PERIOD);
-    let distributed_batches = state.store.distributed_batches();
+    let distributes_batches = state.store.distributes_batches();
 
     let transport = select_transport()?;
     let postgres_url = cfg.storage.postgres_url.clone();
@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
 
     // fleet batch drain: on a distributed store any instance claims submitted batches
     let (batch_shutdown_tx, batch_shutdown_rx) = tokio::sync::watch::channel(false);
-    let batch_task = if distributed_batches {
+    let batch_task = if distributes_batches {
         let offline = app_state.offline.clone();
         tracing::info!("batch drain loop started (distributed store)");
         Some(tokio::spawn(async move {
@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // SIGHUP → live reload (storage-backend changes still need a restart)
+    // a SIGHUP triggers a live reload (storage-backend changes still need a restart)
     #[cfg(unix)]
     {
         let app = app_state.clone();
@@ -286,7 +286,7 @@ async fn read_source_text(src: Option<&str>) -> Result<Cow<'static, str>, String
     }
 }
 
-// GW_TRANSPORT: mock = zero egress, http = real HTTP, unset = mock:// in-process and real URLs over HTTP
+// the GW_TRANSPORT env var: mock = zero egress, http = real HTTP, unset = mock:// in-process and real URLs over HTTP
 fn select_transport() -> anyhow::Result<gw_engines::SharedTransport> {
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
@@ -322,7 +322,7 @@ async fn shutdown_signal() {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(e) => tracing::error!("install SIGTERM handler: {e}"),
+            Err(e) => tracing::error!(error = %e, "install SIGTERM handler failed"),
         }
     };
     #[cfg(not(unix))]

@@ -30,7 +30,7 @@ pub mod thinking_signature;
 pub use alerts::{AlertBus, AlertEvent};
 pub use avail::{AvailState, AvailStore, classify};
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
-pub use content::{ContentRecord, sealing_available};
+pub use content::{ContentRecord, can_seal};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
 pub use health::{HealthStore, RedisHealth};
 pub use keystore::{KeyStore, PostgresKeyStore};
@@ -461,15 +461,9 @@ impl AccountPool {
         health: &dyn HealthStore,
         latency: Option<&latency::Latency>,
     ) -> Option<Arc<Account>> {
-        let candidates: Vec<&Arc<Account>> = self
-            .accounts
-            .iter()
-            .filter(|a| serves(a, p, provider))
-            .collect();
-        let checks =
-            futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
-        let unhealthy: Vec<&str> = candidates
-            .iter()
+        let serving = || self.accounts.iter().filter(|a| serves(a, p, provider));
+        let checks = futures::future::join_all(serving().map(|a| health.available(&a.name))).await;
+        let unhealthy: Vec<&str> = serving()
             .zip(checks)
             .filter(|(_, ok)| !ok)
             .map(|(a, _)| a.name.as_str())
@@ -1380,7 +1374,7 @@ mod tests {
             .await
             .unwrap();
         assert!(st.store.file_get(&f.id).await.unwrap().is_some());
-        assert!(!st.store.distributed_batches());
+        assert!(!st.store.distributes_batches());
     }
 
     #[test]

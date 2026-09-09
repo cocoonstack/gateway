@@ -4,8 +4,7 @@
 
 use crate::ErrCode;
 
-/// One classification from the contract's closed set. `ModelStreamError` is
-/// in-stream only and never renders at the HTTP phase.
+/// One classification from the contract's closed set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrClass {
     Validation,
@@ -73,7 +72,7 @@ impl ErrClass {
             ErrClass::ModelTimeout => 408,
             ErrClass::Conflict => 409,
             ErrClass::RequestEntityTooLarge => 413,
-            // ModelStreamError never renders at the HTTP phase; 424 nominal
+            // the in-stream ModelStreamError never renders at the HTTP phase; 424 nominal
             ErrClass::ModelError | ErrClass::ModelStreamError => 424,
             ErrClass::Throttling => 429,
             ErrClass::InternalServer => 500,

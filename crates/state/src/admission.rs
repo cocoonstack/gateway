@@ -95,7 +95,7 @@ impl BudgetScope {
         match self {
             Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
             Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
-            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak),
+            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak_id),
             Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
         }
     }
@@ -128,9 +128,9 @@ impl BillingLedger {
 
     pub(crate) fn repairing(store: Arc<dyn Store>) -> Self {
         let (queue, mut pending) = mpsc::channel::<LedgerWrite>(LEDGER_QUEUE_CAPACITY);
-        let deferred = store.deferred_ledger_writes();
+        let deferred = store.defers_ledger_writes();
         let worker_store = store.clone();
-        // The bounded worker owns accepted rows through caller cancellation.
+        // the bounded worker owns accepted rows through caller cancellation
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(LEDGER_BATCH_MAX);
             let mut row_acks = Vec::with_capacity(LEDGER_BATCH_MAX);
@@ -178,22 +178,27 @@ impl BillingLedger {
         rx.await.unwrap_or(0)
     }
 
-    async fn write(&self, record: &BillingRecord) {
-        if self.deferred
+    async fn write(&self, record: BillingRecord) {
+        let record = if self.deferred
             && let Some(queue) = &self.queue
         {
-            let queued = if record.user_id.is_empty() {
-                queue
-                    .try_send(LedgerWrite::Row(record.clone(), None))
-                    .is_ok()
-            } else {
-                Self::queue_attributed(queue, record).await
-            };
-            if queued {
+            if record.user_id.is_empty() {
+                match queue.try_send(LedgerWrite::Row(record, None)) {
+                    Ok(()) => return,
+                    Err(refused) => match refused.into_inner() {
+                        LedgerWrite::Row(record, _) => record,
+                        LedgerWrite::Flush(_) => return,
+                    },
+                }
+            } else if Self::queue_attributed(queue, &record).await {
                 return;
+            } else {
+                record
             }
-        }
-        let Err(e) = self.store.ledger_add(record).await else {
+        } else {
+            record
+        };
+        let Err(e) = self.store.ledger_add(&record).await else {
             return;
         };
         metrics::counter!("gateway_ledger_write_failures_total").increment(1);
@@ -202,11 +207,7 @@ impl BillingLedger {
             return;
         };
         tracing::error!(error = %e, "billing ledger write failed; queued for repair");
-        if queue
-            .send(LedgerWrite::Row(record.clone(), None))
-            .await
-            .is_err()
-        {
+        if queue.send(LedgerWrite::Row(record, None)).await.is_err() {
             tracing::error!("billing ledger repair worker stopped");
         }
     }
@@ -469,16 +470,26 @@ pub async fn reserve_tpm(
     }
 }
 
+/// What a settled request cost, for the budgets and the decision trail.
+pub struct Settled {
+    pub total_tokens: i64,
+    pub cost_micros: i64,
+}
+
 /// Settle reserves to actuals, accrue the per-(AK, model) counter and write the
 /// ledger concurrently; a transient ledger failure goes to the bounded repair queue.
 pub async fn settle_and_bill(
     state: &GatewayState,
     cfg: &GatewayConfig,
     s: SettleInput<'_>,
-) -> BillingRecord {
+) -> Settled {
     let gov = state.governance.as_ref();
     let total = clamp_tokens(s.billing.total);
     let record = billing_record(cfg, &s.billing);
+    let settled = Settled {
+        total_tokens: record.total_tokens,
+        cost_micros: record.cost_micros,
+    };
     let settle_daily = gov.quota_settle(s.billing.ak, total - s.reserved, s.reserved_at);
     let consume_model = async {
         if let Some(key) = &s.model_quota_key {
@@ -500,9 +511,9 @@ pub async fn settle_and_bill(
             None => {}
         }
     };
-    let write_ledger = state.billing.write(&record);
+    let write_ledger = state.billing.write(record);
     tokio::join!(settle_daily, consume_model, settle_tpm, write_ledger);
-    record
+    settled
 }
 
 fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
@@ -658,7 +669,7 @@ mod tests {
         store.fail_next_ledger_writes(2);
         let ledger = BillingLedger::repairing(store.clone());
         let record = record("req-repair");
-        ledger.write(&record).await;
+        ledger.write(record.clone()).await;
         let (count, rows) = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let snapshot = store.ledger_snapshot(usize::MAX).await.unwrap();
@@ -684,7 +695,7 @@ mod tests {
         let mut row = record("req-attributed");
         row.user_id = "user-42".into();
 
-        ledger.write(&row).await;
+        ledger.write(row.clone()).await;
 
         let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 1);
@@ -702,7 +713,7 @@ mod tests {
         let mut row = record("req-fallback");
         row.user_id = "user-42".into();
 
-        ledger.write(&row).await;
+        ledger.write(row.clone()).await;
 
         let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 1);
@@ -735,7 +746,7 @@ mod tests {
         let ledger = BillingLedger::repairing(store.clone());
         let queue = ledger.queue.as_ref().unwrap();
 
-        ledger.write(&record("req-0")).await;
+        ledger.write(record("req-0")).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while queue.capacity() != LEDGER_QUEUE_CAPACITY {
                 tokio::task::yield_now().await;
@@ -745,12 +756,12 @@ mod tests {
         .expect("repair worker did not take the first row");
 
         for i in 1..=LEDGER_QUEUE_CAPACITY {
-            ledger.write(&record(format!("req-{i}"))).await;
+            ledger.write(record(format!("req-{i}"))).await;
         }
         assert_eq!(queue.capacity(), 0);
 
         let blocked_record = record(format!("req-{}", LEDGER_QUEUE_CAPACITY + 1));
-        let mut blocked = Box::pin(ledger.write(&blocked_record));
+        let mut blocked = Box::pin(ledger.write(blocked_record.clone()));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), blocked.as_mut())
                 .await
@@ -781,7 +792,7 @@ mod tests {
         let store = Arc::new(crate::MemoryStore::default());
         store.fail_next_ledger_writes(1);
         let ledger = BillingLedger::repairing(store.clone());
-        ledger.write(&record("req-flush")).await;
+        ledger.write(record("req-flush")).await;
         ledger.flush().await;
         let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 1);
@@ -796,7 +807,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(3_600), async {
             for i in 0..=LEDGER_QUEUE_CAPACITY {
-                ledger.write(&record(format!("req-{i}"))).await;
+                ledger.write(record(format!("req-{i}"))).await;
             }
         })
         .await
@@ -851,9 +862,12 @@ mod tests {
         let prev = BudgetScope::KeyCost.key(Some(previous_month(month)), &ak, "");
         assert_eq!(
             BudgetScope::KeyCost.key(Some(month), &ak, ""),
-            format!("m:{y}{m:02}:cb:ak:k1")
+            format!("m:{y}{m:02}:cb:ak:{}", ak.ak_id)
         );
-        assert_eq!(BudgetScope::KeyCost.key(None, &ak, ""), "cb:ak:k1");
+        assert_eq!(
+            BudgetScope::KeyCost.key(None, &ak, ""),
+            format!("cb:ak:{}", ak.ak_id)
+        );
 
         let untouched = budgets(gov, &cfg, &ak, "").await;
         assert_eq!(untouched.len(), 1);
@@ -890,7 +904,7 @@ mod tests {
             err.starts_with("monthly cost budget exhausted for key:"),
             "{err}"
         );
-        assert_eq!(gov.quota_used("cb:ak:k1").await, 0);
+        assert_eq!(gov.quota_used(&format!("cb:ak:{}", ak.ak_id)).await, 0);
         gov.quota_reset_all().await;
         assert!(
             check_budgets(gov, &cfg, &ak, "").await.is_err(),

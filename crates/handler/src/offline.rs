@@ -2,6 +2,7 @@
 //! instance, a distributed store persists items for any instance's drain loop.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use gw_models::{BatchItem, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
@@ -11,7 +12,7 @@ use crate::OnlineHandler;
 /// Batch orchestration built on top of the online handler.
 #[derive(Clone)]
 pub struct OfflineHandler {
-    pub online: OnlineHandler,
+    online: OnlineHandler,
 }
 
 impl OfflineHandler {
@@ -24,20 +25,16 @@ impl OfflineHandler {
         &self,
         ak: Arc<AkInfo>,
         model: String,
-        items: Vec<BatchItem>,
+        mut items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
-        if store.distributed_batches() {
+        if store.distributes_batches() {
             // persist the EFFECTIVE user: execution, billing and erasure key on one identity
-            let items: Vec<BatchItem> = items
-                .into_iter()
-                .map(|mut i| {
-                    if let Some(owner) = ak.owner_override() {
-                        i.user = owner.to_owned();
-                    }
-                    i
-                })
-                .collect();
+            if let Some(owner) = ak.owner_override() {
+                for item in &mut items {
+                    item.user = owner.to_owned();
+                }
+            }
             // atomic: the job becomes claimable only once all items are saved
             store
                 .batch_enqueue(&ak.ak, &ak.tenant, &model, &items)
@@ -90,9 +87,8 @@ impl OfflineHandler {
         };
         let done_indices: std::collections::HashSet<usize> =
             prior.iter().map(|r| r.index).collect();
-        use std::sync::atomic::Ordering::Relaxed;
         // heartbeat: keeps a slow item from being judged stale, flips `lost` when the fence moves
-        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
         let hb = {
             let store = store.clone();
             let id = id.to_owned();
@@ -122,7 +118,7 @@ impl OfflineHandler {
                 break;
             }
             // re-read before dispatch (fail CLOSED): an erasure while queued blanks the stored item
-            if store.distributed_batches() {
+            if store.distributes_batches() {
                 match store.batch_item_snapshot(id, index).await {
                     Ok(Some(fresh)) => item = fresh,
                     Ok(None) | Err(_) => {
@@ -140,7 +136,7 @@ impl OfflineHandler {
             }
             let user = ak.attributed_user(&item.user).to_owned();
             // local backends keep no item rows: the erasure marker stops the rest (fail closed)
-            let erased_mid_batch = !store.distributed_batches()
+            let erased_mid_batch = !store.distributes_batches()
                 && store
                     .user_erased_since(&ak.tenant, &user, captured_at)
                     .await
@@ -180,7 +176,7 @@ impl OfflineHandler {
                 Ok(Err(e)) => failed_item(index, e.to_string(), user),
                 Err(join_err) => failed_item(index, format!("item task failed: {join_err}"), user),
             };
-            // if we lost the claim mid-run, don't persist — the new owner is authoritative
+            // a claim lost mid-run is not persisted: the new owner is authoritative
             if lost.load(Relaxed) {
                 break;
             }
@@ -213,7 +209,7 @@ impl OfflineHandler {
             let claimed = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
-                    if stopping(changed, &shutdown) {
+                    if is_stopping(changed, &shutdown) {
                         return;
                     }
                     continue;
@@ -276,7 +272,7 @@ impl OfflineHandler {
     }
 }
 
-fn stopping(
+fn is_stopping(
     changed: Result<(), tokio::sync::watch::error::RecvError>,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
@@ -289,7 +285,7 @@ async fn pause_or_stop(
 ) -> bool {
     tokio::select! {
         biased;
-        changed = shutdown.changed() => stopping(changed, shutdown),
+        changed = shutdown.changed() => is_stopping(changed, shutdown),
         _ = tokio::time::sleep(poll) => false,
     }
 }

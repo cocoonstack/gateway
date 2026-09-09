@@ -104,20 +104,6 @@ pub fn long_context_scale(
     )
 }
 
-/// Weighted (prompt, completion) for the paths carrying no cache/reasoning
-/// components (estimates, realtime turns).
-pub fn weighted_pair(prompt: i64, completion: i64, rate: &TokenRate) -> (i64, i64) {
-    let input = TokenInput {
-        prompt,
-        completion,
-        ..Default::default()
-    };
-    (
-        weighted_prompt(&input, rate),
-        weighted_completion(&input, rate),
-    )
-}
-
 /// Cache-normalized prompt (clamped at 0).
 fn normalize_prompt(input: &TokenInput, rate: &TokenRate) -> i64 {
     let mut prompt = input.prompt;
@@ -229,15 +215,6 @@ mod tests {
         };
         assert_eq!(weighted_prompt(&input, &rate), 250);
         assert_eq!(weighted_completion(&input, &rate), 60);
-    }
-
-    #[test]
-    fn weighted_pair_carries_flat_counts() {
-        let rate = TokenRate {
-            prompt_weight: 0.5,
-            ..Default::default()
-        };
-        assert_eq!(weighted_pair(100, 50, &rate), (50, 50));
     }
 
     #[test]

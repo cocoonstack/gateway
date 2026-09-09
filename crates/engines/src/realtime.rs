@@ -4,11 +4,6 @@
 
 use serde_json::Value;
 
-/// Whether a client frame is the OpenAI-dialect generation trigger.
-pub fn is_response_create(frame: &Value) -> bool {
-    frame["type"] == "response.create"
-}
-
 /// The client frame that starts a generation — the admission point. OpenAI
 /// signals it as `response.create`, Gemini Live as a completed client turn.
 pub fn is_client_turn(provider: &str, frame: &Value) -> bool {
@@ -16,7 +11,7 @@ pub fn is_client_turn(provider: &str, frame: &Value) -> bool {
         return frame["clientContent"]["turnComplete"] == Value::Bool(true)
             || frame["client_content"]["turn_complete"] == Value::Bool(true);
     }
-    is_response_create(frame)
+    frame["type"] == "response.create"
 }
 
 /// Visit a realtime frame's text-bearing string leaves with a visitor that may
@@ -99,7 +94,6 @@ pub fn is_realtime_turn_started(provider: &str, frame: &Value) -> bool {
 /// Delivered output in one frame: OpenAI deltas yield text (or audio quanta),
 /// Gemini `modelTurn` parts count as byte-estimated opaque units.
 pub fn realtime_output_delta(frame: &Value) -> (Option<&str>, usize) {
-    // Gemini Live: delivered output rides serverContent.modelTurn parts
     if let Some(parts) = frame["serverContent"]["modelTurn"]["parts"].as_array() {
         let opaque = parts
             .iter()

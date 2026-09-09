@@ -52,7 +52,7 @@ pub(crate) fn aws_headers(
         ("host", host.into()),
         ("x-amz-date", amz_date.into()),
         ("authorization", authorization),
-        // InvokeModel requires accept; content-type is unsigned and added by the caller
+        // the InvokeModel call requires accept; content-type is unsigned and added by the caller
         ("accept", "application/json".into()),
     ]
 }
@@ -174,8 +174,8 @@ pub(crate) async fn bedrock_stream<F>(
 where
     F: FnMut(Value) -> GResult<Vec<StreamChunk>>,
 {
-    let model = base.model_name()?.to_owned();
-    let reply = bedrock_send(base, &model, body).await?;
+    let uri = invoke_uri(base.model_name()?, base.request.stream);
+    let reply = bedrock_send_uri(base, &uri, body).await?;
     let status = reply.status;
     crate::pump::reject_json_error("bedrock", status, &reply.body)?;
     let r =

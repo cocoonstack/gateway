@@ -11,8 +11,7 @@ use crate::transport::{
     HeaderMap, MOCK_B64, MOCK_CREATED, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
 };
 
-/// Deterministic fake vendor: parses the engine-built body and answers in the
-/// vendor's wire shape; an account named "…down…" gets a 503 (the failover trigger).
+/// Deterministic fake vendor: parses the engine-built body and answers in the vendor's wire shape.
 #[derive(Debug, Default)]
 pub struct MockTransport;
 
@@ -30,11 +29,12 @@ impl MockTransport {
         }
     }
 
+    fn last_user(messages: &[Value]) -> Option<&Value> {
+        messages.iter().rev().find(|m| m["role"] == "user")
+    }
+
     fn last_user_text(messages: &[Value]) -> String {
-        messages
-            .iter()
-            .rev()
-            .find(|m| m["role"] == "user")
+        Self::last_user(messages)
             .and_then(|m| {
                 m["content"].as_str().map(str::to_owned).or_else(|| {
                     m["content"].as_array().map(|blocks| {
@@ -65,10 +65,7 @@ impl MockTransport {
     }
 
     fn image_count(messages: &[Value]) -> usize {
-        messages
-            .iter()
-            .rev()
-            .find(|m| m["role"] == "user")
+        Self::last_user(messages)
             .and_then(|m| m["content"].as_array())
             .map(|parts| parts.iter().filter(|p| p["type"] == "image_url").count())
             .unwrap_or(0)
@@ -321,7 +318,7 @@ impl MockTransport {
                 .map(String::into_bytes)
                 .collect(),
             UpstreamBody::Json(bytes) => {
-                let mut v: Value = serde_json::from_slice(&bytes)
+                let v: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| GatewayError::internal("mock bedrock reply").with_source(e))?;
                 if v.get("generation").is_some() {
                     let text = v["generation"].as_str().unwrap_or_default().to_owned();
@@ -332,18 +329,6 @@ impl MockTransport {
                         json!({"generation": b, "prompt_token_count": null,
                                "generation_token_count": v["generation_token_count"],
                                "stop_reason": "stop"}),
-                    ]
-                } else if v.get("text").is_some() {
-                    let text = v["text"].as_str().unwrap_or_default().to_owned();
-                    let (a, b) = Self::split_half(&text);
-                    vec![
-                        json!({"is_finished": false, "event_type": "text-generation", "text": a}),
-                        json!({"is_finished": false, "event_type": "text-generation", "text": b}),
-                        json!({"is_finished": true, "event_type": "stream-end",
-                               "finish_reason": "COMPLETE",
-                               "amazon-bedrock-invocationMetrics": {
-                                   "inputTokenCount": v["meta"]["tokens"]["input_tokens"].take(),
-                                   "outputTokenCount": v["meta"]["tokens"]["output_tokens"].take()}}),
                     ]
                 } else {
                     // a JSON answer to a stream request (the tool-use reply) stays JSON

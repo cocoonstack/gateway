@@ -1,6 +1,8 @@
 //! Rule-based request/response plugins from `config.security`: the pre-stage
 //! blocks and DLP-redacts inbound text, the post-stage redacts the response.
 
+use std::fmt::Write as _;
+
 use gw_config::{Action, SecurityConf};
 use gw_models::{Block, ChatMsg, GatewayRequest, GatewayResponse, ModelParamV2};
 
@@ -38,12 +40,11 @@ impl<'a> ScanCounts<'a> {
         }
     }
 
-    fn visit(&mut self, s: &str) -> usize {
-        self.blocklist += i64::from(blocklist_hit(self.sec, s));
+    fn visit(&mut self, s: &str) {
+        self.blocklist += i64::from(is_blocklisted(self.sec, s));
         for (i, r) in self.sec.regexes.iter().enumerate() {
             self.regex[i] += r.re.find_iter(s).count() as i64;
         }
-        0
     }
 
     /// Fold the counts into a [`ScanOutcome`]; any block-action hit denies.
@@ -198,7 +199,10 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
         return ScanOutcome::default();
     }
     let mut counts = ScanCounts::new(sec);
-    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| counts.visit(s));
+    for_each_request_text(request, SignedThinking::Visit, &mut |s, _| {
+        counts.visit(s);
+        0
+    });
     counts.outcome()
 }
 
@@ -281,23 +285,15 @@ pub fn apply_mask_spans_frame(
 }
 
 /// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.
-fn blocklist_hit(sec: &SecurityConf, text: &str) -> bool {
-    if text.is_ascii() {
-        return sec
-            .blocklist
-            .iter()
-            .any(|w| contains_ignore_ascii_case(text, w));
-    }
-    let lower = text.to_lowercase();
-    sec.blocklist.iter().any(|w| lower.contains(w))
-}
-
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
-    if n.is_empty() || n.len() > h.len() {
+fn is_blocklisted(sec: &SecurityConf, text: &str) -> bool {
+    let Some(matcher) = &sec.blocklist_matcher else {
         return false;
+    };
+    if text.is_ascii() {
+        matcher.is_match(text)
+    } else {
+        matcher.is_match(&text.to_lowercase())
     }
-    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// Walk every string leaf of a JSON value with a rewriting visitor; returns summed hits.
@@ -673,26 +669,29 @@ fn walk_native_event(
     fragments: &mut EventFragments,
     f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
-    if event["type"] == "message_start" {
-        let mut hits = walk_object_excluding(event, &["message"], f);
-        if let Some(message) = event.get_mut("message") {
-            hits += walk_object_excluding(message, &["content"], f);
-            if let Some(content) = message.get_mut("content") {
-                hits += walk_part_text(content, SignedThinking::Prose, &mut |s, _| f(s));
+    match event["type"].as_str() {
+        Some("message_start") => {
+            let mut hits = walk_object_excluding(event, &["message"], f);
+            if let Some(message) = event.get_mut("message") {
+                hits += walk_object_excluding(message, &["content"], f);
+                if let Some(content) = message.get_mut("content") {
+                    hits += walk_part_text(content, SignedThinking::Prose, &mut |s, _| f(s));
+                }
             }
+            return hits;
         }
-        return hits;
-    }
-    if event["type"] == "content_block_start" {
-        let mut hits = walk_object_excluding(event, &["content_block"], f);
-        if let Some(block) = event.get_mut("content_block") {
-            hits += if block.as_object().is_some_and(is_signed_thinking_block) {
-                walk_signed_prose(block, &mut |s, _| f(s))
-            } else {
-                walk_part_value(block, f)
-            };
+        Some("content_block_start") => {
+            let mut hits = walk_object_excluding(event, &["content_block"], f);
+            if let Some(block) = event.get_mut("content_block") {
+                hits += if block.as_object().is_some_and(is_signed_thinking_block) {
+                    walk_signed_prose(block, &mut |s, _| f(s))
+                } else {
+                    walk_part_value(block, f)
+                };
+            }
+            return hits;
         }
-        return hits;
+        _ => {}
     }
     if event["type"] == "content_block_delta" && event.get("delta").is_some() {
         let opaque_key: Option<&'static str> = match event["delta"]["type"].as_str() {
@@ -715,7 +714,7 @@ fn walk_native_event(
         }
         return hits;
     }
-    // Responses deltas join per output item so a pattern split across frames still matches
+    // deltas join per output item so a pattern split across frames still matches
     if let Some(index) = event["output_index"].as_u64()
         && let Some(text) = event["delta"].as_str()
     {
@@ -746,13 +745,17 @@ fn collect_delta_payload(
     opaque_key: Option<&str>,
     fragments: &mut EventFragments,
 ) {
+    let mut path = String::from("delta");
     let Some(object) = delta.as_object() else {
-        collect_delta_fragments(delta, index, "delta", fragments);
+        collect_delta_fragments(delta, index, &mut path, fragments);
         return;
     };
     for (key, value) in object {
         if key != "type" && Some(key.as_str()) != opaque_key {
-            collect_delta_fragments(value, index, &format!("delta/{key}"), fragments);
+            path.push('/');
+            path.push_str(key);
+            collect_delta_fragments(value, index, &mut path, fragments);
+            path.truncate("delta".len());
         }
         if fragments.overflowed {
             break;
@@ -763,19 +766,22 @@ fn collect_delta_payload(
 fn collect_delta_fragments(
     value: &serde_json::Value,
     index: u64,
-    path: &str,
+    path: &mut String,
     fragments: &mut EventFragments,
 ) {
     if fragments.overflowed {
         return;
     }
+    let len = path.len();
     match value {
         serde_json::Value::String(text) => {
             fragments.append(index, path, text);
         }
         serde_json::Value::Array(values) => {
             for (position, value) in values.iter().enumerate() {
-                collect_delta_fragments(value, index, &format!("{path}/{position}"), fragments);
+                let _ = write!(path, "/{position}");
+                collect_delta_fragments(value, index, path, fragments);
+                path.truncate(len);
                 if fragments.overflowed {
                     break;
                 }
@@ -783,7 +789,10 @@ fn collect_delta_fragments(
         }
         serde_json::Value::Object(object) => {
             for (key, value) in object {
-                collect_delta_fragments(value, index, &format!("{path}/{key}"), fragments);
+                path.push('/');
+                path.push_str(key);
+                collect_delta_fragments(value, index, path, fragments);
+                path.truncate(len);
                 if fragments.overflowed {
                     break;
                 }
@@ -982,8 +991,9 @@ fn redact(text: &str) -> Option<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_models::ChatMsg;
+
+    use super::*;
 
     #[test]
     fn mask_spans_map_across_slots_like_inbound_text() {
@@ -1020,6 +1030,7 @@ mod tests {
             dlp_redact: true,
             ..Default::default()
         }
+        .compiled()
     }
 
     #[test]
@@ -1044,7 +1055,8 @@ mod tests {
             blocklist: vec!["forbiddenword".into(), "禁词".into()],
             dlp_redact: false,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
             ..Default::default()
@@ -1112,7 +1124,8 @@ mod tests {
             blocklist: vec!["watch".into()],
             blocklist_action: Action::Flag,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut frame = serde_json::json!({"type":"input_text","text":"please watch this"});
         let (out, text, _) = realtime_frame_scan(&s2, &mut frame, false);
         assert!(out.block.is_none(), "flag does not block realtime");
@@ -1127,7 +1140,8 @@ mod tests {
             blocklist_action: Action::Flag,
             detect_secrets: true,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut frame = serde_json::json!({
             "type":"input_text","text":"key sk-abcdefghijklmnopqrstuvwxyz012345"
         });
@@ -1400,7 +1414,8 @@ mod tests {
             blocklist: vec!["watchword".into()],
             blocklist_action: Action::Flag,
             ..Default::default()
-        };
+        }
+        .compiled();
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "contains watchword here")],
             ..Default::default()

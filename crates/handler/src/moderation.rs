@@ -109,17 +109,13 @@ impl Moderator for BedrockGuardrail {
 /// The moderator the config names, else the allow-all default.
 pub fn from_config(conf: Option<&ModerationConf>) -> Arc<dyn Moderator> {
     let Some(conf) = conf else {
-        return default_moderator();
+        return Arc::new(AllowModerator);
     };
     let api_key = conf.api_key().unwrap_or_else(|| {
         tracing::warn!(var = %conf.api_key_env, "moderation api key env is unset; reviews will fail");
         String::new()
     });
     Arc::new(BedrockGuardrail::new(conf, api_key))
-}
-
-pub fn default_moderator() -> Arc<dyn Moderator> {
-    Arc::new(AllowModerator)
 }
 
 /// Map an `ApplyGuardrail` reply onto a verdict over the reviewed `text`.

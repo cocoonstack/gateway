@@ -51,7 +51,7 @@ pub fn budget_effort(budget: i64) -> &'static str {
 /// The thinking dialect of a model on the Anthropic wire, by name. Vendors
 /// speaking that wire (MiniMax, GLM, Kimi) cloned the budget dialect.
 pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
-    // Bedrock ids carry a vendor (and region) prefix: `us.anthropic.claude-…`
+    // ids on Bedrock carry a vendor (and region) prefix: `us.anthropic.claude-…`
     let model = model.find("claude").map_or(model, |i| &model[i..]);
     if !model.starts_with("claude") || model.starts_with("claude-3") {
         return ThinkingDialect::Budget;

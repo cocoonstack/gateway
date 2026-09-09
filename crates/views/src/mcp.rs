@@ -29,8 +29,8 @@ const FORWARDED_HEADERS: [&str; 5] = [
 const RETURNED_HEADERS: [&str; 2] = ["content-type", "mcp-session-id"];
 /// Methods whose results carry prose an agent reads; reviewed under `security.moderate`.
 const REVIEWED_METHODS: [&str; 3] = ["tools/call", "resources/read", "prompts/get"];
-/// Result fields that carry base64 binary, never prose: skipped so the review
-/// neither reads nor rewrites an image, audio clip or blob resource.
+/// Base64 payload fields, skipped only inside an image/audio block or a blob
+/// resource so the review neither reads nor rewrites binary.
 const OPAQUE_KEYS: [&str; 2] = ["blob", "data"];
 const JSONRPC_TOOL_DENIED: i64 = -32000;
 const JSONRPC_RESULT_BLOCKED: i64 = -32001;
@@ -48,7 +48,7 @@ struct Call {
 /// `data` payload it could not parse, or framing it passes through.
 enum Segment {
     Message(Value),
-    Opaque(String),
+    Opaque,
     Raw(String),
 }
 
@@ -267,13 +267,12 @@ fn parse_call(body: &[u8]) -> Result<Call, String> {
     let Value::Object(mut obj) = v else {
         return Err("JSON-RPC batches are not supported; send one message per request".to_owned());
     };
-    let method = obj
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let tool = match obj.get("params").and_then(|p| p.get("name")) {
-        Some(Value::String(name)) if method == "tools/call" => Some(name.clone()),
+    let method = match obj.remove("method") {
+        Some(Value::String(method)) => method,
+        _ => String::new(),
+    };
+    let tool = match obj.get_mut("params").and_then(|p| p.get_mut("name")) {
+        Some(Value::String(name)) if method == "tools/call" => Some(std::mem::take(name)),
         _ if method == "tools/call" => {
             return Err("tools/call needs a string params.name".to_owned());
         }
@@ -289,7 +288,7 @@ fn parse_call(body: &[u8]) -> Result<Call, String> {
 /// Keep only the allowlisted tools in every `tools/list` result; `None` when a message could not be parsed.
 fn filter_tool_list(bytes: &[u8], sse: bool, allowed: &[String]) -> Option<Vec<u8>> {
     let mut segments = parse_segments(bytes, sse);
-    if segments.iter().any(|seg| matches!(seg, Segment::Opaque(_))) {
+    if segments.iter().any(|seg| matches!(seg, Segment::Opaque)) {
         return None;
     }
     for tools in segments.iter_mut().filter_map(|seg| match seg {
@@ -322,7 +321,7 @@ async fn moderate_result(
     sse: bool,
 ) -> Vec<u8> {
     let mut segments = parse_segments(bytes, sse);
-    if segments.iter().any(|seg| matches!(seg, Segment::Opaque(_))) {
+    if segments.iter().any(|seg| matches!(seg, Segment::Opaque)) {
         return blocked(snap, ak, server, label, id, UNREVIEWABLE, sse).await;
     }
     let texts: Vec<&mut String> = segments.iter_mut().flat_map(review_slots).collect();
@@ -389,12 +388,22 @@ fn collect_prose<'a>(v: &'a mut Value, out: &mut Vec<&'a mut String>) {
     match v {
         Value::String(s) => out.push(s),
         Value::Array(items) => items.iter_mut().for_each(|x| collect_prose(x, out)),
-        Value::Object(map) => map
-            .iter_mut()
-            .filter(|(k, _)| !OPAQUE_KEYS.contains(&k.as_str()))
-            .for_each(|(_, x)| collect_prose(x, out)),
+        Value::Object(map) => {
+            let binary = is_binary_node(map);
+            map.iter_mut()
+                .filter(|(k, _)| !(binary && OPAQUE_KEYS.contains(&k.as_str())))
+                .for_each(|(_, x)| collect_prose(x, out));
+        }
         _ => {}
     }
+}
+
+/// An image/audio content block or a blob resource: its payload is base64, not prose.
+fn is_binary_node(map: &serde_json::Map<String, Value>) -> bool {
+    matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("image" | "audio")
+    ) || (map.contains_key("blob") && (map.contains_key("uri") || map.contains_key("mimeType")))
 }
 
 /// A bare JSON body is one message; an event stream is its events, each event's `data` lines joined by newlines, framing kept verbatim.
@@ -404,7 +413,7 @@ fn parse_segments(bytes: &[u8], sse: bool) -> Vec<Segment> {
     if !sse {
         return vec![match serde_json::from_str(text) {
             Ok(msg) => Segment::Message(msg),
-            Err(_) => Segment::Opaque(text.to_owned()),
+            Err(_) => Segment::Opaque,
         }];
     }
     let mut segments = Vec::new();
@@ -413,7 +422,7 @@ fn parse_segments(bytes: &[u8], sse: bool) -> Vec<Segment> {
         if let Some(payload) = data.take() {
             segments.push(match serde_json::from_str(&payload) {
                 Ok(msg) => Segment::Message(msg),
-                Err(_) => Segment::Opaque(payload),
+                Err(_) => Segment::Opaque,
             });
         }
     };
@@ -444,14 +453,7 @@ fn serialize_segments(segments: Vec<Segment>, sse: bool, hint: usize) -> Vec<u8>
     for seg in segments {
         match seg {
             Segment::Raw(s) => out.extend_from_slice(s.as_bytes()),
-            Segment::Opaque(payload) if sse => {
-                for line in payload.split('\n') {
-                    out.extend_from_slice(b"data: ");
-                    out.extend_from_slice(line.as_bytes());
-                    out.push(b'\n');
-                }
-            }
-            Segment::Opaque(payload) => out.extend_from_slice(payload.as_bytes()),
+            Segment::Opaque => {}
             Segment::Message(msg) => {
                 if sse {
                     out.extend_from_slice(b"data: ");
@@ -967,10 +969,9 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::from_yaml(&app_yaml(base)).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let app_state = AppState::new(cfg, state.clone(), Arc::new(gw_engines::MockTransport));
-        let app_state = AppState {
-            handler: app_state.handler.with_moderator(Arc::new(EmailMasker)),
-            ..app_state
-        };
+        let mut inner = (*app_state.0).clone();
+        inner.handler = inner.handler.with_moderator(Arc::new(EmailMasker));
+        let app_state = AppState(Arc::new(inner));
         (crate::app(app_state), state)
     }
 
@@ -1072,6 +1073,10 @@ mod tests {
             Some("err_body") => {
                 json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":"see bob@example.com"}})
             }
+            Some("structured_data") => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"data":"note bob@example.com"},
+                    "content":[{"type":"image","data":"Ym9iQGV4YW1wbGUuY29t"}]}})
+            }
             _ => {
                 json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"name":"contact bob@example.com"}}})
             }
@@ -1126,6 +1131,16 @@ mod tests {
             v["result"]["structuredContent"]["name"], "contact [MASKED]",
             "structured prose under any key is reviewed: {v}"
         );
+
+        let v = call_tool(&app, "structured_data").await;
+        assert_eq!(
+            v["result"]["structuredContent"]["data"], "note [MASKED]",
+            "a data field outside a binary block is prose: {v}"
+        );
+        assert_eq!(
+            v["result"]["content"][0]["data"], "Ym9iQGV4YW1wbGUuY29t",
+            "an image block's payload is never read or rewritten"
+        );
     }
 
     #[tokio::test]
@@ -1173,11 +1188,7 @@ mod tests {
             matches!(segments[1], Segment::Message(_)),
             "joined data lines parse"
         );
-        assert!(
-            segments
-                .iter()
-                .any(|s| matches!(s, Segment::Opaque(p) if p == "not json"))
-        );
+        assert!(segments.iter().any(|s| matches!(s, Segment::Opaque)));
         assert!(filter_tool_list(sse, true, &["add".to_owned()]).is_none());
         let bom = "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"add\"},{\"name\":\"x\"}]}}";
         let filtered = filter_tool_list(bom.as_bytes(), false, &["add".to_owned()]).unwrap();

@@ -229,11 +229,13 @@ pub struct ModelConf {
     /// capacity.
     #[serde(default)]
     pub variants: Vec<VariantConf>,
+    #[serde(skip)]
+    kind: Option<Protocol>,
 }
 
 impl ModelConf {
     pub fn protocol(&self) -> Option<Protocol> {
-        Protocol::from_wire(&self.protocol)
+        self.kind
     }
 }
 
@@ -388,6 +390,9 @@ pub struct SecurityConf {
     /// Blocklist terms; normalized to lower-case (empties dropped) at load.
     #[serde(default)]
     pub blocklist: Vec<String>,
+    /// The blocklist as one automaton; `None` when the list is empty.
+    #[serde(skip)]
+    pub blocklist_matcher: Option<aho_corasick::AhoCorasick>,
     /// What a blocklist hit does (default: block).
     #[serde(default)]
     pub blocklist_action: Action,
@@ -413,6 +418,12 @@ pub struct SecurityConf {
 }
 
 impl SecurityConf {
+    /// The policy as load leaves it: blocklist lower-cased and compiled, regexes built.
+    pub fn compiled(mut self) -> Self {
+        compile_security(&mut self);
+        self
+    }
+
     /// Whether responses must be redacted before leaving — the one predicate
     /// the outbound-DLP masking AND the stream-buffering boundary share, so a
     /// secrets-only tenant can't stream raw deltas past the masking.
@@ -764,6 +775,8 @@ pub struct GatewayConfig {
     product_idx: HashMap<String, usize>,
     #[serde(skip)]
     tenant_idx: HashMap<String, usize>,
+    #[serde(skip)]
+    account_idx: HashMap<String, usize>,
 }
 
 impl GatewayConfig {
@@ -781,6 +794,7 @@ impl GatewayConfig {
         self.model_idx = index_by(&self.models, |m| &m.name);
         self.product_idx = index_by(&self.products, |p| &p.name);
         self.tenant_idx = index_by(&self.tenants, |t| &t.name);
+        self.account_idx = index_by(&self.accounts, |a| &a.name);
     }
 
     /// Expand provider presets: fill each model's default wire type and
@@ -869,6 +883,9 @@ impl GatewayConfig {
             if let Some(sec) = t.security.as_mut() {
                 compile_security(sec);
             }
+        }
+        for m in &mut self.models {
+            m.kind = Protocol::from_wire(&m.protocol);
         }
         Ok(())
     }
@@ -1278,6 +1295,10 @@ impl GatewayConfig {
         self.models.get(*self.model_idx.get(name)?)
     }
 
+    pub fn find_account(&self, name: &str) -> Option<&AccountConf> {
+        self.accounts.get(*self.account_idx.get(name)?)
+    }
+
     /// Pricing for a public model name; zero if unlisted.
     fn prices_for(&self, name: &str) -> (i64, i64) {
         self.find_model(name)
@@ -1344,7 +1365,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
             wires: &["gemini", "realtime"],
             default_model_wire: "gemini",
         },
-        // OpenAI-protocol vendors: same wire shape, different base URL.
+        // vendors on the OpenAI protocol share the wire shape and differ by base URL
         "deepseek" => ProviderPreset {
             endpoint: "https://api.deepseek.com",
             wires: &["openai-chat"],
@@ -1469,6 +1490,19 @@ fn compile_security(sec: &mut SecurityConf) {
         .filter(|w| !w.is_empty())
         .map(|w| w.to_lowercase())
         .collect();
+    sec.blocklist_matcher = (!sec.blocklist.is_empty())
+        .then(|| {
+            aho_corasick::AhoCorasickBuilder::new()
+                .ascii_case_insensitive(true)
+                .build(&sec.blocklist)
+        })
+        .and_then(|built| match built {
+            Ok(matcher) => Some(matcher),
+            Err(e) => {
+                tracing::error!(error = %e, "blocklist did not compile; the list is ignored");
+                None
+            }
+        });
     sec.regexes = sec
         .regex_rules
         .iter()

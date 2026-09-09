@@ -40,7 +40,7 @@ pub struct ContentRecord {
 }
 
 /// Whether a deployment key is configured (so `full` retention may store raw).
-pub fn sealing_available() -> bool {
+pub fn can_seal() -> bool {
     CIPHER.is_some()
 }
 

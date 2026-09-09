@@ -18,30 +18,29 @@ use crate::transport::{Headers, SharedTransport, Transport, UpstreamBody, Upstre
 
 /// Gemini `parts` from a unified message: text and data-URI images (`inlineData`);
 /// remote image URLs cannot be inlined without a fetch and are skipped.
-fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
-    if let Some(Value::Array(parts)) = &m.parts {
+fn gemini_parts(mut m: gw_models::ChatMsg) -> Vec<Value> {
+    if let Some(Value::Array(parts)) = m.parts.take() {
         let mut out = Vec::new();
-        for p in parts {
-            match p["type"].as_str() {
-                Some("text") => {
-                    if let Some(t) = p["text"].as_str() {
-                        out.push(json!({"text": t}));
-                    }
+        for mut p in parts {
+            if p["type"] == "text" {
+                if let Some(Value::String(t)) = p.get_mut("text").map(Value::take) {
+                    out.push(object([("text", Value::String(t))]));
                 }
-                Some("image_url") => {
-                    let url = p["image_url"]["url"].as_str().unwrap_or_default();
-                    if let Some((mime, data)) = parse_data_uri(url) {
-                        out.push(json!({"inlineData": {"mimeType": mime, "data": data}}));
-                    }
-                }
-                _ => {}
+            } else if p["type"] == "image_url"
+                && let Some(Value::String(url)) = p
+                    .get_mut("image_url")
+                    .and_then(|u| u.get_mut("url"))
+                    .map(Value::take)
+                && let Some((mime, data)) = parse_data_uri(&url)
+            {
+                out.push(json!({"inlineData": {"mimeType": mime, "data": data}}));
             }
         }
         if !out.is_empty() {
             return out;
         }
     }
-    vec![json!({"text": m.content})]
+    vec![object([("text", Value::String(m.content))])]
 }
 
 /// Parse a `data:<mime>;base64,<payload>` URI into `(mime, payload)`.
@@ -67,13 +66,11 @@ impl VertexEngine {
         ]
     }
 
-    fn build_body(&self) -> Value {
-        // Gemini has no system role: system turns go to systemInstruction, never contents
-        let contents: Vec<Value> = self
-            .base
-            .request
-            .message
-            .iter()
+    fn build_body(&mut self) -> Value {
+        let system = self.base.system_text();
+        // there is no system role on Gemini: system turns go to systemInstruction, never contents
+        let contents: Vec<Value> = std::mem::take(&mut self.base.request.message)
+            .into_iter()
             .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
                 let role = if m.role == gw_consts::role::AI {
@@ -89,7 +86,6 @@ impl VertexEngine {
             .collect();
         let mut body = json!({});
         body["contents"] = Value::Array(contents);
-        let system = self.base.system_text();
         if !system.is_empty() {
             let part = object([("text", system.into())]);
             body["systemInstruction"] = object([("parts", Value::Array(vec![part]))]);
@@ -115,7 +111,7 @@ impl VertexEngine {
 
     /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames decoded
     /// as they arrive and forwarded through `stream_tx` (the live-pump contract).
-    async fn run_stream(&self) -> GResult<EngineOutcome> {
+    async fn run_stream(&mut self) -> GResult<EngineOutcome> {
         let body = self.build_body();
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
@@ -309,14 +305,14 @@ impl ModelEngine for EmbeddingsEngine {
 /// finished at "stop".
 fn family_outcome(
     message: String,
-    model: &str,
+    model: String,
     v: serde_json::Value,
     status: u16,
 ) -> EngineOutcome {
     EngineOutcome::with_status(
         GatewayResponse {
             message,
-            model: model.to_owned(),
+            model,
             response_v2: Some(v),
             finish_reason: "stop".to_owned(),
             ..Default::default()
@@ -410,7 +406,7 @@ impl ModelEngine for ImageEngine {
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
         );
-        let mut outcome = family_outcome(format!("{count} image(s) {verb}"), &model, v, status);
+        let mut outcome = family_outcome(format!("{count} image(s) {verb}"), model, v, status);
         outcome.response.prompt_tokens = input;
         outcome.response.completion_tokens = output;
         outcome.response.billed_units = count as i64;
@@ -565,7 +561,7 @@ impl ModelEngine for AudioEngine {
                 .or_else(|| local_seconds.map(|s| s.ceil() as i64))
                 .unwrap_or(0);
         }
-        let mut outcome = family_outcome(message, &model, v, status);
+        let mut outcome = family_outcome(message, model, v, status);
         outcome.response.prompt_tokens = input;
         outcome.response.completion_tokens = output;
         outcome.response.billed_units = units;
@@ -575,7 +571,7 @@ impl ModelEngine for AudioEngine {
 }
 
 /// A vendor duration as whole billed seconds (fractions round up).
-pub fn whole_seconds(v: &Value) -> Option<i64> {
+fn whole_seconds(v: &Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_f64().map(|f| f.ceil() as i64))
         .or_else(|| {
@@ -673,7 +669,7 @@ impl ModelEngine for VideoEngine {
         let dialect = video_dialect(self.base.provider(), self.base.wire_kind());
         let model = self.base.model_name()?;
         let mut body = Map::new();
-        // Kling names the field model_name and takes no inline image on this path
+        // the field is model_name on Kling, which takes no inline image on this path
         if dialect == VideoDialect::Kling {
             if p.image.is_some() {
                 return Err(GatewayError::bad_request(
@@ -742,7 +738,7 @@ impl ModelEngine for VideoEngine {
                 vec![
                     ("duration", p.duration_seconds.map(|d| d.to_string().into())),
                     ("aspect_ratio", p.aspect_ratio.map(Value::from)),
-                    // Kling has quality modes, not resolutions: 1080p rides mode=pro
+                    // quality modes replace resolutions on Kling: 1080p rides mode=pro
                     (
                         "mode",
                         p.resolution.map(|r| {
@@ -812,7 +808,7 @@ fn video_outcome(model: &str, v: Value, status: u16) -> EngineOutcome {
         .unwrap_or_default()
         .to_owned();
     let units = whole_seconds(&v["video"]["duration"]).unwrap_or(0);
-    let mut out = family_outcome(message, model, v, status);
+    let mut out = family_outcome(message, model.to_owned(), v, status);
     out.response.step = step;
     out.response.billed_units = units;
     out
@@ -1064,16 +1060,17 @@ impl ModelEngine for SearchEngine {
                 (status, v, "/results")
             }
         };
-        let titles: Vec<String> = v
+        let summary = v
             .pointer(results)
             .and_then(Value::as_array)
             .map(|rs| {
                 rs.iter()
-                    .filter_map(|r| r["title"].as_str().map(str::to_owned))
-                    .collect()
+                    .filter_map(|r| r["title"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             })
             .unwrap_or_default();
-        let mut out = family_outcome(titles.join("; "), &param.model_name, v, status);
+        let mut out = family_outcome(summary, param.model_name.clone(), v, status);
         out.response.billed_units = 1;
         Ok(out)
     }
@@ -1113,7 +1110,7 @@ impl ModelEngine for ModerationsEngine {
             .unwrap_or(0);
         Ok(family_outcome(
             format!("{flagged} flagged"),
-            model,
+            model.to_owned(),
             v,
             status,
         ))
@@ -1151,7 +1148,7 @@ impl ModelEngine for RerankEngine {
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
         let tokens = rerank_tokens(&v);
         let units = crate::engine::tok(&v["meta"]["billed_units"]["search_units"]);
-        let mut out = family_outcome(format!("{n} results"), &model, v, status);
+        let mut out = family_outcome(format!("{n} results"), model, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
         out.response.billed_units = units;
@@ -1190,7 +1187,7 @@ impl ModelEngine for PassthroughEngine {
         } else {
             "error"
         };
-        Ok(family_outcome(message.to_owned(), &model, v, status))
+        Ok(family_outcome(message.to_owned(), model, v, status))
     }
 }
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gw_config::GatewayConfig;
 use gw_engines::{EngineOutcome, SharedTransport};
-use gw_models::GatewayRequest;
+use gw_models::{GResult, GatewayError, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, GatewayState};
 
 pub struct DagContext {
@@ -26,6 +26,9 @@ pub struct DagContext {
     /// Request-level cache hit (downstream nodes short-circuit on this and skip
     /// account/engine/billing).
     pub cache_hit: bool,
+    /// The handler will retry an upstream fault on a fallback model, so this
+    /// attempt's failure is not the client-visible outcome.
+    pub fallback_ahead: bool,
     /// This request's cache key (computed by cache_lookup, reused by cache_store).
     pub cache_key: Option<String>,
     /// Governance key for the (AK, model) daily counter — set by model_quota
@@ -62,6 +65,7 @@ impl DagContext {
             outcome: None,
             decisions: Vec::new(),
             cache_hit: false,
+            fallback_ahead: false,
             cache_key: None,
             model_quota_key: None,
             quota_reserved: None,
@@ -78,6 +82,14 @@ impl DagContext {
     /// The effective end user: the key's `owner` (authoritative) else request
     /// metadata; `""` when neither is present. Resolution lives on [`AkInfo`] so
     /// REST and realtime can't diverge on an empty owner.
+    /// The resolved model param; a node reaching here before resolve_model is a broken plan.
+    pub fn model_param(&self) -> GResult<&ModelParamV2> {
+        self.request
+            .model_param_v2
+            .as_ref()
+            .ok_or_else(|| GatewayError::internal("model param missing after resolve_model"))
+    }
+
     pub fn effective_user_id(&self) -> &str {
         self.ak
             .attributed_user(self.request.user_id.as_deref().unwrap_or_default())

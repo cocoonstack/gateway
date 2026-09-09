@@ -79,9 +79,13 @@ impl PostgresKeyStore {
                 banned BOOLEAN NOT NULL DEFAULT FALSE,
                 model_quotas TEXT NOT NULL DEFAULT '{}',
                 owner TEXT,
-                source TEXT NOT NULL DEFAULT 'admin')",
+                source TEXT NOT NULL DEFAULT 'admin',
+                mcp_servers TEXT NOT NULL DEFAULT '[]',
+                mcp_tools TEXT NOT NULL DEFAULT '{}')",
                 "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS owner TEXT",
                 "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS suspended_until_epoch_secs BIGINT",
+                "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS mcp_servers TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS mcp_tools TEXT NOT NULL DEFAULT '{}'",
             ],
         )
         .await?;
@@ -104,7 +108,7 @@ impl PostgresKeyStore {
     async fn fetch(&self, ak: &str) -> Result<Option<Arc<AkInfo>>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs FROM access_keys WHERE ak = $1",
+             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs, mcp_servers, mcp_tools FROM access_keys WHERE ak = $1",
         )
         .bind(ak)
         .fetch_optional(&self.pool)
@@ -153,7 +157,7 @@ impl KeyStore for PostgresKeyStore {
     }
 
     async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>> {
-        // FOR UPDATE: concurrent patches serialize instead of clobbering fields
+        // concurrent patches serialize under FOR UPDATE instead of clobbering fields
         let mut tx = self
             .pool
             .begin()
@@ -161,7 +165,7 @@ impl KeyStore for PostgresKeyStore {
             .map_err(|e| crate::sqlx_err("begin patch", e))?;
         let row = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs FROM access_keys
+             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs, mcp_servers, mcp_tools FROM access_keys
              WHERE ak = $1 FOR UPDATE",
         )
         .bind(ak)
@@ -213,7 +217,7 @@ impl KeyStore for PostgresKeyStore {
     ) -> GResult<Vec<AkInfo>> {
         let rows = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
-             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs FROM access_keys
+             expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs, mcp_servers, mcp_tools FROM access_keys
              WHERE ($1::text IS NULL OR tenant = $1) ORDER BY ak LIMIT $2 OFFSET $3",
         )
         .bind(tenant)
@@ -260,10 +264,13 @@ async fn upsert(
     source: KeySource,
 ) -> Result<(), sqlx::Error> {
     let quotas = serde_json::to_string(&*info.model_quotas).unwrap_or_else(|_| "{}".into());
+    let servers = serde_json::to_string(&info.mcp.servers).unwrap_or_else(|_| "[]".into());
+    let tools = serde_json::to_string(&info.mcp.tools).unwrap_or_else(|_| "{}".into());
     sqlx::query(
         "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
-         tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, owner, source)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, owner, source,
+         mcp_servers, mcp_tools)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (ak) DO UPDATE SET
            product = EXCLUDED.product, tenant = EXCLUDED.tenant,
            qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
@@ -271,6 +278,7 @@ async fn upsert(
            expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
            banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
            owner = EXCLUDED.owner,
+           mcp_servers = EXCLUDED.mcp_servers, mcp_tools = EXCLUDED.mcp_tools,
            source = CASE WHEN access_keys.source = 'config' AND EXCLUDED.source = 'admin'
                          THEN 'config' ELSE EXCLUDED.source END",
     )
@@ -285,6 +293,8 @@ async fn upsert(
     .bind(&quotas)
     .bind(&info.owner)
     .bind(source_str(source))
+    .bind(&servers)
+    .bind(&tools)
     .execute(exec)
     .await
     .map(|_| ())
@@ -307,7 +317,10 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
         ),
         owner: row.get(9),
         suspended_until_epoch_secs: row.get(10),
-        mcp: Default::default(),
+        mcp: std::sync::Arc::new(crate::McpAccess {
+            servers: serde_json::from_str(row.get::<&str, _>(11)).unwrap_or_default(),
+            tools: serde_json::from_str(row.get::<&str, _>(12)).unwrap_or_default(),
+        }),
     }
 }
 
@@ -413,5 +426,30 @@ mod tests {
             "config ownership is sticky against admin overwrite"
         );
         assert!(ks.authenticate("pk-b").await.is_some());
+
+        let cfg = gw_config::GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmcp_servers: [{name: srv, endpoint: http://h/mcp}]\naccess_keys: [{ak: pk-mcp, product: p, qps: 1, daily_token_quota: 5, mcp_servers: [srv], mcp_tools: {srv: [t1]}}]",
+        )
+        .unwrap();
+        ks.reload_config_keys(&cfg.access_keys).await.unwrap();
+        let k = ks
+            .authenticate("pk-mcp")
+            .await
+            .expect("config key persisted");
+        assert_eq!(k.mcp.servers, vec!["srv".to_owned()]);
+        assert_eq!(k.mcp.tools["srv"], vec!["t1".to_owned()]);
+
+        let mut admin = info("pk-plain", 1.0);
+        admin.mcp = std::sync::Arc::new(crate::McpAccess {
+            servers: vec!["srv".into()],
+            tools: Default::default(),
+        });
+        ks.put(admin, KeySource::Admin).await.unwrap();
+        let k = ks
+            .authenticate("pk-plain")
+            .await
+            .expect("admin key persisted");
+        assert_eq!(k.mcp.servers, vec!["srv".to_owned()]);
+        assert!(k.mcp.tools.is_empty());
     }
 }

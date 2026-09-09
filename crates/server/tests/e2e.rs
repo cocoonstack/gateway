@@ -1347,6 +1347,7 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let mut done = None;
     for _ in 0..100 {
         let j = body_json(
             app.clone()
@@ -1356,10 +1357,12 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
         )
         .await;
         if j["status"] == "completed" {
+            done = Some(j);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    done.expect("batch finished");
     let resp = app
         .clone()
         .oneshot(post(
@@ -3624,13 +3627,13 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
 async fn model_qpm_limit_third_call_429() {
     let app = app();
     let body = r#"{"model":"qpm-mini","messages":[{"role":"user","content":"q"}]}"#;
-    for _ in 0..2 {
+    for i in 0..2 {
         let r = app
             .clone()
             .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.status(), StatusCode::OK, "warm-up call {i}");
     }
     let r = app
         .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
@@ -4364,13 +4367,13 @@ async fn bespoke_dashscope_native_wire() {
 async fn product_qpm_limit_third_call_429() {
     let app = app();
     let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"p"}]}"#;
-    for _ in 0..2 {
+    for i in 0..2 {
         let r = app
             .clone()
             .oneshot(post("/v1/chat/completions", Some("ak-prod-limited"), body))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.status(), StatusCode::OK, "warm-up call {i}");
     }
     let r = app
         .oneshot(post("/v1/chat/completions", Some("ak-prod-limited"), body))

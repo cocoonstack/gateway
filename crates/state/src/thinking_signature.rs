@@ -140,8 +140,8 @@ impl ThinkingSignatureAudit {
         };
         let messages = &request.message;
 
-        // Anthropic validates only the latest logical assistant turn (older thinking may be
-        // omitted); consecutive same-role messages form one turn
+        // only the latest logical assistant turn is validated upstream, so older thinking may be omitted
+        // consecutive same-role messages form one turn
         let mut trailing_user_start = messages.len();
         while trailing_user_start > 0
             && messages[trailing_user_start - 1].role == gw_consts::role::USER
@@ -543,7 +543,7 @@ impl CapturedBlock {
         }
     }
 
-    fn complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         match self {
             Self::Thinking { complete, .. }
             | Self::RedactedThinking { complete, .. }
@@ -709,7 +709,7 @@ impl ThinkingStreamCapture {
     }
 
     fn register(&mut self) {
-        if self.disabled || self.blocks.values().any(|block| !block.complete()) {
+        if self.disabled || self.blocks.values().any(|block| !block.is_complete()) {
             return;
         }
         let mut sequence = ProtectedSequence::default();
@@ -739,7 +739,6 @@ impl ThinkingStreamCapture {
             }
         }
         self.audit.remember_sequence(&self.context, &sequence);
-        drop(sequence);
         self.blocks.clear();
         self.captured_bytes = 0;
         self.registered = true;
@@ -779,10 +778,11 @@ fn replace_bounded(target: &mut String, value: Option<&Value>) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_consts::Protocol;
     use gw_models::ModelParamV2;
     use serde_json::json;
+
+    use super::*;
 
     fn message(role: &str, content: Value) -> ChatMsg {
         let mut message = ChatMsg::text(role, String::new());
