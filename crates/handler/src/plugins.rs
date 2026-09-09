@@ -212,6 +212,27 @@ pub fn inbound_text(request: &mut GatewayRequest) -> String {
     out
 }
 
+/// The review text of arbitrary text slots, joined the way [`inbound_text`] joins a request's.
+pub fn slot_text<'a>(slots: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for s in slots {
+        push_text(&mut out, s);
+    }
+    out
+}
+
+/// Apply mask spans addressing a [`slot_text`] back onto its slots, in the same order; returns the spans hit.
+pub fn apply_mask_slots<'a>(
+    spans: &[std::ops::Range<usize>],
+    slots: impl IntoIterator<Item = &'a mut String>,
+) -> usize {
+    let mut masker = SpanMasker::new(spans);
+    for s in slots {
+        masker.apply(s);
+    }
+    masker.hits
+}
+
 fn push_text(out: &mut String, s: &str) {
     if !s.is_empty() {
         if !out.is_empty() {

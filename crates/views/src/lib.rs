@@ -46,6 +46,7 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 mod mcp;
+mod mcp_auth;
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
@@ -73,6 +74,8 @@ pub struct AppState {
     pub offline: OfflineHandler,
     /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
     pub mcp: reqwest::Client,
+    /// Upstream MCP credentials, OAuth tokens cached per server.
+    pub mcp_auth: Arc<mcp_auth::McpAuth>,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
     /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
@@ -99,6 +102,7 @@ impl AppState {
             handler,
             offline,
             mcp: reqwest::Client::new(),
+            mcp_auth: Arc::default(),
             loader,
             config_store: None,
         }
@@ -114,7 +118,9 @@ impl AppState {
     pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
         let cfg = loader().await?;
-        self.handler.reload(cfg).await.map_err(|e| e.to_string())
+        self.handler.reload(cfg).await.map_err(|e| e.to_string())?;
+        self.mcp_auth.clear();
+        Ok(())
     }
 }
 
@@ -5709,6 +5715,7 @@ mod tests {
             handler,
             offline,
             mcp: reqwest::Client::new(),
+            mcp_auth: Arc::default(),
             loader: None,
             config_store: None,
         };
@@ -5773,6 +5780,7 @@ mod tests {
             handler,
             offline,
             mcp: reqwest::Client::new(),
+            mcp_auth: Arc::default(),
             loader: None,
             config_store: None,
         };

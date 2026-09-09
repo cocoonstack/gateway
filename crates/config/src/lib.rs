@@ -40,6 +40,11 @@ pub enum ConfigError {
     UnknownTenant { ak: String, tenant: String },
     #[error("access key `{ak}` references unknown mcp server `{server}`")]
     UnknownMcpServer { ak: String, server: String },
+    #[error("mcp server `{server}`: {reason}")]
+    BadMcpServer {
+        server: String,
+        reason: &'static str,
+    },
     #[error("tenant `{tenant}` entitles unknown model `{model}`")]
     UnknownEntitledModel { tenant: String, model: String },
     #[error("`{owner}` sets a daily quota for unknown model `{model}`")]
@@ -118,6 +123,9 @@ pub struct McpServerConf {
     /// Env var holding a bearer token for the server; empty = none.
     #[serde(default)]
     pub api_key_env: String,
+    /// OAuth 2.0 client for the server's token endpoint; exclusive with `api_key_env`.
+    #[serde(default)]
+    pub oauth: Option<McpOAuthConf>,
     #[serde(default = "default_mcp_timeout")]
     pub timeout_seconds: u64,
 }
@@ -127,6 +135,42 @@ impl McpServerConf {
     pub fn api_key(&self) -> Option<String> {
         token_from_env(&self.api_key_env)
     }
+}
+
+/// An OAuth 2.0 client the gateway runs against an MCP server's token endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpOAuthConf {
+    pub token_url: String,
+    pub client_id: String,
+    /// Env var holding the client secret; empty = a public client.
+    #[serde(default)]
+    pub client_secret_env: String,
+    #[serde(default)]
+    pub grant: McpGrant,
+    /// Env var seeding the refresh token for `grant: refresh_token`; a rotated token replaces it in memory.
+    #[serde(default)]
+    pub refresh_token_env: String,
+    #[serde(default)]
+    pub scope: String,
+}
+
+impl McpOAuthConf {
+    pub fn client_secret(&self) -> Option<String> {
+        token_from_env(&self.client_secret_env)
+    }
+
+    pub fn refresh_token(&self) -> Option<String> {
+        token_from_env(&self.refresh_token_env)
+    }
+}
+
+/// The OAuth 2.0 grant an [`McpOAuthConf`] exercises.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpGrant {
+    #[default]
+    ClientCredentials,
+    RefreshToken,
 }
 
 /// Public model name → dispatch type + demo pricing + per-model governance.
@@ -1027,6 +1071,24 @@ impl GatewayConfig {
             "mcp server",
             self.mcp_servers.iter().map(|m| m.name.as_str()),
         )?;
+        for m in &self.mcp_servers {
+            let Some(o) = &m.oauth else {
+                continue;
+            };
+            let reason = if !m.api_key_env.is_empty() {
+                "api_key_env and oauth are exclusive"
+            } else if o.token_url.is_empty() || o.client_id.is_empty() {
+                "oauth needs token_url and client_id"
+            } else if o.grant == McpGrant::RefreshToken && o.refresh_token_env.is_empty() {
+                "grant refresh_token needs refresh_token_env"
+            } else {
+                continue;
+            };
+            return Err(ConfigError::BadMcpServer {
+                server: m.name.clone(),
+                reason,
+            });
+        }
         for k in &self.access_keys {
             let unknown = k
                 .mcp_servers
