@@ -1118,7 +1118,6 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
-        check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         check_unique(
             "mcp server",
             self.mcp_servers.iter().map(|m| m.name.as_str()),
