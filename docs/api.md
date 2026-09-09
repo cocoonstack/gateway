@@ -194,7 +194,15 @@ an allowlist for that server (`access_keys[].mcp_tools`), `tools/list` results
 are filtered to it and a `tools/call` outside it answers a JSON-RPC error
 (`-32000`) without reaching the server. Every `tools/call` — served or denied —
 is a `mcp` security event (`rule = mcp:<server>`, `action = call:<tool>` /
-`deny:<tool>`). JSON-RPC batches are refused (400); the key's QPS applies.
+`deny:<tool>`). When the key's tenant sets `security.moderate`, a served
+`tools/call` result is buffered and its text content reviewed by the
+configured moderator before it reaches the client: a mask rewrites the text
+in place, a denial replaces the result with a JSON-RPC error (`-32001`, the
+moderator's reason), and either lands as a `mcp` security event
+(`rule = moderation`, `action = mask` / `block`). JSON-RPC batches are refused
+(400); the key's QPS applies. A server declared with `oauth` is called with an
+access token the gateway fetches from the server's token endpoint; a `401`
+from the server fetches a fresh token and retries the call once.
 
 ## Batch & files
 

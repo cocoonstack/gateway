@@ -266,6 +266,15 @@ mcp_servers:                   # Model Context Protocol servers proxied at /mcp/
     endpoint: http://tools.internal:3001/mcp   # the server's Streamable HTTP endpoint
     api_key_env: TOOLS_TOKEN     # optional bearer token for the server, from the env
     timeout_seconds: 60
+  - name: crm
+    endpoint: https://mcp.crm.example/mcp
+    oauth:                       # exclusive with api_key_env: the gateway fetches the bearer itself
+      token_url: https://auth.crm.example/oauth/token
+      client_id: gateway
+      client_secret_env: CRM_CLIENT_SECRET   # empty = a public client
+      grant: client_credentials  # client_credentials (default) | refresh_token
+      refresh_token_env: CRM_REFRESH_TOKEN   # seed for grant: refresh_token; a rotated token replaces it in memory
+      scope: mcp:tools           # optional
 
 alerts:                        # outbound webhook; omit = off
   webhook_url_env: GW_ALERT_WEBHOOK   # env var naming the URL (secrets stay out of config)

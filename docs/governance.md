@@ -95,6 +95,26 @@ counts the traffic. Keys created through the admin API carry no MCP
 entitlement; the servers' own credentials stay in the gateway's environment
 (`mcp_servers[].api_key_env`), so an agent never holds them.
 
+A server that takes OAuth 2.0 instead of a static bearer declares
+`mcp_servers[].oauth`: the gateway runs the client-credentials grant (or the
+refresh-token grant from a seeded refresh token, keeping a rotated one in
+memory) against `token_url`, caches the access token per server until 30 s
+before its `expires_in`, and on a `401` from the server fetches a fresh token
+and retries the call once. Tokens are dropped on config reload. The client
+secret and refresh-token seed are read from the environment at fetch time.
+
+A tenant whose `security.moderate` is on has every served `tools/call` result
+reviewed by the moderator behind `moderation:` — the same review the chat and
+realtime surfaces apply to inbound text, now over the result's text content
+(`result.content[].text`, joined by newlines; other content types pass
+untouched). A mask rewrites the text in place (`[MASKED]`), a denial replaces
+the result with a JSON-RPC error `-32001` carrying the moderator's reason, and
+a moderator failure follows `moderation_fail_open`. Results are buffered for
+the review, so a reviewed tenant trades streaming of tool results for the
+guarantee that no unreviewed text reaches the agent; both outcomes are `mcp`
+security events with `rule = moderation` and `action = mask` (hits = spans) or
+`block`. Tenants without `moderate` stream results as before.
+
 ```yaml
 mcp_servers:
   - {name: tools, endpoint: http://tools.internal:3001/mcp, api_key_env: TOOLS_TOKEN}
