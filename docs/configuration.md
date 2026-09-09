@@ -38,8 +38,8 @@ default (lost on restart); a SQLite path makes them durable on one node.
 config (versioned documents + a change feed every instance follows), the
 shared access-key table, the shared ledger/files/batches store, and a
 distributed batch queue (any instance claims and runs submitted batches).
-`redis_url` shares rate/quota/TPM counters and account-health cooldowns across
-instances; `shared_cache: true` additionally moves the request cache into
+`redis_url` shares rate/quota/TPM counters, monthly cost counters and
+account-health cooldowns across instances; `shared_cache: true` additionally moves the request cache into
 Redis so a hit on one instance serves the fleet (off = each instance caches
 in-process, a miss just recomputes). `ledger_max_rows` is not a hard cap:
 pruning spares rows not yet folded into the usage rollup, so the table can
@@ -128,7 +128,7 @@ models:
     long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
     batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price; must be finite and in (0.0, 1.0]
     prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
-    fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / connection failure / vendor 429
+    fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / connection failure / vendor 429 (rejected at load when unknown, self or duplicate)
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
       - {model: gpt-4o-next, weight: 10}
@@ -272,6 +272,7 @@ mcp_servers:                   # Model Context Protocol servers proxied at /mcp/
     endpoint: http://tools.internal:3001/mcp   # the server's Streamable HTTP endpoint
     api_key_env: TOOLS_TOKEN     # optional bearer token for the server, from the env
     timeout_seconds: 60
+    max_reply_bytes: 16777216    # largest reply buffered for allowlist filtering or result review
   - name: crm
     endpoint: https://mcp.crm.example/mcp
     oauth:                       # exclusive with api_key_env: the gateway fetches the bearer itself
@@ -310,6 +311,7 @@ scoped to that tenant (see [API — Admin](api.md#admin-dynamic-config)).
 
 ```yaml
 trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unforgeable);
+max_live_streams_per_key: 64   # concurrent realtime sessions + MCP listen streams one key may hold; 0 = unlimited
                                # true = trust x-real-ip / rightmost x-forwarded-for hop
                                # (only behind a proxy that sets them)
 ```

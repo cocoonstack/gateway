@@ -166,11 +166,15 @@ impl Transport for HttpTransport {
                     tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 }
                 Err(e) => {
-                    return Err(GatewayError::new(
-                        upstream_fault_code(e.is_timeout()),
-                        502,
-                        format!("upstream request failed: {e}"),
-                    ));
+                    let what = if e.is_timeout() {
+                        "upstream request timed out"
+                    } else {
+                        "upstream request failed"
+                    };
+                    return Err(
+                        GatewayError::new(upstream_fault_code(e.is_timeout()), 502, what)
+                            .with_source(e),
+                    );
                 }
             }
         };

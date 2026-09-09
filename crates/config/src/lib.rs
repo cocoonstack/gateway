@@ -130,6 +130,9 @@ pub struct McpServerConf {
     pub oauth: Option<McpOAuthConf>,
     #[serde(default = "default_mcp_timeout")]
     pub timeout_seconds: u64,
+    /// Largest reply the proxy buffers for filtering or review; a larger one is refused.
+    #[serde(default = "default_mcp_max_reply_bytes")]
+    pub max_reply_bytes: usize,
 }
 
 impl McpServerConf {
@@ -743,6 +746,9 @@ pub struct GatewayConfig {
     /// MCP servers reachable through `/mcp/{server}` by entitled keys.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConf>,
+    /// Concurrent realtime sessions plus MCP listen streams one key may hold; 0 = unlimited.
+    #[serde(default = "default_max_live_streams")]
+    pub max_live_streams_per_key: usize,
     /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
     /// default: the audit records the real TCP peer, which a client can't forge.
     /// Enable only when a trusted proxy fronts the gateway and sets those headers.
@@ -1434,6 +1440,14 @@ fn default_moderation_timeout() -> u64 {
 
 fn default_mcp_timeout() -> u64 {
     60
+}
+
+fn default_mcp_max_reply_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_max_live_streams() -> usize {
+    64
 }
 
 fn default_alert_dedup_seconds() -> u64 {

@@ -39,6 +39,8 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     async fn counter_get(&self, key: &str) -> i64;
     /// Add to a calendar-window counter, arming `ttl` on first use; returns the new total.
     async fn counter_add(&self, key: &str, amount: i64, ttl: Duration) -> i64;
+    /// Drop in-process counters outside the windows `prefixes` name; a TTL backend has nothing to do.
+    async fn counter_retain(&self, prefixes: &[String]);
 
     /// Fixed-window request limit (QPM): take one permit.
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool;
@@ -112,6 +114,9 @@ impl Governance for MemoryGovernance {
     }
     async fn counter_add(&self, key: &str, amount: i64, _ttl: Duration) -> i64 {
         self.counters.consume(key, amount)
+    }
+    async fn counter_retain(&self, prefixes: &[String]) {
+        self.counters.retain_prefixed(prefixes);
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.qpm.reserve(key, 1, limit, window)
@@ -296,6 +301,7 @@ impl Governance for RedisGovernance {
     async fn counter_add(&self, key: &str, amount: i64, ttl: Duration) -> i64 {
         self.incr_window(&counter_key(key), amount, ttl).await
     }
+    async fn counter_retain(&self, _prefixes: &[String]) {}
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
     }

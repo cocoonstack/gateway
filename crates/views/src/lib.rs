@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::mem::take;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -58,6 +58,11 @@ const STREAM_CHANNEL_CAP: usize = 64;
 /// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
 pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
+const ADMIN_PAGE_MAX: usize = 10_000;
+/// Longest `x-gw-user` accepted: the hint keys governance counters.
+const USER_HINT_MAX_BYTES: usize = 256;
+const MCP_SESSION_CAP: u64 = 100_000;
+const MCP_SESSION_TTL: Duration = Duration::from_secs(24 * 3_600);
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
 
@@ -76,6 +81,8 @@ pub struct AppState {
     pub mcp: reqwest::Client,
     /// Upstream MCP credentials, OAuth tokens cached per server.
     pub mcp_auth: Arc<mcp_auth::McpAuth>,
+    /// MCP session id → the fingerprint of the key that opened it.
+    pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
     /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
@@ -101,8 +108,9 @@ impl AppState {
         Self {
             handler,
             offline,
-            mcp: reqwest::Client::new(),
+            mcp: mcp_client(),
             mcp_auth: Arc::default(),
+            mcp_sessions: mcp_sessions(),
             loader,
             config_store: None,
         }
@@ -122,6 +130,25 @@ impl AppState {
         self.mcp_auth.clear();
         Ok(())
     }
+}
+
+/// The MCP proxy's client: no redirects, so a server or token endpoint cannot
+/// steer a credentialed request elsewhere.
+fn mcp_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "mcp client fell back to the default client");
+            reqwest::Client::new()
+        })
+}
+
+fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
+    moka::sync::Cache::builder()
+        .max_capacity(MCP_SESSION_CAP)
+        .time_to_live(MCP_SESSION_TTL)
+        .build()
 }
 
 pub fn app(state: AppState) -> Router {
@@ -348,6 +375,13 @@ async fn realtime_ws(
             }
         }
     };
+    let Some(stream_guard) = snap
+        .state
+        .streams
+        .open(&ak.ak, snap.cfg.max_live_streams_per_key)
+    else {
+        return error_response(429, "too many open realtime sessions for this key");
+    };
     let Some(model) = q.remove("model") else {
         return error_response(400, "model query param is required");
     };
@@ -414,13 +448,14 @@ async fn realtime_ws(
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
-    if account.endpoint.is_empty() {
-        ws.on_upgrade(move |socket| {
-            realtime_session(socket, s, ak, m, mt, account.name.clone(), hint)
-        })
-    } else {
-        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, m, mt, account, hint))
-    }
+    ws.on_upgrade(move |socket| async move {
+        let _held = stream_guard;
+        if account.endpoint.is_empty() {
+            realtime_session(socket, s, ak, m, mt, account.name.clone(), hint).await
+        } else {
+            realtime_bridge(socket, s, ak, m, mt, account, hint).await
+        }
+    })
 }
 
 /// A realtime session's model identity: entitlement judges `requested`, pricing and routing follow `served`.
@@ -499,7 +534,7 @@ async fn realtime_gate(
         _ => {
             return Err((
                 ErrClass::AccessDenied,
-                format!("access key {} is no longer valid", ak.ak),
+                format!("access key {} is no longer valid", ak.ak_id),
             ));
         }
     };
@@ -1255,7 +1290,7 @@ async fn ledger(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
         Err(e) => gateway_error(e),
@@ -1319,6 +1354,12 @@ async fn authenticate(
             "missing api key (Authorization: Bearer <ak> or x-api-key)",
         ));
     };
+    if headers
+        .get("x-gw-user")
+        .is_some_and(|v| v.len() > USER_HINT_MAX_BYTES)
+    {
+        return Err((400, "x-gw-user exceeds 256 bytes"));
+    }
     let info = s
         .handler
         .state()
@@ -1942,6 +1983,15 @@ async fn admin_key_patch(
         banned: body["banned"].as_bool(),
         suspended_until_epoch_secs: tri("suspended_until_epoch_secs"),
     };
+    // a ban or an abuse suspension is a platform sanction; a tenant may add one, never lift one
+    if matches!(scope, AdminScope::Tenant(_))
+        && (patch.banned == Some(false) || patch.suspended_until_epoch_secs.is_some())
+    {
+        return error_response(
+            403,
+            "lifting a ban or changing a suspension requires the global admin token",
+        );
+    }
     let patched = s.handler.state().auth.patch(&ak, &patch).await;
     match patched {
         Err(e) => gateway_error(e),
@@ -2033,7 +2083,7 @@ async fn admin_config_versions(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match store.list_versions(limit).await {
         Ok(versions) => Json(json!({ "versions": versions })).into_response(),
         Err(e) => gateway_error(e),
@@ -2193,7 +2243,7 @@ async fn admin_key_list(
         return Json(resp).into_response();
     }
     let offset = q_num(&q, "offset", 0);
-    let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     // the scope filters in the store before paging, or a tenant admin's page could come back empty
     let tenant = scope.tenant_filter(&q);
     let listed = match s.handler.state().auth.list(tenant, offset, limit).await {
@@ -2409,7 +2459,7 @@ async fn admin_security_events(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let tenant = scope.tenant_filter(&q);
-    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.security_events(tenant, limit).await {
         Ok(events) => Json(json!({ "events": events })).into_response(),
         Err(e) => gateway_error(e),
@@ -2426,7 +2476,7 @@ async fn admin_audit_ops(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match s.handler.state().store.admin_audit_list(limit).await {
         Ok(entries) => Json(json!({ "entries": entries })).into_response(),
         Err(e) => gateway_error(e),
@@ -5715,8 +5765,9 @@ mod tests {
         let app = AppState {
             handler,
             offline,
-            mcp: reqwest::Client::new(),
+            mcp: mcp_client(),
             mcp_auth: Arc::default(),
+            mcp_sessions: mcp_sessions(),
             loader: None,
             config_store: None,
         };
@@ -5780,8 +5831,9 @@ mod tests {
         let app = AppState {
             handler,
             offline,
-            mcp: reqwest::Client::new(),
+            mcp: mcp_client(),
             mcp_auth: Arc::default(),
+            mcp_sessions: mcp_sessions(),
             loader: None,
             config_store: None,
         };

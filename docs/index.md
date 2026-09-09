@@ -6,8 +6,8 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 
 ```
 client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
-       ──► pipeline: resolve/quota/cache → account select (PTU, failover)
-                     → rate limits → engine → usage → billing ledger
+       ──► pipeline: resolve/quota/cache → account select (PTU, latency-ranked tiers, failover)
+                     → rate limits → engine (retry, then the fallback chain) → usage → billing ledger
        ──► providers: real endpoints over HTTP · in-process mock for the rest
 ```
 
@@ -24,6 +24,7 @@ client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
 - [Architecture](architecture.md) — crate layout, pipeline, trait seams
 - [Performance](performance.md) — measured per-node throughput and latency, how to reproduce
 - [Development](development.md) — build, test, workspace map, contributing
+- [Security model](security.md) — trust boundaries, what is checked and recorded, failure postures, hardening
 
 ## Repository
 

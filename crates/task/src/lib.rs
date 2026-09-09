@@ -31,6 +31,10 @@ pub fn spawn_quota_reset(
         loop {
             tick.tick().await;
             state.governance.quota_reset_all().await;
+            state
+                .governance
+                .counter_retain(&gw_state::admission::month_prefixes())
+                .await;
             tracing::info!(target: "task", "quota_reset: all AK daily counters cleared");
         }
     })

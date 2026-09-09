@@ -40,6 +40,7 @@ on jemalloc as its global allocator.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | either enables the per-request OTLP span export ([Observability](observability.md#traces)) |
 | `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | service name (default `gw`) and sampler of the exported spans (SDK defaults: parent-based, always on) |
 | provider key vars | named by each account's `api_key_env` |
+| MCP credential vars | named by `mcp_servers[].api_key_env`, `oauth.client_secret_env` and `oauth.refresh_token_env`; read at each call or token fetch, never stored |
 
 The process drains on SIGINT/SIGTERM (graceful shutdown of in-flight requests).
 
@@ -85,7 +86,9 @@ storage:
   awaited write, so an accepted request never loses its row under overload.
 - **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
   namespaced under `gw:`, windows self-expire), otherwise in-process. Without
-  Redis, each replica limits independently.
+  Redis, each replica limits independently. A configured Redis that is
+  unreachable **fails open**: every limit, quota and budget passes with a
+  warning until it returns ([Governance](governance.md#limits)).
 - `ledger_max_rows` is not a hard cap: pruning spares rows not yet folded
   into the usage rollup, so the table can briefly exceed the cap under
   rollup lag.

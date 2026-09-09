@@ -27,7 +27,7 @@ server → views → handler → {dag, engines} → {models, state} → {protoco
 client ──► views (auth, parse, protocol normalize)
        ──► handler (pre plugins: blocklist, moderation, then DLP redact)
        ──► dag: preprocess        resolve model, quota check, cache lookup
-              account_select      priority / PTU-first / cooldown-aware selection
+              account_select      priority / PTU-first / cooldown-aware selection, latency-ranked tiers when enabled
               model_access        rate limits, engine call, retry-on-5xx failover
               post_process        usage → billing ledger, cache store
        ──► handler (post plugins) ──► views (JSON or SSE re-emit)
@@ -43,7 +43,9 @@ The DAG executes four fixed layers; nodes within a layer run
 sequentially in declaration order. `account_select` and
 `model_access` form a retry loop: an upstream 5xx excludes the failed
 account and reselects once; a PTU→paygo switch is recorded as
-`ptu_spillover` in the ledger.
+`ptu_spillover` in the ledger. Around the DAG, the handler re-runs all four
+layers for the next entry of the model's `fallback_models` chain when a run
+ends in an upstream fault before any byte was sent.
 
 ## Seams (traits)
 
