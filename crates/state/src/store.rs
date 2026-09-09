@@ -50,6 +50,8 @@ const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60
 
 /// A put prunes async video jobs older than this (vendor results expire far sooner).
 const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+/// Rows per batch_items INSERT: four binds each under the 65535-parameter limit.
+const BATCH_ITEM_CHUNK: usize = 16_000;
 
 // store pool size when storage.postgres_max_connections is unset
 const PG_MAX_CONNECTIONS: u32 = 10;
@@ -1365,6 +1367,7 @@ impl SqliteStore {
                 served_model TEXT NOT NULL, account TEXT NOT NULL,
                 unit_price_micros INTEGER NOT NULL, created_at_epoch_secs INTEGER NOT NULL,
                 billed INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS video_jobs_created_idx ON video_jobs (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -2408,6 +2411,7 @@ impl PostgresStore {
                 served_model TEXT NOT NULL, account TEXT NOT NULL,
                 unit_price_micros BIGINT NOT NULL, created_at_epoch_secs BIGINT NOT NULL,
                 billed INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS video_jobs_created_idx ON video_jobs (created_at_epoch_secs)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
                 ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
@@ -2741,18 +2745,21 @@ sql_store_impl!(PostgresStore, postgres, {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("insert batch", e))?;
-        for (idx, item) in items.iter().enumerate() {
-            let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
-            sqlx::query(
-                "INSERT INTO batch_items (batch_id, idx, messages, user_id) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(&id)
-            .bind(idx as i64)
-            .bind(json)
-            .bind(&item.user)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| crate::sqlx_err("save batch item", e))?;
+        for (chunk, items) in items.chunks(BATCH_ITEM_CHUNK).enumerate() {
+            let mut qb = sqlx::QueryBuilder::new(
+                "INSERT INTO batch_items (batch_id, idx, messages, user_id) ",
+            );
+            qb.push_values(items.iter().enumerate(), |mut v, (i, item)| {
+                let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
+                v.push_bind(&id)
+                    .push_bind((chunk * BATCH_ITEM_CHUNK + i) as i64)
+                    .push_bind(json)
+                    .push_bind(&item.user);
+            });
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| crate::sqlx_err("save batch items", e))?;
         }
         tx.commit()
             .await
