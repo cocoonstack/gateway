@@ -19,6 +19,8 @@ const LEDGER_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const LEDGER_RETRY_MAX: Duration = Duration::from_secs(30);
 // a store that refuses writes must drain the queue rather than wedge it
 const LEDGER_RETRY_ATTEMPTS: usize = 8;
+// a month's counter must outlive the next month's rollover read
+const MONTH_COUNTER_TTL: Duration = Duration::from_secs(62 * 86_400);
 
 /// Outcome of a tenant-fallback swap; `AlreadyServing` IS degraded (nowhere
 /// further to go) and must not be denied as `Unconfigured`.
@@ -43,11 +45,27 @@ pub struct SettleInput<'a> {
     pub model_quota_key: Option<String>,
 }
 
-/// One daily budget: its governance counter and cap.
+/// One budget: its window, governance counter and cap.
 struct Budget {
     scope: BudgetScope,
+    window: Window,
     key: String,
     limit: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Window {
+    Day,
+    Month,
+}
+
+impl Window {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "daily",
+            Self::Month => "monthly",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -71,13 +89,21 @@ impl BudgetScope {
         if self.charges_cost() { "cost" } else { "token" }
     }
 
-    /// The governance counter; user scopes carry the tenant so one user id under two tenants meters apart.
-    fn key(self, ak: &AkInfo, user: &str) -> String {
+    /// The governance counter: user scopes carry the tenant, month counters their calendar month.
+    fn key(self, month: Option<(i64, u32)>, ak: &AkInfo, user: &str) -> String {
+        let tag;
+        let prefix = match month {
+            Some((y, m)) => {
+                tag = format!("m:{y}{m:02}:");
+                tag.as_str()
+            }
+            None => "",
+        };
         match self {
-            Self::UserTokens => format!("ub:{}:{user}", ak.tenant),
-            Self::TenantCost => format!("cb:tenant:{}", ak.tenant),
-            Self::KeyCost => format!("cb:ak:{}", ak.ak),
-            Self::UserCost => format!("cb:user:{}:{user}", ak.tenant),
+            Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
+            Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
+            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak),
+            Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
         }
     }
 
@@ -264,18 +290,23 @@ pub async fn flush_billing(state: &GatewayState) {
     }
 }
 
-/// Daily budgets (soft caps: check-then-consume, so concurrent turns can
-/// overshoot by one): admit while every configured scope is under its cap.
+/// Daily and monthly budgets (soft caps: check-then-consume, so concurrent
+/// turns can overshoot by one): admit while every configured scope is under its cap.
 pub async fn check_budgets(
     gov: &dyn Governance,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
 ) -> Result<(), String> {
-    for b in budgets(cfg, ak, user) {
-        if !gov.quota_check(&b.key, b.limit).await {
+    for b in budgets(gov, cfg, ak, user).await {
+        let under = match b.window {
+            Window::Day => gov.quota_check(&b.key, b.limit).await,
+            Window::Month => gov.counter_get(&b.key).await < b.limit,
+        };
+        if !under {
             return Err(format!(
-                "daily {} budget exhausted for {}",
+                "{} {} budget exhausted for {}",
+                b.window.label(),
                 b.scope.unit(),
                 b.scope.subject(ak, user)
             ));
@@ -284,8 +315,8 @@ pub async fn check_budgets(
     Ok(())
 }
 
-/// Accrue actual usage to the daily budgets; a scope that reaches its cap
-/// raises a `budget_exhausted` alert (the bus dedups repeats).
+/// Accrue actual usage to the budgets; a scope that reaches its cap raises a
+/// `budget_exhausted` alert (the bus dedups repeats).
 pub async fn consume_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,
@@ -294,7 +325,8 @@ pub async fn consume_budgets(
     tokens: i64,
     cost_micros: i64,
 ) {
-    for b in budgets(cfg, ak, user) {
+    let gov = state.governance.as_ref();
+    for b in budgets(gov, cfg, ak, user).await {
         let amount = if b.scope.charges_cost() {
             cost_micros
         } else {
@@ -303,12 +335,20 @@ pub async fn consume_budgets(
         if amount <= 0 {
             continue;
         }
-        let used = state.governance.quota_consume(&b.key, amount).await;
+        let used = match b.window {
+            Window::Day => gov.quota_consume(&b.key, amount).await,
+            Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
+        };
         if used >= b.limit {
             state.alerts.emit(
                 "budget_exhausted",
                 b.scope.subject(ak, user),
-                format!("daily {} budget: {used} of {}", b.scope.unit(), b.limit),
+                format!(
+                    "{} {} budget: {used} of {}",
+                    b.window.label(),
+                    b.scope.unit(),
+                    b.limit
+                ),
             );
         }
     }
@@ -488,29 +528,98 @@ fn model_qpm_key(model: &str) -> String {
     format!("model:{model}")
 }
 
-/// The tenant's daily budgets that apply to `ak` and `user`; empty when none is configured.
-fn budgets(cfg: &GatewayConfig, ak: &AkInfo, user: &str) -> Vec<Budget> {
+/// The tenant's budgets that apply to `ak` and `user`; empty when none is
+/// configured. With rollover on, a month's cap grows by what the previous
+/// month left unspent, at most one month's cap (one counter read per scope).
+async fn budgets(
+    gov: &dyn Governance,
+    cfg: &GatewayConfig,
+    ak: &AkInfo,
+    user: &str,
+) -> Vec<Budget> {
     let Some(t) = cfg.find_tenant(&ak.tenant) else {
         return Vec::new();
     };
     let scopes = [
-        (BudgetScope::UserTokens, t.user_daily_token_quota),
-        (BudgetScope::TenantCost, t.daily_cost_quota_micros),
-        (BudgetScope::KeyCost, t.key_daily_cost_quota_micros),
-        (BudgetScope::UserCost, t.user_daily_cost_quota_micros),
+        (
+            BudgetScope::UserTokens,
+            Window::Day,
+            t.user_daily_token_quota,
+        ),
+        (
+            BudgetScope::TenantCost,
+            Window::Day,
+            t.daily_cost_quota_micros,
+        ),
+        (
+            BudgetScope::KeyCost,
+            Window::Day,
+            t.key_daily_cost_quota_micros,
+        ),
+        (
+            BudgetScope::UserCost,
+            Window::Day,
+            t.user_daily_cost_quota_micros,
+        ),
+        (
+            BudgetScope::TenantCost,
+            Window::Month,
+            t.monthly_cost_quota_micros,
+        ),
+        (
+            BudgetScope::KeyCost,
+            Window::Month,
+            t.key_monthly_cost_quota_micros,
+        ),
+        (
+            BudgetScope::UserCost,
+            Window::Month,
+            t.user_monthly_cost_quota_micros,
+        ),
     ];
-    scopes
-        .into_iter()
-        .filter(|(scope, _)| !scope.per_user() || !user.is_empty())
-        .filter_map(|(scope, limit)| {
-            let limit = limit?;
-            Some(Budget {
-                scope,
-                key: scope.key(ak, user),
-                limit,
-            })
-        })
-        .collect()
+    let month = civil_month(crate::epoch_secs());
+    let mut out = Vec::new();
+    for (scope, window, limit) in scopes {
+        let Some(mut limit) = limit else {
+            continue;
+        };
+        if scope.per_user() && user.is_empty() {
+            continue;
+        }
+        let key = match window {
+            Window::Day => scope.key(None, ak, user),
+            Window::Month => scope.key(Some(month), ak, user),
+        };
+        if window == Window::Month && t.monthly_cost_rollover {
+            let spent = gov
+                .counter_get(&scope.key(Some(previous_month(month)), ak, user))
+                .await;
+            limit = limit.saturating_add((limit - spent).clamp(0, limit));
+        }
+        out.push(Budget {
+            scope,
+            window,
+            key,
+            limit,
+        });
+    }
+    out
+}
+
+/// The proleptic-Gregorian (year, month) of a UTC epoch second.
+fn civil_month(epoch_secs: i64) -> (i64, u32) {
+    let z = epoch_secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m as u32)
+}
+
+fn previous_month((y, m): (i64, u32)) -> (i64, u32) {
+    if m == 1 { (y - 1, 12) } else { (y, m - 1) }
 }
 
 #[cfg(test)]
@@ -702,6 +811,87 @@ mod tests {
         assert!(
             ledger.flush().await > 0,
             "flush reports the rows the exhausted retries dropped"
+        );
+    }
+
+    #[test]
+    fn civil_month_follows_the_gregorian_calendar() {
+        assert_eq!(civil_month(0), (1970, 1));
+        assert_eq!(civil_month(-1), (1969, 12));
+        assert_eq!(civil_month(1_788_825_600), (2026, 9));
+        assert_eq!(civil_month(1_767_225_599), (2025, 12));
+        assert_eq!(civil_month(1_767_225_600), (2026, 1));
+        assert_eq!(civil_month(951_782_400), (2000, 2));
+        assert_eq!(civil_month(954_547_200), (2000, 4));
+        assert_eq!(previous_month((2026, 1)), (2025, 12));
+        assert_eq!(previous_month((2026, 9)), (2026, 8));
+    }
+
+    async fn monthly_fixture(
+        rollover: bool,
+    ) -> (Arc<GatewayConfig>, Arc<GatewayState>, Arc<AkInfo>) {
+        let yaml = format!(
+            "listen: {{host: h, port: 1}}\ntenants: [{{name: t1, key_monthly_cost_quota_micros: 3, monthly_cost_rollover: {rollover}}}]\naccess_keys: [{{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 1}}]"
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let ak = state.auth.authenticate("k1").await.unwrap();
+        (cfg, state, ak)
+    }
+
+    #[tokio::test]
+    async fn monthly_keys_carry_their_month_and_rollover_carries_the_remainder() {
+        let (cfg, state, ak) = monthly_fixture(true).await;
+        let gov = state.governance.as_ref();
+        let month = civil_month(crate::epoch_secs());
+        let (y, m) = month;
+        let prev = BudgetScope::KeyCost.key(Some(previous_month(month)), &ak, "");
+        assert_eq!(
+            BudgetScope::KeyCost.key(Some(month), &ak, ""),
+            format!("m:{y}{m:02}:cb:ak:k1")
+        );
+        assert_eq!(BudgetScope::KeyCost.key(None, &ak, ""), "cb:ak:k1");
+
+        let untouched = budgets(gov, &cfg, &ak, "").await;
+        assert_eq!(untouched.len(), 1);
+        assert!(untouched[0].window == Window::Month);
+        assert_eq!(
+            untouched[0].limit, 6,
+            "an unspent month carries its whole cap"
+        );
+
+        gov.counter_add(&prev, 1, MONTH_COUNTER_TTL).await;
+        assert_eq!(budgets(gov, &cfg, &ak, "").await[0].limit, 5);
+        gov.counter_add(&prev, 10, MONTH_COUNTER_TTL).await;
+        assert_eq!(
+            budgets(gov, &cfg, &ak, "").await[0].limit,
+            3,
+            "an overspent month carries nothing"
+        );
+
+        let (cfg, state, ak) = monthly_fixture(false).await;
+        assert_eq!(
+            budgets(state.governance.as_ref(), &cfg, &ak, "").await[0].limit,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn monthly_budget_denies_at_the_cap_without_touching_daily_counters() {
+        let (cfg, state, ak) = monthly_fixture(false).await;
+        let gov = state.governance.as_ref();
+        check_budgets(gov, &cfg, &ak, "").await.unwrap();
+        consume_budgets(&state, &cfg, &ak, "", 10, 3).await;
+        let err = check_budgets(gov, &cfg, &ak, "").await.unwrap_err();
+        assert!(
+            err.starts_with("monthly cost budget exhausted for key:"),
+            "{err}"
+        );
+        assert_eq!(gov.quota_used("cb:ak:k1").await, 0);
+        gov.quota_reset_all().await;
+        assert!(
+            check_budgets(gov, &cfg, &ak, "").await.is_err(),
+            "the daily reset leaves month counters alone"
         );
     }
 }

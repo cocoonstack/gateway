@@ -1532,6 +1532,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monthly_cost_budgets_deny_at_the_cap_and_alert() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 1000}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, key_monthly_cost_quota_micros: 1, monthly_cost_quota_micros: 1000000}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let mut alerts = h.state().alerts.take_receiver().expect("receiver");
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let req = |content: &str| GatewayRequest {
+            is_online: true,
+            message: vec![ChatMsg::text("user", content)],
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
+            ..Default::default()
+        };
+        h.run(req("first spends past one micro"), key.clone())
+            .await
+            .unwrap();
+        let ev = alerts.try_recv().expect("the key cap raises an alert");
+        assert_eq!(ev.kind, "budget_exhausted");
+        assert!(
+            ev.detail.starts_with("monthly cost budget: "),
+            "{}",
+            ev.detail
+        );
+        let err = h
+            .run(req("second is over"), key)
+            .await
+            .err()
+            .expect("second denied by the monthly key budget");
+        assert_eq!(err.code, gw_consts::ErrCode::QUOTA_EXHAUSTED);
+        assert!(
+            err.message
+                .contains("monthly cost budget exhausted for key:"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn cost_budgets_deny_at_the_cap_and_alert() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 1000}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, key_daily_cost_quota_micros: 1, daily_cost_quota_micros: 1000000}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());

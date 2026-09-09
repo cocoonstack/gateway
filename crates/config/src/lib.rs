@@ -579,6 +579,18 @@ pub struct TenantConf {
     /// Daily charged-cost cap in micro-dollars per end user; `None` = unlimited.
     #[serde(default)]
     pub user_daily_cost_quota_micros: Option<i64>,
+    /// Calendar-month (UTC) charged-cost cap in micro-dollars pooled across the tenant's keys; `None` = unlimited.
+    #[serde(default)]
+    pub monthly_cost_quota_micros: Option<i64>,
+    /// Calendar-month charged-cost cap in micro-dollars metered per key; `None` = unlimited.
+    #[serde(default)]
+    pub key_monthly_cost_quota_micros: Option<i64>,
+    /// Calendar-month charged-cost cap in micro-dollars per end user; `None` = unlimited.
+    #[serde(default)]
+    pub user_monthly_cost_quota_micros: Option<i64>,
+    /// Carry the previous month's unspent monthly budget into the current month, at most one month's cap.
+    #[serde(default)]
+    pub monthly_cost_rollover: bool,
     /// Content-safety policy for this tenant; `None` = use the global `security:`.
     #[serde(default)]
     pub security: Option<SecurityConf>,
@@ -936,6 +948,9 @@ impl GatewayConfig {
                 || t.daily_cost_quota_micros.is_some_and(|v| v < 0)
                 || t.key_daily_cost_quota_micros.is_some_and(|v| v < 0)
                 || t.user_daily_cost_quota_micros.is_some_and(|v| v < 0)
+                || t.monthly_cost_quota_micros.is_some_and(|v| v < 0)
+                || t.key_monthly_cost_quota_micros.is_some_and(|v| v < 0)
+                || t.user_monthly_cost_quota_micros.is_some_and(|v| v < 0)
                 || t.model_quotas.values().any(|v| *v < 0)
             {
                 return Err(neg_limit(format!("tenant {}", t.name)));

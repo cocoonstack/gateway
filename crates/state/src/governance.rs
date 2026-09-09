@@ -35,6 +35,10 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     async fn quota_consume(&self, ak: &str, tokens: i64) -> i64;
     /// Reset every daily counter.
     async fn quota_reset_all(&self);
+    /// A calendar-window counter; `key` names its window, so nothing buckets or resets it.
+    async fn counter_get(&self, key: &str) -> i64;
+    /// Add to a calendar-window counter, arming `ttl` on first use; returns the new total.
+    async fn counter_add(&self, key: &str, amount: i64, ttl: Duration) -> i64;
 
     /// Fixed-window request limit (QPM): take one permit.
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool;
@@ -75,6 +79,7 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
 pub struct MemoryGovernance {
     rate: RateLimiter,
     quota: QuotaStore,
+    counters: QuotaStore,
     qpm: TokenWindow,
     tpm: TokenWindow,
 }
@@ -101,6 +106,12 @@ impl Governance for MemoryGovernance {
     }
     async fn quota_reset_all(&self) {
         self.quota.reset_all();
+    }
+    async fn counter_get(&self, key: &str) -> i64 {
+        self.counters.used(key)
+    }
+    async fn counter_add(&self, key: &str, amount: i64, _ttl: Duration) -> i64 {
+        self.counters.consume(key, amount)
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.qpm.reserve(key, 1, limit, window)
@@ -268,6 +279,23 @@ impl Governance for RedisGovernance {
         // no-op: quota keys are stamped by UTC day, a per-instance sweep would wipe the shared
         // keyspace
     }
+    async fn counter_get(&self, key: &str) -> i64 {
+        let mut conn = self.conn.clone();
+        match redis::cmd("GET")
+            .arg(counter_key(key))
+            .query_async::<Option<i64>>(&mut conn)
+            .await
+        {
+            Ok(v) => v.unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(error = %e, key, "redis counter read failed; treating as 0");
+                0
+            }
+        }
+    }
+    async fn counter_add(&self, key: &str, amount: i64, ttl: Duration) -> i64 {
+        self.incr_window(&counter_key(key), amount, ttl).await
+    }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
     }
@@ -294,6 +322,10 @@ impl Governance for RedisGovernance {
 
 fn tpm_key(key: &str) -> String {
     format!("gw:tpm:{key}")
+}
+
+fn counter_key(key: &str) -> String {
+    format!("gw:counter:{key}")
 }
 
 /// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
@@ -341,6 +373,31 @@ async fn settle_floored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn redis_counters_accrue_under_their_own_key_and_ttl() {
+        let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
+            return;
+        };
+        let g = RedisGovernance::connect(&url).await.expect("redis connect");
+        let key = format!("m:202609:cb:ak:{}", std::process::id());
+        assert_eq!(g.counter_get(&key).await, 0);
+        assert_eq!(g.counter_add(&key, 2, Duration::from_secs(60)).await, 2);
+        assert_eq!(g.counter_add(&key, 3, Duration::from_secs(60)).await, 5);
+        assert_eq!(g.counter_get(&key).await, 5);
+        let mut conn = g.conn.clone();
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(counter_key(&key))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!((1..=60).contains(&ttl), "ttl armed on first use: {ttl}");
+        let _: i64 = redis::cmd("DEL")
+            .arg(counter_key(&key))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn redis_governance_enforces_limits() {

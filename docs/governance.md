@@ -44,6 +44,7 @@ unconfigured (key, model) pairs never touch a counter.
 | Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
 | Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
 | Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (soft) |
+| Monthly cost | pooled per tenant / per key / per end user | `tenants[].monthly_cost_quota_micros`, `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` (UTC calendar month; soft; `monthly_cost_rollover` carries the unspent remainder) |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |
 | QPM | per product | `products[].qpm` |
@@ -176,10 +177,20 @@ per end user — are soft caps of the same kind over the ledger's charged
 `cost_micros` (list price or the tenant's `model_prices`, so unit-priced
 surfaces count too); they apply on every surface, realtime and batch included,
 and a response-cache hit, which bills nothing, counts nothing.
+The monthly counterparts — `monthly_cost_quota_micros`,
+`key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` — meter the
+same charged cost over the UTC calendar month and can be set alongside the
+daily caps. With `monthly_cost_rollover: true` a month's cap grows by whatever
+the previous month left unspent, at most one further month's cap; the carry is
+computed from the previous month's own cap, so it never compounds. Monthly
+counters live outside the daily reset (in Redis, `gw:counter:m:<yyyymm>:…`
+with a 62-day TTL) and the rollover read costs one counter read per configured
+scope per request; without it the monthly check is the same single read as the
+daily one.
 Keys without a tenant take a declared `default` tenant's budgets. Reaching any
 budget raises a `budget_exhausted` alert on the webhook — subject
 `tenant:<name>`, `key:<fingerprint>` or `user:<tenant>/<id>`, detail the
-day's total against the cap — muted per `alerts.dedup_seconds` while it holds.
+window's total against the cap — muted per `alerts.dedup_seconds` while it holds.
 
 A background task folds completed ledger minutes into durable per-(minute,
 tenant, user, model) rollup buckets. Each pass recomputes from the rollup
