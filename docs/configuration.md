@@ -191,7 +191,7 @@ wins.
 
 ```yaml
 accounts:
-  - name: openai-main
+  - name: openai-main        # unique across accounts; a duplicate is rejected at load
     provider: openai
     priority: 1                # lower = preferred
     tier: ptu                  # ptu (provisioned, preferred) | paygo (default)
