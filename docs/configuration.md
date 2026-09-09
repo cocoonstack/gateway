@@ -84,6 +84,10 @@ tenants:
     daily_cost_quota_micros: 50000000      # optional: $50/day pooled across acme's keys
     key_daily_cost_quota_micros: 10000000  # optional: $10/day per key
     user_daily_cost_quota_micros: 2000000  # optional: $2/day per end user
+    monthly_cost_quota_micros: 1000000000  # optional: $1000/calendar month (UTC) pooled
+    key_monthly_cost_quota_micros: 200000000   # optional: $200/month per key
+    user_monthly_cost_quota_micros: 40000000   # optional: $40/month per end user
+    monthly_cost_rollover: true            # optional: last month's unspent budget carries over (at most one month's cap)
     security:                # optional; overrides the global `security:` WHOLE for this tenant
       blocklist: ["forbidden"]
       blocklist_action: flag        # block | flag | shadow
