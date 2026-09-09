@@ -255,6 +255,7 @@ stability:
   unstable_error_rate: 0.1         # window error rate that reports `unstable`
   unavailable_error_rate: 0.5      # ... and `unavailable`
   availability_min_samples: 20     # fewer samples than this reports `no_data`
+  latency_routing: false           # rank same-priority accounts by observed call latency instead of round-robin
 
 products:
   - name: myproduct

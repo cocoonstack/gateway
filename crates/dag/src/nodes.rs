@@ -306,10 +306,15 @@ impl DagNode for SelectAccount {
             .find_model(served_model(ctx.request.model_param_v2.as_ref()));
         ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
         let provider = conf.and_then(|m| m.provider.as_deref());
+        let latency = ctx
+            .cfg
+            .stability
+            .latency_routing
+            .then_some(&ctx.state.latency);
         let account = ctx
             .state
             .pool
-            .select_healthy(mt, provider, &[], ctx.state.health.as_ref())
+            .select_healthy(mt, provider, &[], ctx.state.health.as_ref(), latency)
             .await;
         let Some(account) = account else {
             // unsampled, an exhausted pool would read no_data forever
@@ -447,9 +452,10 @@ impl DagNode for CallEngine {
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let mut engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
+        let started = std::time::Instant::now();
         match engine.run().await {
             Ok(outcome) => {
-                note_engine_outcome(ctx, &outcome).await;
+                note_engine_outcome(ctx, &outcome, started.elapsed()).await;
                 ctx.decide(
                     "call_engine",
                     format!(
@@ -473,6 +479,11 @@ impl DagNode for CallEngine {
                     .ok_or_else(|| GatewayError::internal("call_engine without an account"))?;
                 note_failure(ctx, &failed.name).await;
                 let provider = model_provider(ctx);
+                let latency = ctx
+                    .cfg
+                    .stability
+                    .latency_routing
+                    .then_some(&ctx.state.latency);
                 let next = ctx
                     .state
                     .pool
@@ -481,6 +492,7 @@ impl DagNode for CallEngine {
                         provider,
                         std::slice::from_ref(&failed.name),
                         ctx.state.health.as_ref(),
+                        latency,
                     )
                     .await;
                 let Some(next) = next else {
@@ -499,9 +511,10 @@ impl DagNode for CallEngine {
                 );
                 ctx.request.account = Some(next.clone());
                 let mut retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
+                let started = std::time::Instant::now();
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        note_engine_outcome(ctx, &outcome).await;
+                        note_engine_outcome(ctx, &outcome, started.elapsed()).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
@@ -520,7 +533,11 @@ impl DagNode for CallEngine {
     }
 }
 
-async fn note_engine_outcome(ctx: &mut DagContext, outcome: &gw_engines::EngineOutcome) {
+async fn note_engine_outcome(
+    ctx: &mut DagContext,
+    outcome: &gw_engines::EngineOutcome,
+    elapsed: std::time::Duration,
+) {
     if outcome.terminal_error.is_some() {
         ctx.state
             .avail
@@ -539,6 +556,9 @@ async fn note_engine_outcome(ctx: &mut DagContext, outcome: &gw_engines::EngineO
         .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
     if let Some(account) = ctx.request.account.as_ref() {
         ctx.state.health.record_success(&account.name).await;
+        if ctx.cfg.stability.latency_routing {
+            ctx.state.latency.record(&account.name, elapsed);
+        }
     }
 }
 
