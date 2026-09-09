@@ -29,8 +29,8 @@ const FORWARDED_HEADERS: [&str; 5] = [
 const RETURNED_HEADERS: [&str; 2] = ["content-type", "mcp-session-id"];
 /// Methods whose results carry prose an agent reads; reviewed under `security.moderate`.
 const REVIEWED_METHODS: [&str; 3] = ["tools/call", "resources/read", "prompts/get"];
-/// Result fields that carry base64 binary, never prose: skipped so the review
-/// neither reads nor rewrites an image, audio clip or blob resource.
+/// Base64 payload fields, skipped only inside an image/audio block or a blob
+/// resource so the review neither reads nor rewrites binary.
 const OPAQUE_KEYS: [&str; 2] = ["blob", "data"];
 const JSONRPC_TOOL_DENIED: i64 = -32000;
 const JSONRPC_RESULT_BLOCKED: i64 = -32001;
@@ -388,12 +388,22 @@ fn collect_prose<'a>(v: &'a mut Value, out: &mut Vec<&'a mut String>) {
     match v {
         Value::String(s) => out.push(s),
         Value::Array(items) => items.iter_mut().for_each(|x| collect_prose(x, out)),
-        Value::Object(map) => map
-            .iter_mut()
-            .filter(|(k, _)| !OPAQUE_KEYS.contains(&k.as_str()))
-            .for_each(|(_, x)| collect_prose(x, out)),
+        Value::Object(map) => {
+            let binary = is_binary_node(map);
+            map.iter_mut()
+                .filter(|(k, _)| !(binary && OPAQUE_KEYS.contains(&k.as_str())))
+                .for_each(|(_, x)| collect_prose(x, out));
+        }
         _ => {}
     }
+}
+
+/// An image/audio content block or a blob resource: its payload is base64, not prose.
+fn is_binary_node(map: &serde_json::Map<String, Value>) -> bool {
+    matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("image" | "audio")
+    ) || (map.contains_key("blob") && (map.contains_key("uri") || map.contains_key("mimeType")))
 }
 
 /// A bare JSON body is one message; an event stream is its events, each event's `data` lines joined by newlines, framing kept verbatim.
@@ -1063,6 +1073,10 @@ mod tests {
             Some("err_body") => {
                 json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":"see bob@example.com"}})
             }
+            Some("structured_data") => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"data":"note bob@example.com"},
+                    "content":[{"type":"image","data":"Ym9iQGV4YW1wbGUuY29t"}]}})
+            }
             _ => {
                 json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"name":"contact bob@example.com"}}})
             }
@@ -1116,6 +1130,16 @@ mod tests {
         assert_eq!(
             v["result"]["structuredContent"]["name"], "contact [MASKED]",
             "structured prose under any key is reviewed: {v}"
+        );
+
+        let v = call_tool(&app, "structured_data").await;
+        assert_eq!(
+            v["result"]["structuredContent"]["data"], "note [MASKED]",
+            "a data field outside a binary block is prose: {v}"
+        );
+        assert_eq!(
+            v["result"]["content"][0]["data"], "Ym9iQGV4YW1wbGUuY29t",
+            "an image block's payload is never read or rewritten"
         );
     }
 

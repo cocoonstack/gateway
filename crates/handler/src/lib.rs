@@ -256,6 +256,8 @@ impl OnlineHandler {
 
         let mut tried = 0;
         loop {
+            ctx.fallback_ahead = !ctx.request.replays_reasoning_output()
+                && next_fallback(&snap.cfg, &ctx, tried).is_some();
             // a panicking node must refund too; the refund reads only whole-written ctx fields
             let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
                 .catch_unwind()
@@ -1135,6 +1137,26 @@ mod tests {
             hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "a gateway denial reaches no vendor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_fallback_samples_one_success_for_the_requested_model() {
+        let (endpoint, _) = vendor_by_model().await;
+        let h = fallback_handler(
+            &endpoint,
+            "tenants: [{name: t1, models: [broken, healthy]}]",
+        )
+        .await;
+        let ak = h.state().auth.authenticate("k1").await.unwrap();
+        h.run(chat_req("broken", "hi"), ak).await.unwrap();
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(
+            avail.window("broken", minute - 5, minute).await,
+            (1, 0),
+            "the client saw one success; the failed first attempt is not a sample"
         );
     }
 

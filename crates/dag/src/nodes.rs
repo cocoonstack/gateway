@@ -309,9 +309,7 @@ impl DagNode for SelectAccount {
             .await;
         let Some(account) = account else {
             // unsampled, an exhausted pool would read no_data forever
-            ctx.state
-                .avail
-                .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
+            note_unavailable(ctx);
             return Err(GatewayError::new(
                 ErrCode::SYSTEM_ERROR,
                 503,
@@ -482,9 +480,7 @@ impl DagNode for CallEngine {
                     )
                     .await;
                 let Some(next) = next else {
-                    ctx.state
-                        .avail
-                        .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
+                    note_unavailable(ctx);
                     return Err(named(first_err, ctx));
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
@@ -506,9 +502,7 @@ impl DagNode for CallEngine {
                         Ok(())
                     }
                     Err(e) => {
-                        ctx.state
-                            .avail
-                            .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
+                        note_unavailable(ctx);
                         note_failure(ctx, &next.name).await;
                         Err(named(e, ctx))
                     }
@@ -525,6 +519,15 @@ fn latency_clock(ctx: &DagContext) -> Option<std::time::Instant> {
         .stability
         .latency_routing
         .then(std::time::Instant::now)
+}
+
+/// A failed attempt is unavailable unless the handler still has a fallback model to try.
+fn note_unavailable(ctx: &DagContext) {
+    if !ctx.fallback_ahead {
+        ctx.state
+            .avail
+            .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
+    }
 }
 
 async fn note_engine_outcome(

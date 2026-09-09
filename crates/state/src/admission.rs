@@ -95,7 +95,7 @@ impl BudgetScope {
         match self {
             Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
             Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
-            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak),
+            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak_id),
             Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
         }
     }
@@ -862,9 +862,12 @@ mod tests {
         let prev = BudgetScope::KeyCost.key(Some(previous_month(month)), &ak, "");
         assert_eq!(
             BudgetScope::KeyCost.key(Some(month), &ak, ""),
-            format!("m:{y}{m:02}:cb:ak:k1")
+            format!("m:{y}{m:02}:cb:ak:{}", ak.ak_id)
         );
-        assert_eq!(BudgetScope::KeyCost.key(None, &ak, ""), "cb:ak:k1");
+        assert_eq!(
+            BudgetScope::KeyCost.key(None, &ak, ""),
+            format!("cb:ak:{}", ak.ak_id)
+        );
 
         let untouched = budgets(gov, &cfg, &ak, "").await;
         assert_eq!(untouched.len(), 1);
@@ -901,7 +904,7 @@ mod tests {
             err.starts_with("monthly cost budget exhausted for key:"),
             "{err}"
         );
-        assert_eq!(gov.quota_used("cb:ak:k1").await, 0);
+        assert_eq!(gov.quota_used(&format!("cb:ak:{}", ak.ak_id)).await, 0);
         gov.quota_reset_all().await;
         assert!(
             check_budgets(gov, &cfg, &ak, "").await.is_err(),

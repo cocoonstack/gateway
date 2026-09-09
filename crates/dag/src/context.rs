@@ -26,6 +26,9 @@ pub struct DagContext {
     /// Request-level cache hit (downstream nodes short-circuit on this and skip
     /// account/engine/billing).
     pub cache_hit: bool,
+    /// The handler will retry an upstream fault on a fallback model, so this
+    /// attempt's failure is not the client-visible outcome.
+    pub fallback_ahead: bool,
     /// This request's cache key (computed by cache_lookup, reused by cache_store).
     pub cache_key: Option<String>,
     /// Governance key for the (AK, model) daily counter — set by model_quota
@@ -62,6 +65,7 @@ impl DagContext {
             outcome: None,
             decisions: Vec::new(),
             cache_hit: false,
+            fallback_ahead: false,
             cache_key: None,
             model_quota_key: None,
             quota_reserved: None,
