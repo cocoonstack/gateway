@@ -779,10 +779,11 @@ fn replace_bounded(target: &mut String, value: Option<&Value>) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_consts::Protocol;
     use gw_models::ModelParamV2;
     use serde_json::json;
+
+    use super::*;
 
     fn message(role: &str, content: Value) -> ChatMsg {
         let mut message = ChatMsg::text(role, String::new());

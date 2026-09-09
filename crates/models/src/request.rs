@@ -311,8 +311,9 @@ pub(crate) fn is_protected_anthropic_block(block: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_consts::Protocol;
+
+    use super::*;
 
     #[test]
     fn dispatch_protocol() {

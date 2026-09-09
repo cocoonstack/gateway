@@ -982,8 +982,9 @@ fn redact(text: &str) -> Option<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_models::ChatMsg;
+
+    use super::*;
 
     #[test]
     fn mask_spans_map_across_slots_like_inbound_text() {

@@ -2,6 +2,7 @@
 //! instance, a distributed store persists items for any instance's drain loop.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use gw_models::{BatchItem, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
@@ -90,9 +91,8 @@ impl OfflineHandler {
         };
         let done_indices: std::collections::HashSet<usize> =
             prior.iter().map(|r| r.index).collect();
-        use std::sync::atomic::Ordering::Relaxed;
         // heartbeat: keeps a slow item from being judged stale, flips `lost` when the fence moves
-        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
         let hb = {
             let store = store.clone();
             let id = id.to_owned();

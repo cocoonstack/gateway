@@ -817,9 +817,10 @@ async fn persist_content(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, ModelParamV2};
+
+    use super::*;
 
     fn handler() -> OnlineHandler {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());

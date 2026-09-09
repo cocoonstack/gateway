@@ -184,8 +184,9 @@ fn message_text(msg: &ChatMsg) -> std::borrow::Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn heuristic_classifies_runs() {
