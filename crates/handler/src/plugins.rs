@@ -39,7 +39,7 @@ impl<'a> ScanCounts<'a> {
     }
 
     fn visit(&mut self, s: &str) -> usize {
-        self.blocklist += i64::from(blocklist_hit(self.sec, s));
+        self.blocklist += i64::from(is_blocklisted(self.sec, s));
         for (i, r) in self.sec.regexes.iter().enumerate() {
             self.regex[i] += r.re.find_iter(s).count() as i64;
         }
@@ -281,7 +281,7 @@ pub fn apply_mask_spans_frame(
 }
 
 /// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.
-fn blocklist_hit(sec: &SecurityConf, text: &str) -> bool {
+fn is_blocklisted(sec: &SecurityConf, text: &str) -> bool {
     if text.is_ascii() {
         return sec
             .blocklist

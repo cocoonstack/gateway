@@ -305,7 +305,7 @@ impl OnlineHandler {
 
         // raw response pre-outbound-DLP, only when full retention can store it (key present)
         let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
-            && gw_state::sealing_available();
+            && gw_state::can_seal();
         let raw_response = capture_raw
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
@@ -2933,7 +2933,7 @@ mod tests {
         let submitter = OfflineHandler::new(online.clone());
         let ak = state.auth.authenticate("ak-demo-123").await.unwrap();
 
-        assert!(state.store.distributed_batches());
+        assert!(state.store.distributes_batches());
         let job = submitter
             .submit(
                 ak,

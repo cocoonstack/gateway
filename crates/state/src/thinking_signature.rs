@@ -543,7 +543,7 @@ impl CapturedBlock {
         }
     }
 
-    fn complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         match self {
             Self::Thinking { complete, .. }
             | Self::RedactedThinking { complete, .. }
@@ -709,7 +709,7 @@ impl ThinkingStreamCapture {
     }
 
     fn register(&mut self) {
-        if self.disabled || self.blocks.values().any(|block| !block.complete()) {
+        if self.disabled || self.blocks.values().any(|block| !block.is_complete()) {
             return;
         }
         let mut sequence = ProtectedSequence::default();

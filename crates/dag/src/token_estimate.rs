@@ -12,13 +12,13 @@ pub trait TokenEncoder: Send + Sync {
 }
 
 /// Real tiktoken `cl100k_base` BPE — the tokenizer OpenAI's models use.
-pub struct TiktokenEncoder {
+struct TiktokenEncoder {
     bpe: tiktoken_rs::CoreBPE,
 }
 
 impl TiktokenEncoder {
     /// Fails only if the embedded vocabulary fails to load.
-    pub fn new() -> Result<Self, String> {
+    fn new() -> Result<Self, String> {
         let bpe = tiktoken_rs::cl100k_base().map_err(|e| format!("load cl100k_base: {e}"))?;
         Ok(Self { bpe })
     }
@@ -33,8 +33,7 @@ impl TokenEncoder for TiktokenEncoder {
 /// Approximation of cl100k_base counting (NOT tiktoken): ASCII letters ~1 token
 /// per 4 chars, digits per 3, punctuation 1 each, non-ASCII 1 per char;
 /// whitespace folds into the following word.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HeuristicEncoder;
+struct HeuristicEncoder;
 
 impl HeuristicEncoder {
     const LETTERS_PER_TOKEN: usize = 4;

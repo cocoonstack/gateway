@@ -12,7 +12,7 @@ use crate::OnlineHandler;
 /// Batch orchestration built on top of the online handler.
 #[derive(Clone)]
 pub struct OfflineHandler {
-    pub online: OnlineHandler,
+    online: OnlineHandler,
 }
 
 impl OfflineHandler {
@@ -28,7 +28,7 @@ impl OfflineHandler {
         items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
-        if store.distributed_batches() {
+        if store.distributes_batches() {
             // persist the EFFECTIVE user: execution, billing and erasure key on one identity
             let items: Vec<BatchItem> = items
                 .into_iter()
@@ -122,7 +122,7 @@ impl OfflineHandler {
                 break;
             }
             // re-read before dispatch (fail CLOSED): an erasure while queued blanks the stored item
-            if store.distributed_batches() {
+            if store.distributes_batches() {
                 match store.batch_item_snapshot(id, index).await {
                     Ok(Some(fresh)) => item = fresh,
                     Ok(None) | Err(_) => {
@@ -140,7 +140,7 @@ impl OfflineHandler {
             }
             let user = ak.attributed_user(&item.user).to_owned();
             // local backends keep no item rows: the erasure marker stops the rest (fail closed)
-            let erased_mid_batch = !store.distributed_batches()
+            let erased_mid_batch = !store.distributes_batches()
                 && store
                     .user_erased_since(&ak.tenant, &user, captured_at)
                     .await
@@ -213,7 +213,7 @@ impl OfflineHandler {
             let claimed = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
-                    if stopping(changed, &shutdown) {
+                    if is_stopping(changed, &shutdown) {
                         return;
                     }
                     continue;
@@ -276,7 +276,7 @@ impl OfflineHandler {
     }
 }
 
-fn stopping(
+fn is_stopping(
     changed: Result<(), tokio::sync::watch::error::RecvError>,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
@@ -289,7 +289,7 @@ async fn pause_or_stop(
 ) -> bool {
     tokio::select! {
         biased;
-        changed = shutdown.changed() => stopping(changed, shutdown),
+        changed = shutdown.changed() => is_stopping(changed, shutdown),
         _ = tokio::time::sleep(poll) => false,
     }
 }

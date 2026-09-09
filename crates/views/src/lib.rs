@@ -5672,10 +5672,7 @@ mod tests {
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_CONTENT_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, retention: {content: full, days: 1}, security: {dlp_redact: false, detect_secrets: false}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         // SAFETY: unique var name for this test; no concurrent reader of it.
         unsafe { std::env::set_var("GW_TEST_CONTENT_ADMIN", "s3cret") };
-        assert!(
-            !gw_state::sealing_available(),
-            "test env has no content key"
-        );
+        assert!(!gw_state::can_seal(), "test env has no content key");
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));

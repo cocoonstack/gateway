@@ -128,7 +128,7 @@ impl BillingLedger {
 
     pub(crate) fn repairing(store: Arc<dyn Store>) -> Self {
         let (queue, mut pending) = mpsc::channel::<LedgerWrite>(LEDGER_QUEUE_CAPACITY);
-        let deferred = store.deferred_ledger_writes();
+        let deferred = store.defers_ledger_writes();
         let worker_store = store.clone();
         // the bounded worker owns accepted rows through caller cancellation
         tokio::spawn(async move {

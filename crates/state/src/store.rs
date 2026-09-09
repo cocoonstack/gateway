@@ -525,7 +525,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         Ok(())
     }
     /// Whether rows may batch off the request path; in-process backends stay synchronous.
-    fn deferred_ledger_writes(&self) -> bool {
+    fn defers_ledger_writes(&self) -> bool {
         false
     }
     /// Total count plus the most recent `limit` records in chronological order;
@@ -667,7 +667,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 
     /// Whether this backend runs a fleet work queue; local backends execute on
     /// the submitting instance.
-    fn distributed_batches(&self) -> bool {
+    fn distributes_batches(&self) -> bool {
         false
     }
     /// Atomically enqueue a batch and its items so a partial save never leaves
@@ -1839,7 +1839,7 @@ macro_rules! sql_store_impl {
                 Ok(())
             }
 
-            fn deferred_ledger_writes(&self) -> bool {
+            fn defers_ledger_writes(&self) -> bool {
                 true
             }
 
@@ -2717,7 +2717,7 @@ sql_store_impl!(PostgresStore, postgres, {
         Ok(Some(done))
     }
 
-    fn distributed_batches(&self) -> bool {
+    fn distributes_batches(&self) -> bool {
         true
     }
 
@@ -4268,7 +4268,7 @@ mod tests {
         );
         assert_eq!(got.status, BatchStatus::Failed);
 
-        assert!(store.distributed_batches());
+        assert!(store.distributes_batches());
         let qmsgs = vec![
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "one")],

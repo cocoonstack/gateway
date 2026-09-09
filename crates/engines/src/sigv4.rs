@@ -39,7 +39,7 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// The derived signing key: kSecret → kDate → kRegion → kService → kSigning.
-pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, service.as_bytes());

@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let purge_task = gw_task::spawn_content_purge(state.clone(), gw_task::PURGE_PERIOD);
     let rollup_task = gw_task::spawn_usage_rollup(state.clone(), gw_task::ROLLUP_PERIOD);
     let avail_task = gw_task::spawn_avail_flush(state.clone(), gw_task::AVAIL_FLUSH_PERIOD);
-    let distributed_batches = state.store.distributed_batches();
+    let distributes_batches = state.store.distributes_batches();
 
     let transport = select_transport()?;
     let postgres_url = cfg.storage.postgres_url.clone();
@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
 
     // fleet batch drain: on a distributed store any instance claims submitted batches
     let (batch_shutdown_tx, batch_shutdown_rx) = tokio::sync::watch::channel(false);
-    let batch_task = if distributed_batches {
+    let batch_task = if distributes_batches {
         let offline = app_state.offline.clone();
         tracing::info!("batch drain loop started (distributed store)");
         Some(tokio::spawn(async move {

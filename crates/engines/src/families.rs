@@ -575,7 +575,7 @@ impl ModelEngine for AudioEngine {
 }
 
 /// A vendor duration as whole billed seconds (fractions round up).
-pub fn whole_seconds(v: &Value) -> Option<i64> {
+fn whole_seconds(v: &Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_f64().map(|f| f.ceil() as i64))
         .or_else(|| {

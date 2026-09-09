@@ -30,7 +30,7 @@ pub mod thinking_signature;
 pub use alerts::{AlertBus, AlertEvent};
 pub use avail::{AvailState, AvailStore, classify};
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
-pub use content::{ContentRecord, sealing_available};
+pub use content::{ContentRecord, can_seal};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
 pub use health::{HealthStore, RedisHealth};
 pub use keystore::{KeyStore, PostgresKeyStore};
@@ -1380,7 +1380,7 @@ mod tests {
             .await
             .unwrap();
         assert!(st.store.file_get(&f.id).await.unwrap().is_some());
-        assert!(!st.store.distributed_batches());
+        assert!(!st.store.distributes_batches());
     }
 
     #[test]
