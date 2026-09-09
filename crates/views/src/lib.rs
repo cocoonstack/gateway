@@ -399,6 +399,7 @@ async fn realtime_ws(
             served_conf.and_then(|m| m.provider.as_deref()),
             &[],
             snap.state.health.as_ref(),
+            None,
         )
         .await;
     let Some(account) = account else {

@@ -22,6 +22,7 @@ pub mod content;
 pub mod governance;
 pub mod health;
 pub mod keystore;
+pub mod latency;
 pub mod store;
 pub mod thinking_signature;
 
@@ -451,6 +452,7 @@ impl AccountPool {
         provider: Option<&str>,
         excluded: &[String],
         health: &dyn HealthStore,
+        latency: Option<&latency::Latency>,
     ) -> Option<Arc<Account>> {
         let candidates: Vec<&Arc<Account>> = self
             .accounts
@@ -465,7 +467,7 @@ impl AccountPool {
             .filter(|(_, ok)| !ok)
             .map(|(a, _)| a.name.as_str())
             .collect();
-        self.select_with(p, provider, |name| {
+        self.select_with(p, provider, latency, |name| {
             excluded.iter().any(|e| e == name) || unhealthy.contains(&name)
         })
     }
@@ -482,6 +484,7 @@ impl AccountPool {
         &self,
         p: Protocol,
         provider: Option<&str>,
+        latency: Option<&latency::Latency>,
         is_excluded: impl Fn(&str) -> bool,
     ) -> Option<Arc<Account>> {
         let eligible = |a: &&Arc<Account>| serves(a, p, provider) && !is_excluded(&a.name);
@@ -504,7 +507,16 @@ impl AccountPool {
             .iter()
             .filter(|a| eligible(a) && a.is_ptu() == has_ptu && a.priority == best)
             .collect();
-        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % top.len();
+        let start = self.rr.fetch_add(1, Ordering::Relaxed) % top.len();
+        let idx = match latency {
+            // the rotating start keeps ties (unknown or equal latency) round-robin
+            Some(latency) => (0..top.len())
+                .map(|k| (start + k) % top.len())
+                .map(|i| (latency.rank(&top[i].name), i))
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map_or(start, |(_, i)| i),
+            None => start,
+        };
         Some(Arc::clone(top[idx]))
     }
 }
@@ -747,6 +759,8 @@ pub struct GatewayState {
     pub alerts: Arc<alerts::AlertBus>,
     /// Ten-minute, fail-open replay consistency cache for Anthropic thinking.
     pub thinking_signatures: ThinkingSignatureAudit,
+    /// Per-account call latency for `stability.latency_routing`; per instance.
+    pub latency: latency::Latency,
 }
 
 impl Default for GatewayState {
@@ -763,6 +777,7 @@ impl Default for GatewayState {
             avail: Arc::new(avail::MemoryAvail::default()),
             alerts: Arc::new(alerts::AlertBus::default()),
             thinking_signatures: ThinkingSignatureAudit::new(),
+            latency: latency::Latency::default(),
         }
     }
 }
@@ -880,6 +895,7 @@ impl GatewayState {
             avail: prev.avail.clone(),
             alerts: prev.alerts.clone(),
             thinking_signatures: prev.thinking_signatures.clone(),
+            latency: prev.latency.clone(),
         })
     }
 }
@@ -1036,6 +1052,51 @@ mod tests {
 
     fn state() -> GatewayState {
         GatewayState::from_config(&GatewayConfig::embedded_default().unwrap())
+    }
+
+    #[tokio::test]
+    async fn pool_ranks_a_tier_by_latency_when_asked() {
+        let yaml = "listen: {host: h, port: 1}\naccounts: [{name: fast, provider: p, protocols: ['openai-chat']}, {name: slow, provider: p, protocols: ['openai-chat']}]";
+        let s = GatewayState::from_config(&GatewayConfig::from_yaml(yaml).unwrap());
+        async fn pick(s: &GatewayState, latency: Option<&latency::Latency>) -> String {
+            s.pool
+                .select_healthy(
+                    Protocol::OpenaiChat,
+                    Some("p"),
+                    &[],
+                    s.health.as_ref(),
+                    latency,
+                )
+                .await
+                .unwrap()
+                .name
+                .clone()
+        }
+        let lat = latency::Latency::default();
+        lat.record("fast", Duration::from_millis(20));
+        lat.record("slow", Duration::from_millis(200));
+        for _ in 0..4 {
+            assert_eq!(pick(&s, Some(&lat)).await, "fast");
+        }
+        let unranked = [pick(&s, None).await, pick(&s, None).await];
+        assert!(
+            unranked.contains(&"fast".to_owned()) && unranked.contains(&"slow".to_owned()),
+            "round-robin without the ranker: {unranked:?}"
+        );
+        lat.backdate("slow", Duration::from_secs(60));
+        assert_eq!(
+            pick(&s, Some(&lat)).await,
+            "slow",
+            "an account unseen for a minute is probed again"
+        );
+        lat.record("slow", Duration::from_millis(200));
+        assert_eq!(pick(&s, Some(&lat)).await, "fast");
+        let fresh = latency::Latency::default();
+        let probes = [pick(&s, Some(&fresh)).await, pick(&s, Some(&fresh)).await];
+        assert!(
+            probes.contains(&"fast".to_owned()) && probes.contains(&"slow".to_owned()),
+            "unknown accounts round-robin: {probes:?}"
+        );
     }
 
     fn ak_info(ak: &str) -> AkInfo {
@@ -1348,19 +1409,19 @@ mod tests {
         let h = s.health.as_ref();
         let a = s
             .pool
-            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h)
+            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h, None)
             .await
             .unwrap();
         let b = s
             .pool
-            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h)
+            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h, None)
             .await
             .unwrap();
         assert_eq!(a.name, "mock-openai-1");
         assert_eq!(b.name, "mock-openai-1");
         assert_eq!(
             s.pool
-                .select_healthy(Protocol::AnthropicMessages, None, &[], h)
+                .select_healthy(Protocol::AnthropicMessages, None, &[], h, None)
                 .await
                 .unwrap()
                 .name,
@@ -1368,7 +1429,7 @@ mod tests {
         );
         assert!(
             s.pool
-                .select_healthy(Protocol::Video, Some("nonexistent"), &[], h)
+                .select_healthy(Protocol::Video, Some("nonexistent"), &[], h, None)
                 .await
                 .is_none()
         );
@@ -1408,7 +1469,7 @@ mod tests {
         let h = s.health.as_ref();
         let first = s
             .pool
-            .select_healthy(Protocol::OpenaiChat, Some("tencent"), &[], h)
+            .select_healthy(Protocol::OpenaiChat, Some("tencent"), &[], h, None)
             .await
             .unwrap();
         assert_eq!(first.name, "mock-hunyuan-ptu-down");
@@ -1420,6 +1481,7 @@ mod tests {
                 Some("tencent"),
                 &["mock-hunyuan-ptu-down".into()],
                 h,
+                None,
             )
             .await
             .unwrap();

@@ -171,7 +171,12 @@ the total budget, while a stalled stream fails at the gap.
 
 Multiple accounts can serve the same protocol. Selection is by `priority`
 (lower first), round-robin within a tie, with PTU-tier accounts preferred over
-paygo. On an upstream 5xx the failed account is excluded and another is tried
+paygo. With `stability.latency_routing: true` the tie is ranked instead by
+each account's observed call latency — an exponentially weighted average of
+completed calls, kept per instance — so the fastest account of a tier takes
+the traffic while an account never or not recently (60 s) sampled ranks first
+and gets probed; equal ranks stay round-robin. The realtime surface keeps
+round-robin. On an upstream 5xx the failed account is excluded and another is tried
 once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
 an account into cooldown (`stability.failure_threshold` / `cooldown_seconds`),
 and it auto-recovers on expiry. A streaming response that already sent bytes to
