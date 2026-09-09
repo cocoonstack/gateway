@@ -275,9 +275,7 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         }
     };
     let (vendor, vendor_unit) = cfg
-        .accounts
-        .iter()
-        .find(|a| a.name == b.account)
+        .find_account(b.account)
         .map(|a| {
             (
                 (
@@ -814,13 +812,13 @@ impl Store for MemoryStore {
             ));
         }
         // watermark first: rollup-then-records is the lock order advance uses
-        let watermark = rollup_watermark(&lock(&self.rollup));
+        let watermark = (self.ledger_max_rows > 0).then(|| rollup_watermark(&lock(&self.rollup)));
         let mut ledger = lock(&self.ledger);
         if !ledger.request_ids.insert(r.request_id.clone()) {
             return Ok(());
         }
         ledger.rows.push(r.clone());
-        if self.ledger_max_rows > 0
+        if let Some(watermark) = watermark
             && ledger.rows.len() > self.ledger_max_rows
             && self
                 .prune_seq

@@ -837,7 +837,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         ctx.tpm_reserved.take(),
         ctx.model_quota_key.take(),
     );
-    let record = admission::settle_and_bill(
+    let settled = admission::settle_and_bill(
         ctx.state.as_ref(),
         &ctx.cfg,
         admission::SettleInput {
@@ -875,15 +875,15 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         &ctx.cfg,
         &ctx.ak,
         ctx.effective_user_id(),
-        record.total_tokens,
-        record.cost_micros,
+        settled.total_tokens,
+        settled.cost_micros,
     )
     .await;
     ctx.decide(
         "cost_calc",
         format!(
             "tokens={} cost_micros={}",
-            record.total_tokens, record.cost_micros
+            settled.total_tokens, settled.cost_micros
         ),
     );
     Ok(())

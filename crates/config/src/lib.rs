@@ -764,6 +764,8 @@ pub struct GatewayConfig {
     product_idx: HashMap<String, usize>,
     #[serde(skip)]
     tenant_idx: HashMap<String, usize>,
+    #[serde(skip)]
+    account_idx: HashMap<String, usize>,
 }
 
 impl GatewayConfig {
@@ -781,6 +783,7 @@ impl GatewayConfig {
         self.model_idx = index_by(&self.models, |m| &m.name);
         self.product_idx = index_by(&self.products, |p| &p.name);
         self.tenant_idx = index_by(&self.tenants, |t| &t.name);
+        self.account_idx = index_by(&self.accounts, |a| &a.name);
     }
 
     /// Expand provider presets: fill each model's default wire type and
@@ -1101,6 +1104,7 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
+        check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         check_unique(
             "mcp server",
             self.mcp_servers.iter().map(|m| m.name.as_str()),
@@ -1276,6 +1280,10 @@ impl GatewayConfig {
 
     pub fn find_model(&self, name: &str) -> Option<&ModelConf> {
         self.models.get(*self.model_idx.get(name)?)
+    }
+
+    pub fn find_account(&self, name: &str) -> Option<&AccountConf> {
+        self.accounts.get(*self.account_idx.get(name)?)
     }
 
     /// Pricing for a public model name; zero if unlisted.

@@ -638,7 +638,7 @@ async fn bill_realtime_turn(
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
-    let record = admission::settle_and_bill(
+    let settled = admission::settle_and_bill(
         state,
         cfg,
         admission::SettleInput {
@@ -677,7 +677,7 @@ async fn bill_realtime_turn(
         ak,
         admit.user.as_str(),
         total,
-        record.cost_micros,
+        settled.cost_micros,
     )
     .await;
     if !estimated {

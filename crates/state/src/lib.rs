@@ -461,15 +461,9 @@ impl AccountPool {
         health: &dyn HealthStore,
         latency: Option<&latency::Latency>,
     ) -> Option<Arc<Account>> {
-        let candidates: Vec<&Arc<Account>> = self
-            .accounts
-            .iter()
-            .filter(|a| serves(a, p, provider))
-            .collect();
-        let checks =
-            futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
-        let unhealthy: Vec<&str> = candidates
-            .iter()
+        let serving = || self.accounts.iter().filter(|a| serves(a, p, provider));
+        let checks = futures::future::join_all(serving().map(|a| health.available(&a.name))).await;
+        let unhealthy: Vec<&str> = serving()
             .zip(checks)
             .filter(|(_, ok)| !ok)
             .map(|(a, _)| a.name.as_str())

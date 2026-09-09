@@ -1,6 +1,8 @@
 //! Rule-based request/response plugins from `config.security`: the pre-stage
 //! blocks and DLP-redacts inbound text, the post-stage redacts the response.
 
+use std::fmt::Write as _;
+
 use gw_config::{Action, SecurityConf};
 use gw_models::{Block, ChatMsg, GatewayRequest, GatewayResponse, ModelParamV2};
 
@@ -282,6 +284,9 @@ pub fn apply_mask_spans_frame(
 
 /// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.
 fn is_blocklisted(sec: &SecurityConf, text: &str) -> bool {
+    if sec.blocklist.is_empty() {
+        return false;
+    }
     if text.is_ascii() {
         return sec
             .blocklist
@@ -746,13 +751,17 @@ fn collect_delta_payload(
     opaque_key: Option<&str>,
     fragments: &mut EventFragments,
 ) {
+    let mut path = String::from("delta");
     let Some(object) = delta.as_object() else {
-        collect_delta_fragments(delta, index, "delta", fragments);
+        collect_delta_fragments(delta, index, &mut path, fragments);
         return;
     };
     for (key, value) in object {
         if key != "type" && Some(key.as_str()) != opaque_key {
-            collect_delta_fragments(value, index, &format!("delta/{key}"), fragments);
+            path.push('/');
+            path.push_str(key);
+            collect_delta_fragments(value, index, &mut path, fragments);
+            path.truncate("delta".len());
         }
         if fragments.overflowed {
             break;
@@ -763,19 +772,22 @@ fn collect_delta_payload(
 fn collect_delta_fragments(
     value: &serde_json::Value,
     index: u64,
-    path: &str,
+    path: &mut String,
     fragments: &mut EventFragments,
 ) {
     if fragments.overflowed {
         return;
     }
+    let len = path.len();
     match value {
         serde_json::Value::String(text) => {
             fragments.append(index, path, text);
         }
         serde_json::Value::Array(values) => {
             for (position, value) in values.iter().enumerate() {
-                collect_delta_fragments(value, index, &format!("{path}/{position}"), fragments);
+                let _ = write!(path, "/{position}");
+                collect_delta_fragments(value, index, path, fragments);
+                path.truncate(len);
                 if fragments.overflowed {
                     break;
                 }
@@ -783,7 +795,10 @@ fn collect_delta_fragments(
         }
         serde_json::Value::Object(object) => {
             for (key, value) in object {
-                collect_delta_fragments(value, index, &format!("{path}/{key}"), fragments);
+                path.push('/');
+                path.push_str(key);
+                collect_delta_fragments(value, index, path, fragments);
+                path.truncate(len);
                 if fragments.overflowed {
                     break;
                 }
