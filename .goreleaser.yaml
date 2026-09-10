@@ -39,6 +39,11 @@ changelog:
       - '^test:'
       - '^review:'
 
+checksum:
+  extra_files:
+    - glob: dist-gw/*.tar.gz
+    - glob: dist-web/*.tar.gz
+
 release:
   extra_files:
     - glob: dist-gw/*.tar.gz
