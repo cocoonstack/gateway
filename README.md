@@ -42,6 +42,7 @@ curl -sN localhost:8080/v1/messages \
 
 # Your own config
 GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
+gw --version                       # the built binary takes no other arguments
 
 # Go live: give an account `endpoint` + `api_key_env` in the config — that's it.
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
