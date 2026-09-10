@@ -22,12 +22,26 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 const BATCH_STALE_SECS: i64 = 120;
 const BATCH_POLL: Duration = Duration::from_secs(2);
 const CONFIG_FEED_RETRY: Duration = Duration::from_secs(5);
+const USAGE: &str = "usage: gw [--version | --help]\nconfiguration comes from the environment: GW_CONFIG, GW_TRANSPORT, GW_PORT";
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(flag) = env::args().nth(1) {
+        return match flag.as_str() {
+            "--version" | "-V" => {
+                println!("gw {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                Ok(())
+            }
+            _ => Err(anyhow::anyhow!("unknown argument {flag}\n{USAGE}")),
+        };
+    }
     let tracer_provider = init_tracing()?;
 
     // reloads re-read this captured source
