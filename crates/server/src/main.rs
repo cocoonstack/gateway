@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 const BATCH_STALE_SECS: i64 = 120;
 const BATCH_POLL: Duration = Duration::from_secs(2);
 const CONFIG_FEED_RETRY: Duration = Duration::from_secs(5);
-const USAGE: &str = "usage: gw [--version | --help]\nconfiguration comes from the environment: GW_CONFIG, GW_TRANSPORT, GW_PORT";
+const USAGE: &str = "usage: gw [--version | --help]\nconfiguration comes from the environment: GW_CONFIG, GW_HOST, GW_PORT, GW_TRANSPORT";
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -77,7 +77,6 @@ async fn main() -> anyhow::Result<()> {
         None => cfg,
     };
 
-    // the GW_HOST / GW_PORT env vars win over the config file (GW_HOST=0.0.0.0 for containers)
     let host = env::var("GW_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
     let port = env::var("GW_PORT")
         .ok()
@@ -155,7 +154,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // change feed: reload on every published config version; reconnects forever
     if config_store.is_some() {
         let app = app_state.clone();
         tokio::spawn(async move {
@@ -300,7 +298,6 @@ async fn read_source_text(src: Option<&str>) -> Result<Cow<'static, str>, String
     }
 }
 
-// the GW_TRANSPORT env var: mock = zero egress, http = real HTTP, unset = mock:// in-process and real URLs over HTTP
 fn select_transport() -> anyhow::Result<gw_engines::SharedTransport> {
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
