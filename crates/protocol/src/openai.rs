@@ -135,10 +135,10 @@ pub struct Usage {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: i64,
-    /// Anthropic cache writes ride inside `prompt_tokens`; surfaced so a client
-    /// can reconcile the write premium it was billed.
+    /// OpenAI's own name for cache writes, which ride inside `prompt_tokens`;
+    /// Anthropic-family writes are reported here too.
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub cache_creation_input_tokens: i64,
+    pub cache_write_tokens: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]

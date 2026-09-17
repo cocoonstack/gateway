@@ -56,6 +56,7 @@ impl OpenAiEngine {
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let messages = Value::Array(self.wire_messages());
+        let typed = self.base.take_typed();
         let param = self.base.param()?;
         let protocol = param.protocol;
         let reasoning_model = is_openai_reasoning_model(&param.model_name);
@@ -68,7 +69,7 @@ impl OpenAiEngine {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
-        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
+        if let Some(gw_models::TypedParams::Chat(p)) = typed {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
                     if let Some(v) = $v {
@@ -88,6 +89,9 @@ impl OpenAiEngine {
                 "reasoning_effort",
                 p.reasoning
                     .and_then(|reasoning| reasoning_effort(*reasoning))
+                    .map(|effort| {
+                        gw_protocol::reasoning::openai_effort(&param.model_name, effort, "xhigh")
+                    })
             );
             put!("presence_penalty", p.presence_penalty);
             put!("frequency_penalty", p.frequency_penalty);

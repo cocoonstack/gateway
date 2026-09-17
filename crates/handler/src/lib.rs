@@ -1220,7 +1220,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct CachedUsageTransport;
+    struct CachedUsageTransport(serde_json::Value);
 
     #[async_trait::async_trait]
     impl gw_engines::Transport for CachedUsageTransport {
@@ -1232,7 +1232,7 @@ mod tests {
             if let gw_engines::UpstreamBody::Json(b) = &mut resp.body {
                 let mut v: serde_json::Value = serde_json::from_slice(b).unwrap();
                 v["usage"]["prompt_tokens"] = 100.into();
-                v["usage"]["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 80});
+                v["usage"]["prompt_tokens_details"] = self.0.clone();
                 *b = serde_json::to_vec(&v).unwrap().into();
             }
             Ok(resp)
@@ -1246,7 +1246,9 @@ mod tests {
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, state),
-            Arc::new(CachedUsageTransport),
+            Arc::new(CachedUsageTransport(
+                serde_json::json!({"cached_tokens": 80}),
+            )),
         );
         let key = h.state().auth.authenticate("k1").await.unwrap();
         h.run(chat_req("m-cache", "hi"), key).await.unwrap();
@@ -1258,6 +1260,28 @@ mod tests {
             "20 + 80*0.1 billable at 1000 micros/1k"
         );
         assert_eq!(rec.total_tokens, 28 + rec.completion_tokens);
+    }
+
+    #[tokio::test]
+    async fn openai_cache_writes_bill_the_write_weight() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m-cache, protocol: openai-chat, input_price_per_1k_micros: 1000, token_rate: {read_cache: 0.1, write_cache: 1.25}}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(CachedUsageTransport(
+                serde_json::json!({"cached_tokens": 0, "cache_write_tokens": 80}),
+            )),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        h.run(chat_req("m-cache", "hi"), key).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let rec = &ledger[0];
+        assert_eq!(rec.prompt_tokens, 100, "raw column: 20 fresh + 80 written");
+        assert_eq!(
+            rec.cost_micros, 120,
+            "20 + 80*1.25 billable at 1000 micros/1k"
+        );
     }
 
     #[tokio::test]

@@ -3,11 +3,16 @@
 //! replay (OpenRouter's), its conversion to and from Anthropic thinking
 //! blocks, and the effort ↔ budget maps the cross-family engines apply.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 
 /// `format` marker on Anthropic-signed units, so a replay knows which vendor
 /// can verify them.
 pub const FORMAT_ANTHROPIC: &str = "anthropic-claude-v1";
+
+/// Effort tiers, weakest first.
+const EFFORT_TIERS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// How an Anthropic model generation takes a thinking request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +50,25 @@ pub fn budget_effort(budget: i64) -> &'static str {
         10240..=20479 => "high",
         20480..=28671 => "xhigh",
         _ => "max",
+    }
+}
+
+/// An effort GPT-6 accepts: the generation always reasons, so `none` and
+/// `minimal` are vendor 400s there and clamp to the floor, and a tier above
+/// `top` — the surface's own ceiling, `xhigh` on chat completions and `max` on
+/// Responses and Bedrock — clamps down to it. Other families pass through: a
+/// vendor 400 on a tier it never listed stays the contract.
+pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, top: &'static str) -> Cow<'a, str> {
+    if !model.contains("gpt-6") {
+        return effort;
+    }
+    if matches!(effort.as_ref(), "none" | "minimal") {
+        return Cow::Borrowed(EFFORT_TIERS[0]);
+    }
+    let tier = |name: &str| EFFORT_TIERS.iter().position(|t| *t == name);
+    match (tier(&effort), tier(top)) {
+        (Some(want), Some(ceiling)) if want > ceiling => Cow::Borrowed(top),
+        _ => effort,
     }
 }
 

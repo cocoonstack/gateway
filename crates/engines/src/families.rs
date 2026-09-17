@@ -1354,6 +1354,8 @@ impl ResponsesEngine {
                 body.insert("tool_choice".to_owned(), v);
             }
             if let Some(effort) = p.reasoning.and_then(|r| r.effort) {
+                let model = self.base.model_name().unwrap_or_default();
+                let effort = gw_protocol::reasoning::openai_effort(model, effort, "max");
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }
@@ -1599,7 +1601,10 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
         output,
         crate::engine::tok(&usage["input_tokens_details"]["cached_tokens"]),
         crate::engine::tok(&usage["output_tokens_details"]["reasoning_tokens"]),
-    );
+    )
+    .with_cache_write(crate::engine::tok(
+        &usage["input_tokens_details"]["cache_write_tokens"],
+    ));
     (input, output, Some(common))
 }
 

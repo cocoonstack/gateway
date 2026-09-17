@@ -1324,6 +1324,81 @@ async fn anthropic_replays_signed_reasoning_details_ahead_of_the_turn() {
 }
 
 #[tokio::test]
+async fn gpt6_clamps_efforts_to_the_vocabulary_each_surface_takes() {
+    for (effort, want) in [
+        ("none", "low"),
+        ("minimal", "low"),
+        ("low", "low"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ] {
+        let t = RecordingTransport::new(OPENAI_OK);
+        let req = reasoning_req(
+            Protocol::OpenaiChat,
+            "gpt-6-astra",
+            gw_models::ReasoningParam {
+                effort: Some(effort.to_owned().into()),
+                ..Default::default()
+            },
+        );
+        let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        assert_eq!(t.body_json()["reasoning_effort"], want, "chat {effort}");
+    }
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-6-astra",
+        gw_models::ReasoningParam {
+            thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":32768})),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["reasoning_effort"],
+        "xhigh",
+        "an Anthropic-dialect budget must not derive a tier the chat surface rejects"
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-5.6-sol",
+        gw_models::ReasoningParam {
+            effort: Some("none".into()),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["reasoning_effort"],
+        "none",
+        "older generations still take none"
+    );
+
+    for (effort, want) in [("none", "low"), ("max", "max")] {
+        let t = RecordingTransport::new(
+            r#"{"id":"r","object":"response","model":"gpt-6-astra","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let req = reasoning_req(
+            Protocol::Responses,
+            "gpt-6-astra",
+            gw_models::ReasoningParam {
+                effort: Some(effort.to_owned().into()),
+                ..Default::default()
+            },
+        );
+        let _ = ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+        assert_eq!(
+            t.body_json()["reasoning"]["effort"],
+            want,
+            "responses {effort}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_reasoning_effort_and_thinking_dialects() {
     let t = RecordingTransport::new(OPENAI_OK);
     let mut req = reasoning_req(
