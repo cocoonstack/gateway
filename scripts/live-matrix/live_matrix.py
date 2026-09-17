@@ -399,6 +399,16 @@ def case_embeddings(gw: Gateway, model: str, inputs: list[str] | None = None) ->
     check_ledger(gw, name, model, wire, False, before, f"dims={len(j['data'][0]['embedding'])} n={len(j['data'])}")
 
 
+def check_vendor_cost(name: str, row: dict[str, Any], usage: dict[str, Any]) -> None:
+    """A vendor that prices the call itself must reach the ledger: ticks are 1e-10 USD, `cost` is USD."""
+    ticks, usd = usage.get("cost_in_usd_ticks"), usage.get("cost")
+    if ticks is None and usd is None:
+        return
+    want = round(ticks / 1e4) if ticks is not None else round(usd * 1e6)
+    got = row["vendor_cost_micros"]
+    record(f"{name} [vendor cost]", got == want, f"ledger vendor={got} wire={want}")
+
+
 def case_image(gw: Gateway, model: str) -> None:
     """One generated image bills one unit at the model's unit price (plus any token usage the vendor reports)."""
     name = f"{model} image"
@@ -424,6 +434,7 @@ def case_image(gw: Gateway, model: str) -> None:
         f"images={len(j.get('data', []))} ledger units/cost={row['billed_units']}/{row['cost_micros']} "
         f"expected {len(j.get('data', []))}/{expected_cost} usage={json.dumps(usage)}",
     )
+    check_vendor_cost(name, row, usage)
 
 
 def video_handle(j: dict[str, Any]) -> str | None:
@@ -1036,6 +1047,7 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
             },
         }
         check_ledger(gw, name, model, wire, False, before, f"text={text[:30]!r}")
+        check_vendor_cost(name, gw.ledger()[1], usage)
     case_chat(gw, model, "responses model", stream=True, prompt=prompt)
     case_messages(gw, model, "responses model", stream=True, prompt=prompt)
     name = f"{model} responses model tool loop (chat)"
