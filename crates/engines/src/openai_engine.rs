@@ -158,7 +158,7 @@ impl OpenAiEngine {
                 Some(Value::Array(details)) => Some(details),
                 _ => None,
             },
-            tool_calls: message.remove("tool_calls").filter(|t| !t.is_null()),
+            tool_calls: take_tool_calls(&mut message),
             model: match v.get_mut("model").map(Value::take) {
                 Some(Value::String(model)) => model,
                 _ => String::new(),
@@ -294,7 +294,7 @@ fn apply_sse_event(
                 ..Default::default()
             });
         }
-        tool_calls = delta.remove("tool_calls").filter(|t| !t.is_null());
+        tool_calls = take_tool_calls(delta);
     }
     if let Some(mut tool_calls) = tool_calls {
         withhold_block_open_arguments(&mut tool_calls);
@@ -496,6 +496,12 @@ fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {
         Some(Value::String(s)) => Some(s),
         _ => None,
     }
+}
+
+fn take_tool_calls(object: &mut Map<String, Value>) -> Option<Value> {
+    object
+        .remove("tool_calls")
+        .filter(|t| !t.is_null() && t.as_array().is_none_or(|calls| !calls.is_empty()))
 }
 
 /// Copy token fields + keep the raw usage subtree for the DAG node.
@@ -798,6 +804,33 @@ mod tests {
             .unwrap();
         assert_eq!(out.response.reasoning, "via reasoning");
         assert!(out.response.reasoning_details.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_tool_calls_keep_the_vendor_finish_reason() {
+        let body = r#"{"model":"venus","choices":[{"message":{"content":"[269, 254]","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":91,"completion_tokens":11,"total_tokens":102}}"#;
+        let out = OpenAiEngine::new(req(false), Arc::new(Reply(body, false)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.response.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_empty_tool_calls_emit_no_tool_call_chunk() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = OpenAiEngine::new(req(true), Arc::new(Reply(sse, true)))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.response.tool_calls.is_none());
+        assert!(!out.chunks.iter().any(|c| c.tool_calls.is_some()));
     }
 
     #[tokio::test]
