@@ -14,14 +14,13 @@ pub const FORMAT_ANTHROPIC: &str = "anthropic-claude-v1";
 /// Effort tiers, weakest first.
 const EFFORT_TIERS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// Sampling knobs a reasoning-first generation answers 400 for.
+/// Sampling knobs OpenAI answers 400 for while a request reasons.
 const SAMPLING_KNOBS: [&str; 4] = [
     "temperature",
     "top_p",
     "presence_penalty",
     "frequency_penalty",
 ];
-const REASONING_SAMPLING_KNOBS: [&str; 2] = ["temperature", "top_p"];
 
 /// How an Anthropic model generation takes a thinking request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +83,14 @@ fn openai_generation(model: &str) -> Option<(u32, u32)> {
     (major >= 5).then_some((major, minor))
 }
 
-/// Generations that reject sampling knobs regardless of reasoning effort.
-fn always_rejects_sampling(generation: (u32, u32)) -> bool {
-    generation.0 >= 6 || generation == (5, 0) || (generation.0 == 5 && generation.1 >= 5)
+/// Whether the request reasons at all: an effort other than `none`, or a
+/// generation that cannot turn reasoning off — GPT-5.0, which knows `minimal`
+/// but not `none`, and GPT-6 onward.
+fn reasoning_engaged(model: &str, generation: (u32, u32), effort: Option<&str>) -> bool {
+    match effort {
+        Some(effort) => effort != "none",
+        None => generation.0 >= 6 || generation == (5, 0) || model.contains("gpt-6"),
+    }
 }
 
 /// An effort the model takes on this wire. Efforts past its ceiling clamp down
@@ -96,9 +100,8 @@ fn always_rejects_sampling(generation: (u32, u32)) -> bool {
 pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) -> Cow<'a, str> {
     let generation = openai_generation(model);
     let always_reasons = model.contains("gpt-6");
-    let takes_minimal = !always_reasons
-        && matches!(generation, None | Some((5, 0)))
-        && wire != EffortWire::Bedrock;
+    let takes_minimal =
+        !always_reasons && matches!(generation, None | Some((5, 0))) && wire != EffortWire::Bedrock;
     let takes_none = !always_reasons && generation != Some((5, 0));
     match effort.as_ref() {
         "none" if !takes_none => {
@@ -126,9 +129,10 @@ pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) ->
 
 /// Bring an assembled upstream body to what the model takes: the effort — flat
 /// `reasoning_effort` on chat completions, `reasoning.effort` on Responses —
-/// clamps to a tier it accepts, and the sampling knobs its generation rejects
-/// outright go. `logprobs`, `top_logprobs` and `stop` stay, so the vendor's own
-/// 400 tells the client it cannot have the data or the stop point it asked for.
+/// clamps to a tier it accepts, and the sampling knobs go once the request
+/// reasons, which is when OpenAI refuses them. `logprobs`, `top_logprobs` and
+/// `stop` stay, so the vendor's own 400 tells the client it cannot have the
+/// data or the stop point it asked for.
 pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: EffortWire) {
     let slot = if body.contains_key("reasoning_effort") {
         body.get_mut("reasoning_effort")
@@ -145,15 +149,12 @@ pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: E
     } else {
         None
     };
-    let knobs: &[&str] = match openai_generation(model) {
-        Some(generation) if always_rejects_sampling(generation) => &SAMPLING_KNOBS,
-        Some((5, 1 | 2)) if effort.is_some_and(|effort| EFFORT_TIERS.contains(&effort)) => {
-            &REASONING_SAMPLING_KNOBS
+    if openai_generation(model)
+        .is_some_and(|generation| reasoning_engaged(model, generation, effort))
+    {
+        for knob in SAMPLING_KNOBS {
+            body.remove(knob);
         }
-        _ => &[],
-    };
-    for knob in knobs {
-        body.remove(*knob);
     }
 }
 
@@ -301,45 +302,55 @@ mod tests {
     }
 
     #[test]
-    fn only_the_generations_that_refuse_them_lose_the_sampling_knobs() {
-        let body = || -> Map<String, Value> {
-            serde_json::from_value(json!({
+    fn sampling_knobs_go_only_once_the_request_reasons() {
+        let body = |effort: Option<&str>| -> Map<String, Value> {
+            let mut b: Map<String, Value> = serde_json::from_value(json!({
                 "temperature": 0.5, "top_p": 0.9, "presence_penalty": 0.5,
                 "frequency_penalty": 0.5, "logprobs": true, "stop": ["END"]
             }))
-            .unwrap()
+            .unwrap();
+            if let Some(effort) = effort {
+                b.insert("reasoning_effort".into(), effort.into());
+            }
+            b
         };
-        for model in ["gpt-5", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra"] {
-            let mut b = body();
+        let kept = |model: &str, effort: Option<&str>| {
+            let mut b = body(effort);
             normalize_openai_body(model, &mut b, EffortWire::Chat);
-            assert_eq!(
-                b.keys().collect::<Vec<_>>(),
-                ["logprobs", "stop"],
-                "{model} keeps only what the vendor must refuse itself"
-            );
-        }
-        for model in ["gpt-5.1", "gpt-5.4", "openai/gpt-6-astra", "deepseek-v4"] {
-            let mut b = body();
-            normalize_openai_body(model, &mut b, EffortWire::Chat);
-            assert_eq!(b.len(), 6, "{model} keeps the knobs it honours");
+            b.contains_key("temperature") && b.contains_key("presence_penalty")
+        };
+
+        for (model, effort) in [
+            ("gpt-5.1", Some("high")),
+            ("gpt-5.4", Some("low")),
+            ("gpt-5.6-luna", Some("xhigh")),
+            ("gpt-5", None),
+            ("gpt-5", Some("minimal")),
+            ("gpt-6-astra", None),
+            ("gpt-6-astra", Some("none")),
+        ] {
+            assert!(!kept(model, effort), "{model} reasons at {effort:?}");
         }
 
-        for model in ["gpt-5.1", "gpt-5.2"] {
-            let mut b = body();
-            b.insert("reasoning_effort".into(), "high".into());
-            normalize_openai_body(model, &mut b, EffortWire::Chat);
-            for knob in REASONING_SAMPLING_KNOBS {
-                assert!(!b.contains_key(knob), "{model} keeps {knob}");
-            }
-            for knob in ["presence_penalty", "frequency_penalty", "logprobs", "stop"] {
-                assert!(b.contains_key(knob), "{model} drops {knob}");
-            }
+        for (model, effort) in [
+            ("gpt-5.1", None),
+            ("gpt-5.4", Some("none")),
+            ("gpt-5.5", Some("none")),
+            ("gpt-5.6-terra", None),
+            ("openai/gpt-6-astra", Some("high")),
+            ("us.openai.gpt-5.6-luna", Some("high")),
+            ("deepseek-v4", Some("high")),
+        ] {
+            assert!(kept(model, effort), "{model} does not reason at {effort:?}");
         }
 
-        let mut b = body();
-        b.insert("reasoning_effort".into(), "none".into());
-        normalize_openai_body("gpt-5.2", &mut b, EffortWire::Chat);
-        assert_eq!(b.len(), 7, "gpt-5.2 drops knobs at effort none");
+        let mut b = body(Some("high"));
+        normalize_openai_body("gpt-6-astra", &mut b, EffortWire::Chat);
+        assert_eq!(
+            b.keys().collect::<Vec<_>>(),
+            ["logprobs", "reasoning_effort", "stop"],
+            "only what the vendor must refuse itself stays"
+        );
     }
 
     #[test]

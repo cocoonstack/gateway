@@ -100,12 +100,14 @@ mapping per model family:
 
 Sampling knobs the client sent along a gateway-mapped effort (`temperature`,
 `top_p`, `top_k`) are dropped for Anthropic, which rejects them with thinking on.
-GPT-5.0 and GPT-5.5 onward reject `temperature` other than their default,
-`top_p` and both penalties outright. GPT-5.1 and 5.2 accept `temperature` and
-`top_p` only at effort `none`, while 5.3 and 5.4 honour them. The incompatible
-fields are dropped on chat, Responses and a native Responses body alike. Bedrock
-refuses the same two `inferenceConfig` fields for an `openai.gpt-<n>` id, which
-drop there too. `logprobs`, `top_logprobs` and `stop`, which those models also
+OpenAI refuses `temperature` other than its default, `top_p` and both penalties
+for exactly as long as a request reasons — every generation from 5.1 on takes
+them at effort `none` or with no effort at all, while 5.0 and 6 take them never,
+since neither can turn reasoning off — so the gateway drops those four once the
+request reasons, on chat, Responses and a native Responses body alike. Bedrock
+refuses `temperature`/`topP` for an `openai.gpt-<n>` id whatever the effort, its
+own validation rather than the model's, so they drop from `inferenceConfig`
+unconditionally there. `logprobs`, `top_logprobs` and `stop`, which those models also
 refuse, are left in: dropping them would silently withhold data the client asked
 for or move where generation stops, so the vendor's own 400 says so instead.
 OpenRouter swallows every one of these itself, so its ids keep what the client

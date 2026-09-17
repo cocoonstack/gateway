@@ -1472,7 +1472,27 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     assert_eq!(b["reasoning_effort"], "high");
     assert_eq!(b["max_completion_tokens"], 700);
     assert!(b.get("max_tokens").is_none());
-    assert_eq!(b["temperature"], 0.2, "the OpenAI wire keeps its own knobs");
+    assert!(
+        b.get("temperature").is_none() && b.get("top_p").is_none(),
+        "OpenAI refuses the sampling knobs while a request reasons: {b}"
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-5.4",
+        gw_models::ReasoningParam {
+            effort: Some("none".into()),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        (&b["reasoning_effort"], &b["temperature"]),
+        (&serde_json::json!("none"), &serde_json::json!(0.2)),
+        "a request that does not reason keeps them"
+    );
 
     for (reasoning, want) in [
         (
