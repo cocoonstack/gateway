@@ -9,6 +9,13 @@ use serde_json::Value;
 
 /// A normalized usage view of the vendor's usage subtree (Anthropic or OpenAI
 /// field map); `None` for a total-only vendor, callers keep the top-level counts.
+/// The vendor's own charge for the call in micro-dollars, when the usage subtree
+/// carries one; OpenRouter reports `cost` in USD on both wires, buffered and streamed.
+pub fn extract_vendor_cost_micros(v: &Value) -> Option<i64> {
+    let usd = v.get("cost")?.as_f64()?;
+    (usd.is_finite() && usd >= 0.0).then_some((usd * 1_000_000.0).round() as i64)
+}
+
 pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<CommonUsage> {
     fn get(v: &Value, path: &[&str]) -> i64 {
         let mut cur = v;
@@ -65,6 +72,30 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendor_cost_from_either_wire() {
+        let chat = serde_json::json!({"prompt_tokens":8,"completion_tokens":4,"cost":3.6e-06});
+        assert_eq!(extract_vendor_cost_micros(&chat), Some(4));
+        let messages = serde_json::json!({"input_tokens":8,"output_tokens":4,"cost":0.000084});
+        assert_eq!(extract_vendor_cost_micros(&messages), Some(84));
+        let big = serde_json::json!({"cost":1.5});
+        assert_eq!(extract_vendor_cost_micros(&big), Some(1_500_000));
+    }
+
+    #[test]
+    fn vendor_cost_absent_or_unusable() {
+        for raw in [
+            serde_json::json!({"prompt_tokens":8,"completion_tokens":4}),
+            serde_json::json!({"cost":null}),
+            serde_json::json!({"cost":"0.001"}),
+            serde_json::json!({"cost":-1.0}),
+            serde_json::json!({"cost":f64::NAN}),
+            serde_json::json!({"cost":f64::INFINITY}),
+        ] {
+            assert_eq!(extract_vendor_cost_micros(&raw), None, "{raw}");
+        }
+    }
 
     #[test]
     fn openai_map() {
