@@ -40,4 +40,4 @@ pub use sse::SseDecoder;
 pub use transport::{
     MockTransport, SharedTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse,
 };
-pub use usage_extract::extract_common_usage;
+pub use usage_extract::{extract_common_usage, extract_vendor_cost_micros};

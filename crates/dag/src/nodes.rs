@@ -810,6 +810,11 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         .as_ref()
         .map(|o| o.response.ptu_spillover)
         .unwrap_or(false);
+    let vendor_cost = ctx
+        .outcome
+        .as_ref()
+        .and_then(|o| o.response.raw_usage.as_ref())
+        .and_then(gw_engines::extract_vendor_cost_micros);
     let param = ctx.request.model_param_v2.as_ref();
     // cost bills at the served model's price; the (AK, model) counter accrues to the requested name
     let served = served_model(param);
@@ -857,7 +862,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
                 discount,
                 ptu_spillover,
                 estimated,
-                vendor_cost: None,
+                vendor_cost,
                 unit_price: None,
             },
             reserved,
