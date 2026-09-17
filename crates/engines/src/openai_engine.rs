@@ -56,7 +56,7 @@ impl OpenAiEngine {
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let messages = Value::Array(self.wire_messages());
-        let typed = self.base.take_typed();
+        let (typed, raw) = (self.base.take_typed(), self.base.take_raw());
         let param = self.base.param()?;
         let protocol = param.protocol;
         let reasoning_model = is_openai_reasoning_model(&param.model_name);
@@ -89,9 +89,6 @@ impl OpenAiEngine {
                 "reasoning_effort",
                 p.reasoning
                     .and_then(|reasoning| reasoning_effort(*reasoning))
-                    .map(|effort| {
-                        gw_protocol::reasoning::openai_effort(&param.model_name, effort, "xhigh")
-                    })
             );
             put!("presence_penalty", p.presence_penalty);
             put!("frequency_penalty", p.frequency_penalty);
@@ -119,8 +116,8 @@ impl OpenAiEngine {
                 }
             }
         }
-        let raw = self.base.take_raw();
         crate::base::merge_raw_extras_owned(&mut body, raw);
+        gw_protocol::reasoning::normalize_openai_body(&param.model_name, &mut body, "xhigh");
 
         Ok(UpstreamRequest {
             protocol,

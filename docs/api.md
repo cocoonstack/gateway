@@ -94,12 +94,18 @@ mapping per model family:
 
 | Family | Request | Response |
 |--------|---------|----------|
-| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400). GPT-6 always reasons, so `none` and `minimal` clamp to `low` there, and a tier past the surface's ceiling clamps to it — `xhigh` on chat completions, `max` on Responses and Bedrock `reasoning_config` | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
+| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400). GPT-6 always reasons, so `none` and `minimal` clamp to `low` there, and a tier past the surface's ceiling clamps to it — `xhigh` on chat completions, `max` on Responses and Bedrock `reasoning_config`; the clamp is applied to the assembled body, so a native `/v1/responses` passthrough gets it too | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
 | Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024, `medium` 4096, `high` 16384, `xhigh` 24576, `max` 32768), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
 | Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on; `xhigh` clamps to `high` on 4.6, which predates it); `temperature` / `top_p` / `top_k` are dropped for 4.7+, which rejects them | same |
 
 Sampling knobs the client sent along a gateway-mapped effort (`temperature`,
 `top_p`, `top_k`) are dropped for Anthropic, which rejects them with thinking on.
+GPT-6 rejects `temperature` other than its default, `top_p` and both penalties
+outright, so those four are dropped on every GPT-6 request — chat, Responses,
+and a native Responses body forwarded as the client wrote it. `logprobs`,
+`top_logprobs` and `stop`, which the model also refuses, are left in: dropping
+them would silently withhold data the client asked for or move where generation
+stops, so the vendor's own 400 says so instead.
 
 The reply carries the reasoning prose as `message.reasoning_content` and its
 units as `message.reasoning_details` — `reasoning.text` (with `signature`

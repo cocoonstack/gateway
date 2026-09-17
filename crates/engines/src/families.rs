@@ -1266,7 +1266,9 @@ impl ResponsesEngine {
         if !self.base.request.preserve_responses_wire {
             self.cross_protocol_body(&mut body);
         }
-        body.insert("model".to_owned(), self.base.model_name()?.into());
+        let model = self.base.model_name()?;
+        gw_protocol::reasoning::normalize_openai_body(model, &mut body, "max");
+        body.insert("model".to_owned(), model.into());
         Ok(Value::Object(body))
     }
 
@@ -1354,8 +1356,6 @@ impl ResponsesEngine {
                 body.insert("tool_choice".to_owned(), v);
             }
             if let Some(effort) = p.reasoning.and_then(|r| r.effort) {
-                let model = self.base.model_name().unwrap_or_default();
-                let effort = gw_protocol::reasoning::openai_effort(model, effort, "max");
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }

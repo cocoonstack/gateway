@@ -14,6 +14,14 @@ pub const FORMAT_ANTHROPIC: &str = "anthropic-claude-v1";
 /// Effort tiers, weakest first.
 const EFFORT_TIERS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// Sampling knobs GPT-6 answers 400 for; it takes only its own defaults.
+const SAMPLING_KNOBS: [&str; 4] = [
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+];
+
 /// How an Anthropic model generation takes a thinking request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThinkingDialect {
@@ -69,6 +77,31 @@ pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, top: &'static str) -
     match (tier(&effort), tier(top)) {
         (Some(want), Some(ceiling)) if want > ceiling => Cow::Borrowed(top),
         _ => effort,
+    }
+}
+
+/// Bring an assembled upstream body to what the model takes: the effort — flat
+/// `reasoning_effort` on chat completions, `reasoning.effort` on Responses —
+/// clamps to a tier it accepts, and the sampling knobs GPT-6 rejects outright
+/// go. `logprobs`, `top_logprobs` and `stop` stay, so the vendor's own 400
+/// tells the client it cannot have the data or the stop point it asked for.
+pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, top: &'static str) {
+    let slot = if body.contains_key("reasoning_effort") {
+        body.get_mut("reasoning_effort")
+    } else {
+        body.get_mut("reasoning")
+            .and_then(|reasoning| reasoning.get_mut("effort"))
+    };
+    if let Some(slot) = slot
+        && slot.is_string()
+        && let Value::String(effort) = slot.take()
+    {
+        *slot = openai_effort(model, Cow::Owned(effort), top).into();
+    }
+    if model.contains("gpt-6") {
+        for knob in SAMPLING_KNOBS {
+            body.remove(knob);
+        }
     }
 }
 
