@@ -2755,7 +2755,7 @@ fn openai_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>) ->
             .filter(|d| d.read_cache > 0 || d.write_cache > 0)
             .map(|d| gw_protocol::openai::PromptTokensDetails {
                 cached_tokens: d.read_cache,
-                cache_creation_input_tokens: d.write_cache,
+                cache_write_tokens: d.write_cache,
             }),
         completion_tokens_details: u.filter(|d| d.reason > 0).map(|d| {
             gw_protocol::openai::CompletionTokensDetails {
@@ -2794,8 +2794,9 @@ fn responses_usage(pt: i64, ct: i64, tt: i64, u: Option<gw_models::CommonUsage>)
     let (p, c) = (u.prompt_total(), u.completion_total());
     let mut usage =
         json!({"input_tokens": p, "output_tokens": c, "total_tokens": p.saturating_add(c)});
-    if u.read_cache > 0 {
-        usage["input_tokens_details"] = json!({"cached_tokens": u.read_cache});
+    if u.read_cache > 0 || u.write_cache > 0 {
+        usage["input_tokens_details"] =
+            json!({"cached_tokens": u.read_cache, "cache_write_tokens": u.write_cache});
     }
     if u.reason > 0 {
         usage["output_tokens_details"] = json!({"reasoning_tokens": u.reason});
@@ -6272,7 +6273,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_usage_counts_anthropic_cache_inside_prompt() {
+    fn openai_usage_counts_cache_inside_prompt() {
         let u = gw_models::CommonUsage {
             platform_input: 8,
             read_cache: 2,
@@ -6288,10 +6289,7 @@ mod tests {
         );
         assert_eq!(w.total_tokens, 16);
         let details = w.prompt_tokens_details.unwrap();
-        assert_eq!(
-            (details.cached_tokens, details.cache_creation_input_tokens),
-            (2, 1)
-        );
+        assert_eq!((details.cached_tokens, details.cache_write_tokens), (2, 1));
 
         let w = openai_usage(8, 5, 13, None);
         assert_eq!((w.prompt_tokens, w.total_tokens), (8, 13));
@@ -6338,6 +6336,7 @@ mod tests {
         );
         assert_eq!(w["total_tokens"], 18);
         assert_eq!(w["input_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(w["input_tokens_details"]["cache_write_tokens"], 1);
         assert_eq!(w["output_tokens_details"]["reasoning_tokens"], 2);
 
         let w = responses_usage(9, 4, 13, None);

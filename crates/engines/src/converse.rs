@@ -4,8 +4,14 @@
 //! events) are transcoded back into the Messages shapes the engine, the views
 //! and the native `/v1/messages` stream already understand.
 
+use std::borrow::Cow;
+
 use gw_protocol::object;
+use gw_protocol::reasoning::{budget_effort, openai_effort};
 use serde_json::{Map, Value, json};
+
+/// Marker of the Bedrock ids whose family takes `reasoning_config`.
+const OPENAI_PREFIX: &str = "openai.gpt-";
 
 /// Converse stream events as the Anthropic sequence: implicit text/reasoning
 /// blocks get a synthesized `content_block_start`, the trailing `metadata`
@@ -131,8 +137,10 @@ impl Events {
 }
 
 /// A Messages body as a Converse body; Claude-only knobs and passthrough extras
-/// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids).
-pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
+/// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids,
+/// where an OpenAI id takes the effort as `reasoning_config` instead).
+pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
+    let claude = model.contains("claude");
     let mut out = Map::with_capacity(6);
     if let Some(system) = body.remove("system") {
         let blocks = match system {
@@ -186,8 +194,10 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
     }
 
     if !claude {
-        body.remove("thinking");
-        body.remove("output_config");
+        let (thinking, output_config) = (body.remove("thinking"), body.remove("output_config"));
+        if let Some(effort) = openai_reasoning_config(model, thinking, output_config) {
+            body.insert("reasoning_config".to_owned(), effort);
+        }
     }
     body.remove("model");
     body.remove("stream");
@@ -196,6 +206,24 @@ pub(crate) fn request(mut body: Map<String, Value>, claude: bool) -> Value {
         out.insert("additionalModelRequestFields".into(), Value::Object(body));
     }
     Value::Object(out)
+}
+
+/// The Anthropic-dialect thinking of a body as Bedrock's OpenAI `reasoning_config`
+/// effort; `openai.gpt-oss-*` and every other family declare no such knob.
+fn openai_reasoning_config(
+    model: &str,
+    thinking: Option<Value>,
+    output_config: Option<Value>,
+) -> Option<Value> {
+    let after = model.find(OPENAI_PREFIX)? + OPENAI_PREFIX.len();
+    if !model.as_bytes().get(after).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let effort = match output_config.map(|mut c| c["effort"].take()) {
+        Some(Value::String(effort)) => Cow::Owned(effort),
+        _ => Cow::Borrowed(budget_effort(thinking?["budget_tokens"].as_i64()?)),
+    };
+    Some(openai_effort(model, effort, "max").into())
 }
 
 /// A buffered Converse reply as a Messages reply.
@@ -465,7 +493,7 @@ mod tests {
             "seed": 7
         }))
         .unwrap();
-        let out = request(body, true);
+        let out = request(body, "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
         assert_eq!(
             out["system"],
             json!([{"text": "be brief"}, {"cachePoint": {"type": "default", "ttl": "1h"}}])
@@ -510,9 +538,50 @@ mod tests {
             serde_json::from_value(json!({"messages": [], "thinking": {"type": "adaptive"}}))
                 .unwrap();
         assert!(
-            request(body, false)
+            request(body, "us.amazon.nova-lite-v1:0")
                 .get("additionalModelRequestFields")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn openai_ids_take_the_effort_as_reasoning_config() {
+        let body = |thinking: Value| -> Map<String, Value> {
+            serde_json::from_value(json!({"messages": [], "thinking": thinking})).unwrap()
+        };
+        let out = request(
+            body(json!({"type": "enabled", "budget_tokens": 16384})),
+            "us.openai.gpt-6-astra",
+        );
+        assert_eq!(
+            out["additionalModelRequestFields"],
+            json!({"reasoning_config": "high"})
+        );
+
+        let out = request(
+            body(json!({"type": "enabled", "budget_tokens": 32768})),
+            "us.openai.gpt-6-astra",
+        );
+        assert_eq!(
+            out["additionalModelRequestFields"]["reasoning_config"], "max",
+            "Bedrock takes the top tier the chat surface rejects"
+        );
+
+        let mut with_effort = body(json!({"type": "adaptive"}));
+        with_effort.insert("output_config".to_owned(), json!({"effort": "none"}));
+        let out = request(with_effort, "openai.gpt-6-astra");
+        assert_eq!(
+            out["additionalModelRequestFields"]["reasoning_config"], "low",
+            "GPT-6 always reasons"
+        );
+
+        let out = request(
+            body(json!({"type": "enabled", "budget_tokens": 16384})),
+            "openai.gpt-oss-20b-1:0",
+        );
+        assert!(
+            out.get("additionalModelRequestFields").is_none(),
+            "gpt-oss declares no reasoning knob"
         );
     }
 
@@ -524,7 +593,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "get_weather"}
         }))
         .unwrap();
-        let out = request(body, false);
+        let out = request(body, "us.amazon.nova-lite-v1:0");
         assert_eq!(
             out["toolConfig"]["toolChoice"],
             json!({"tool": {"name": "get_weather"}})
@@ -542,7 +611,11 @@ mod tests {
             "tool_choice": {"type": "none"}
         }))
         .unwrap();
-        assert!(request(body, false).get("toolConfig").is_none());
+        assert!(
+            request(body, "us.amazon.nova-lite-v1:0")
+                .get("toolConfig")
+                .is_none()
+        );
     }
 
     #[test]

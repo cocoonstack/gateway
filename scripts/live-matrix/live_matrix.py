@@ -181,7 +181,7 @@ def oracle(model: str, wire: dict[str, Any], messages_protocol: bool) -> tuple[i
         c = max(wire.get("completion_tokens", 0), 0)
         details = wire.get("prompt_tokens_details") or {}
         cached = min(max(details.get("cached_tokens") or 0, 0), p)
-        written = min(max(details.get("cache_creation_input_tokens") or 0, 0), p - cached)
+        written = min(max(details.get("cache_write_tokens") or 0, 0), p - cached)
         reason = min(max((wire.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0, 0), c)
         prompt_total, completion_total = p, c
         bp = rnd((p - cached - written) * w("prompt") + cached * w("read_cache") + written * w("write_cache"))
@@ -765,7 +765,7 @@ def case_prompt_cache(
     if native:
         written, read = u1.get("cache_creation_input_tokens") or 0, u2.get("cache_read_input_tokens") or 0
     else:
-        written = (u1.get("prompt_tokens_details") or {}).get("cache_creation_input_tokens") or 0
+        written = (u1.get("prompt_tokens_details") or {}).get("cache_write_tokens") or 0
         read = (u2.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
     o1, o2 = oracle(model, u1, native), oracle(model, u2, native)
     ok = (
@@ -998,7 +998,8 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
             "prompt_tokens_details": {
-                "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+                "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0),
+                "cache_write_tokens": (usage.get("input_tokens_details") or {}).get("cache_write_tokens", 0),
             },
             "completion_tokens_details": {
                 "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
@@ -1038,6 +1039,7 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
 
 def run_group(gw: Gateway, group: str) -> None:
     prime = "Is 17 prime? One word."
+    arith = "What is 123456 * 789? Work it out carefully before answering, then give only the number."
     if group == "anthropic":
         haiku, sonnet45, sonnet46, opus5 = (
             "claude-haiku-4-5-20251001",
@@ -1108,6 +1110,14 @@ def run_group(gw: Gateway, group: str) -> None:
         case_thinking_tiers(gw, "gpt-5.4-mini", native=True, tiers=[1024, 4096, 16384, 24576], expect_reasoning=False)
         case_embeddings(gw, "text-embedding-3-small")
         case_responses_surfaces(gw, "gpt-4.1-nano")
+        # gpt-6 astra always reasons and its chat surface stops at xhigh, so none/minimal/max clamp
+        astra = "gpt-6-astra"
+        case_chat(gw, astra, "effort xhigh", prompt=arith, reasoning_effort="xhigh", max_tokens=4000)
+        case_chat(gw, astra, "effort none", prompt=prime, reasoning_effort="none", max_tokens=4000)
+        case_chat(gw, astra, "effort max", stream=True, prompt=arith, reasoning_effort="max", max_tokens=4000)
+        case_prompt_cache(gw, astra, words=400, expect_write=True)
+        case_messages(gw, astra, "cross-protocol thinking budget 32768", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
+        case_thinking_tiers(gw, astra, native=True, tiers=[1024, 4096, 16384, 24576, 32768], expect_reasoning=False)
     elif group == "gemini":
         # free tier: 5 RPM per model, so pace the calls
         for model in ("gemini-3.6-flash",):
@@ -1198,6 +1208,8 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(
             gw, "openai/gpt-oss-20b:free", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
         )
+        # the routed astra reports the same cache fields; the free tier caps max_tokens at what the balance affords
+        case_chat(gw, "openai/gpt-6-astra", "effort xhigh", prompt=prime, reasoning_effort="xhigh", max_tokens=600)
     elif group == "rerank":
         case_rerank(gw, "rerank-v3.5", unit_priced=True)
         case_rerank(gw, "jina-reranker-v3")
@@ -1286,8 +1298,6 @@ def run_group(gw: Gateway, group: str) -> None:
         sonnet5, opus5 = "global.anthropic.claude-sonnet-5", "global.anthropic.claude-opus-5"
         fable = "global.anthropic.claude-fable-5-1"
         steps = "Solve 23*47 step by step briefly."
-        # the 5 family skips adaptive thinking on the easy prompt; this one makes it think
-        arith = "What is 123456 * 789? Work it out carefully before answering, then give only the number."
         case_messages(gw, haiku, "aws-anthropic")
         case_messages(
             gw,
@@ -1341,6 +1351,11 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, "apac.amazon.nova-lite-v1:0", "converse chat")
         case_chat(gw, "apac.amazon.nova-lite-v1:0", "converse chat", stream=True)
         case_chat(gw, "openai.gpt-oss-20b-1:0", "converse reasoning", prompt=prime, expect_reasoning=True)
+        # the effort reaches an openai.* id as Converse reasoning_config, where the top tier is max
+        astra = "global.openai.gpt-6-astra"
+        case_chat(gw, astra, "converse effort xhigh", prompt=arith, reasoning_effort="xhigh", max_tokens=4000)
+        case_messages(gw, astra, "converse thinking budget 32768", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
+        case_chat(gw, astra, "converse stream", stream=True, prompt=prime, max_tokens=4000)
     elif group == "agents":
         case_claude_code(gw, "claude-haiku-4-5-20251001")
         case_codex(gw, "gpt-5.4")

@@ -1161,6 +1161,7 @@ async fn anthropic_prompt_cache_marks_system_and_latest_user_turn() {
     assert_eq!(b["messages"][0]["content"], "hello");
 }
 
+const RESPONSES_OK: &str = r#"{"id":"r","object":"response","model":"gpt-6-astra","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#;
 const CLAUDE_OK: &str = r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
 const OPENAI_OK: &str = r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
 
@@ -1321,6 +1322,135 @@ async fn anthropic_replays_signed_reasoning_details_ahead_of_the_turn() {
         ])
     );
     assert!(turn.get("reasoning_content").is_none());
+}
+
+#[tokio::test]
+async fn gpt6_clamps_efforts_to_the_vocabulary_each_surface_takes() {
+    for (effort, want) in [
+        ("none", "low"),
+        ("minimal", "low"),
+        ("low", "low"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ] {
+        let t = RecordingTransport::new(OPENAI_OK);
+        let req = reasoning_req(
+            Protocol::OpenaiChat,
+            "gpt-6-astra",
+            gw_models::ReasoningParam {
+                effort: Some(effort.to_owned().into()),
+                ..Default::default()
+            },
+        );
+        let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["reasoning_effort"], want, "chat {effort}");
+        assert!(
+            b.get("temperature").is_none() && b.get("top_p").is_none(),
+            "chat must not carry knobs GPT-6 rejects: {b}"
+        );
+    }
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-6-astra",
+        gw_models::ReasoningParam {
+            thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":32768})),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["reasoning_effort"],
+        "xhigh",
+        "an Anthropic-dialect budget must not derive a tier the chat surface rejects"
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-5.6-sol",
+        gw_models::ReasoningParam {
+            effort: Some("none".into()),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["reasoning_effort"],
+        "none",
+        "older generations still take none"
+    );
+
+    for (effort, want) in [("none", "low"), ("max", "max")] {
+        let t = RecordingTransport::new(RESPONSES_OK);
+        let req = reasoning_req(
+            Protocol::Responses,
+            "gpt-6-astra",
+            gw_models::ReasoningParam {
+                effort: Some(effort.to_owned().into()),
+                ..Default::default()
+            },
+        );
+        let _ = ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["reasoning"]["effort"], want, "responses {effort}");
+        assert!(
+            b.get("temperature").is_none() && b.get("top_p").is_none(),
+            "cross-protocol responses must not carry knobs GPT-6 rejects: {b}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gpt6_normalizes_the_native_responses_body_it_forwards() {
+    for (effort, want) in [("none", "low"), ("minimal", "low"), ("max", "max")] {
+        let t = RecordingTransport::new(RESPONSES_OK);
+        let mut req = GatewayRequest {
+            preserve_responses_wire: true,
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::Responses, "gpt-6-astra")),
+            ..Default::default()
+        };
+        req.model_param_v2.as_mut().unwrap().raw = serde_json::json!({
+            "input": [{"role":"user","content":"hi"}],
+            "reasoning": {"effort": effort, "summary": "auto"},
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "logprobs": true
+        });
+        let _ = ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["reasoning"]["effort"], want, "native {effort}");
+        assert_eq!(
+            b["reasoning"]["summary"], "auto",
+            "the rest rides untouched"
+        );
+        assert!(
+            b.get("temperature").is_none() && b.get("top_p").is_none(),
+            "native body must not carry knobs GPT-6 rejects: {b}"
+        );
+        assert_eq!(
+            b["logprobs"], true,
+            "what only the vendor can refuse stays the vendor's 400"
+        );
+    }
+
+    let t = RecordingTransport::new(RESPONSES_OK);
+    let mut req = GatewayRequest {
+        preserve_responses_wire: true,
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::Responses, "gpt-5.4")),
+        ..Default::default()
+    };
+    req.model_param_v2.as_mut().unwrap().raw =
+        serde_json::json!({"input": "hi", "reasoning": {"effort": "none"}, "temperature": 0.5});
+    let _ = ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        (&b["reasoning"]["effort"], &b["temperature"]),
+        (&serde_json::json!("none"), &serde_json::json!(0.5)),
+        "older generations keep their own body"
+    );
 }
 
 #[tokio::test]

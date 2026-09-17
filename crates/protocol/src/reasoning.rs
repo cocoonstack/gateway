@@ -3,11 +3,24 @@
 //! replay (OpenRouter's), its conversion to and from Anthropic thinking
 //! blocks, and the effort ↔ budget maps the cross-family engines apply.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 
 /// `format` marker on Anthropic-signed units, so a replay knows which vendor
 /// can verify them.
 pub const FORMAT_ANTHROPIC: &str = "anthropic-claude-v1";
+
+/// Effort tiers, weakest first.
+const EFFORT_TIERS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Sampling knobs GPT-6 answers 400 for; it takes only its own defaults.
+const SAMPLING_KNOBS: [&str; 4] = [
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+];
 
 /// How an Anthropic model generation takes a thinking request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +58,50 @@ pub fn budget_effort(budget: i64) -> &'static str {
         10240..=20479 => "high",
         20480..=28671 => "xhigh",
         _ => "max",
+    }
+}
+
+/// An effort GPT-6 accepts: the generation always reasons, so `none` and
+/// `minimal` are vendor 400s there and clamp to the floor, and a tier above
+/// `top` — the surface's own ceiling, `xhigh` on chat completions and `max` on
+/// Responses and Bedrock — clamps down to it. Other families pass through: a
+/// vendor 400 on a tier it never listed stays the contract.
+pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, top: &'static str) -> Cow<'a, str> {
+    if !model.contains("gpt-6") {
+        return effort;
+    }
+    if matches!(effort.as_ref(), "none" | "minimal") {
+        return Cow::Borrowed(EFFORT_TIERS[0]);
+    }
+    let tier = |name: &str| EFFORT_TIERS.iter().position(|t| *t == name);
+    match (tier(&effort), tier(top)) {
+        (Some(want), Some(ceiling)) if want > ceiling => Cow::Borrowed(top),
+        _ => effort,
+    }
+}
+
+/// Bring an assembled upstream body to what the model takes: the effort — flat
+/// `reasoning_effort` on chat completions, `reasoning.effort` on Responses —
+/// clamps to a tier it accepts, and the sampling knobs GPT-6 rejects outright
+/// go. `logprobs`, `top_logprobs` and `stop` stay, so the vendor's own 400
+/// tells the client it cannot have the data or the stop point it asked for.
+pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, top: &'static str) {
+    let slot = if body.contains_key("reasoning_effort") {
+        body.get_mut("reasoning_effort")
+    } else {
+        body.get_mut("reasoning")
+            .and_then(|reasoning| reasoning.get_mut("effort"))
+    };
+    if let Some(slot) = slot
+        && slot.is_string()
+        && let Value::String(effort) = slot.take()
+    {
+        *slot = openai_effort(model, Cow::Owned(effort), top).into();
+    }
+    if model.contains("gpt-6") {
+        for knob in SAMPLING_KNOBS {
+            body.remove(knob);
+        }
     }
 }
 

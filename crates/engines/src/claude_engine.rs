@@ -331,7 +331,7 @@ impl ModelEngine for ClaudeEngine {
             }
             gw_consts::Protocol::AwsConverse => {
                 let model = self.base.model_name()?.to_owned();
-                let body = crate::converse::request(self.build_body()?, model.contains("claude"));
+                let body = crate::converse::request(self.build_body()?, &model);
                 let uri = crate::bedrock::converse_uri(&model, self.base.request.stream);
                 let reply = crate::bedrock::bedrock_send_uri(&mut self.base, &uri, body).await?;
                 match reply.body {

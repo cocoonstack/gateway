@@ -62,6 +62,7 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
             get(v, &["prompt_tokens_details", "cached_tokens"]),
             get(v, &["completion_tokens_details", "reasoning_tokens"]),
         )
+        .with_cache_write(get(v, &["prompt_tokens_details", "cache_write_tokens"]))
         .with_audio(
             get(v, &["prompt_tokens_details", "audio_tokens"]),
             get(v, &["completion_tokens_details", "audio_tokens"]),
@@ -107,6 +108,28 @@ mod tests {
         assert_eq!(u.read_cache, 4);
         assert_eq!(u.completion, 3);
         assert_eq!(u.reason, 2);
+    }
+
+    #[test]
+    fn openai_cache_writes_leave_the_fresh_input_count() {
+        let raw = serde_json::json!({"prompt_tokens":5567,"completion_tokens":4,"total_tokens":5571,
+            "prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":5564},
+            "completion_tokens_details":{"reasoning_tokens":0}});
+        let u = extract_common_usage(&raw, false).unwrap();
+        assert_eq!(
+            (u.platform_input, u.write_cache, u.read_cache),
+            (3, 5564, 0)
+        );
+        assert_eq!(u.prompt_total(), 5567);
+
+        let raw = serde_json::json!({"prompt_tokens":10,"completion_tokens":2,
+            "prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":99}});
+        let u = extract_common_usage(&raw, false).unwrap();
+        assert_eq!(
+            (u.platform_input, u.read_cache, u.write_cache),
+            (0, 4, 6),
+            "a write past the fresh remainder is capped, not added"
+        );
     }
 
     #[test]

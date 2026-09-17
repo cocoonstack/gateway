@@ -45,6 +45,14 @@ impl CommonUsage {
         }
     }
 
+    /// Cache writes inside an OpenAI-shaped `prompt_tokens` (GPT-6 prices them
+    /// above fresh input), carved out of the fresh count like cache reads.
+    pub fn with_cache_write(mut self, cache_write: i64) -> Self {
+        self.write_cache = cache_write.clamp(0, self.platform_input);
+        self.platform_input -= self.write_cache;
+        self
+    }
+
     /// Audio subsets of the input/completion counts, clamped to their parents.
     pub fn with_audio(mut self, audio_input: i64, audio_output: i64) -> Self {
         self.audio_input = audio_input.clamp(0, self.platform_input);

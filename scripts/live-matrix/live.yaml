@@ -45,6 +45,8 @@ models:
   - {name: text-embedding-3-small, provider: openai, protocol: embeddings, input_price_per_1k_micros: 20}
   - {name: gpt-5.4-mini, provider: openai, input_price_per_1k_micros: 250, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}
   - {name: gpt-4.1-nano, provider: openai, protocol: responses, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  # gpt-6 astra: automatic caching with priced writes, effort low..xhigh on chat, a price tier past 272k prompt tokens
+  - {name: gpt-6-astra, provider: openai, input_price_per_1k_micros: 10000, output_price_per_1k_micros: 50000, token_rate: {read_cache: 0.1, write_cache: 1.25}, long_context: {threshold_tokens: 272000, prompt_weight: 2.0, completion_weight: 1.5}}
   # codex cli speaks the native responses wire with encrypted reasoning; needs a reasoning model on that protocol
   - {name: gpt-5.4, provider: openai, protocol: responses, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 10000, token_rate: {read_cache: 0.1}}
   # gemini
@@ -72,6 +74,7 @@ models:
   - {name: BAAI/bge-reranker-v2-m3, provider: siliconflow, protocol: rerank, input_price_per_1k_micros: 10}
   # openrouter
   - {name: openai/gpt-oss-20b:free, provider: openrouter, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  - {name: openai/gpt-6-astra, provider: openrouter, input_price_per_1k_micros: 10000, output_price_per_1k_micros: 50000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
   # xai
   - {name: grok-4.3, provider: xai, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.16}}
   - {name: grok-4.6, provider: xai, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
@@ -121,6 +124,7 @@ models:
   - {name: "global.anthropic.claude-fable-5-1", provider: aws-jp, protocol: aws-anthropic, input_price_per_1k_micros: 10000, output_price_per_1k_micros: 50000, token_rate: {read_cache: 0.025, write_cache: 1.25}}
   - {name: "apac.amazon.nova-lite-v1:0", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 60, output_price_per_1k_micros: 240}
   - {name: "openai.gpt-oss-20b-1:0", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 70, output_price_per_1k_micros: 300}
+  - {name: "global.openai.gpt-6-astra", provider: aws-jp, protocol: aws-converse, input_price_per_1k_micros: 10000, output_price_per_1k_micros: 50000}
 
 accounts:
   - name: dashscope-native

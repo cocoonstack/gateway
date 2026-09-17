@@ -56,6 +56,7 @@ impl OpenAiEngine {
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let messages = Value::Array(self.wire_messages());
+        let (typed, raw) = (self.base.take_typed(), self.base.take_raw());
         let param = self.base.param()?;
         let protocol = param.protocol;
         let reasoning_model = is_openai_reasoning_model(&param.model_name);
@@ -68,7 +69,7 @@ impl OpenAiEngine {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
-        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
+        if let Some(gw_models::TypedParams::Chat(p)) = typed {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
                     if let Some(v) = $v {
@@ -115,8 +116,8 @@ impl OpenAiEngine {
                 }
             }
         }
-        let raw = self.base.take_raw();
         crate::base::merge_raw_extras_owned(&mut body, raw);
+        gw_protocol::reasoning::normalize_openai_body(&param.model_name, &mut body, "xhigh");
 
         Ok(UpstreamRequest {
             protocol,

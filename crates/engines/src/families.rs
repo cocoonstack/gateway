@@ -1266,7 +1266,9 @@ impl ResponsesEngine {
         if !self.base.request.preserve_responses_wire {
             self.cross_protocol_body(&mut body);
         }
-        body.insert("model".to_owned(), self.base.model_name()?.into());
+        let model = self.base.model_name()?;
+        gw_protocol::reasoning::normalize_openai_body(model, &mut body, "max");
+        body.insert("model".to_owned(), model.into());
         Ok(Value::Object(body))
     }
 
@@ -1599,7 +1601,10 @@ fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) 
         output,
         crate::engine::tok(&usage["input_tokens_details"]["cached_tokens"]),
         crate::engine::tok(&usage["output_tokens_details"]["reasoning_tokens"]),
-    );
+    )
+    .with_cache_write(crate::engine::tok(
+        &usage["input_tokens_details"]["cache_write_tokens"],
+    ));
     (input, output, Some(common))
 }
 
