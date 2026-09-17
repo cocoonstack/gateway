@@ -21,6 +21,7 @@ const SAMPLING_KNOBS: [&str; 4] = [
     "presence_penalty",
     "frequency_penalty",
 ];
+const REASONING_SAMPLING_KNOBS: [&str; 2] = ["temperature", "top_p"];
 
 /// How an Anthropic model generation takes a thinking request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +84,8 @@ fn openai_generation(model: &str) -> Option<(u32, u32)> {
     (major >= 5).then_some((major, minor))
 }
 
-/// Generations that take only their own sampling defaults: GPT-5.0, then 5.5
-/// onward. 5.1 through 5.4 honour the knobs, so the rule is a table, not a
-/// version cutoff.
-fn rejects_sampling(generation: (u32, u32)) -> bool {
+/// Generations that reject sampling knobs regardless of reasoning effort.
+fn always_rejects_sampling(generation: (u32, u32)) -> bool {
     generation.0 >= 6 || generation == (5, 0) || (generation.0 == 5 && generation.1 >= 5)
 }
 
@@ -97,8 +96,9 @@ fn rejects_sampling(generation: (u32, u32)) -> bool {
 pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) -> Cow<'a, str> {
     let generation = openai_generation(model);
     let always_reasons = model.contains("gpt-6");
-    let takes_minimal =
-        !always_reasons && generation == Some((5, 0)) && wire != EffortWire::Bedrock;
+    let takes_minimal = !always_reasons
+        && matches!(generation, None | Some((5, 0)))
+        && wire != EffortWire::Bedrock;
     let takes_none = !always_reasons && generation != Some((5, 0));
     match effort.as_ref() {
         "none" if !takes_none => {
@@ -136,16 +136,24 @@ pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: E
         body.get_mut("reasoning")
             .and_then(|reasoning| reasoning.get_mut("effort"))
     };
-    if let Some(slot) = slot
+    let effort = if let Some(slot) = slot
         && slot.is_string()
         && let Value::String(effort) = slot.take()
     {
         *slot = openai_effort(model, Cow::Owned(effort), wire).into();
-    }
-    if openai_generation(model).is_some_and(rejects_sampling) {
-        for knob in SAMPLING_KNOBS {
-            body.remove(knob);
+        slot.as_str()
+    } else {
+        None
+    };
+    let knobs: &[&str] = match openai_generation(model) {
+        Some(generation) if always_rejects_sampling(generation) => &SAMPLING_KNOBS,
+        Some((5, 1 | 2)) if effort.is_some_and(|effort| EFFORT_TIERS.contains(&effort)) => {
+            &REASONING_SAMPLING_KNOBS
         }
+        _ => &[],
+    };
+    for knob in knobs {
+        body.remove(*knob);
     }
 }
 
@@ -275,6 +283,7 @@ mod tests {
             ("gpt-6-astra", Chat, "none", "low"),
             ("gpt-6-astra", Responses, "max", "max"),
             ("openai/gpt-5.6-luna", Chat, "max", "max"),
+            ("openai/gpt-5.6-luna", Chat, "minimal", "minimal"),
             ("openai/gpt-6-astra", Chat, "none", "low"),
             ("us.openai.gpt-5.6-luna", Bedrock, "max", "max"),
             ("us.openai.gpt-5.6-luna", Bedrock, "none", "none"),
@@ -314,6 +323,23 @@ mod tests {
             normalize_openai_body(model, &mut b, EffortWire::Chat);
             assert_eq!(b.len(), 6, "{model} keeps the knobs it honours");
         }
+
+        for model in ["gpt-5.1", "gpt-5.2"] {
+            let mut b = body();
+            b.insert("reasoning_effort".into(), "high".into());
+            normalize_openai_body(model, &mut b, EffortWire::Chat);
+            for knob in REASONING_SAMPLING_KNOBS {
+                assert!(!b.contains_key(knob), "{model} keeps {knob}");
+            }
+            for knob in ["presence_penalty", "frequency_penalty", "logprobs", "stop"] {
+                assert!(b.contains_key(knob), "{model} drops {knob}");
+            }
+        }
+
+        let mut b = body();
+        b.insert("reasoning_effort".into(), "none".into());
+        normalize_openai_body("gpt-5.2", &mut b, EffortWire::Chat);
+        assert_eq!(b.len(), 7, "gpt-5.2 drops knobs at effort none");
     }
 
     #[test]
