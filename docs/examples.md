@@ -194,10 +194,50 @@ records xAI's `cost_in_usd_ticks` as the vendor cost) and its realtime voice
 socket (`protocol: realtime`, model `grok-voice-latest`, billed by the delivered
 output estimate since xAI reports no usage). `reasoning_effort` passes through
 verbatim — grok-4.6 takes `low`…`xhigh`, grok-4.3 also `none`, and a model
-answers 400 for a value it does not list — and the usage's `cached_tokens` /
-`reasoning_tokens` land in the ledger like any OpenAI-shaped vendor. Anthropic
-clients reach Grok through `/v1/messages` (the gateway converts; xAI's own
-Anthropic-compatible endpoint is deprecated).
+answers 400 for a value it does not list. Anthropic clients reach Grok through
+`/v1/messages` (the gateway converts; xAI's own Anthropic-compatible endpoint is
+deprecated).
+
+Price the chat models by their reasoning too: xAI's chat wire reports
+`reasoning_tokens` *outside* `completion_tokens` and adds them into
+`total_tokens`, and the gateway reads that arithmetic and bills them at the
+output rate. Every reply carries `usage.cost_in_usd_ticks`, so with list prices
+configured the ledger's `cost_micros` matches the vendor's own charge — the
+check `scripts/live-matrix/live_matrix.py --group xai` runs.
+
+The same models are served by Bedrock and OpenRouter, both of which normalize
+that usage shape to the OpenAI one:
+
+```yaml
+providers:
+  - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_API_KEY}
+accounts:
+  # Converse: reasoning is encrypted, no prompt caching, effort as `reasoning_config`
+  - {name: bedrock, provider: aws, endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
+     api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-converse"]}
+  # the same account's OpenAI-compatible endpoint: effort, implicit cache reads, no reasoning prose
+  - {name: bedrock-oai, provider: aws-oai, endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com/openai",
+     api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["openai-chat"]}
+models:
+  - {name: x-ai/grok-4.3, provider: openrouter,
+     input_price_per_1k_micros: 1250, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.16}}
+  - {name: "us.xai.grok-4.6", provider: aws, protocol: aws-converse,
+     input_price_per_1k_micros: 2200, output_price_per_1k_micros: 6600}
+  - {name: "global.xai.grok-4.6", provider: aws-oai, protocol: openai-chat,
+     input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
+```
+
+Bedrock serves `xai.grok-4.6` only through its `us.` and `global.` inference
+profiles. Converse returns the reasoning encrypted (a `redacted_thinking` block
+on `/v1/messages`, replayable in a tool loop), refuses `cachePoint`, and reports
+no cache reads — so leave `read_cache` off that model. The account's
+OpenAI-compatible endpoint is the fuller route: it takes `reasoning_effort`
+`none`…`max`, reports implicit cache reads as `cached_tokens`, and needs no
+preset — `kind: openai` plus the `/openai` base URL and the Bedrock API key.
+That caching is implicit and best-effort: an identical prefix repeated within
+seconds is read back on one run and missed on the next, so treat a cache hit as
+a discount that may not arrive, never as a planned price. OpenRouter reports
+`usage.cost`, so its rows carry a vendor cost as well.
 
 ## Coding agents
 

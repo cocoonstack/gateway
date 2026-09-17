@@ -223,7 +223,10 @@ Secrets never live in config files: `api_key_env` names an environment
 variable that is read per request. The optional `cost_*_price` fields record
 what the vendor charges, so the ledger carries `vendor_cost_micros` alongside
 the charged `cost_micros` and margin is queryable per tenant/model via
-`GET /admin/usage`.
+`GET /admin/usage`. A vendor that prices the call itself overrides those
+fields: OpenRouter's `usage.cost` in USD and xAI's `usage.cost_in_usd_ticks`
+(1e-10 USD a tick) are recorded as the exact vendor cost on every wire that
+carries them.
 
 ### `security`, `stability`, `products`
 

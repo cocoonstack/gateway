@@ -46,6 +46,7 @@ GROUPS = [
     "bedrock-jp",
     "agents",
     "xai",
+    "grok",
     "video",
     "search",
     "openai-aux",
@@ -292,6 +293,35 @@ def case_chat(
     check_ledger(gw, name, model, wire, False, before, note)
     if expect_reasoning:
         record(name + " [reasoning present]", bool(reasoning), f"reasoning_len={len(reasoning)}")
+
+
+def case_vendor_cost(gw: Gateway, model: str, **extra: Any) -> None:
+    """Ledger cost against the vendor's own reported charge — the one oracle a misread usage cannot satisfy,
+    since the wire the client sees and the ledger both come from that same reading. Needs list pricing."""
+    name = f"{model} vendor cost"
+    before, _ = gw.ledger()
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with exactly one word: hello"}],
+        **extra,
+    }
+    st, txt = gw.call("/v1/chat/completions", body)
+    if st != 200:
+        record(name, False, f"HTTP {st}: {txt[:300]}")
+        return
+    count, row = gw.ledger()
+    if count != before + 1:
+        record(name, False, f"ledger count {before}->{count} (expected +1)")
+        return
+    billed, vendor = row["cost_micros"], row["vendor_cost_micros"]
+    usage = json.dumps(json.loads(txt).get("usage"), separators=(",", ":"))
+    # the gateway rounds weighted token counts before pricing them, the vendor does not
+    slack = max(2, round(vendor * 0.01))
+    record(
+        name,
+        vendor > 0 and abs(billed - vendor) <= slack,
+        f"ledger cost={billed} vendor={vendor} slack={slack} usage={usage}",
+    )
 
 
 def case_messages(
@@ -1207,14 +1237,14 @@ def run_group(gw: Gateway, group: str) -> None:
     elif group == "openrouter":
         case_chat(
             gw,
-            "openai/gpt-oss-20b:free",
+            "openai/gpt-oss-20b",
             "reasoning_effort low",
             prompt=prime,
             expect_reasoning=True,
             reasoning_effort="low",
         )
         case_chat(
-            gw, "openai/gpt-oss-20b:free", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
+            gw, "openai/gpt-oss-20b", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
         )
         # the routed astra reports the same cache fields; the free tier caps max_tokens at what the balance affords
         case_chat(gw, "openai/gpt-6-astra", "effort xhigh", prompt=prime, reasoning_effort="xhigh", max_tokens=600)
@@ -1241,9 +1271,24 @@ def run_group(gw: Gateway, group: str) -> None:
             prompt=prime,
         )
         case_prompt_cache(gw, "grok-4.3", words=400)
+        case_vendor_cost(gw, "grok-4.3")
         case_responses_surfaces(gw, "grok-4.5")
         case_image(gw, "grok-imagine-image-2.0")
         case_video(gw, "grok-imagine-video-1.5")
+    elif group == "grok":
+        case_chat(gw, "x-ai/grok-4.3", "openrouter", expect_reasoning=True)
+        case_chat(gw, "x-ai/grok-4.3", "openrouter", stream=True, prompt=prime, expect_reasoning=True)
+        case_messages(gw, "x-ai/grok-4.3", "openrouter cross-protocol")
+        case_vendor_cost(gw, "x-ai/grok-4.3")
+        case_messages(
+            gw,
+            "us.xai.grok-4.6",
+            "converse thinking→effort",
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            prompt=prime,
+        )
+        case_chat(gw, "global.xai.grok-4.6", "bedrock openai-compat", reasoning_effort="low")
+        case_chat(gw, "global.xai.grok-4.6", "bedrock openai-compat", stream=True, reasoning_effort="low", prompt=prime)
     elif group == "video":
         case_video(gw, "sora-2", {"duration": 4, "resolution": "720x1280"}, done="completed", units=4, content=True)
         case_video(gw, "Wan-AI/Wan2.2-T2V-A14B", {"resolution": "1280x720"}, done="Succeed", units=1)

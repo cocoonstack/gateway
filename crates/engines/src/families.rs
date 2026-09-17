@@ -885,10 +885,7 @@ fn normalize_video_poll(dialect: VideoDialect, status: u16, body: Value) -> Vide
         VideoDialect::Generations => (
             body["status"] == "done",
             whole_seconds(&body["video"]["duration"]).unwrap_or(0),
-            // 1 tick = 1e-10 USD; micros are 1e-6
-            body["usage"]["cost_in_usd_ticks"]
-                .as_f64()
-                .map(|t| (t / 1e4).round() as i64),
+            crate::usage_extract::extract_vendor_cost_micros(&body["usage"]),
         ),
     };
     VideoPoll {

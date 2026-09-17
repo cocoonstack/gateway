@@ -10,8 +10,8 @@ use gw_protocol::object;
 use gw_protocol::reasoning::{EffortWire, budget_effort, openai_effort};
 use serde_json::{Map, Value, json};
 
-/// Marker of the Bedrock ids whose family takes `reasoning_config`.
-const OPENAI_PREFIX: &str = "openai.gpt-";
+/// Markers of the Bedrock ids whose family takes `reasoning_config`.
+const REASONING_CONFIG_MARKERS: [&str; 2] = ["openai.gpt-", "xai.grok-"];
 
 /// Converse stream events as the Anthropic sequence: implicit text/reasoning
 /// blocks get a synthesized `content_block_start`, the trailing `metadata`
@@ -138,7 +138,7 @@ impl Events {
 
 /// A Messages body as a Converse body; Claude-only knobs and passthrough extras
 /// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids,
-/// where an OpenAI id takes the effort as `reasoning_config` instead).
+/// where a reasoning-config family takes the effort as `reasoning_config` instead).
 pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let claude = model.contains("claude");
     let mut out = Map::with_capacity(6);
@@ -165,10 +165,10 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         ("top_p", "topP"),
         ("stop_sequences", "stopSequences"),
     ] {
-        // Bedrock rejects these sampling fields for OpenAI model ids
+        // Bedrock rejects these sampling fields for the reasoning families
         let sampling = matches!(to, "temperature" | "topP");
         match body.remove(from) {
-            Some(v) if !(sampling && openai_family(model)) => {
+            Some(v) if !(sampling && reasoning_family(model)) => {
                 inference.insert(to.into(), v);
             }
             _ => {}
@@ -200,7 +200,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
 
     if !claude {
         let (thinking, output_config) = (body.remove("thinking"), body.remove("output_config"));
-        if let Some(effort) = openai_reasoning_config(model, thinking, output_config) {
+        if let Some(effort) = reasoning_config(model, thinking, output_config) {
             body.insert("reasoning_config".to_owned(), effort);
         }
     }
@@ -213,14 +213,14 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     Value::Object(out)
 }
 
-/// The Anthropic-dialect thinking of a body as Bedrock's OpenAI `reasoning_config`
+/// The Anthropic-dialect thinking of a body as Bedrock's `reasoning_config`
 /// effort; `openai.gpt-oss-*` and every other family declare no such knob.
-fn openai_reasoning_config(
+fn reasoning_config(
     model: &str,
     thinking: Option<Value>,
     output_config: Option<Value>,
 ) -> Option<Value> {
-    if !openai_family(model) {
+    if !reasoning_family(model) {
         return None;
     }
     let effort = match output_config.map(|mut c| c["effort"].take()) {
@@ -230,13 +230,17 @@ fn openai_reasoning_config(
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
 }
 
-/// Whether a Bedrock id names an OpenAI reasoning family; `openai.gpt-oss-*`
-/// takes the sampling knobs and declares no reasoning enum.
-fn openai_family(model: &str) -> bool {
-    model
-        .find(OPENAI_PREFIX)
-        .and_then(|i| model.as_bytes().get(i + OPENAI_PREFIX.len()))
-        .is_some_and(u8::is_ascii_digit)
+/// Whether a Bedrock id names a reasoning family: one that rejects the sampling
+/// knobs and takes a `reasoning_config` enum. The marker is followed by the
+/// version digit, so `openai.gpt-oss-*` — which takes the knobs and declares no
+/// enum — stays out.
+fn reasoning_family(model: &str) -> bool {
+    REASONING_CONFIG_MARKERS.iter().any(|marker| {
+        model
+            .find(marker)
+            .and_then(|i| model.as_bytes().get(i + marker.len()))
+            .is_some_and(u8::is_ascii_digit)
+    })
 }
 
 /// A buffered Converse reply as a Messages reply.
@@ -617,6 +621,32 @@ mod tests {
         );
         let out = request(body(), "us.amazon.nova-lite-v1:0");
         assert_eq!(out["inferenceConfig"]["topP"], 0.5);
+    }
+
+    #[test]
+    fn grok_ids_take_the_effort_as_reasoning_config() {
+        let body = |thinking: Value| -> Map<String, Value> {
+            serde_json::from_value(json!({"messages": [], "thinking": thinking})).unwrap()
+        };
+        for model in ["xai.grok-4.6", "us.xai.grok-4.6", "global.xai.grok-4.6"] {
+            let out = request(
+                body(json!({"type": "enabled", "budget_tokens": 16384})),
+                model,
+            );
+            assert_eq!(
+                out["additionalModelRequestFields"],
+                json!({"reasoning_config": "high"}),
+                "{model}"
+            );
+        }
+
+        let mut with_effort = body(json!({"type": "adaptive"}));
+        with_effort.insert("output_config".to_owned(), json!({"effort": "none"}));
+        let out = request(with_effort, "us.xai.grok-4.6");
+        assert_eq!(
+            out["additionalModelRequestFields"]["reasoning_config"], "none",
+            "Grok lists none, so it is not clamped away"
+        );
     }
 
     #[test]
