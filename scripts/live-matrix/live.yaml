@@ -76,7 +76,7 @@ models:
   - {name: BAAI/bge-m3, provider: siliconflow, protocol: embeddings, input_price_per_1k_micros: 10}
   - {name: BAAI/bge-reranker-v2-m3, provider: siliconflow, protocol: rerank, input_price_per_1k_micros: 10}
   # openrouter
-  - {name: openai/gpt-oss-20b:free, provider: openrouter, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
+  - {name: openai/gpt-oss-20b, provider: openrouter, input_price_per_1k_micros: 30, output_price_per_1k_micros: 130}
   - {name: openai/gpt-6-astra, provider: openrouter, input_price_per_1k_micros: 10000, output_price_per_1k_micros: 50000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
   # OpenRouter normalizes the tiers and knobs itself, so the gateway leaves its ids alone
   - {name: openai/gpt-5.6-luna, provider: openrouter, input_price_per_1k_micros: 200, output_price_per_1k_micros: 1200, token_rate: {read_cache: 0.1, write_cache: 1.25}}
@@ -87,6 +87,11 @@ models:
   - {name: grok-4.5, provider: xai, protocol: responses, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.15}}
   - {name: grok-imagine-image-2.0, provider: xai, protocol: image, unit_price_micros: 70000}
   - {name: grok-imagine-video-1.5, provider: xai, protocol: video, unit_price_micros: 100000}
+  # grok on the other backends, at each one's list price (openrouter and the bedrock
+  # openai-compatible endpoint both normalize xAI's usage shape; converse does not)
+  - {name: x-ai/grok-4.3, provider: openrouter, input_price_per_1k_micros: 1250, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.16}}
+  - {name: "us.xai.grok-4.6", provider: aws, protocol: aws-converse, input_price_per_1k_micros: 2200, output_price_per_1k_micros: 6600, token_rate: {read_cache: 0.25}}
+  - {name: "global.xai.grok-4.6", provider: aws-oai, protocol: openai-chat, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
   # async video dialects: sora bills per second, wan/hailuo per delivered video, dashscope per reported second
   - {name: sora-2, provider: openai, protocol: video, unit_price_micros: 100000}
   - {name: Wan-AI/Wan2.2-T2V-A14B, provider: siliconflow, protocol: video, unit_price_micros: 500000}
@@ -152,6 +157,7 @@ accounts:
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}
   - {name: bedrock, provider: aws, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["aws-anthropic", "aws-converse", "aws-llama", "aws-embed"], timeout_seconds: 120}
   - {name: bedrock-jp, provider: aws-jp, endpoint: https://bedrock-runtime.ap-northeast-1.amazonaws.com, api_key_env: AWS_BEARER_TOKEN_BEDROCK_JP, protocols: ["aws-anthropic", "aws-converse"], timeout_seconds: 180}
+  - {name: bedrock-oai, provider: aws-oai, endpoint: https://bedrock-runtime.us-east-1.amazonaws.com/openai, api_key_env: AWS_BEARER_TOKEN_BEDROCK, protocols: ["openai-chat"], timeout_seconds: 300}
 
 security:
   dlp_redact: false
