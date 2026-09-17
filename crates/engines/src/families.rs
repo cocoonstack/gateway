@@ -406,10 +406,12 @@ impl ModelEngine for ImageEngine {
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
         );
+        let raw_usage = (!v["usage"].is_null()).then(|| v["usage"].clone());
         let mut outcome = family_outcome(format!("{count} image(s) {verb}"), model, v, status);
         outcome.response.prompt_tokens = input;
         outcome.response.completion_tokens = output;
         outcome.response.billed_units = count as i64;
+        outcome.response.raw_usage = raw_usage;
         crate::engine::fill_total_if_zero(&mut outcome.response);
         Ok(outcome)
     }
@@ -1423,6 +1425,7 @@ impl ResponsesEngine {
                 .collect();
         }
         let (input, output, common_usage) = responses_usage(&v["usage"]);
+        let raw_usage = (!v["usage"].is_null()).then(|| v["usage"].clone());
         let resp = GatewayResponse {
             message: text,
             tool_calls: if tool_calls.is_empty() {
@@ -1439,6 +1442,7 @@ impl ResponsesEngine {
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
             common_usage,
+            raw_usage,
             response_v2: Some(v),
             ..Default::default()
         };
@@ -1669,6 +1673,7 @@ fn responses_apply_frame(
             resp.completion_tokens = output;
             crate::engine::fill_total_if_zero(resp);
             resp.common_usage = common;
+            resp.raw_usage = (!r["usage"].is_null()).then(|| r["usage"].clone());
             chunk.finish_reason = Some(resp.finish_reason.clone());
         }
         _ => {}
@@ -2120,6 +2125,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_vendor_reported_cost_survives_the_image_and_responses_paths() {
+        let mut r = req(Protocol::Image, "grok-imagine-image-2.0", None);
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Image(ImageParams {
+            prompt: "a cube".into(),
+            n: 1,
+            size: None,
+            image: None,
+            mask: None,
+        }));
+        let out = ImageEngine::new(
+            r,
+            Arc::new(BytesReply(
+                br#"{"data":[{"b64_json":"AA=="}],"usage":{"cost_in_usd_ticks":400000000}}"#,
+            )),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            out.response
+                .raw_usage
+                .as_ref()
+                .and_then(crate::extract_vendor_cost_micros),
+            Some(40_000)
+        );
+
+        let mut r = req(Protocol::Responses, "grok-4.5", None);
+        r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"input": "hi"});
+        let out = ResponsesEngine::new(
+            r,
+            Arc::new(BytesReply(
+                br#"{"id":"resp_1","model":"grok-4.5","status":"completed","output":[],
+                     "usage":{"input_tokens":508,"output_tokens":170,"cost_in_usd_ticks":20360000}}"#,
+            )),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            out.response
+                .raw_usage
+                .as_ref()
+                .and_then(crate::extract_vendor_cost_micros),
+            Some(2036)
+        );
+    }
+
+    #[tokio::test]
     async fn responses_api_streaming() {
         let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.stream = true;
@@ -2282,6 +2335,7 @@ mod tests {
             ),
             (15, 1056, 1071)
         );
+        assert!(out.response.raw_usage.is_some());
 
         let mut r = req(Protocol::Stt, "gpt-4o-mini-transcribe", None);
         r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::AudioStt(SttParams {
