@@ -1118,6 +1118,14 @@ def run_group(gw: Gateway, group: str) -> None:
         case_prompt_cache(gw, astra, words=400, expect_write=True)
         case_messages(gw, astra, "cross-protocol thinking budget 32768", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
         case_thinking_tiers(gw, astra, native=True, tiers=[1024, 4096, 16384, 24576, 32768], expect_reasoning=False)
+        # 5.6 takes none but no generation takes max on chat, and both refuse the sampling knobs
+        for model in ("gpt-5.6-luna", "gpt-5.6-terra"):
+            case_chat(gw, model, "effort none", prompt=prime, reasoning_effort="none", max_tokens=4000)
+            case_chat(gw, model, "effort xhigh + knobs", stream=True, prompt=arith, reasoning_effort="xhigh", max_tokens=4000, temperature=0.4, top_p=0.9)
+            case_messages(gw, model, "cross-protocol budget 32768", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
+        case_chat(gw, astra, "knobs", prompt=prime, max_tokens=4000, temperature=0.4, top_p=0.9, presence_penalty=0.3)
+        case_prompt_cache(gw, "gpt-5.6-luna", words=400, expect_write=True)
+        case_chat(gw, "gpt-5-mini", "effort none on the 5.0 floor", prompt=prime, reasoning_effort="none", max_tokens=4000)
     elif group == "gemini":
         # free tier: 5 RPM per model, so pace the calls
         for model in ("gemini-3.6-flash",):
@@ -1210,6 +1218,8 @@ def run_group(gw: Gateway, group: str) -> None:
         )
         # the routed astra reports the same cache fields; the free tier caps max_tokens at what the balance affords
         case_chat(gw, "openai/gpt-6-astra", "effort xhigh", prompt=prime, reasoning_effort="xhigh", max_tokens=600)
+        case_chat(gw, "openai/gpt-6-astra", "effort none clamps, the route refuses it", prompt=prime, reasoning_effort="none", max_tokens=600)
+        case_chat(gw, "openai/gpt-5.6-luna", "max and knobs ride through", prompt=prime, reasoning_effort="max", max_tokens=600, temperature=0.4, top_p=0.9)
     elif group == "rerank":
         case_rerank(gw, "rerank-v3.5", unit_priced=True)
         case_rerank(gw, "jina-reranker-v3")
@@ -1355,6 +1365,9 @@ def run_group(gw: Gateway, group: str) -> None:
         astra = "global.openai.gpt-6-astra"
         case_chat(gw, astra, "converse effort xhigh", prompt=arith, reasoning_effort="xhigh", max_tokens=4000)
         case_messages(gw, astra, "converse thinking budget 32768", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
+        luna = "global.openai.gpt-5.6-luna"
+        case_chat(gw, luna, "converse effort none + knobs", prompt=prime, reasoning_effort="none", max_tokens=4000, temperature=0.4, top_p=0.9)
+        case_messages(gw, luna, "converse budget 32768 keeps max", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
         case_chat(gw, astra, "converse stream", stream=True, prompt=prime, max_tokens=4000)
     elif group == "agents":
         case_claude_code(gw, "claude-haiku-4-5-20251001")

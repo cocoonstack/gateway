@@ -1458,7 +1458,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     let t = RecordingTransport::new(OPENAI_OK);
     let mut req = reasoning_req(
         Protocol::OpenaiChat,
-        "gpt-5",
+        "gpt-5.4",
         gw_models::ReasoningParam {
             effort: Some("high".into()),
             ..Default::default()
@@ -1499,7 +1499,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         ),
     ] {
         let t = RecordingTransport::new(OPENAI_OK);
-        let req = reasoning_req(Protocol::OpenaiChat, "gpt-5", reasoning);
+        let req = reasoning_req(Protocol::OpenaiChat, "gpt-5.4", reasoning);
         let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
         assert_eq!(b["reasoning_effort"], want);
@@ -1510,12 +1510,12 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         (4096, "medium"),
         (16384, "high"),
         (24576, "xhigh"),
-        (32768, "max"),
+        (32768, "xhigh"),
     ] {
         let t = RecordingTransport::new(OPENAI_OK);
         let req = reasoning_req(
             Protocol::OpenaiChat,
-            "gpt-5",
+            "gpt-5.4",
             gw_models::ReasoningParam {
                 thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":budget})),
                 ..Default::default()

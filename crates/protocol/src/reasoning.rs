@@ -14,7 +14,7 @@ pub const FORMAT_ANTHROPIC: &str = "anthropic-claude-v1";
 /// Effort tiers, weakest first.
 const EFFORT_TIERS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// Sampling knobs GPT-6 answers 400 for; it takes only its own defaults.
+/// Sampling knobs a reasoning-first generation answers 400 for.
 const SAMPLING_KNOBS: [&str; 4] = [
     "temperature",
     "top_p",
@@ -61,18 +61,62 @@ pub fn budget_effort(budget: i64) -> &'static str {
     }
 }
 
-/// An effort GPT-6 accepts: the generation always reasons, so `none` and
-/// `minimal` are vendor 400s there and clamp to the floor, and a tier above
-/// `top` — the surface's own ceiling, `xhigh` on chat completions and `max` on
-/// Responses and Bedrock — clamps down to it. Other families pass through: a
-/// vendor 400 on a tier it never listed stays the contract.
-pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, top: &'static str) -> Cow<'a, str> {
-    if !model.contains("gpt-6") {
-        return effort;
+/// The upstream a reasoning body is built for. The same model takes different
+/// tiers on each: no OpenAI generation takes `max` on chat completions, GPT-5.6
+/// is the first to take it on Responses, and Bedrock takes it from every
+/// generation while taking `minimal` from none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortWire {
+    Chat,
+    Responses,
+    Bedrock,
+}
+
+/// The GPT generation of an id OpenAI serves itself (`gpt-5.6-luna` → `(5, 6)`).
+/// A vendor-prefixed id — OpenRouter `openai/gpt-…`, Bedrock `openai.gpt-…` —
+/// is not that wire and yields `None`: those two normalize the request
+/// themselves, and clamping for them would take away tiers they do serve.
+fn openai_generation(model: &str) -> Option<(u32, u32)> {
+    let version = model.strip_prefix("gpt-")?.split('-').next()?;
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    let (major, minor) = (major.parse().ok()?, minor.parse().ok()?);
+    (major >= 5).then_some((major, minor))
+}
+
+/// Generations that take only their own sampling defaults: GPT-5.0, then 5.5
+/// onward. 5.1 through 5.4 honour the knobs, so the rule is a table, not a
+/// version cutoff.
+fn rejects_sampling(generation: (u32, u32)) -> bool {
+    generation.0 >= 6 || generation == (5, 0) || (generation.0 == 5 && generation.1 >= 5)
+}
+
+/// An effort the model takes on this wire. Efforts past its ceiling clamp down
+/// and efforts below its floor clamp up, because either is a vendor 400: a
+/// budget of 32768 maps to `max`, which no OpenAI model takes on chat
+/// completions, and GPT-6 always reasons, so `none` never reaches it.
+pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) -> Cow<'a, str> {
+    let generation = openai_generation(model);
+    let always_reasons = model.contains("gpt-6");
+    let takes_minimal =
+        !always_reasons && generation == Some((5, 0)) && wire != EffortWire::Bedrock;
+    let takes_none = !always_reasons && generation != Some((5, 0));
+    match effort.as_ref() {
+        "none" if !takes_none => {
+            return Cow::Borrowed(if takes_minimal {
+                "minimal"
+            } else {
+                EFFORT_TIERS[0]
+            });
+        }
+        "minimal" if !takes_minimal => return Cow::Borrowed(EFFORT_TIERS[0]),
+        _ => {}
     }
-    if matches!(effort.as_ref(), "none" | "minimal") {
-        return Cow::Borrowed(EFFORT_TIERS[0]);
-    }
+    let top = match (wire, generation) {
+        (EffortWire::Chat, Some(generation)) if generation <= (5, 1) => "high",
+        (EffortWire::Chat, Some(_)) => "xhigh",
+        (EffortWire::Responses, Some(generation)) if generation < (5, 6) => "xhigh",
+        _ => "max",
+    };
     let tier = |name: &str| EFFORT_TIERS.iter().position(|t| *t == name);
     match (tier(&effort), tier(top)) {
         (Some(want), Some(ceiling)) if want > ceiling => Cow::Borrowed(top),
@@ -82,10 +126,10 @@ pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, top: &'static str) -
 
 /// Bring an assembled upstream body to what the model takes: the effort — flat
 /// `reasoning_effort` on chat completions, `reasoning.effort` on Responses —
-/// clamps to a tier it accepts, and the sampling knobs GPT-6 rejects outright
-/// go. `logprobs`, `top_logprobs` and `stop` stay, so the vendor's own 400
-/// tells the client it cannot have the data or the stop point it asked for.
-pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, top: &'static str) {
+/// clamps to a tier it accepts, and the sampling knobs its generation rejects
+/// outright go. `logprobs`, `top_logprobs` and `stop` stay, so the vendor's own
+/// 400 tells the client it cannot have the data or the stop point it asked for.
+pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: EffortWire) {
     let slot = if body.contains_key("reasoning_effort") {
         body.get_mut("reasoning_effort")
     } else {
@@ -96,9 +140,9 @@ pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, top: &'
         && slot.is_string()
         && let Value::String(effort) = slot.take()
     {
-        *slot = openai_effort(model, Cow::Owned(effort), top).into();
+        *slot = openai_effort(model, Cow::Owned(effort), wire).into();
     }
-    if model.contains("gpt-6") {
+    if openai_generation(model).is_some_and(rejects_sampling) {
         for knob in SAMPLING_KNOBS {
             body.remove(knob);
         }
@@ -209,6 +253,67 @@ mod tests {
         }
         assert_eq!(budget_effort(8192), "medium");
         assert_eq!(budget_effort(65536), "max");
+    }
+
+    #[test]
+    fn openai_generations_take_their_own_tiers_per_wire() {
+        use EffortWire::*;
+        for (model, wire, effort, want) in [
+            ("gpt-5", Chat, "max", "high"),
+            ("gpt-5-mini", Chat, "xhigh", "high"),
+            ("gpt-5", Chat, "none", "minimal"),
+            ("gpt-5.1", Chat, "max", "high"),
+            ("gpt-5.1", Chat, "none", "none"),
+            ("gpt-5.4", Chat, "max", "xhigh"),
+            ("gpt-5.4", Chat, "minimal", "low"),
+            ("gpt-5.4", Responses, "max", "xhigh"),
+            ("gpt-5.5", Responses, "max", "xhigh"),
+            ("gpt-5.6-luna", Chat, "max", "xhigh"),
+            ("gpt-5.6-luna", Chat, "none", "none"),
+            ("gpt-5.6-luna", Responses, "max", "max"),
+            ("gpt-6-astra", Chat, "max", "xhigh"),
+            ("gpt-6-astra", Chat, "none", "low"),
+            ("gpt-6-astra", Responses, "max", "max"),
+            ("openai/gpt-5.6-luna", Chat, "max", "max"),
+            ("openai/gpt-6-astra", Chat, "none", "low"),
+            ("us.openai.gpt-5.6-luna", Bedrock, "max", "max"),
+            ("us.openai.gpt-5.6-luna", Bedrock, "none", "none"),
+            ("us.openai.gpt-5.6-luna", Bedrock, "minimal", "low"),
+            ("us.openai.gpt-6-astra", Bedrock, "none", "low"),
+            ("deepseek-v4", Chat, "max", "max"),
+            ("claude-sonnet-5", Chat, "max", "max"),
+        ] {
+            assert_eq!(
+                openai_effort(model, Cow::Borrowed(effort), wire),
+                want,
+                "{model} on {wire:?} asked {effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_generations_that_refuse_them_lose_the_sampling_knobs() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({
+                "temperature": 0.5, "top_p": 0.9, "presence_penalty": 0.5,
+                "frequency_penalty": 0.5, "logprobs": true, "stop": ["END"]
+            }))
+            .unwrap()
+        };
+        for model in ["gpt-5", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra"] {
+            let mut b = body();
+            normalize_openai_body(model, &mut b, EffortWire::Chat);
+            assert_eq!(
+                b.keys().collect::<Vec<_>>(),
+                ["logprobs", "stop"],
+                "{model} keeps only what the vendor must refuse itself"
+            );
+        }
+        for model in ["gpt-5.1", "gpt-5.4", "openai/gpt-6-astra", "deepseek-v4"] {
+            let mut b = body();
+            normalize_openai_body(model, &mut b, EffortWire::Chat);
+            assert_eq!(b.len(), 6, "{model} keeps the knobs it honours");
+        }
     }
 
     #[test]

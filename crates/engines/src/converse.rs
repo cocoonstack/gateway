@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 
 use gw_protocol::object;
-use gw_protocol::reasoning::{budget_effort, openai_effort};
+use gw_protocol::reasoning::{EffortWire, budget_effort, openai_effort};
 use serde_json::{Map, Value, json};
 
 /// Marker of the Bedrock ids whose family takes `reasoning_config`.
@@ -165,8 +165,13 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         ("top_p", "topP"),
         ("stop_sequences", "stopSequences"),
     ] {
-        if let Some(v) = body.remove(from) {
-            inference.insert(to.into(), v);
+        // the OpenAI families take only their own sampling defaults, here too
+        let sampling = matches!(to, "temperature" | "topP");
+        match body.remove(from) {
+            Some(v) if !(sampling && openai_family(model)) => {
+                inference.insert(to.into(), v);
+            }
+            _ => {}
         }
     }
     if !inference.is_empty() {
@@ -215,15 +220,23 @@ fn openai_reasoning_config(
     thinking: Option<Value>,
     output_config: Option<Value>,
 ) -> Option<Value> {
-    let after = model.find(OPENAI_PREFIX)? + OPENAI_PREFIX.len();
-    if !model.as_bytes().get(after).is_some_and(u8::is_ascii_digit) {
+    if !openai_family(model) {
         return None;
     }
     let effort = match output_config.map(|mut c| c["effort"].take()) {
         Some(Value::String(effort)) => Cow::Owned(effort),
         _ => Cow::Borrowed(budget_effort(thinking?["budget_tokens"].as_i64()?)),
     };
-    Some(openai_effort(model, effort, "max").into())
+    Some(openai_effort(model, effort, EffortWire::Bedrock).into())
+}
+
+/// Whether a Bedrock id names an OpenAI reasoning family; `openai.gpt-oss-*`
+/// takes the sampling knobs and declares no reasoning enum.
+fn openai_family(model: &str) -> bool {
+    model
+        .find(OPENAI_PREFIX)
+        .and_then(|i| model.as_bytes().get(i + OPENAI_PREFIX.len()))
+        .is_some_and(u8::is_ascii_digit)
 }
 
 /// A buffered Converse reply as a Messages reply.
@@ -583,6 +596,27 @@ mod tests {
             out.get("additionalModelRequestFields").is_none(),
             "gpt-oss declares no reasoning knob"
         );
+    }
+
+    #[test]
+    fn openai_ids_lose_the_sampling_knobs_bedrock_refuses_for_them() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({"messages": [], "max_tokens": 64, "temperature": 0.2,
+                "top_p": 0.5, "stop_sequences": ["END"]}))
+            .unwrap()
+        };
+        let out = request(body(), "us.openai.gpt-6-astra");
+        assert_eq!(
+            out["inferenceConfig"],
+            json!({"maxTokens": 64, "stopSequences": ["END"]})
+        );
+        let out = request(body(), "openai.gpt-oss-20b-1:0");
+        assert_eq!(
+            out["inferenceConfig"]["temperature"], 0.2,
+            "gpt-oss takes them"
+        );
+        let out = request(body(), "us.amazon.nova-lite-v1:0");
+        assert_eq!(out["inferenceConfig"]["topP"], 0.5);
     }
 
     #[test]
