@@ -7,15 +7,19 @@
 use gw_models::CommonUsage;
 use serde_json::Value;
 
-/// A normalized usage view of the vendor's usage subtree (Anthropic or OpenAI
-/// field map); `None` for a total-only vendor, callers keep the top-level counts.
 /// The vendor's own charge for the call in micro-dollars, when the usage subtree
-/// carries one; OpenRouter reports `cost` in USD on both wires, buffered and streamed.
+/// carries one: OpenRouter's `cost` in USD on both wires, buffered and streamed,
+/// or xAI's `cost_in_usd_ticks` at 1e-10 USD a tick.
 pub fn extract_vendor_cost_micros(v: &Value) -> Option<i64> {
-    let usd = v.get("cost")?.as_f64()?;
-    (usd.is_finite() && usd >= 0.0).then_some((usd * 1_000_000.0).round() as i64)
+    let micros = match v.get("cost").and_then(Value::as_f64) {
+        Some(usd) => usd * 1_000_000.0,
+        None => v.get("cost_in_usd_ticks")?.as_f64()? / 1e4,
+    };
+    (micros.is_finite() && micros >= 0.0).then_some(micros.round() as i64)
 }
 
+/// A normalized usage view of the vendor's usage subtree (Anthropic or OpenAI
+/// field map); `None` for a total-only vendor, callers keep the top-level counts.
 pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<CommonUsage> {
     fn get(v: &Value, path: &[&str]) -> i64 {
         let mut cur = v;
@@ -56,11 +60,19 @@ pub fn extract_common_usage(v: &Value, messages_protocol: bool) -> Option<Common
                 .clamp(0, write_cache),
         }
     } else {
+        let prompt = get(v, &["prompt_tokens"]).max(0);
+        let completion = get(v, &["completion_tokens"]).max(0);
+        let reason = get(v, &["completion_tokens_details", "reasoning_tokens"]).max(0);
+        // xAI's chat wire adds reasoning into total_tokens instead of completion_tokens
+        let outside = get(v, &["total_tokens"])
+            .saturating_sub(prompt)
+            .saturating_sub(completion)
+            .clamp(0, reason);
         CommonUsage::from_openai_parts(
-            get(v, &["prompt_tokens"]),
-            get(v, &["completion_tokens"]),
+            prompt,
+            completion.saturating_add(outside),
             get(v, &["prompt_tokens_details", "cached_tokens"]),
-            get(v, &["completion_tokens_details", "reasoning_tokens"]),
+            reason,
         )
         .with_cache_write(get(v, &["prompt_tokens_details", "cache_write_tokens"]))
         .with_audio(
@@ -82,6 +94,10 @@ mod tests {
         assert_eq!(extract_vendor_cost_micros(&messages), Some(84));
         let big = serde_json::json!({"cost":1.5});
         assert_eq!(extract_vendor_cost_micros(&big), Some(1_500_000));
+        let xai = serde_json::json!({"prompt_tokens":650,"cost_in_usd_ticks":26_860_000i64});
+        assert_eq!(extract_vendor_cost_micros(&xai), Some(2686));
+        let image = serde_json::json!({"cost_in_usd_ticks":400_000_000i64});
+        assert_eq!(extract_vendor_cost_micros(&image), Some(40_000));
     }
 
     #[test]
@@ -93,9 +109,48 @@ mod tests {
             serde_json::json!({"cost":-1.0}),
             serde_json::json!({"cost":f64::NAN}),
             serde_json::json!({"cost":f64::INFINITY}),
+            serde_json::json!({"cost_in_usd_ticks":null}),
+            serde_json::json!({"cost_in_usd_ticks":-1.0}),
         ] {
             assert_eq!(extract_vendor_cost_micros(&raw), None, "{raw}");
         }
+    }
+
+    #[test]
+    fn xai_chat_reasoning_outside_completion_still_bills_as_output() {
+        let raw = serde_json::json!({"prompt_tokens":650,"completion_tokens":3,"total_tokens":1041,
+            "prompt_tokens_details":{"cached_tokens":640},
+            "completion_tokens_details":{"reasoning_tokens":388}});
+        let u = extract_common_usage(&raw, false).unwrap();
+        assert_eq!((u.platform_input, u.read_cache), (10, 640));
+        assert_eq!((u.completion, u.reason), (3, 388));
+        assert_eq!(
+            u.completion_total(),
+            391,
+            "reasoning bills at the output rate"
+        );
+
+        let normalized = serde_json::json!({"prompt_tokens":220,"completion_tokens":302,"total_tokens":522,
+            "completion_tokens_details":{"reasoning_tokens":299}});
+        let u = extract_common_usage(&normalized, false).unwrap();
+        assert_eq!(
+            (u.completion, u.reason, u.completion_total()),
+            (3, 299, 302),
+            "a vendor counting reasoning inside completion is untouched"
+        );
+    }
+
+    #[test]
+    fn an_inflated_total_cannot_bill_past_the_reasoning_count() {
+        let raw = serde_json::json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":9_000,
+            "completion_tokens_details":{"reasoning_tokens":2}});
+        let u = extract_common_usage(&raw, false).unwrap();
+        assert_eq!((u.completion, u.reason, u.completion_total()), (5, 2, 7));
+
+        let negative = serde_json::json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":9_000,
+            "completion_tokens_details":{"reasoning_tokens":-3}});
+        let u = extract_common_usage(&negative, false).unwrap();
+        assert_eq!((u.completion, u.reason), (5, 0));
     }
 
     #[test]
