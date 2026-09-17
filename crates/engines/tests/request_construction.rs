@@ -1458,7 +1458,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     let t = RecordingTransport::new(OPENAI_OK);
     let mut req = reasoning_req(
         Protocol::OpenaiChat,
-        "gpt-5",
+        "gpt-5.4",
         gw_models::ReasoningParam {
             effort: Some("high".into()),
             ..Default::default()
@@ -1472,7 +1472,27 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     assert_eq!(b["reasoning_effort"], "high");
     assert_eq!(b["max_completion_tokens"], 700);
     assert!(b.get("max_tokens").is_none());
-    assert_eq!(b["temperature"], 0.2, "the OpenAI wire keeps its own knobs");
+    assert!(
+        b.get("temperature").is_none() && b.get("top_p").is_none(),
+        "OpenAI refuses the sampling knobs while a request reasons: {b}"
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let req = reasoning_req(
+        Protocol::OpenaiChat,
+        "gpt-5.4",
+        gw_models::ReasoningParam {
+            effort: Some("none".into()),
+            ..Default::default()
+        },
+    );
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        (&b["reasoning_effort"], &b["temperature"]),
+        (&serde_json::json!("none"), &serde_json::json!(0.2)),
+        "a request that does not reason keeps them"
+    );
 
     for (reasoning, want) in [
         (
@@ -1499,7 +1519,7 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         ),
     ] {
         let t = RecordingTransport::new(OPENAI_OK);
-        let req = reasoning_req(Protocol::OpenaiChat, "gpt-5", reasoning);
+        let req = reasoning_req(Protocol::OpenaiChat, "gpt-5.4", reasoning);
         let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
         assert_eq!(b["reasoning_effort"], want);
@@ -1510,12 +1530,12 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
         (4096, "medium"),
         (16384, "high"),
         (24576, "xhigh"),
-        (32768, "max"),
+        (32768, "xhigh"),
     ] {
         let t = RecordingTransport::new(OPENAI_OK);
         let req = reasoning_req(
             Protocol::OpenaiChat,
-            "gpt-5",
+            "gpt-5.4",
             gw_models::ReasoningParam {
                 thinking: Some(serde_json::json!({"type":"enabled","budget_tokens":budget})),
                 ..Default::default()

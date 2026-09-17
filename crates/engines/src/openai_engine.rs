@@ -117,7 +117,11 @@ impl OpenAiEngine {
             }
         }
         crate::base::merge_raw_extras_owned(&mut body, raw);
-        gw_protocol::reasoning::normalize_openai_body(&param.model_name, &mut body, "xhigh");
+        gw_protocol::reasoning::normalize_openai_body(
+            &param.model_name,
+            &mut body,
+            gw_protocol::reasoning::EffortWire::Chat,
+        );
 
         Ok(UpstreamRequest {
             protocol,

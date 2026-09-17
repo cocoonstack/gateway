@@ -94,18 +94,24 @@ mapping per model family:
 
 | Family | Request | Response |
 |--------|---------|----------|
-| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400). GPT-6 always reasons, so `none` and `minimal` clamp to `low` there, and a tier past the surface's ceiling clamps to it — `xhigh` on chat completions, `max` on Responses and Bedrock `reasoning_config`; the clamp is applied to the assembled body, so a native `/v1/responses` passthrough gets it too | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
+| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400). An OpenAI id OpenAI serves itself is clamped to the tiers its generation takes on that wire, since either end is a 400: no generation takes `max` on chat completions (5.0/5.1 stop at `high`, 5.2 on at `xhigh`), Responses takes it from 5.6 on, GPT-6 always reasons so `none`/`minimal` become `low`, and 5.0 knows `minimal` but not `none`. The clamp runs on the assembled body, so a native `/v1/responses` passthrough gets it too. A vendor-prefixed id is left alone — OpenRouter (`openai/gpt-…`) normalizes tiers itself, and Bedrock (`openai.gpt-…`) takes `max` from every generation through `reasoning_config`, but never `minimal` | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
 | Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024, `medium` 4096, `high` 16384, `xhigh` 24576, `max` 32768), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
 | Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on; `xhigh` clamps to `high` on 4.6, which predates it); `temperature` / `top_p` / `top_k` are dropped for 4.7+, which rejects them | same |
 
 Sampling knobs the client sent along a gateway-mapped effort (`temperature`,
 `top_p`, `top_k`) are dropped for Anthropic, which rejects them with thinking on.
-GPT-6 rejects `temperature` other than its default, `top_p` and both penalties
-outright, so those four are dropped on every GPT-6 request — chat, Responses,
-and a native Responses body forwarded as the client wrote it. `logprobs`,
-`top_logprobs` and `stop`, which the model also refuses, are left in: dropping
-them would silently withhold data the client asked for or move where generation
-stops, so the vendor's own 400 says so instead.
+OpenAI refuses `temperature` other than its default, `top_p` and both penalties
+for exactly as long as a request reasons — every generation from 5.1 on takes
+them at effort `none` or with no effort at all, while 5.0 and 6 take them never,
+since neither can turn reasoning off — so the gateway drops those four once the
+request reasons, on chat, Responses and a native Responses body alike. Bedrock
+refuses `temperature`/`topP` for an `openai.gpt-<n>` id whatever the effort, its
+own validation rather than the model's, so they drop from `inferenceConfig`
+unconditionally there. `logprobs`, `top_logprobs` and `stop`, which those models also
+refuse, are left in: dropping them would silently withhold data the client asked
+for or move where generation stops, so the vendor's own 400 says so instead.
+OpenRouter swallows every one of these itself, so its ids keep what the client
+sent.
 
 The reply carries the reasoning prose as `message.reasoning_content` and its
 units as `message.reasoning_details` — `reasoning.text` (with `signature`

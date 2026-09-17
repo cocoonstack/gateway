@@ -1267,7 +1267,11 @@ impl ResponsesEngine {
             self.cross_protocol_body(&mut body);
         }
         let model = self.base.model_name()?;
-        gw_protocol::reasoning::normalize_openai_body(model, &mut body, "max");
+        gw_protocol::reasoning::normalize_openai_body(
+            model,
+            &mut body,
+            gw_protocol::reasoning::EffortWire::Responses,
+        );
         body.insert("model".to_owned(), model.into());
         Ok(Value::Object(body))
     }
