@@ -165,7 +165,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         ("top_p", "topP"),
         ("stop_sequences", "stopSequences"),
     ] {
-        // the OpenAI families take only their own sampling defaults, here too
+        // Bedrock rejects these sampling fields for OpenAI model ids
         let sampling = matches!(to, "temperature" | "topP");
         match body.remove(from) {
             Some(v) if !(sampling && openai_family(model)) => {

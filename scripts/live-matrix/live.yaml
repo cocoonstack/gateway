@@ -45,7 +45,7 @@ models:
   - {name: text-embedding-3-small, provider: openai, protocol: embeddings, input_price_per_1k_micros: 20}
   - {name: gpt-5.4-mini, provider: openai, input_price_per_1k_micros: 250, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}
   - {name: gpt-4.1-nano, provider: openai, protocol: responses, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
-  # 5.6 and 6 take only their own sampling defaults, and no generation takes `max` on chat
+  # 5.6 and 6 reject client sampling knobs while reasoning, and no generation takes `max` on chat
   - {name: gpt-5.6-luna, provider: openai, input_price_per_1k_micros: 200, output_price_per_1k_micros: 1200, token_rate: {read_cache: 0.1, write_cache: 1.25}}
   - {name: gpt-5.6-terra, provider: openai, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 12000, token_rate: {read_cache: 0.1, write_cache: 1.25}}
   # gpt-6 astra: automatic caching with priced writes, effort low..xhigh on chat, a price tier past 272k prompt tokens
