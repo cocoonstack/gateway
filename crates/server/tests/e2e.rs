@@ -2906,6 +2906,90 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
 }
 
 #[tokio::test]
+async fn replayed_stream_tool_calls_carry_an_index() {
+    #[derive(Debug)]
+    struct ToolStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for ToolStream {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let request: Value = serde_json::from_slice(&request.body).unwrap();
+            let body = if request["messages"][0]["content"] == "json" {
+                let response = json!({"model":"gpt-4o","choices":[{"index":0,
+                    "message":{"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call-a","type":"function","function":{"name":"ls","arguments":"{}"}},
+                        {"id":"call-b","type":"function","function":{"name":"pwd","arguments":"{}"}}]},
+                    "finish_reason":"tool_calls"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}});
+                gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&response).unwrap().into(),
+                )
+            } else {
+                let sse = concat!(
+                    "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mail leak@evil.com\"}}]}\n\n",
+                    "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"type\":\"function\",\"function\":{\"name\":\"ls\",\"arguments\":\"{\"}}]}}]}\n\n",
+                    "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}]}\n\n",
+                    "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-b\",\"type\":\"function\",\"function\":{\"name\":\"pwd\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec())
+            };
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body,
+                headers: Default::default(),
+            })
+        }
+    }
+
+    for (dlp, content) in [(true, "pii"), (false, "json")] {
+        let yaml = format!(
+            r#"
+listen: {{host: 127.0.0.1, port: 0}}
+security: {{dlp_redact: {dlp}, detect_secrets: false}}
+access_keys: [{{ak: ak-idx, product: demo, qps: 100, daily_token_quota: 1000000}}]
+models: [{{name: gpt-4o, protocol: openai-chat}}]
+accounts: [{{name: a, provider: openai, protocols: ["openai-chat"]}}]
+"#
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app = gw_views::app(AppState::new(cfg, state, Arc::new(ToolStream)));
+        let body = json!({"model":"gpt-4o","stream":true,
+            "messages":[{"role":"user","content":content}]});
+        let resp = app
+            .oneshot(post(
+                "/v1/chat/completions",
+                Some("ak-idx"),
+                &body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert_eq!(text.contains("[REDACTED_EMAIL]"), dlp, "{content}: {text}");
+        let calls: Vec<Value> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|l| *l != "[DONE]")
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["choices"][0]["delta"]["tool_calls"].as_array().cloned()
+            })
+            .flatten()
+            .collect();
+        assert_eq!(calls.len(), 2, "{content}: {text}");
+        for (i, (call, id)) in calls.iter().zip(["call-a", "call-b"]).enumerate() {
+            assert_eq!(call["index"], i, "{content}: {text}");
+            assert_eq!(call["id"], id, "{content}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn batch_response_never_leaks_the_owning_key() {
     let app = app();
     let submit = json!({"model":"gpt-4o-mini","items":[

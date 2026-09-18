@@ -3249,9 +3249,16 @@ fn synth_chunks(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engines::Stre
     let native =
         resp.anthropic_content.is_some() || chunks.iter().any(|c| c.native_event.is_some());
     if !native
-        && let Some(tc) = resp.tool_calls.take()
+        && let Some(mut tc) = resp.tool_calls.take()
         && !chunks.iter().any(|c| c.tool_calls.is_some())
     {
+        for (i, call) in tc.as_array_mut().into_iter().flatten().enumerate() {
+            if let Some(call) = call.as_object_mut()
+                && !call.contains_key("index")
+            {
+                call.insert("index".to_owned(), i.into());
+            }
+        }
         chunks.push(gw_engines::StreamChunk {
             tool_calls: Some(tc),
             ..Default::default()
