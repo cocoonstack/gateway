@@ -44,10 +44,12 @@ entitlement, bad requests) and gateway-internal errors never fall back, and a
 request carrying signed thinking stays pinned to its model (a signature only
 replays against the model that produced it). Each hop re-runs the pipeline for
 the next model: entitlement, model QPM, quota reservation and account selection
-apply to the model actually served. Tenant/key QPS and product QPM consume one
-permit per external request, retained across fallback attempts. The per-model
-daily counter follows the hop's target, including when that target degrades to
-the tenant fallback. A fallback the caller's tenant is not entitled to is
+run per hop against that hop's model (a failed hop's QPM permit is spent; its
+reservations are refunded). Tenant/key QPS and product QPM spend at most one
+permit per external request: the first hop that reaches them takes it and later
+hops reuse it, and a request served from the cache never reaches them. The
+per-model daily counter follows the hop's target, including when that target
+degrades to the tenant fallback. A fallback the caller's tenant is not entitled to is
 skipped, the response echoes the requested name, the ledger records both
 requested and served (`served_model`), the decision trail carries
 `fallback: <from> -> <to>: <why>`, and `gateway_model_fallbacks_total{from, to}`

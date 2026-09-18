@@ -9,6 +9,7 @@ shared, what stays local, and what the LB needs to do.
 |-------|---------|--------------------------|
 | Rate limits / quotas / TPM (`Governance`) | Redis (`storage.redis_url`) | ✅ when Redis is set (includes pooled tenant QPS) |
 | Account health / cooldown (`HealthStore`) | Redis (`storage.redis_url`) | ✅ when Redis is set — one instance's cooldown benches the account for all |
+| Per-model availability counts (`AvailStore`, behind `/admin/models/status`) | Redis (`storage.redis_url`) | ✅ when Redis is set — every instance's samples land in the same minute buckets (one hour retained); in-process otherwise |
 | Config: keys/models/providers/tenants (`ConfigStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — versioned documents + a change feed |
 | Access-key table (`KeyStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — admin key CRUD is fleet-wide within ~2s and survives restarts; a key's MCP servers and tool allowlists are stored with it |
 | Billing ledger / files / batches / video jobs (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres (a video poll may land on any instance; the settle claim is one atomic row update); SQLite stays per-node |

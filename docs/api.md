@@ -105,9 +105,9 @@ for exactly as long as a request reasons — every generation from 5.1 on takes
 them at effort `none` or with no effort at all, while 5.0 and 6 take them never,
 since neither can turn reasoning off — so the gateway drops those four once the
 request reasons, on chat, Responses and a native Responses body alike. Bedrock
-refuses `temperature`/`topP` for an `openai.gpt-<n>` id whatever the effort, its
-own validation rather than the model's, so they drop from `inferenceConfig`
-unconditionally there. `logprobs`, `top_logprobs` and `stop`, which those models also
+refuses `temperature`/`topP` for an `openai.gpt-<n>` or `xai.grok-<n>` id whatever
+the effort, its own validation rather than the model's, so they drop from
+`inferenceConfig` unconditionally there. `logprobs`, `top_logprobs` and `stop`, which those models also
 refuse, are left in: dropping them would silently withhold data the client asked
 for or move where generation stops, so the vendor's own 400 says so instead.
 OpenRouter swallows every one of these itself, so its ids keep what the client
