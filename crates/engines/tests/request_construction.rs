@@ -1883,7 +1883,10 @@ async fn converse_preserves_parallel_tool_calls_for_the_vendor() {
         p.raw = serde_json::json!({"parallel_tool_calls": parallel});
         let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
-        assert_eq!(b["toolConfig"]["toolChoice"], serde_json::json!({"any": {}}));
+        assert_eq!(
+            b["toolConfig"]["toolChoice"],
+            serde_json::json!({"any": {}})
+        );
         assert_eq!(
             b["additionalModelRequestFields"]["parallel_tool_calls"],
             parallel
