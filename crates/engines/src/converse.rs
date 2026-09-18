@@ -218,12 +218,16 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
 fn reasoning_config(
     model: &str,
     thinking: Option<Value>,
-    output_config: Option<Value>,
+    mut output_config: Option<Value>,
 ) -> Option<Value> {
     if !reasoning_family(model) {
         return None;
     }
-    let effort = match output_config.map(|mut c| c["effort"].take()) {
+    let effort = match output_config
+        .as_mut()
+        .and_then(|c| c.get_mut("effort"))
+        .map(Value::take)
+    {
         Some(Value::String(effort)) => Cow::Owned(effort),
         _ => Cow::Borrowed(budget_effort(thinking?["budget_tokens"].as_i64()?)),
     };
@@ -600,6 +604,22 @@ mod tests {
             out.get("additionalModelRequestFields").is_none(),
             "gpt-oss declares no reasoning knob"
         );
+    }
+
+    #[test]
+    fn a_non_object_output_config_falls_back_to_the_budget() {
+        for output_config in [json!("high"), json!(3), json!(["high"]), json!(true)] {
+            let mut body: Map<String, Value> = serde_json::from_value(json!({
+                "messages": [], "thinking": {"type": "enabled", "budget_tokens": 16384}
+            }))
+            .unwrap();
+            body.insert("output_config".to_owned(), output_config);
+            let out = request(body, "us.openai.gpt-6-astra");
+            assert_eq!(
+                out["additionalModelRequestFields"],
+                json!({"reasoning_config": "high"})
+            );
+        }
     }
 
     #[test]
