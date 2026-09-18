@@ -501,16 +501,9 @@ pub async fn settle_and_bill(
         }
     };
     let settle_tpm = async {
-        match s.tpm_reserved {
-            Some(est) => {
-                gov.token_window_settle(s.billing.ak, total - est, gw_consts::MINUTE)
-                    .await
-            }
-            None if total > 0 => {
-                gov.token_window_add(s.billing.ak, total, gw_consts::MINUTE)
-                    .await
-            }
-            None => {}
+        if let Some(est) = s.tpm_reserved {
+            gov.token_window_settle(s.billing.ak, total - est, gw_consts::MINUTE)
+                .await;
         }
     };
     let write_ledger = state.billing.write(record);

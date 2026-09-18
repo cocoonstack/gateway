@@ -61,10 +61,7 @@ pub fn budget_effort(budget: i64) -> &'static str {
     }
 }
 
-/// The upstream a reasoning body is built for. The same model takes different
-/// tiers on each: no OpenAI generation takes `max` on chat completions, GPT-5.6
-/// is the first to take it on Responses, and Bedrock takes it from every
-/// generation while taking `minimal` from none.
+/// The upstream a reasoning body is built for; the tiers a model takes differ per wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortWire {
     Chat,
@@ -72,10 +69,8 @@ pub enum EffortWire {
     Bedrock,
 }
 
-/// The GPT generation of an id OpenAI serves itself (`gpt-5.6-luna` → `(5, 6)`).
-/// A vendor-prefixed id — OpenRouter `openai/gpt-…`, Bedrock `openai.gpt-…` —
-/// is not that wire and yields `None`: those two normalize the request
-/// themselves, and clamping for them would take away tiers they do serve.
+/// The GPT generation of an id OpenAI serves itself (`gpt-5.6-luna` → `(5, 6)`); a
+/// vendor-prefixed id is `None`, since OpenRouter and Bedrock normalize the request themselves.
 fn openai_generation(model: &str) -> Option<(u32, u32)> {
     let version = model.strip_prefix("gpt-")?.split('-').next()?;
     let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
@@ -83,20 +78,17 @@ fn openai_generation(model: &str) -> Option<(u32, u32)> {
     (major >= 5).then_some((major, minor))
 }
 
-/// Whether the request reasons at all: an effort other than `none`, or a
-/// generation that cannot turn reasoning off — GPT-5.0, which knows `minimal`
-/// but not `none`, and GPT-6 onward.
-fn reasoning_engaged(model: &str, generation: (u32, u32), effort: Option<&str>) -> bool {
+/// Whether the request reasons: an effort other than `none`, or a generation that cannot
+/// turn reasoning off (GPT-5.0 knows `minimal` but not `none`; GPT-6 onward always reasons).
+fn reasoning_engaged(generation: (u32, u32), effort: Option<&str>) -> bool {
     match effort {
         Some(effort) => effort != "none",
-        None => generation.0 >= 6 || generation == (5, 0) || model.contains("gpt-6"),
+        None => generation.0 >= 6 || generation == (5, 0),
     }
 }
 
-/// An effort the model takes on this wire. Efforts past its ceiling clamp down
-/// and efforts below its floor clamp up, because either is a vendor 400: a
-/// budget of 32768 maps to `max`, which no OpenAI model takes on chat
-/// completions, and GPT-6 always reasons, so `none` never reaches it.
+/// An effort the model takes on this wire: past its ceiling clamps down, below its floor
+/// clamps up, since either is a vendor 400.
 pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) -> Cow<'a, str> {
     let generation = openai_generation(model);
     let always_reasons = model.contains("gpt-6");
@@ -127,12 +119,8 @@ pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) ->
     }
 }
 
-/// Bring an assembled upstream body to what the model takes: the effort — flat
-/// `reasoning_effort` on chat completions, `reasoning.effort` on Responses —
-/// clamps to a tier it accepts, and the sampling knobs go once the request
-/// reasons, which is when OpenAI refuses them. `logprobs`, `top_logprobs` and
-/// `stop` stay, so the vendor's own 400 tells the client it cannot have the
-/// data or the stop point it asked for.
+/// Clamp the body's effort to a tier the model takes and drop the sampling knobs once it
+/// reasons; `logprobs`/`top_logprobs`/`stop` stay so the vendor's own 400 reaches the client.
 pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: EffortWire) {
     let slot = if body.contains_key("reasoning_effort") {
         body.get_mut("reasoning_effort")
@@ -149,9 +137,7 @@ pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: E
     } else {
         None
     };
-    if openai_generation(model)
-        .is_some_and(|generation| reasoning_engaged(model, generation, effort))
-    {
+    if openai_generation(model).is_some_and(|generation| reasoning_engaged(generation, effort)) {
         for knob in SAMPLING_KNOBS {
             body.remove(knob);
         }

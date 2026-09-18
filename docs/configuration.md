@@ -38,8 +38,9 @@ default (lost on restart); a SQLite path makes them durable on one node.
 config (versioned documents + a change feed every instance follows), the
 shared access-key table, the shared ledger/files/batches store, and a
 distributed batch queue (any instance claims and runs submitted batches).
-`redis_url` shares rate/quota/TPM counters, monthly cost counters and
-account-health cooldowns across instances; `shared_cache: true` additionally moves the request cache into
+`redis_url` shares rate/quota/TPM counters, monthly cost counters,
+account-health cooldowns and the per-model availability counts behind
+`/admin/models/status` across instances; `shared_cache: true` additionally moves the request cache into
 Redis so a hit on one instance serves the fleet (off = each instance caches
 in-process, a miss just recomputes). `ledger_max_rows` is not a hard cap:
 pruning spares rows not yet folded into the usage rollup, so the table can
@@ -314,9 +315,9 @@ scoped to that tenant (see [API — Admin](api.md#admin-dynamic-config)).
 
 ```yaml
 trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unforgeable);
-max_live_streams_per_key: 64   # concurrent realtime sessions + MCP listen streams one key may hold; 0 = unlimited
                                # true = trust x-real-ip / rightmost x-forwarded-for hop
                                # (only behind a proxy that sets them)
+max_live_streams_per_key: 64   # concurrent realtime sessions + MCP listen streams one key may hold; 0 = unlimited
 ```
 
 ## Observability

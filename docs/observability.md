@@ -84,9 +84,10 @@ the unit-priced surfaces; also summed in `/admin/usage`), charged
 `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag (set
 when counts came from an aborted stream rather than a vendor usage payload).
 Writes are idempotent by `request_id`; a transient store failure is held in a
-bounded repair queue and retried until the durable backend accepts it. A full
-queue applies backpressure to settlement until the repair worker makes room,
-so an accepted billing row is not discarded.
+bounded repair queue and retried with backoff — eight attempts, about 13 s —
+before the batch is dropped and counted in `gateway_ledger_write_failures_total`.
+A full queue applies backpressure to settlement until the repair worker makes
+room, so overload alone never discards an accepted row.
 Per-user usage additionally rolls into durable minute buckets every minute, so
 `GET /admin/usage/users` stays correct after `ledger_max_rows` pruning (see
 [Governance](governance.md#per-user-attribution-and-billing)).

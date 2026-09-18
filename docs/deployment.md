@@ -7,7 +7,7 @@ Download a tagged release tarball (Linux/macOS, x86_64/arm64) and extract the
 
 ```bash
 # substitute the release tag and target platform
-VERSION=v0.1.9
+VERSION=v0.2.0
 OS=linux      # or darwin
 ARCH=amd64    # or arm64
 curl --proto '=https' --tlsv1.2 -LsSf -o gw.tar.gz \

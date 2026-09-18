@@ -95,8 +95,10 @@ Stated so an operator can choose them deliberately:
   MCP request spend the key's QPS permits; replies the proxy must buffer are
   capped per server (`max_reply_bytes`); `x-gw-user` is capped at 256 bytes,
   since it keys governance counters.
-- Billing store unreachable: rows queue in a bounded repair queue and apply
-  backpressure rather than being dropped.
+- Billing store unreachable: rows queue in a bounded repair queue that applies
+  backpressure when full and retries each batch eight times with backoff
+  (about 13 s); a batch the store still refuses after that is dropped and
+  counted in `gateway_ledger_write_failures_total`.
 
 ## Operating recommendations
 

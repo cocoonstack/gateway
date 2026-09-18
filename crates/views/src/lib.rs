@@ -1067,10 +1067,10 @@ async fn realtime_bridge(
                                         .unwrap_or_else(|| ak.clone());
                                     let user = billed.attributed_user(&hint).to_owned();
                                     Some(RealtimeAdmit {
+                                        tpm_reserved: billed.tokens_per_minute.map(|_| 0),
                                         ak: billed,
                                         user,
                                         reserved: 0,
-                                        tpm_reserved: None,
                                         at: gw_state::epoch_secs(),
                                         request_id: gw_handler::new_request_id(),
                                         snap,
