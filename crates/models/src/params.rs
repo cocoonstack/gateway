@@ -60,6 +60,9 @@ pub struct ChatParams {
     /// system prompt (anthropic passes it directly; openai carries it via messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// The Messages surface's native system blocks, for the Anthropic wires (cache_control, ttl).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_blocks: Option<Value>,
     /// The client's reasoning request; absent — and free — on the hot path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Box<ReasoningParam>>,
