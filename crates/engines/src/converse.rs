@@ -235,7 +235,6 @@ fn reasoning_config(
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
 }
 
-/// Whether a Converse model id names a Claude model.
 pub(crate) fn claude_model(model: &str) -> bool {
     model.contains("claude")
 }

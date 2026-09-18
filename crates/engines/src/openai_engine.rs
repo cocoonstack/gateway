@@ -404,8 +404,6 @@ fn normalize_tools_openai(tools: Value) -> Value {
     )
 }
 
-/// `tool_choice` in the OpenAI chat shape: anthropic-shaped choices convert,
-/// native ones pass through.
 pub(crate) fn normalize_tool_choice_openai(mut choice: Value) -> Value {
     match choice["type"].as_str() {
         Some("auto") => "auto".into(),
