@@ -1863,15 +1863,17 @@ async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
 }
 
 #[tokio::test]
-async fn converse_preserves_parallel_tool_calls_for_the_vendor() {
-    for parallel in [false, true] {
+async fn converse_parallel_tool_calls_follow_the_model_family() {
+    for (model, parallel) in [
+        ("anthropic.claude-3-haiku-20240307-v1:0", false),
+        ("anthropic.claude-3-haiku-20240307-v1:0", true),
+        ("openai.gpt-oss-20b-1:0", false),
+        ("openai.gpt-oss-20b-1:0", true),
+    ] {
         let t = RecordingTransport::new(
             r#"{"output":{"message":{"role":"assistant","content":[{"toolUse":{"toolUseId":"call_1","name":"get_weather","input":{}}}]}},"stopReason":"tool_use","usage":{"inputTokens":3,"outputTokens":1}}"#,
         );
-        let mut req = chat_req(
-            Protocol::AwsConverse,
-            "anthropic.claude-3-haiku-20240307-v1:0",
-        );
+        let mut req = chat_req(Protocol::AwsConverse, model);
         let p = req.model_param_v2.as_mut().unwrap();
         p.typed = Some(TypedParams::Chat(ChatParams {
             tools: Some(serde_json::json!([{
@@ -1883,14 +1885,23 @@ async fn converse_preserves_parallel_tool_calls_for_the_vendor() {
         p.raw = serde_json::json!({"parallel_tool_calls": parallel});
         let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
-        assert_eq!(
-            b["toolConfig"]["toolChoice"],
-            serde_json::json!({"any": {}})
-        );
-        assert_eq!(
-            b["additionalModelRequestFields"]["parallel_tool_calls"],
-            parallel
-        );
+        let extras = &b["additionalModelRequestFields"];
+        if model.contains("claude") {
+            assert!(b["toolConfig"].get("toolChoice").is_none(), "{model} {b}");
+            assert_eq!(
+                extras["tool_choice"],
+                serde_json::json!({"type": "any", "disable_parallel_tool_use": !parallel}),
+                "{model} {parallel}"
+            );
+            assert!(extras.get("parallel_tool_calls").is_none(), "{model} {b}");
+        } else {
+            assert_eq!(
+                b["toolConfig"]["toolChoice"],
+                serde_json::json!({"any": {}})
+            );
+            assert_eq!(extras["parallel_tool_calls"], parallel, "{model}");
+            assert!(extras.get("tool_choice").is_none(), "{model} {b}");
+        }
         assert!(b.get("parallel_tool_calls").is_none());
         assert!(b.get("tool_choice").is_none());
     }

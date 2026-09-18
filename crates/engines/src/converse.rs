@@ -139,7 +139,7 @@ impl Events {
 /// A Messages body as a Converse body; Claude-only knobs and passthrough extras ride in
 /// `additionalModelRequestFields`.
 pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
-    let claude = model.contains("claude");
+    let claude = claude_model(model);
     let reasoning = reasoning_family(model);
     let mut out = Map::with_capacity(6);
     if let Some(system) = body.remove("system") {
@@ -182,10 +182,18 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
             .collect(),
         _ => Vec::new(),
     };
-    let (disable_tools, tool_choice) = body
-        .remove("tool_choice")
-        .map(converse_tool_choice)
-        .unwrap_or_default();
+    // Bedrock refuses the flag next to toolConfig.toolChoice, so the whole choice rides in the extras
+    let choice_in_extras = claude
+        && body
+            .get("tool_choice")
+            .is_some_and(|choice| choice.get("disable_parallel_tool_use").is_some());
+    let (disable_tools, tool_choice) = if choice_in_extras {
+        (false, None)
+    } else {
+        body.remove("tool_choice")
+            .map(converse_tool_choice)
+            .unwrap_or_default()
+    };
     if !tools.is_empty() && !disable_tools {
         let mut config = Map::with_capacity(2);
         config.insert("tools".into(), Value::Array(tools));
@@ -225,6 +233,11 @@ fn reasoning_config(
         _ => Cow::Borrowed(budget_effort(thinking?["budget_tokens"].as_i64()?)),
     };
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
+}
+
+/// Whether a Converse model id names a Claude model.
+pub(crate) fn claude_model(model: &str) -> bool {
+    model.contains("claude")
 }
 
 /// A Bedrock id whose family rejects the sampling knobs and takes `reasoning_config`; the
@@ -777,5 +790,27 @@ mod tests {
         assert_eq!(out[10]["delta"]["partial_json"], "{\"a\":1}");
         assert_eq!(out[12]["delta"]["stop_reason"], "tool_use");
         assert_eq!(out[13]["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn a_claude_choice_with_the_parallel_flag_rides_in_the_extras() {
+        let choice = json!({"type": "any", "disable_parallel_tool_use": true});
+        let body = |model_choice: Value| {
+            serde_json::from_value::<Map<String, Value>>(json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+                "tool_choice": model_choice,
+            }))
+            .unwrap()
+        };
+        let out = request(
+            body(choice.clone()),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        );
+        assert!(out["toolConfig"].get("toolChoice").is_none(), "{out}");
+        assert_eq!(out["additionalModelRequestFields"]["tool_choice"], choice);
+        let out = request(body(choice), "openai.gpt-oss-20b-1:0");
+        assert_eq!(out["toolConfig"]["toolChoice"], json!({"any": {}}));
+        assert!(out.get("additionalModelRequestFields").is_none(), "{out}");
     }
 }
