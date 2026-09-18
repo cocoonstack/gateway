@@ -1307,7 +1307,7 @@ def run_group(gw: Gateway, group: str) -> None:
         # parameters (size/duration) silently kill the task into UNKNOWN on intl — submit bare
         case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
         case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1, content=True)
-        case_video(gw, "kling-v1-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed")
+        case_video(gw, "kling-v2-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed")
     elif group == "search":
         case_search(gw, "brave-search")
     elif group == "openai-rt":
