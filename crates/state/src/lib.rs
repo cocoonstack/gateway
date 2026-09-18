@@ -544,12 +544,6 @@ impl TokenWindow {
         settle_on(&mut self.slot(key, window).1, delta);
     }
 
-    /// Post-add actual token usage (saturating on a hostile i64::MAX count).
-    pub fn add(&self, key: &str, tokens: i64, window: std::time::Duration) {
-        let mut e = self.slot(key, window);
-        e.1 = e.1.saturating_add(tokens);
-    }
-
     /// The current window's entry, rotated if elapsed — under one entry guard so
     /// a concurrent rollover can't land tokens in the wrong window.
     fn slot(

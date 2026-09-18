@@ -55,8 +55,6 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     ) -> bool;
     /// Apply the settle delta to the current window (negative refunds).
     async fn token_window_settle(&self, key: &str, delta: i64, window: Duration);
-    /// Add to the current TPM window.
-    async fn token_window_add(&self, key: &str, tokens: i64, window: Duration);
 
     /// Refund an admission reservation whole (daily quota + optional TPM
     /// window) — for a request/turn that never reached billing.
@@ -132,9 +130,6 @@ impl Governance for MemoryGovernance {
     }
     async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
         self.tpm.settle(key, delta, window);
-    }
-    async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
-        self.tpm.add(key, tokens, window);
     }
 }
 
@@ -320,9 +315,6 @@ impl Governance for RedisGovernance {
         }
         settle_floored(&self.conn, &tpm_key(key), delta, window).await;
     }
-    async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
-        self.incr_window(&tpm_key(key), tokens, window).await;
-    }
 }
 
 fn tpm_key(key: &str) -> String {
@@ -442,11 +434,12 @@ mod tests {
         assert!(g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
 
-        g.token_window_add(&ak, 10, Duration::from_secs(60)).await;
+        g.token_window_settle(&ak, 10, Duration::from_secs(60))
+            .await;
         assert!(
             !g.token_window_reserve(&ak, 1, 10, Duration::from_secs(60))
                 .await,
-            "window full after add"
+            "an unreserved settle fills the window"
         );
         g.quota_reset_all().await;
     }
@@ -492,11 +485,12 @@ mod tests {
         assert!(g.window_allow("m", 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow("m", 1, Duration::from_secs(60)).await);
 
-        g.token_window_add("ak", 10, Duration::from_secs(60)).await;
+        g.token_window_settle("ak", 10, Duration::from_secs(60))
+            .await;
         assert!(
             !g.token_window_reserve("ak", 1, 10, Duration::from_secs(60))
                 .await,
-            "window full after add"
+            "an unreserved settle fills the window"
         );
     }
 
