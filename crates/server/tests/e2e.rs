@@ -4865,11 +4865,8 @@ async fn chat_surface_renders_anthropic_tool_use_as_tool_calls() {
                     headers: Default::default(),
                 });
             }
-            let mut tool_use =
+            let tool_use =
                 json!({"type":"tool_use","id":"tool-1","name":"shell","input":{"command":"ls"}});
-            if request["messages"][0]["content"] == "broken" {
-                tool_use["id"] = Value::Null;
-            }
             let response = json!({
                 "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
                 "content":[{"type":"text","text":"I'll list them."}, tool_use],
@@ -4960,27 +4957,6 @@ accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messag
         "{\"command\":\"ls\"}"
     );
 
-    let body = json!({"model":"claude-test","max_tokens":64,"tools":tools,
-        "messages":[{"role":"user","content":"broken"}]});
-    let resp = app
-        .clone()
-        .oneshot(post(
-            "/v1/chat/completions",
-            Some("ak-tools"),
-            &body.to_string(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let v = body_json(resp).await;
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("do not render as OpenAI tool_calls"),
-        "{v}"
-    );
-
     let body = json!({"model":"claude-test","max_tokens":64,"stream":true,"tools":tools,
         "messages":[{"role":"user","content":"list files"}]});
     for buffered in [false, true] {
@@ -5069,5 +5045,124 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         let marked = sent["system"][0]["cache_control"]["type"] == "ephemeral"
             && sent["messages"][0]["content"][0]["cache_control"]["type"] == "ephemeral";
         assert_eq!(marked, cached, "{model}: {sent}");
+    }
+}
+
+#[tokio::test]
+async fn chat_tool_calls_keep_vendor_fields_both_ways() {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct SignedCalls {
+        body: Mutex<Option<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for SignedCalls {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let request: Value = serde_json::from_slice(&request.body).unwrap();
+            let stream = request["stream"] == true;
+            *self.body.lock().unwrap() = Some(request);
+            let body = if stream {
+                let sse = concat!(
+                    "data: {\"model\":\"gem\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mail leak@evil.com\"}}]}\n\n",
+                    "data: {\"model\":\"gem\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"click\",\"arguments\":\"{\\\"x\\\":1\"},\"extra_content\":{\"google\":{\"thought_signature\":\"c2ln\"}}}]}}]}\n\n",
+                    "data: {\"model\":\"gem\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                gw_engines::transport::UpstreamBody::Sse(sse.as_bytes().to_vec())
+            } else {
+                let response = json!({"model":"gem","choices":[{"index":0,
+                    "message":{"role":"assistant","content":null,"tool_calls":[{
+                        "id":"call-1","type":"function","function":{"name":"click","arguments":"{}"},
+                        "extra_content":{"google":{"thought_signature":"c2ln"}}}]},
+                    "finish_reason":"tool_calls"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}});
+                gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&response).unwrap().into(),
+                )
+            };
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body,
+                headers: Default::default(),
+            })
+        }
+    }
+
+    fn app_with(dlp_redact: bool, fixture: Arc<SignedCalls>) -> Router {
+        let yaml = format!(
+            r#"
+listen: {{host: 127.0.0.1, port: 0}}
+security: {{dlp_redact: {dlp_redact}, detect_secrets: false}}
+access_keys: [{{ak: ak-sig, product: demo, qps: 100, daily_token_quota: 1000000}}]
+models: [{{name: gem, protocol: openai-chat}}]
+accounts: [{{name: g, provider: openai, protocols: ["openai-chat"]}}]
+"#
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        gw_views::app(AppState::new(cfg, state, fixture))
+    }
+
+    let signed = json!({"google":{"thought_signature":"c2ln"}});
+    let messages = json!([
+        {"role":"user","content":"click"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"call-0","type":"function",
+            "function":{"name":"click","arguments":"{}"},"extra_content":signed}]},
+        {"role":"tool","tool_call_id":"call-0","content":"clicked"}]);
+
+    let fixture = Arc::new(SignedCalls::default());
+    let body = json!({"model":"gem","messages":messages});
+    let resp = app_with(false, fixture.clone())
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-sig"),
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = fixture.body.lock().unwrap().take().expect("upstream body");
+    assert_eq!(
+        sent["messages"][1]["tool_calls"][0]["extra_content"], signed,
+        "{sent}"
+    );
+    let v = body_json(resp).await;
+    assert_eq!(
+        v["choices"][0]["message"]["tool_calls"][0]["extra_content"], signed,
+        "{v}"
+    );
+
+    let body = json!({"model":"gem","stream":true,"messages":messages});
+    for dlp in [false, true] {
+        let resp = app_with(dlp, fixture.clone())
+            .oneshot(post(
+                "/v1/chat/completions",
+                Some("ak-sig"),
+                &body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert_eq!(text.contains("[REDACTED_EMAIL]"), dlp, "dlp={dlp}: {text}");
+        let calls: Vec<Value> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|l| *l != "[DONE]")
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["choices"][0]["delta"]["tool_calls"].as_array().cloned()
+            })
+            .flatten()
+            .collect();
+        assert!(
+            calls.iter().any(|c| c["extra_content"] == signed),
+            "dlp={dlp}: {text}"
+        );
     }
 }

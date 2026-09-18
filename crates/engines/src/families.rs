@@ -1263,7 +1263,7 @@ impl ResponsesEngine {
             _ => serde_json::Map::new(),
         };
         if !self.base.request.preserve_responses_wire {
-            self.cross_protocol_body(&mut body);
+            self.cross_protocol_body(&mut body)?;
         }
         let model = self.base.model_name()?;
         gw_protocol::reasoning::normalize_openai_body(
@@ -1276,7 +1276,7 @@ impl ResponsesEngine {
     }
 
     /// A Responses body from the chat/messages turns and the typed params.
-    fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) {
+    fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) -> GResult<()> {
         let system = self.base.system_text();
         if !system.is_empty() {
             body.entry("instructions").or_insert(system.into());
@@ -1321,13 +1321,22 @@ impl ResponsesEngine {
                 }
             }
             if let Some(Value::Array(tool_calls)) = m.tool_calls {
-                calls.extend(tool_calls.into_iter().map(|mut c| {
-                    function_call(
-                        c["id"].take(),
-                        c["function"]["name"].take(),
-                        c["function"]["arguments"].take(),
-                    )
-                }));
+                calls.reserve(tool_calls.len());
+                for call in tool_calls {
+                    let Value::Object(mut call) = call else {
+                        return Err(GatewayError::bad_request("tool call must be an object"));
+                    };
+                    let Some(Value::Object(mut function)) = call.remove("function") else {
+                        return Err(GatewayError::bad_request(
+                            "tool call function must be an object",
+                        ));
+                    };
+                    calls.push(function_call(
+                        call.remove("id").unwrap_or_default(),
+                        function.remove("name").unwrap_or_default(),
+                        function.remove("arguments").unwrap_or_default(),
+                    ));
+                }
             }
             if !m.content.is_empty() {
                 input.push(object([
@@ -1362,6 +1371,7 @@ impl ResponsesEngine {
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }
+        Ok(())
     }
 
     fn url(&self) -> String {

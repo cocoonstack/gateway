@@ -35,22 +35,6 @@ impl Default for MessageContent {
     }
 }
 
-/// One function call requested by the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String, // "function"
-    pub function: FunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
-    /// JSON-encoded arguments string (OpenAI wire format).
-    pub arguments: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Cow<'static, str>,
@@ -58,7 +42,7 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<Value>>,
     /// present on role:"tool" result messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -188,7 +172,7 @@ impl ChatCompletionResponse {
         created: i64,
         model: impl Into<String>,
         content: String,
-        calls: Vec<ToolCall>,
+        calls: Vec<Value>,
         usage: Usage,
     ) -> Self {
         Self::with_message(
@@ -384,6 +368,33 @@ mod tests {
     }
 
     #[test]
+    fn tool_calls_keep_vendor_fields_both_ways() {
+        let j = r#"{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[
+            {"id":"call-1","type":"function","function":{"name":"click","arguments":"{}"},
+             "extra_content":{"google":{"thought_signature":"c2ln"}}}]}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(j).unwrap();
+        let calls = req.messages.into_iter().next().unwrap().tool_calls.unwrap();
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "c2ln"
+        );
+
+        let resp = ChatCompletionResponse::tool_calls(
+            "id",
+            1,
+            "m",
+            String::new(),
+            calls,
+            Usage::default(),
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "c2ln"
+        );
+    }
+
+    #[test]
     fn multimodal_parts_parse_and_flatten() {
         let j = r#"{"model":"m","messages":[{"role":"user","content":[
             {"type":"text","text":"look: "},
@@ -409,14 +420,8 @@ mod tests {
             1,
             "m",
             String::new(),
-            vec![ToolCall {
-                id: "call-1".into(),
-                kind: "function".into(),
-                function: FunctionCall {
-                    name: "get_weather".into(),
-                    arguments: "{}".into(),
-                },
-            }],
+            vec![serde_json::json!({"id":"call-1","type":"function",
+                "function":{"name":"get_weather","arguments":"{}"}})],
             Usage::default(),
         );
         let v = serde_json::to_value(&resp).unwrap();
