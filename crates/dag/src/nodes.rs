@@ -332,6 +332,9 @@ impl DagNode for TenantRateLimit {
         "tenant_rate"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        if ctx.request_limits_admitted {
+            return Ok(());
+        }
         admission::check_tenant_rate(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.tenant)
             .await
             .map_err(limit_denied)
@@ -347,6 +350,9 @@ impl DagNode for RateLimit {
         "rate_limit"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        if ctx.request_limits_admitted {
+            return Ok(());
+        }
         admission::check_ak_rate(ctx.state.governance.as_ref(), &ctx.ak)
             .await
             .map_err(limit_denied)
@@ -362,9 +368,14 @@ impl DagNode for ProductQpmLimit {
         "product_qpm"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        if ctx.request_limits_admitted {
+            return Ok(());
+        }
         admission::check_product_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.product)
             .await
-            .map_err(limit_denied)
+            .map_err(limit_denied)?;
+        ctx.request_limits_admitted = true;
+        Ok(())
     }
 }
 
@@ -816,7 +827,6 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         .and_then(|o| o.response.raw_usage.as_ref())
         .and_then(gw_engines::extract_vendor_cost_micros);
     let param = ctx.request.model_param_v2.as_ref();
-    // cost bills at the served model's price; the (AK, model) counter accrues to the requested name
     let served = served_model(param);
     let requested = requested_model(param);
     let served_conf = ctx.cfg.find_model(served);
