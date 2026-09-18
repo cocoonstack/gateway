@@ -179,6 +179,43 @@ async fn messages_tool_choice_preserves_parallel_policy_on_openai_wires() {
 }
 
 #[tokio::test]
+async fn native_system_blocks_never_reach_an_openai_wire() {
+    for (protocol, reply) in [
+        (Protocol::OpenaiChat, OPENAI_OK),
+        (Protocol::Responses, RESPONSES_OK),
+    ] {
+        let t = RecordingTransport::new(reply);
+        let mut req = chat_req(protocol, "gpt-4.1-mini");
+        req.message.retain(|m| m.role != "system");
+        req.preserve_anthropic_wire = true;
+        req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+            system: Some("You are terse.".into()),
+            system_blocks: Some(
+                serde_json::json!([{"type": "text", "text": "You are terse.",
+                "cache_control": {"type": "ephemeral"}}]),
+            ),
+            ..Default::default()
+        }));
+        if protocol == Protocol::OpenaiChat {
+            OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        } else {
+            ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+        }
+        let b = t.body_json();
+        assert!(b.get("system").is_none(), "{protocol:?} {b}");
+        assert!(b.get("system_blocks").is_none(), "{protocol:?} {b}");
+        if protocol == Protocol::OpenaiChat {
+            assert_eq!(
+                b["messages"][0],
+                serde_json::json!({"role": "system", "content": "You are terse."})
+            );
+        } else {
+            assert_eq!(b["instructions"], "You are terse.");
+        }
+    }
+}
+
+#[tokio::test]
 async fn openai_streaming_requests_usage() {
     let t = RecordingTransport::new(
         r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
@@ -1915,9 +1952,12 @@ async fn native_system_blocks_keep_the_clients_cache_control() {
     let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
     req.prompt_cache = true;
     if let Some(p) = req.model_param_v2.as_mut() {
-        p.raw = serde_json::json!({"system": [
-            {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-        ]});
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            system_blocks: Some(serde_json::json!([
+                {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ])),
+            ..Default::default()
+        }));
     }
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     assert_eq!(

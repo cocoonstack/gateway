@@ -2883,6 +2883,7 @@ async fn chat_completions(
         logprobs: body.logprobs,
         top_logprobs: body.top_logprobs,
         system: None,
+        system_blocks: None,
         reasoning: chat_reasoning(body.reasoning_effort, body.reasoning),
     });
     let stream_model = body.stream.then(|| body.model.clone());
@@ -3359,6 +3360,7 @@ async fn messages(
         tools: body.tools.map(Value::Array),
         tool_choice: body.tool_choice,
         system,
+        system_blocks: native_system,
         reasoning: (body.thinking.is_some() || body.output_config.is_some()).then(|| {
             Box::new(ReasoningParam {
                 thinking: body.thinking,
@@ -3371,9 +3373,6 @@ async fn messages(
     let stream_model = body.stream.then(|| body.model.clone());
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, body.model);
     param.typed = Some(typed);
-    if let Some(blocks) = native_system {
-        body.extra.insert("system".into(), blocks);
-    }
     param.raw = Value::Object(body.extra);
     let user_id = user_hint(user_header(&headers), &param.raw["metadata"]["user_id"]);
 
@@ -4812,6 +4811,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingResponses {
+        seen: std::sync::Mutex<Option<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for RecordingResponses {
+        async fn send(
+            &self,
+            req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            *self.seen.lock().unwrap() = serde_json::from_slice(&req.body).ok();
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
+                    br#"{"id":"resp_1","model":"gpt-5-responses","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#,
+                )),
+                headers: Default::default(),
+            })
+        }
+    }
+
     #[derive(Debug)]
     struct DelayedDlpStream {
         release: Arc<tokio::sync::Notify>,
@@ -4944,6 +4965,26 @@ mod tests {
         assert_eq!(terminal["code"], "validation_exception");
         assert_eq!(terminal["http_status"], 400);
         assert_eq!(terminal["stream_committed"], false);
+    }
+
+    #[tokio::test]
+    async fn messages_system_blocks_become_instructions_on_a_responses_model() {
+        let transport = Arc::new(RecordingResponses::default());
+        let (router, _) = retained_view_app(transport.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-api-key", "retained-ak")
+            .body(Body::from(
+                r#"{"model":"gpt-5-responses","max_tokens":32,"system":[{"type":"text","text":"You are terse.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"reply with ok"}]}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = transport.seen.lock().unwrap().take().unwrap();
+        assert_eq!(sent["instructions"], "You are terse.");
+        assert!(sent.get("system").is_none(), "{sent}");
     }
 
     #[tokio::test]

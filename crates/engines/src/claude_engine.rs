@@ -97,7 +97,10 @@ impl ClaudeEngine {
         let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
+        let mut native_system = None;
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
+            // the native system-block array keeps the client's cache_control (and ttl)
+            native_system = p.system_blocks.filter(Value::is_array);
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
             }
@@ -155,11 +158,6 @@ impl ClaudeEngine {
         }
         body.insert("max_tokens".into(), json!(max_tokens));
         let mut raw = self.base.take_raw();
-        // a native system-block array keeps the client's cache_control (and ttl)
-        let native_system = raw
-            .as_object_mut()
-            .and_then(|extra| extra.remove("system"))
-            .filter(Value::is_array);
         let system = match native_system {
             Some(blocks) if prompt_cache => Some(Value::Array(cached_blocks(blocks))),
             Some(blocks) => Some(blocks),

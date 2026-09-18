@@ -374,6 +374,9 @@ fn for_each_typed_text(
     match typed {
         T::Chat(p) => {
             let mut n = p.system.as_mut().map(&mut *f).unwrap_or(0);
+            if let Some(blocks) = p.system_blocks.as_mut() {
+                n += walk_json_strings(blocks, f);
+            }
             if let Some(t) = p.tools.as_mut() {
                 n += walk_json_strings(t, f);
             }
@@ -1884,6 +1887,21 @@ mod tests {
                 "flat extra prose under media-like keys must be scanned ({proto:?})"
             );
         }
+    }
+
+    #[test]
+    fn blocklist_covers_the_native_system_blocks() {
+        let mut param =
+            gw_models::ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, "m");
+        param.typed = Some(gw_models::TypedParams::Chat(gw_models::ChatParams {
+            system_blocks: Some(serde_json::json!([{"type": "text", "text": "say forbiddenword"}])),
+            ..Default::default()
+        }));
+        let mut req = GatewayRequest {
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        assert!(security_check(&sec(), &mut req).block.is_some());
     }
 
     #[test]
