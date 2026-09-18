@@ -74,6 +74,7 @@ impl ClaudeEngine {
         }
         let param = self.base.param()?;
         let converse = param.protocol == gw_consts::Protocol::AwsConverse;
+        let carries_parallel = !converse || crate::converse::claude_model(&param.model_name);
         let bedrock = matches!(
             param.protocol,
             gw_consts::Protocol::AwsAnthropic | gw_consts::Protocol::AwsConverse
@@ -177,7 +178,7 @@ impl ClaudeEngine {
                 extra.remove("model");
                 extra.remove("stream");
             }
-            if !converse
+            if carries_parallel
                 && let Some(Value::Bool(parallel)) = extra.remove("parallel_tool_calls")
                 && let Some(choice) = body
                     .entry("tool_choice")
