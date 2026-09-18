@@ -148,7 +148,10 @@ sequence (`message_start` → `content_block_*` → `message_delta` →
 the wire: `input_schema` becomes `parameters`, `tool_choice` `{type: any}` /
 `{type: tool, name}` become `required` / `{type: function}`,
 `disable_parallel_tool_use` and `parallel_tool_calls` map onto each other in
-both directions, and a reply that carries `tool_use` blocks reports
+both directions between OpenAI and Messages wires (`anthropic-messages` /
+`aws-anthropic`). Converse leaves a supplied `parallel_tool_calls` in
+`additionalModelRequestFields` for the model to accept or reject. A reply
+that carries `tool_use` blocks reports
 `stop_reason: tool_use` even where the vendor said `stop` (OpenAI does for a
 forced tool). On an OpenAI-protocol
 model, `thinking` (a budget, or `output_config.effort`) becomes

@@ -1780,9 +1780,15 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             max_tokens: Some(64),
+            tools: Some(serde_json::json!([{
+                "type": "function", "function": {"name": "get_weather", "parameters": {}}
+            }])),
+            tool_choice: Some("auto".into()),
             ..Default::default()
         }));
-        p.raw = serde_json::json!({"model": "smuggled", "stream": true, "top_k": 3});
+        p.raw = serde_json::json!({
+            "model": "smuggled", "stream": true, "top_k": 3, "parallel_tool_calls": false
+        });
     }
     let out = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     assert_eq!(out.response.message, "ok");
@@ -1793,6 +1799,11 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
     assert_eq!(b["top_k"], 3);
     assert_eq!(b["system"], "be brief");
     assert_eq!(b["max_tokens"], 64);
+    assert_eq!(
+        b["tool_choice"],
+        serde_json::json!({"type": "auto", "disable_parallel_tool_use": true})
+    );
+    assert!(b.get("parallel_tool_calls").is_none());
     assert!(
         t.url()
             .ends_with("/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
@@ -1849,6 +1860,37 @@ async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
         "url: {}",
         t.url()
     );
+}
+
+#[tokio::test]
+async fn converse_preserves_parallel_tool_calls_for_the_vendor() {
+    for parallel in [false, true] {
+        let t = RecordingTransport::new(
+            r#"{"output":{"message":{"role":"assistant","content":[{"toolUse":{"toolUseId":"call_1","name":"get_weather","input":{}}}]}},"stopReason":"tool_use","usage":{"inputTokens":3,"outputTokens":1}}"#,
+        );
+        let mut req = chat_req(
+            Protocol::AwsConverse,
+            "anthropic.claude-3-haiku-20240307-v1:0",
+        );
+        let p = req.model_param_v2.as_mut().unwrap();
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            tools: Some(serde_json::json!([{
+                "type": "function", "function": {"name": "get_weather", "parameters": {}}
+            }])),
+            tool_choice: Some("required".into()),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"parallel_tool_calls": parallel});
+        let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["toolConfig"]["toolChoice"], serde_json::json!({"any": {}}));
+        assert_eq!(
+            b["additionalModelRequestFields"]["parallel_tool_calls"],
+            parallel
+        );
+        assert!(b.get("parallel_tool_calls").is_none());
+        assert!(b.get("tool_choice").is_none());
+    }
 }
 
 #[tokio::test]

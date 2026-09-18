@@ -73,6 +73,7 @@ impl ClaudeEngine {
             last["content"] = Value::Array(cached_blocks(last["content"].take()));
         }
         let param = self.base.param()?;
+        let converse = param.protocol == gw_consts::Protocol::AwsConverse;
         let bedrock = matches!(
             param.protocol,
             gw_consts::Protocol::AwsAnthropic | gw_consts::Protocol::AwsConverse
@@ -176,7 +177,8 @@ impl ClaudeEngine {
                 extra.remove("model");
                 extra.remove("stream");
             }
-            if let Some(Value::Bool(parallel)) = extra.remove("parallel_tool_calls")
+            if !converse
+                && let Some(Value::Bool(parallel)) = extra.remove("parallel_tool_calls")
                 && let Some(choice) = body
                     .entry("tool_choice")
                     .or_insert_with(|| object([("type", "auto".into())]))
