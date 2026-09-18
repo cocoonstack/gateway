@@ -149,9 +149,11 @@ the wire: `input_schema` becomes `parameters`, `tool_choice` `{type: any}` /
 `{type: tool, name}` become `required` / `{type: function}`,
 `disable_parallel_tool_use` and `parallel_tool_calls` map onto each other in
 both directions between OpenAI and Messages wires (`anthropic-messages` /
-`aws-anthropic`). Converse leaves a supplied `parallel_tool_calls` in
-`additionalModelRequestFields` for the model to accept or reject. A reply
-that carries `tool_use` blocks reports
+`aws-anthropic`). On Converse a Claude model takes the policy as a whole
+`tool_choice` in `additionalModelRequestFields` (Bedrock refuses the flag next
+to `toolConfig.toolChoice`); other families keep `parallel_tool_calls` there
+for the model to accept or reject. A reply that carries `tool_use` blocks
+reports
 `stop_reason: tool_use` even where the vendor said `stop` (OpenAI does for a
 forced tool). On an OpenAI-protocol
 model, `thinking` (a budget, or `output_config.effort`) becomes
