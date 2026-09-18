@@ -235,7 +235,6 @@ fn reasoning_config(
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
 }
 
-/// Whether a Converse model id names a Claude model.
 pub(crate) fn claude_model(model: &str) -> bool {
     model.contains("claude")
 }
@@ -386,9 +385,9 @@ fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
     if let Some(d) = tool.get_mut("description").filter(|d| !d.is_null()) {
         spec.insert("description".into(), d.take());
     }
-    let schema = match tool["input_schema"].take() {
-        Value::Null => json!({"type": "object", "properties": {}}),
-        schema => schema,
+    let schema = match tool.get_mut("input_schema").map(Value::take) {
+        None | Some(Value::Null) => json!({"type": "object", "properties": {}}),
+        Some(schema) => schema,
     };
     spec.insert("inputSchema".into(), object([("json", schema)]));
     if claude && let Some(strict) = tool.get_mut("strict").filter(|strict| !strict.is_null()) {
@@ -790,6 +789,20 @@ mod tests {
         assert_eq!(out[10]["delta"]["partial_json"], "{\"a\":1}");
         assert_eq!(out[12]["delta"]["stop_reason"], "tool_use");
         assert_eq!(out[13]["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn a_non_object_tool_definition_becomes_a_nameless_spec_without_panicking() {
+        let body = serde_json::from_value::<Map<String, Value>>(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": ["y", {"name": "ok", "input_schema": {"type": "object"}}],
+        }))
+        .unwrap();
+        let out = request(body, "us.anthropic.claude-haiku-4-5-20251001-v1:0");
+        let tools = out["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "{out}");
+        assert!(tools[0]["toolSpec"]["name"].is_null(), "{out}");
+        assert_eq!(tools[1]["toolSpec"]["name"], "ok");
     }
 
     #[test]
