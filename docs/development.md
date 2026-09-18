@@ -98,13 +98,22 @@ GW_ADMIN_TOKEN=admin-live GW_CONFIG=scripts/live-matrix/live.yaml ./target/relea
 python3 scripts/live-matrix/live_matrix.py               # or: ... anthropic bedrock
 ```
 
-Last full run (2026-08-19): all cases across Anthropic, OpenAI (incl.
-gpt-realtime-mini through `/v1/realtime` and sora-2 video), Gemini, DeepSeek,
-MiniMax (incl. Hailuo video), Qwen/DashScope (incl. wan2.2-t2v-plus video),
-Qianfan, Moonshot, SiliconFlow (incl. Wan2.2 video), OpenRouter, Cohere/Jina
-rerank, xAI Grok (chat, Responses, image, video; the `grok` group serves the
-same models from OpenRouter and Bedrock), Kling video, Brave search,
-Bedrock (InvokeModel, Converse, Llama), a local Ollama through the generic
-OpenAI-compatible path, OpenAI moderations/TTS/STT, the DashScope legacy wire
-and the Gemini Live realtime dialect — every ledger row matched the oracle
-exactly.
+Last full run (2026-09-17, Linux x86_64): 182/205, every ledger row matching the
+oracle. The groups cover Anthropic, OpenAI (incl. gpt-realtime-mini through
+`/v1/realtime` and sora-2 video), Gemini, DeepSeek, MiniMax (incl. Hailuo
+video), Qwen/DashScope (incl. wan2.2-t2v-plus video), Qianfan, Moonshot,
+SiliconFlow (incl. Wan2.2 video), OpenRouter, Cohere/Jina rerank, xAI Grok
+(chat, Responses, image, video; the `grok` group serves the same models from
+OpenRouter and Bedrock), Kling video, Brave search, Bedrock (InvokeModel,
+Converse, Llama), a local Ollama through the generic OpenAI-compatible path,
+OpenAI moderations/TTS/STT, the DashScope legacy wire and the Gemini Live
+realtime dialect.
+
+None of the 23 failures were gateway defects: MiniMax was out of credits, the
+Kling and Brave keys were dead, that host has no Ollama and no
+`websocket-client` for the two realtime cases, and one transient Bedrock 503 on
+fable-5-1 latched the account unhealthy and cascaded into the nine later
+`aws-anthropic`/`aws-converse` cases — `bedrock bedrock-jp grok xai` re-run
+alone on a fresh gateway is 78/78. That cascade is worth knowing before reading
+a report: a single upstream 503 can mark a whole protocol unserved for the rest
+of the run.

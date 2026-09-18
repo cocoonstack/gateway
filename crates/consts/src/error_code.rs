@@ -16,7 +16,7 @@ use std::fmt;
 pub struct ErrCode(pub i64);
 
 impl ErrCode {
-    pub const SUCCESS: ErrCode = ErrCode(200); // used for metrics tracking
+    pub const SUCCESS: ErrCode = ErrCode(200);
 
     pub const SYSTEM_ERROR: ErrCode = ErrCode(1000);
     pub const DB_WRITE: ErrCode = ErrCode(2000);
