@@ -84,7 +84,9 @@ then `data: [DONE]`. Multimodal `content` arrays, `tools`/`tool_choice`, and
 call pass through both ways, so a client that echoes the assistant turn keeps
 the `extra_content.google.thought_signature` Gemini 3 requires. On an
 `anthropic-messages` model the reply's `tool_use` blocks render as
-`tool_calls` (streamed with `index`) and `stop_reason` maps to `finish_reason`.
+`tool_calls` (streamed with `index`) and `stop_reason` maps to `finish_reason`;
+on a `responses` model `tools` and `tool_choice` are flattened into the
+Responses shape.
 
 ### Reasoning
 
@@ -142,7 +144,11 @@ reconcile the write premium; the Responses surface reports the same two under
 `/v1/messages` works on both Anthropic-protocol models and OpenAI-protocol
 models — the gateway converts between the two, including the streaming event
 sequence (`message_start` → `content_block_*` → `message_delta` →
-`message_stop`) and `stop_reason`/`finish_reason` mapping. On an OpenAI-protocol
+`message_stop`) and `stop_reason`/`finish_reason` mapping. Tools convert with
+the wire: `input_schema` becomes `parameters`, `tool_choice` `{type: any}` /
+`{type: tool, name}` become `required` / `{type: function}`, and a reply that
+carries `tool_use` blocks reports `stop_reason: tool_use` even where the vendor
+said `stop` (OpenAI does for a forced tool). On an OpenAI-protocol
 model, `thinking` (a budget, or `output_config.effort`) becomes
 `reasoning_effort` and the model's reasoning prose comes back as an unsigned
 `thinking` block ahead of the answer (streamed as `thinking_delta`); replaying
