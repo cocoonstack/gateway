@@ -377,7 +377,9 @@ pub fn swap_to_fallback(
         return FallbackSwap::AlreadyServing;
     }
     let from = std::mem::replace(&mut param.model_name, fb.to_owned());
-    param.fallback_from = Some(from.clone());
+    if param.fallback_from.is_none() {
+        param.fallback_from = Some(from.clone());
+    }
     FallbackSwap::Swapped(from, param.model_name.clone())
 }
 
