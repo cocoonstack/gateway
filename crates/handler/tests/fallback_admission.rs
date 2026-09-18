@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use gw_config::GatewayConfig;
+use gw_config::{ConfigError, GatewayConfig};
 use gw_consts::{ErrCode, Protocol};
 use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 use gw_handler::OnlineHandler;
-use gw_models::{ChatMsg, GResult, GatewayRequest, ModelParamV2};
+use gw_models::{ChatMsg, GResult, GatewayError, GatewayRequest, ModelParamV2};
 use gw_state::{GatewayState, SharedConfig};
 use serde_json::Value;
 
@@ -17,7 +17,8 @@ struct Vendor(AtomicUsize);
 impl Transport for Vendor {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        let body: Value = serde_json::from_slice(&req.body).expect("upstream request JSON");
+        let body: Value = serde_json::from_slice(&req.body)
+            .map_err(|e| GatewayError::internal(format!("decode upstream request JSON: {e}")))?;
         let (status, body): (u16, &'static [u8]) = match body["model"].as_str() {
             Some("broken") => (503, br#"{"error":{"message":"vendor down"}}"#),
             Some("throttled") => (429, br#"{"error":{"message":"rate limited"}}"#),
@@ -35,7 +36,11 @@ impl Transport for Vendor {
     }
 }
 
-fn handler(key_qps: f64, limits: &str, model_qpm: u32) -> (OnlineHandler, Arc<Vendor>) {
+fn handler(
+    key_qps: f64,
+    limits: &str,
+    model_qpm: u32,
+) -> Result<(OnlineHandler, Arc<Vendor>), ConfigError> {
     let yaml = format!(
         "listen: {{host: h, port: 1}}
 {limits}
@@ -47,14 +52,14 @@ models:
   - {{name: healthy, protocol: openai-chat, qpm: {model_qpm}}}
 accounts: [{{name: a, provider: p, protocols: [openai-chat]}}]"
     );
-    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).expect("fallback config"));
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml)?);
     let state = Arc::new(GatewayState::from_config(&cfg));
     let vendor = Arc::new(Vendor::default());
     let transport = Arc::clone(&vendor);
-    (
+    Ok((
         OnlineHandler::new(SharedConfig::new(cfg, state), transport),
         vendor,
-    )
+    ))
 }
 
 fn request(model: &str, online: bool) -> GatewayRequest {
@@ -82,7 +87,7 @@ async fn fallback_consumes_each_request_limit_once() {
         ),
     ] {
         for (start, online) in [("broken", true), ("unavailable", true), ("broken", false)] {
-            let (h, vendor) = handler(qps, limits, 100);
+            let (h, vendor) = handler(qps, limits, 100).expect("fallback config");
             let state = h.state();
             let ak = state.auth.authenticate("k").await.expect("access key");
             let ctx = h
@@ -133,7 +138,7 @@ async fn no_account_fallback_does_not_bypass_initial_request_limits() {
             "product qpm limit",
         ),
     ] {
-        let (h, vendor) = handler(qps, limits, 100);
+        let (h, vendor) = handler(qps, limits, 100).expect("fallback config");
         let state = h.state();
         let ak = state.auth.authenticate("k").await.expect("access key");
         let err = h
@@ -150,7 +155,7 @@ async fn no_account_fallback_does_not_bypass_initial_request_limits() {
 
 #[tokio::test]
 async fn fallback_keeps_model_qpm_and_refunds_token_reservations() {
-    let (h, vendor) = handler(100.0, "tenants: [{name: t}]", 0);
+    let (h, vendor) = handler(100.0, "tenants: [{name: t}]", 0).expect("fallback config");
     let state = h.state();
     let ak = state.auth.authenticate("k").await.expect("access key");
     let err = h
