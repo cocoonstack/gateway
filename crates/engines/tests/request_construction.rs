@@ -99,8 +99,10 @@ async fn openai_request_shape() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             temperature: Some(0.5),
             max_tokens: Some(256),
+            tool_choice: Some("auto".into()),
             ..Default::default()
         }));
+        p.raw = serde_json::json!({"parallel_tool_calls": false});
     }
     let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
@@ -111,6 +113,8 @@ async fn openai_request_shape() {
     assert_eq!(b["stream"], false);
     assert_eq!(b["temperature"], 0.5);
     assert_eq!(b["max_tokens"], 256);
+    assert_eq!(b["tool_choice"], "auto");
+    assert_eq!(b["parallel_tool_calls"], false);
     assert!(
         t.url().ends_with("/v1/chat/completions"),
         "url: {}",
@@ -121,6 +125,57 @@ async fn openai_request_shape() {
         Some("application/json")
     );
     assert!(t.header("authorization").unwrap().starts_with("Bearer "));
+}
+
+#[tokio::test]
+async fn messages_tool_choice_preserves_parallel_policy_on_openai_wires() {
+    for (protocol, reply) in [
+        (Protocol::OpenaiChat, OPENAI_OK),
+        (Protocol::Responses, RESPONSES_OK),
+    ] {
+        for kind in ["auto", "any", "tool"] {
+            for disabled in [None, Some(false), Some(true)] {
+                let t = RecordingTransport::new(reply);
+                let mut req = chat_req(protocol, "gpt-4.1-mini");
+                req.preserve_anthropic_wire = true;
+                let mut choice = serde_json::json!({"type": kind});
+                if kind == "tool" {
+                    choice["name"] = "get_weather".into();
+                }
+                if let Some(disabled) = disabled {
+                    choice["disable_parallel_tool_use"] = disabled.into();
+                }
+                req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+                    tools: Some(serde_json::json!([{
+                        "name": "get_weather",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }])),
+                    tool_choice: Some(choice),
+                    ..Default::default()
+                }));
+                if protocol == Protocol::OpenaiChat {
+                    OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+                } else {
+                    ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+                }
+                let b = t.body_json();
+                assert_eq!(
+                    b.get("parallel_tool_calls"),
+                    disabled.map(|v| Value::Bool(!v)).as_ref(),
+                    "{protocol:?} {kind} {disabled:?}"
+                );
+                let expected = match kind {
+                    "auto" => "auto".into(),
+                    "any" => "required".into(),
+                    _ if protocol == Protocol::OpenaiChat => serde_json::json!({
+                        "type": "function", "function": {"name": "get_weather"}
+                    }),
+                    _ => serde_json::json!({"type": "function", "name": "get_weather"}),
+                };
+                assert_eq!(b["tool_choice"], expected);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -183,6 +238,41 @@ async fn anthropic_request_shape() {
         serde_json::json!(["5"]),
         "OpenAI's string stop becomes Anthropic's array"
     );
+}
+
+#[tokio::test]
+async fn chat_parallel_tool_calls_becomes_the_anthropic_parallel_policy() {
+    for (choice, parallel, expected) in [
+        (
+            Some("auto"),
+            false,
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+        ),
+        (
+            None,
+            true,
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": false}),
+        ),
+        (Some("none"), false, serde_json::json!({"type": "none"})),
+    ] {
+        let t = RecordingTransport::new(
+            r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+        let p = req.model_param_v2.as_mut().unwrap();
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            tool_choice: choice.map(Value::from),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"parallel_tool_calls": parallel});
+        let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["tool_choice"], expected, "{choice:?} {parallel}");
+        assert!(
+            b.get("parallel_tool_calls").is_none(),
+            "{choice:?} {parallel}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -445,12 +535,16 @@ async fn responses_api_forwards_native_body() {
     req.model_param_v2.as_mut().unwrap().raw = serde_json::json!({
         "input": [{"role":"user","content":"hi"}],
         "instructions": "be brief",
-        "max_output_tokens": 256
+        "max_output_tokens": 256,
+        "tool_choice": "auto",
+        "parallel_tool_calls": false
     });
     let _ = ResponsesEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["instructions"], "be brief");
     assert_eq!(b["max_output_tokens"], 256);
+    assert_eq!(b["tool_choice"], "auto");
+    assert_eq!(b["parallel_tool_calls"], false);
     assert_eq!(b["input"][0]["role"], "user");
     assert_eq!(b["model"], "gpt-5");
     assert!(t.url().contains("/responses"), "url: {}", t.url());
@@ -1686,9 +1780,15 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
             max_tokens: Some(64),
+            tools: Some(serde_json::json!([{
+                "type": "function", "function": {"name": "get_weather", "parameters": {}}
+            }])),
+            tool_choice: Some("auto".into()),
             ..Default::default()
         }));
-        p.raw = serde_json::json!({"model": "smuggled", "stream": true, "top_k": 3});
+        p.raw = serde_json::json!({
+            "model": "smuggled", "stream": true, "top_k": 3, "parallel_tool_calls": false
+        });
     }
     let out = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     assert_eq!(out.response.message, "ok");
@@ -1699,6 +1799,11 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
     assert_eq!(b["top_k"], 3);
     assert_eq!(b["system"], "be brief");
     assert_eq!(b["max_tokens"], 64);
+    assert_eq!(
+        b["tool_choice"],
+        serde_json::json!({"type": "auto", "disable_parallel_tool_use": true})
+    );
+    assert!(b.get("parallel_tool_calls").is_none());
     assert!(
         t.url()
             .ends_with("/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
@@ -1755,6 +1860,40 @@ async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
         "url: {}",
         t.url()
     );
+}
+
+#[tokio::test]
+async fn converse_preserves_parallel_tool_calls_for_the_vendor() {
+    for parallel in [false, true] {
+        let t = RecordingTransport::new(
+            r#"{"output":{"message":{"role":"assistant","content":[{"toolUse":{"toolUseId":"call_1","name":"get_weather","input":{}}}]}},"stopReason":"tool_use","usage":{"inputTokens":3,"outputTokens":1}}"#,
+        );
+        let mut req = chat_req(
+            Protocol::AwsConverse,
+            "anthropic.claude-3-haiku-20240307-v1:0",
+        );
+        let p = req.model_param_v2.as_mut().unwrap();
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            tools: Some(serde_json::json!([{
+                "type": "function", "function": {"name": "get_weather", "parameters": {}}
+            }])),
+            tool_choice: Some("required".into()),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"parallel_tool_calls": parallel});
+        let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(
+            b["toolConfig"]["toolChoice"],
+            serde_json::json!({"any": {}})
+        );
+        assert_eq!(
+            b["additionalModelRequestFields"]["parallel_tool_calls"],
+            parallel
+        );
+        assert!(b.get("parallel_tool_calls").is_none());
+        assert!(b.get("tool_choice").is_none());
+    }
 }
 
 #[tokio::test]

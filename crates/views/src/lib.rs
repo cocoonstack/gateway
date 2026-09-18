@@ -2741,6 +2741,16 @@ fn finish_anthropic(fr: String) -> Cow<'static, str> {
     }
 }
 
+/// The Anthropic stop reason: `end_turn` becomes `tool_use` when the reply
+/// carries tool_use blocks (OpenAI reports `stop` for a forced tool_choice).
+fn anthropic_stop(fr: String, tool_use: bool) -> Cow<'static, str> {
+    let stop = finish_anthropic(fr);
+    if tool_use && stop == "end_turn" {
+        return Cow::Borrowed("tool_use");
+    }
+    stop
+}
+
 /// The OpenAI wire usage: known normalized parts rebuild the totals (OpenAI
 /// counts cached reads inside `prompt_tokens`, Anthropic outside `input_tokens`)
 /// so the details always stay subsets.
@@ -3454,6 +3464,10 @@ async fn messages(
     if let Some(context) = thinking_context.as_ref() {
         thinking_audit.remember_content(context, &content);
     }
+    let stop = anthropic_stop(
+        outcome.response.finish_reason,
+        content.iter().any(|b| b["type"] == "tool_use"),
+    );
     // built by hand: json! would deep-copy the content blocks
     let mut body = serde_json::Map::with_capacity(7);
     body.insert("id".into(), next_id("msg").into());
@@ -3461,10 +3475,7 @@ async fn messages(
     body.insert("role".into(), "assistant".into());
     body.insert("model".into(), Value::String(outcome.response.model));
     body.insert("content".into(), Value::Array(content));
-    body.insert(
-        "stop_reason".into(),
-        finish_anthropic(outcome.response.finish_reason).into(),
-    );
+    body.insert("stop_reason".into(), stop.into());
     body.insert("usage".into(), json!(usage));
     let response = (StatusCode::OK, Json(Value::Object(body))).into_response();
     terminal_response(&ctx, response).await
@@ -3515,7 +3526,8 @@ fn messages_stream_response(
         next_idx: usize,
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
-        pending_finish: Option<Cow<'static, str>>,
+        tool_blocks: usize,
+        pending_finish: Option<String>,
         thinking_capture: Option<ThinkingStreamCapture>,
     }
 
@@ -3584,6 +3596,7 @@ fn messages_stream_response(
         /// in the start frame, the arguments as one input_json_delta, stop.
         fn emit_tool_block(&mut self, mut block: Value) {
             self.close_block(BlockKind::Text);
+            self.tool_blocks += 1;
             let idx = self.next_idx;
             self.next_idx += 1;
             let mut start = json!({"type":"content_block_start","index":idx,
@@ -3615,10 +3628,10 @@ fn messages_stream_response(
                 }
             }
             self.close_block(BlockKind::Text);
-            let stop = self
-                .pending_finish
-                .take()
-                .unwrap_or(Cow::Borrowed("end_turn"));
+            let stop = anthropic_stop(
+                self.pending_finish.take().unwrap_or_default(),
+                self.tool_blocks > 0,
+            );
             let usage = anthropic_usage(input_tokens, output_tokens, detail);
             self.queue.push_back(Self::ev(
                 "message_delta",
@@ -3699,7 +3712,7 @@ fn messages_stream_response(
                         }
                     }
                     if let Some(fr) = c.finish_reason {
-                        self.pending_finish = Some(finish_anthropic(fr));
+                        self.pending_finish = Some(fr);
                     }
                     if let Some((pt, ct, _)) = c.usage_totals {
                         self.finish(pt, ct, c.common_usage);
@@ -3726,6 +3739,7 @@ fn messages_stream_response(
             thinking_idx: None,
             next_idx: 0,
             tool_frags: None,
+            tool_blocks: 0,
             pending_finish: None,
             thinking_capture: thinking_audit.stream_capture(thinking_context),
         },
@@ -4819,6 +4833,14 @@ mod tests {
                 headers: Default::default(),
             })
         }
+    }
+
+    #[test]
+    fn a_reply_with_tool_use_blocks_stops_for_them() {
+        assert_eq!(anthropic_stop("stop".into(), true), "tool_use");
+        assert_eq!(anthropic_stop("tool_calls".into(), true), "tool_use");
+        assert_eq!(anthropic_stop("length".into(), true), "max_tokens");
+        assert_eq!(anthropic_stop("stop".into(), false), "end_turn");
     }
 
     #[test]
