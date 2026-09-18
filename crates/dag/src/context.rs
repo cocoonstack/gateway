@@ -81,9 +81,6 @@ impl DagContext {
         self.decisions.push((node, what.into()));
     }
 
-    /// The effective end user: the key's `owner` (authoritative) else request
-    /// metadata; `""` when neither is present. Resolution lives on [`AkInfo`] so
-    /// REST and realtime can't diverge on an empty owner.
     /// The resolved model param; a node reaching here before resolve_model is a broken plan.
     pub fn model_param(&self) -> GResult<&ModelParamV2> {
         self.request
@@ -92,6 +89,9 @@ impl DagContext {
             .ok_or_else(|| GatewayError::internal("model param missing after resolve_model"))
     }
 
+    /// The effective end user: the key's `owner` (authoritative) else request
+    /// metadata; `""` when neither is present. Resolution lives on [`AkInfo`] so
+    /// REST and realtime can't diverge on an empty owner.
     pub fn effective_user_id(&self) -> &str {
         self.ak
             .attributed_user(self.request.user_id.as_deref().unwrap_or_default())

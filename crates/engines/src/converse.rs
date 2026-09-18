@@ -136,11 +136,11 @@ impl Events {
     }
 }
 
-/// A Messages body as a Converse body; Claude-only knobs and passthrough extras
-/// ride in `additionalModelRequestFields` (the knobs drop on non-Claude ids,
-/// where a reasoning-config family takes the effort as `reasoning_config` instead).
+/// A Messages body as a Converse body; Claude-only knobs and passthrough extras ride in
+/// `additionalModelRequestFields`.
 pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let claude = model.contains("claude");
+    let reasoning = reasoning_family(model);
     let mut out = Map::with_capacity(6);
     if let Some(system) = body.remove("system") {
         let blocks = match system {
@@ -165,13 +165,10 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         ("top_p", "topP"),
         ("stop_sequences", "stopSequences"),
     ] {
-        // Bedrock rejects these sampling fields for the reasoning families
-        let sampling = matches!(to, "temperature" | "topP");
-        match body.remove(from) {
-            Some(v) if !(sampling && reasoning_family(model)) => {
-                inference.insert(to.into(), v);
-            }
-            _ => {}
+        if let Some(v) = body.remove(from)
+            && !(reasoning && matches!(to, "temperature" | "topP"))
+        {
+            inference.insert(to.into(), v);
         }
     }
     if !inference.is_empty() {
@@ -200,7 +197,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
 
     if !claude {
         let (thinking, output_config) = (body.remove("thinking"), body.remove("output_config"));
-        if let Some(effort) = reasoning_config(model, thinking, output_config) {
+        if reasoning && let Some(effort) = reasoning_config(model, thinking, output_config) {
             body.insert("reasoning_config".to_owned(), effort);
         }
     }
@@ -213,16 +210,12 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     Value::Object(out)
 }
 
-/// The Anthropic-dialect thinking of a body as Bedrock's `reasoning_config`
-/// effort; `openai.gpt-oss-*` and every other family declare no such knob.
+/// The body's Anthropic-dialect thinking as Bedrock's `reasoning_config` effort.
 fn reasoning_config(
     model: &str,
     thinking: Option<Value>,
     mut output_config: Option<Value>,
 ) -> Option<Value> {
-    if !reasoning_family(model) {
-        return None;
-    }
     let effort = match output_config
         .as_mut()
         .and_then(|c| c.get_mut("effort"))
@@ -234,10 +227,8 @@ fn reasoning_config(
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
 }
 
-/// Whether a Bedrock id names a reasoning family: one that rejects the sampling
-/// knobs and takes a `reasoning_config` enum. The marker is followed by the
-/// version digit, so `openai.gpt-oss-*` — which takes the knobs and declares no
-/// enum — stays out.
+/// A Bedrock id whose family rejects the sampling knobs and takes `reasoning_config`; the
+/// version digit after the marker keeps `openai.gpt-oss-*` out.
 fn reasoning_family(model: &str) -> bool {
     REASONING_CONFIG_MARKERS.iter().any(|marker| {
         model
