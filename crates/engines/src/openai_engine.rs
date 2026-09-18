@@ -408,7 +408,10 @@ pub(crate) fn normalize_tool_choice_openai(
     mut choice: Value,
     body: &mut Map<String, Value>,
 ) -> Value {
-    if let Some(disabled) = choice.get("disable_parallel_tool_use").and_then(Value::as_bool) {
+    if let Some(disabled) = choice
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+    {
         body.insert("parallel_tool_calls".into(), (!disabled).into());
     }
     match choice["type"].as_str() {
