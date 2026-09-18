@@ -210,8 +210,8 @@ impl ModelEngine for OpenAiEngine {
     }
 }
 
-/// Merge one `index`-keyed tool-call fragment: the first carries id/type/name,
-/// later ones append to `function.arguments`.
+/// Merge one `index`-keyed tool-call fragment: the first value of each field
+/// wins, later fragments append to `function.arguments`.
 pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
     let Some(frags) = fragment.as_array() else {
         return;
@@ -230,11 +230,9 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
             calls.push(json!({"function": {}}));
         }
         let call = &mut calls[idx];
-        for key in ["id", "type"] {
-            if let Some(v) = f.get(key).filter(|v| !v.is_null())
-                && call.get(key).is_none()
-            {
-                call[key] = v.clone();
+        for (key, v) in f.as_object().into_iter().flatten() {
+            if key != "index" && key != "function" && !v.is_null() && call.get(key).is_none() {
+                call[key.as_str()] = v.clone();
             }
         }
         if let Some(name) = f["function"]["name"].as_str()
@@ -627,6 +625,26 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[0]["function"]["name"], "get_weather");
         assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"sf\"}");
+    }
+
+    #[test]
+    fn tool_call_fragments_keep_vendor_fields_first_wins() {
+        let mut acc = None;
+        merge_tool_call_fragments(
+            &mut acc,
+            &json!([{"index":0,"id":"call_1","type":"function",
+                "function":{"name":"click","arguments":""},
+                "extra_content":{"google":{"thought_signature":"c2ln"}}}]),
+        );
+        merge_tool_call_fragments(
+            &mut acc,
+            &json!([{"index":0,"function":{"arguments":"{}"},
+                "extra_content":{"google":{"thought_signature":"late"}}}]),
+        );
+        let call = &acc.unwrap()[0];
+        assert_eq!(call["extra_content"]["google"]["thought_signature"], "c2ln");
+        assert_eq!(call["function"]["arguments"], "{}");
+        assert!(call.get("index").is_none(), "{call}");
     }
 
     #[test]

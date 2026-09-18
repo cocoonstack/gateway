@@ -2853,7 +2853,7 @@ async fn chat_completions(
                 role: m.role.into_owned(),
                 content,
                 parts: parts.map(Value::Array),
-                tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
+                tool_calls: m.tool_calls.map(Value::Array),
                 tool_call_id: m.tool_call_id,
                 reasoning_content: m.reasoning_content,
                 reasoning_details: m.reasoning_details.map(Value::Array),
@@ -2919,23 +2919,12 @@ async fn chat_completions(
     let model_out = outcome.response.model;
 
     let mut resp = if let Some(tc) = outcome.response.tool_calls.take() {
-        let calls: Vec<gw_protocol::openai::ToolCall> =
-            match serde_json::from_value(Value::Array(openai_tool_calls(tc, &mut 0))) {
-                Ok(calls) => calls,
-                Err(e) => {
-                    let response = error_response(
-                        500,
-                        format!("engine tool calls do not render as OpenAI tool_calls: {e}"),
-                    );
-                    return terminal_response(&ctx, response).await;
-                }
-            };
         ChatCompletionResponse::tool_calls(
             id,
             created,
             model_out,
             outcome.response.message,
-            calls,
+            openai_tool_calls(tc, &mut 0),
             usage,
         )
     } else {
