@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 
 use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_protocol::object;
 use gw_protocol::reasoning::is_thinking_block;
 use serde_json::{Map, Value, json};
 
@@ -101,7 +102,7 @@ impl OpenAiEngine {
                 body.insert("tools".into(), normalize_tools_openai(v));
             }
             if let Some(v) = p.tool_choice {
-                body.insert("tool_choice".into(), v);
+                body.insert("tool_choice".into(), normalize_tool_choice_openai(v));
             }
             if let Some(v) = p.response_format {
                 body.insert("response_format".into(), v);
@@ -398,6 +399,24 @@ fn normalize_tools_openai(tools: Value) -> Value {
             })
             .collect(),
     )
+}
+
+/// `tool_choice` in the OpenAI chat shape: anthropic-shaped choices convert,
+/// native ones pass through.
+pub(crate) fn normalize_tool_choice_openai(mut choice: Value) -> Value {
+    match choice["type"].as_str() {
+        Some("auto") => "auto".into(),
+        Some("none") => "none".into(),
+        Some("any") => "required".into(),
+        Some("tool") => {
+            let name = choice["name"].take();
+            object([
+                ("type", "function".into()),
+                ("function", object([("name", name)])),
+            ])
+        }
+        _ => choice,
+    }
 }
 
 /// The request's `reasoning_effort`: the client's own, else derived from
@@ -878,5 +897,29 @@ mod tests {
         assert_eq!(out.chunks[2].delta, "391");
         assert_eq!(out.response.reasoning, "17*23");
         assert_eq!(out.response.message, "391");
+    }
+
+    #[test]
+    fn anthropic_tool_choices_normalize_to_openai() {
+        for (choice, expected) in [
+            (json!({"type": "auto"}), json!("auto")),
+            (json!({"type": "any"}), json!("required")),
+            (json!({"type": "none"}), json!("none")),
+            (
+                json!({"type": "tool", "name": "get_weather"}),
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+            ),
+            (json!("required"), json!("required")),
+            (
+                json!({"type": "function", "function": {"name": "f"}}),
+                json!({"type": "function", "function": {"name": "f"}}),
+            ),
+        ] {
+            assert_eq!(
+                normalize_tool_choice_openai(choice.clone()),
+                expected,
+                "{choice}"
+            );
+        }
     }
 }
