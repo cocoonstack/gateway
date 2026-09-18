@@ -1365,8 +1365,10 @@ impl ResponsesEngine {
                 );
             }
             if let Some(v) = p.tool_choice {
-                let choice = responses_tool_choice(v, body);
-                body.insert("tool_choice".to_owned(), choice);
+                if let Some(parallel) = crate::openai_engine::parallel_tool_calls(&v) {
+                    body.insert("parallel_tool_calls".to_owned(), parallel);
+                }
+                body.insert("tool_choice".to_owned(), responses_tool_choice(v));
             }
             if let Some(effort) = p.reasoning.and_then(|r| r.effort) {
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
@@ -1562,8 +1564,8 @@ fn responses_tool(mut tool: Value) -> Value {
 }
 
 /// A chat- or Anthropic-shaped `tool_choice` flattened into the Responses shape.
-fn responses_tool_choice(choice: Value, body: &mut Map<String, Value>) -> Value {
-    let mut choice = crate::openai_engine::normalize_tool_choice_openai(choice, body);
+fn responses_tool_choice(choice: Value) -> Value {
+    let mut choice = crate::openai_engine::normalize_tool_choice_openai(choice);
     if let Some(Value::Object(mut function)) = choice.get_mut("function").map(Value::take) {
         function.insert("type".to_owned(), "function".into());
         return Value::Object(function);
@@ -2511,11 +2513,7 @@ mod tests {
             (json!({"type": "any"}), json!("required")),
             (json!("auto"), json!("auto")),
         ] {
-            assert_eq!(
-                responses_tool_choice(choice.clone(), &mut Map::new()),
-                expected,
-                "{choice}"
-            );
+            assert_eq!(responses_tool_choice(choice.clone()), expected, "{choice}");
         }
     }
 }

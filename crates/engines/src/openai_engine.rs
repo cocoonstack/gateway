@@ -102,8 +102,10 @@ impl OpenAiEngine {
                 body.insert("tools".into(), normalize_tools_openai(v));
             }
             if let Some(v) = p.tool_choice {
-                let choice = normalize_tool_choice_openai(v, &mut body);
-                body.insert("tool_choice".into(), choice);
+                if let Some(parallel) = parallel_tool_calls(&v) {
+                    body.insert("parallel_tool_calls".into(), parallel);
+                }
+                body.insert("tool_choice".into(), normalize_tool_choice_openai(v));
             }
             if let Some(v) = p.response_format {
                 body.insert("response_format".into(), v);
@@ -404,16 +406,7 @@ fn normalize_tools_openai(tools: Value) -> Value {
 
 /// `tool_choice` in the OpenAI chat shape: anthropic-shaped choices convert,
 /// native ones pass through.
-pub(crate) fn normalize_tool_choice_openai(
-    mut choice: Value,
-    body: &mut Map<String, Value>,
-) -> Value {
-    if let Some(disabled) = choice
-        .get("disable_parallel_tool_use")
-        .and_then(Value::as_bool)
-    {
-        body.insert("parallel_tool_calls".into(), (!disabled).into());
-    }
+pub(crate) fn normalize_tool_choice_openai(mut choice: Value) -> Value {
     match choice["type"].as_str() {
         Some("auto") => "auto".into(),
         Some("none") => "none".into(),
@@ -427,6 +420,13 @@ pub(crate) fn normalize_tool_choice_openai(
         }
         _ => choice,
     }
+}
+
+/// The OpenAI `parallel_tool_calls` an Anthropic-shaped `tool_choice` implies.
+pub(crate) fn parallel_tool_calls(choice: &Value) -> Option<Value> {
+    choice["disable_parallel_tool_use"]
+        .as_bool()
+        .map(|disabled| (!disabled).into())
 }
 
 /// The request's `reasoning_effort`: the client's own, else derived from
@@ -926,10 +926,24 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                normalize_tool_choice_openai(choice.clone(), &mut Map::new()),
+                normalize_tool_choice_openai(choice.clone()),
                 expected,
                 "{choice}"
             );
         }
+    }
+
+    #[test]
+    fn the_parallel_tool_policy_maps_to_parallel_tool_calls() {
+        assert_eq!(
+            parallel_tool_calls(&json!({"type": "auto", "disable_parallel_tool_use": true})),
+            Some(json!(false))
+        );
+        assert_eq!(
+            parallel_tool_calls(&json!({"type": "any", "disable_parallel_tool_use": false})),
+            Some(json!(true))
+        );
+        assert_eq!(parallel_tool_calls(&json!({"type": "auto"})), None);
+        assert_eq!(parallel_tool_calls(&json!("required")), None);
     }
 }
