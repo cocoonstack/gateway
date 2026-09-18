@@ -176,6 +176,15 @@ impl ClaudeEngine {
                 extra.remove("model");
                 extra.remove("stream");
             }
+            if let Some(Value::Bool(parallel)) = extra.remove("parallel_tool_calls")
+                && let Some(choice) = body
+                    .entry("tool_choice")
+                    .or_insert_with(|| object([("type", "auto".into())]))
+                    .as_object_mut()
+                && choice.get("type").and_then(Value::as_str) != Some("none")
+            {
+                choice.insert("disable_parallel_tool_use".into(), (!parallel).into());
+            }
         }
         crate::base::merge_raw_extras_owned(&mut body, raw);
         Ok(body)

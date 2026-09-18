@@ -241,6 +241,41 @@ async fn anthropic_request_shape() {
 }
 
 #[tokio::test]
+async fn chat_parallel_tool_calls_becomes_the_anthropic_parallel_policy() {
+    for (choice, parallel, expected) in [
+        (
+            Some("auto"),
+            false,
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+        ),
+        (
+            None,
+            true,
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": false}),
+        ),
+        (Some("none"), false, serde_json::json!({"type": "none"})),
+    ] {
+        let t = RecordingTransport::new(
+            r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let mut req = chat_req(Protocol::AnthropicMessages, "claude-sonnet");
+        let p = req.model_param_v2.as_mut().unwrap();
+        p.typed = Some(TypedParams::Chat(ChatParams {
+            tool_choice: choice.map(Value::from),
+            ..Default::default()
+        }));
+        p.raw = serde_json::json!({"parallel_tool_calls": parallel});
+        let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b["tool_choice"], expected, "{choice:?} {parallel}");
+        assert!(
+            b.get("parallel_tool_calls").is_none(),
+            "{choice:?} {parallel}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn anthropic_multimodal_content_preserved() {
     let t = RecordingTransport::new(
         r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
