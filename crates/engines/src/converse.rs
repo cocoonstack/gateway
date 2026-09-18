@@ -182,7 +182,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
             .collect(),
         _ => Vec::new(),
     };
-    // Bedrock refuses the parallel flag next to toolConfig.toolChoice: the whole choice rides in the extras
+    // Bedrock refuses the flag next to toolConfig.toolChoice, so the whole choice rides in the extras
     let choice_in_extras = claude
         && body
             .get("tool_choice")
@@ -235,13 +235,13 @@ fn reasoning_config(
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
 }
 
-/// A Bedrock id whose family rejects the sampling knobs and takes `reasoning_config`; the
-/// version digit after the marker keeps `openai.gpt-oss-*` out.
 /// Whether a Converse model id names a Claude model.
 pub(crate) fn claude_model(model: &str) -> bool {
     model.contains("claude")
 }
 
+/// A Bedrock id whose family rejects the sampling knobs and takes `reasoning_config`; the
+/// version digit after the marker keeps `openai.gpt-oss-*` out.
 fn reasoning_family(model: &str) -> bool {
     REASONING_CONFIG_MARKERS.iter().any(|marker| {
         model
