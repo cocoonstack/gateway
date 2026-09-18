@@ -164,6 +164,7 @@ fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
 }
 
 pub fn app(state: AppState) -> Router {
+    let max_request_bytes = state.handler.cfg().listen.max_request_bytes;
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
@@ -222,6 +223,7 @@ pub fn app(state: AppState) -> Router {
         .fallback(unknown_route)
         .method_not_allowed_fallback(wrong_method)
         .layer(axum::middleware::from_fn(track_requests))
+        .layer(axum::extract::DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
 }
 

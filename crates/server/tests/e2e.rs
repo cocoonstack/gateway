@@ -4488,13 +4488,53 @@ async fn error_contract_machine_channel() {
 
     let oversized = format!(
         r#"{{"model":"m-chat","messages":[{{"role":"user","content":"{}"}}]}}"#,
-        "x".repeat(3 * 1024 * 1024)
+        "x".repeat(33 * 1024 * 1024)
     );
     let r = app
         .oneshot(post(
             "/v1/chat/completions",
             Some("ak-demo-123"),
             &oversized,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let j = body_json(r).await;
+    assert_eq!(j["error"]["code"], "request_entity_too_large_exception");
+}
+
+#[tokio::test]
+async fn request_body_limit_follows_listen_config() {
+    let chat = |n: usize| {
+        format!(
+            r#"{{"model":"m-chat","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(n)
+        )
+    };
+    let r = app()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            &chat(3 * 1024 * 1024),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let mut cfg = GatewayConfig::embedded_default().expect("embedded config");
+    cfg.listen.max_request_bytes = 1024;
+    let cfg = Arc::new(cfg);
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let small = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let r = small
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            &chat(4096),
         ))
         .await
         .unwrap();

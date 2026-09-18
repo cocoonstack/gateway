@@ -81,6 +81,9 @@ pub enum ConfigError {
 pub struct Listen {
     pub host: String,
     pub port: u16,
+    /// Largest request body the gateway buffers, in bytes; read once at startup.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
 }
 
 /// One AK row of the local key table.
@@ -1471,6 +1474,10 @@ fn default_mcp_timeout() -> u64 {
 
 fn default_mcp_max_reply_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+fn default_max_request_bytes() -> usize {
+    32 * 1024 * 1024
 }
 
 fn default_max_live_streams() -> usize {
