@@ -146,9 +146,11 @@ models — the gateway converts between the two, including the streaming event
 sequence (`message_start` → `content_block_*` → `message_delta` →
 `message_stop`) and `stop_reason`/`finish_reason` mapping. Tools convert with
 the wire: `input_schema` becomes `parameters`, `tool_choice` `{type: any}` /
-`{type: tool, name}` become `required` / `{type: function}`, and a reply that
-carries `tool_use` blocks reports `stop_reason: tool_use` even where the vendor
-said `stop` (OpenAI does for a forced tool). On an OpenAI-protocol
+`{type: tool, name}` become `required` / `{type: function}`,
+`disable_parallel_tool_use` and `parallel_tool_calls` map onto each other in
+both directions, and a reply that carries `tool_use` blocks reports
+`stop_reason: tool_use` even where the vendor said `stop` (OpenAI does for a
+forced tool). On an OpenAI-protocol
 model, `thinking` (a budget, or `output_config.effort`) becomes
 `reasoning_effort` and the model's reasoning prose comes back as an unsigned
 `thinking` block ahead of the answer (streamed as `thinking_delta`); replaying
