@@ -92,8 +92,9 @@ Stated so an operator can choose them deliberately:
   `502`; endpoints and error text stay in the gateway log.
 - Abuse of long-lived connections: realtime sessions and MCP listen streams
   are capped per key (`max_live_streams_per_key`); realtime turns and every
-  MCP request spend the key's QPS permits; replies the proxy must buffer are
-  capped per server (`max_reply_bytes`); `x-gw-user` is capped at 256 bytes,
+  MCP request spend the key's QPS permits; request bodies are capped at
+  `listen.max_request_bytes` (32 MiB by default); replies the proxy must buffer
+  are capped per server (`max_reply_bytes`); `x-gw-user` is capped at 256 bytes,
   since it keys governance counters.
 - Billing store unreachable: rows queue in a bounded repair queue that applies
   backpressure when full and retries each batch eight times with backoff
