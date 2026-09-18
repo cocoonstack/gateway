@@ -826,22 +826,22 @@ fn normalize_tools_anthropic(tools: Value) -> Value {
     Value::Array(
         arr.into_iter()
             .map(|mut t| {
-                if let Some(f) = t.get_mut("function") {
+                if let Some(f) = t.get_mut("function").and_then(Value::as_object_mut) {
                     let mut tool = Map::with_capacity(4);
-                    tool.insert("name".into(), f["name"].take());
+                    tool.insert("name".into(), f.remove("name").unwrap_or_default());
                     // optional on both wires, but Anthropic rejects an explicit null
-                    if let Some(description) = f.get_mut("description").filter(|d| !d.is_null()) {
-                        tool.insert("description".into(), description.take());
+                    if let Some(description) = f.remove("description").filter(|d| !d.is_null()) {
+                        tool.insert("description".into(), description);
                     }
                     tool.insert(
                         "input_schema".into(),
-                        match f["parameters"].take() {
-                            Value::Null => json!({"type": "object", "properties": {}}),
-                            schema => schema,
+                        match f.remove("parameters") {
+                            None | Some(Value::Null) => json!({"type": "object", "properties": {}}),
+                            Some(schema) => schema,
                         },
                     );
-                    if let Some(strict) = f.get_mut("strict").filter(|strict| !strict.is_null()) {
-                        tool.insert("strict".into(), strict.take());
+                    if let Some(strict) = f.remove("strict").filter(|strict| !strict.is_null()) {
+                        tool.insert("strict".into(), strict);
                     }
                     Value::Object(tool)
                 } else {
@@ -860,8 +860,12 @@ fn normalize_tool_choice_anthropic(mut choice: Value) -> Value {
             "auto" => json!({"type": "auto"}),
             _ => choice,
         },
-        Value::Object(ref mut fields) if fields["type"] == "function" => {
-            let name = fields["function"]["name"].take();
+        Value::Object(ref mut fields) if fields.get("type").is_some_and(|t| t == "function") => {
+            let name = fields
+                .get_mut("function")
+                .and_then(|f| f.get_mut("name"))
+                .map(Value::take)
+                .unwrap_or_default();
             object([("type", "tool".into()), ("name", name)])
         }
         _ => choice,
@@ -1011,6 +1015,38 @@ mod tests {
         ] {
             assert_eq!(normalize_tool_choice_anthropic(choice), expected);
         }
+    }
+
+    #[test]
+    fn malformed_tool_choices_convert_or_pass_through_without_panicking() {
+        for (choice, expected) in [
+            (
+                json!({"type": "function"}),
+                json!({"type": "tool", "name": null}),
+            ),
+            (
+                json!({"type": "function", "function": "x"}),
+                json!({"type": "tool", "name": null}),
+            ),
+            (json!({"foo": 1}), json!({"foo": 1})),
+            (json!(7), json!(7)),
+        ] {
+            assert_eq!(
+                normalize_tool_choice_anthropic(choice.clone()),
+                expected,
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_tool_definitions_pass_through_without_panicking() {
+        let tools = json!([{"function": "x"}, "y", {"function": {"name": "ok"}}]);
+        let out = normalize_tools_anthropic(tools);
+        assert_eq!(out[0], json!({"function": "x"}));
+        assert_eq!(out[1], json!("y"));
+        assert_eq!(out[2]["name"], "ok");
+        assert_eq!(out[2]["input_schema"]["type"], "object");
     }
 
     #[tokio::test]
