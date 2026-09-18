@@ -18,6 +18,7 @@ One YAML file configures the gateway. Resolution order:
 listen:
   host: 127.0.0.1
   port: 8080
+  max_request_bytes: 33554432   # optional: largest request body buffered, read at startup (default 32 MiB)
 ```
 
 ### `storage` — durable records and fleet backends
