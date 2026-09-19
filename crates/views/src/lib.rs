@@ -2974,6 +2974,9 @@ fn spawn_stream_pipeline(
         request.stream_tx = Some(tx.clone());
     }
     let handler = s.handler.clone();
+    if request.request_id.is_empty() {
+        request.request_id = gw_handler::new_request_id();
+    }
     let request_id = request.request_id.clone();
     let ak_log = Arc::clone(&ak);
     tokio::spawn(
