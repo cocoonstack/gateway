@@ -2974,6 +2974,11 @@ fn spawn_stream_pipeline(
         request.stream_tx = Some(tx.clone());
     }
     let handler = s.handler.clone();
+    if request.request_id.is_empty() {
+        request.request_id = gw_handler::new_request_id();
+    }
+    let request_id = request.request_id.clone();
+    let ak_log = Arc::clone(&ak);
     tokio::spawn(
         async move {
             match handler.run(request, ak).await {
@@ -3059,6 +3064,18 @@ fn spawn_stream_pipeline(
                 Err(e) => {
                     // 499 client-closed classifies to None: the peer is gone, no frame is rendered
                     if let Some(error) = gw_models::StreamError::from_error(e) {
+                        tracing::warn!(
+                            target: "access",
+                            surface,
+                            request_id = %request_id,
+                            ak_id = &*ak_log.ak_id,
+                            product = %ak_log.product,
+                            tenant = %ak_log.tenant,
+                            latency_ms = started.elapsed().as_millis() as u64,
+                            code = error.class.code(),
+                            message = %error.message,
+                            "request failed"
+                        );
                         let _ = tx
                             .send(gw_engines::StreamChunk {
                                 error: Some(Box::new(error)),
@@ -3982,16 +3999,22 @@ fn responses_stream_response(
                 }) => {
                     let err = *err;
                     self.ensure_created();
-                    // the Responses error event is flat (no nested `error`); sequence_number
-                    // continues
+                    // carry both documented shapes: the docs put code/message at the top
+                    // level, the vendor nests them, and a client models only one
                     self.queue.push_back(
                         Event::default().event("error").data(
                             json!({
                                 "type": "error",
                                 "code": err.class.code(),
-                                "message": err.message,
+                                "message": &err.message,
                                 "param": null,
                                 "sequence_number": self.seq,
+                                "error": {
+                                    "type": "error",
+                                    "code": err.class.code(),
+                                    "message": &err.message,
+                                    "param": null,
+                                },
                             })
                             .to_string(),
                         ),
