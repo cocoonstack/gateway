@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"cmp"
 	"errors"
 	"net/http"
 	"strconv"
@@ -248,10 +249,7 @@ func (s *Server) rollbackConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 	p := current(r)
-	kind := r.URL.Query().Get("kind")
-	if kind == "" {
-		kind = "ops"
-	}
+	kind := cmp.Or(r.URL.Query().Get("kind"), "ops")
 	if kind == "ops" {
 		if p.User.Role != user.RoleSystemAdmin {
 			writeError(w, http.StatusForbidden, "system admin role required")

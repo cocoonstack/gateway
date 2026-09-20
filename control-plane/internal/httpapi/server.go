@@ -254,10 +254,7 @@ func period(r *http.Request) (int64, int64, string, error) {
 	now := time.Now().Unix()
 	since := queryInt(r, "since", now-29*86_400)
 	until := queryInt(r, "until", now)
-	bucket := r.URL.Query().Get("bucket")
-	if bucket == "" {
-		bucket = "day"
-	}
+	bucket := cmp.Or(r.URL.Query().Get("bucket"), "day")
 	if since < 0 || until < since {
 		return 0, 0, "", errors.New("since/until must be a valid non-negative range")
 	}
