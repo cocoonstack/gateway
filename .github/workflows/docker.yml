@@ -27,7 +27,7 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
-      - uses: docker/build-push-action@v7.3.0
+      - uses: docker/build-push-action@v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -40,7 +40,7 @@ jobs:
         id: meta-cp
         with:
           images: ghcr.io/${{ github.repository }}-control-plane
-      - uses: docker/build-push-action@v7.3.0
+      - uses: docker/build-push-action@v7.4.0
         with:
           context: control-plane
           platforms: linux/amd64,linux/arm64
