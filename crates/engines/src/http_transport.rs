@@ -166,6 +166,7 @@ impl Transport for HttpTransport {
                     tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 }
                 Err(e) => {
+                    let e = e.without_url();
                     let what = if e.is_timeout() {
                         "upstream request timed out"
                     } else {
@@ -195,7 +196,7 @@ impl Transport for HttpTransport {
             use futures::TryStreamExt;
             let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
                 timeout: e.is_timeout(),
-                message: e.to_string(),
+                message: e.without_url().to_string(),
             }));
             return Ok(UpstreamResponse {
                 status,
@@ -216,6 +217,7 @@ impl Transport for HttpTransport {
             read.await
         };
         let bytes = bytes.map_err(|e| {
+            let e = e.without_url();
             // both stay 502 (failover-eligible); the code split keeps the external 408-vs-424 class
             let what = if e.is_timeout() {
                 "read upstream body timed out"
@@ -412,6 +414,19 @@ mod tests {
             }));
         }
         t.send(req).await.unwrap().status
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_never_carries_the_request_url() {
+        let t = HttpTransport::new(Duration::from_secs(2)).unwrap();
+        let err = t
+            .send(request(
+                "http://127.0.0.1:1/chat?access_token=upstream-secret".into(),
+            ))
+            .await
+            .expect_err("nothing listens on port 1");
+        let source = err.source.expect("the reqwest error rides as the source");
+        assert!(!source.to_string().contains("upstream-secret"), "{source}");
     }
 
     #[tokio::test]
