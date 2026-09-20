@@ -321,8 +321,7 @@ impl DagNode for SelectAccount {
     }
 }
 
-/// model_access/tenant_rate: pooled tenant QPS — all of a tenant's keys share
-/// one bucket, checked ahead of the per-AK limit.
+/// model_access/tenant_rate: pooled tenant QPS.
 pub struct TenantRateLimit;
 
 #[async_trait::async_trait]
@@ -336,7 +335,7 @@ impl DagNode for TenantRateLimit {
         }
         admission::check_tenant_rate(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.tenant)
             .await
-            .map_err(limit_denied)
+            .map_err(pooled_limit_denied)
     }
 }
 
@@ -372,7 +371,7 @@ impl DagNode for ProductQpmLimit {
         }
         admission::check_product_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.product)
             .await
-            .map_err(limit_denied)?;
+            .map_err(pooled_limit_denied)?;
         ctx.request_limits_admitted = true;
         Ok(())
     }
@@ -390,7 +389,7 @@ impl DagNode for ModelQpmLimit {
         let param = ctx.model_param()?;
         admission::check_model_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &param.model_name)
             .await
-            .map_err(limit_denied)
+            .map_err(pooled_limit_denied)
     }
 }
 
@@ -966,8 +965,8 @@ pub fn default_layers() -> Vec<Layer> {
         Layer {
             name: "model_access",
             nodes: vec![
-                Box::new(TenantRateLimit),
                 Box::new(RateLimit),
+                Box::new(TenantRateLimit),
                 Box::new(ProductQpmLimit),
                 Box::new(ModelQpmLimit),
                 Box::new(AkTpmLimit),
@@ -1009,10 +1008,12 @@ fn requested_model(param: Option<&gw_models::ModelParamV2>) -> &str {
         .unwrap_or_default()
 }
 
-/// The shared 429 for throttling-style denials (rate/QPM/TPM); hard quota
-/// exhaustion answers with [`quota_denied`] instead.
 fn limit_denied(msg: String) -> GatewayError {
     GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
+}
+
+fn pooled_limit_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::POOLED_LIMIT_MSG, 429, msg)
 }
 
 fn quota_denied(msg: String) -> GatewayError {
@@ -1045,8 +1046,8 @@ mod tests {
                 (
                     "model_access",
                     vec![
-                        "tenant_rate",
                         "rate_limit",
+                        "tenant_rate",
                         "product_qpm",
                         "model_qpm",
                         "ak_tpm",

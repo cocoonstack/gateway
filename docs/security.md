@@ -75,6 +75,11 @@ response, log line, audit row or trace.
   fails the request instead.
 - A tenant admin may ban its own keys but can neither lift a ban nor change an
   abuse suspension: those are platform sanctions the global token owns.
+- Automatic suspension (`abuse.tiers`) counts REST model-pipeline denials for
+  the key's own QPS or TPM limit. Pooled tenant QPS, product QPM and model QPM
+  denials never count against the key; a sibling's traffic cannot trigger its
+  suspension. Batch items, realtime turns, MCP requests and video polls do not
+  count.
 - Every hit is a security event (`/admin/audit/events`) carrying the rule,
   action and hit count — never the prompt text. Admin mutations land in
   `/admin/audit/ops` with the source IP (the TCP peer; the rightmost

@@ -142,7 +142,7 @@ impl ErrClass {
                 503 => ErrClass::ServiceUnavailable,
                 _ => ErrClass::ModelError,
             },
-            ErrCode::STOP_LIMIT_MSG => ErrClass::Throttling,
+            ErrCode::STOP_LIMIT_MSG | ErrCode::POOLED_LIMIT_MSG => ErrClass::Throttling,
             ErrCode::QUOTA_EXHAUSTED => ErrClass::ServiceQuotaExceeded,
             ErrCode::PERMISSION_CHECK => ErrClass::AccessDenied,
             ErrCode::REQ_JSON | ErrCode::REQ_NON_CHAT => ErrClass::Validation,

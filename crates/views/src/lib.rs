@@ -570,10 +570,10 @@ async fn realtime_gate(
     let gov = state.governance.as_ref();
     let throttled = |m: String| (ErrClass::Throttling, m);
     let quota_exceeded = |m: String| (ErrClass::ServiceQuotaExceeded, m);
-    admission::check_tenant_rate(gov, cfg, &ak.tenant)
+    admission::check_ak_rate(gov, &ak)
         .await
         .map_err(throttled)?;
-    admission::check_ak_rate(gov, &ak)
+    admission::check_tenant_rate(gov, cfg, &ak.tenant)
         .await
         .map_err(throttled)?;
     admission::check_product_qpm(gov, cfg, &ak.product)
@@ -4293,8 +4293,8 @@ async fn admit_video_job(
     let cfg = s.handler.cfg();
     let gov = state.governance.as_ref();
     let admitted = async {
-        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
         admission::check_ak_rate(gov, ak).await?;
+        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
         admission::check_product_qpm(gov, &cfg, &ak.product).await
     };
     if let Err(denied) = admitted.await {
