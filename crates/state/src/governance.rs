@@ -207,8 +207,7 @@ impl RedisGovernance {
         {
             Ok(v) => v,
             Err(e) => {
-                // fail open, but loudly — a persistent outage would otherwise silently disable
-                // limits
+                // fail open, loudly: a persistent outage would otherwise silently disable limits
                 let key_id = crate::access_key_fingerprint(key);
                 tracing::warn!(error = %e, key_id, "redis governance unavailable; limit skipped");
                 0
@@ -275,8 +274,7 @@ impl Governance for RedisGovernance {
         .await
     }
     async fn quota_reset_all(&self) {
-        // no-op: quota keys are stamped by UTC day, a per-instance sweep would wipe the shared
-        // keyspace
+        // no-op: keys carry their UTC day, and a per-instance sweep would wipe the shared keyspace
     }
     async fn counter_get(&self, key: &str) -> i64 {
         let mut conn = self.conn.clone();

@@ -2193,8 +2193,7 @@ async fn admin_config_rollback(
         Ok(None) => return error_response(404, format!("config version {source_id} not found")),
         Err(e) => return gateway_error(e),
     };
-    // a retained document can predate stricter validation; republished unvalidated it would brick
-    // reloads
+    // a retained document can predate stricter validation; unvalidated, it would brick reloads
     if let Err(e) = GatewayConfig::from_yaml(&yaml) {
         return error_response(
             400,

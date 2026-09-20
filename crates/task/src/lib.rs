@@ -1,7 +1,6 @@
 //! Local background tasks: periodic AK daily quota reset, retained-content
 //! purge, the usage rollup, availability flush/alerting, and the alert
-//! webhook dispatcher. Batch job execution lives in gw-handler::offline
-//! (spawned on submit) and needs no separate poller.
+//! webhook dispatcher. Batch execution lives in gw-handler::offline.
 
 use std::collections::HashMap;
 use std::sync::Arc;

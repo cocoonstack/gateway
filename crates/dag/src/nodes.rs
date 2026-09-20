@@ -1,5 +1,4 @@
 //! The default node set for the online chat pipeline.
-//! Metrics-reporting nodes are dropped by design.
 
 use gw_consts::{ErrCode, Protocol};
 use gw_models::{GResult, GatewayError};

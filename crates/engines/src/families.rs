@@ -1,7 +1,6 @@
 //! The non-chat protocol engines, one per Protocol variant. Each engine only
 //! does "build request → Transport → parse response" — nothing else crosses
-//! that boundary. The mock protocol flags byte-level vendor differences as
-//! deferred to a later fidelity pass.
+//! that boundary.
 
 use std::sync::Arc;
 
@@ -251,7 +250,6 @@ base_engine!(EmbeddingsEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for EmbeddingsEngine {
-    /// Merges the openai/ali/vertex embedding engines to the openai shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         // the batch moves: json! would re-copy every input string
@@ -334,7 +332,6 @@ base_engine!(ImageEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for ImageEngine {
-    /// Merges the dalle/wanx/flux/stability/... engines to the images/generations shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let (prompt, n, size, image, mask) = match self.base.take_typed() {
@@ -448,7 +445,6 @@ impl AudioEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for AudioEngine {
-    /// Merges the openai_tts/whisper/azure_asr/elevenlabs/cosyvoice/minimax_t2a etc. engines.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         // speech bills per input char, transcription per second (vendor count, else play length)
@@ -1014,7 +1010,7 @@ base_engine!(SearchEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for SearchEngine {
-    /// Brave or Google CSE on their providers, else the generic mock shape.
+    /// Brave on its provider, else the generic shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {

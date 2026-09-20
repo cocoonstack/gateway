@@ -1444,8 +1444,7 @@ impl SqliteStore {
                 return Err(crate::sqlx_err("migrate billing schema", e));
             }
         }
-        // a dead process's jobs can never progress single-instance — fail them, don't let clients
-        // poll forever
+        // a dead process's jobs never progress single-instance: fail them or clients poll forever
         sqlx::query("UPDATE batches SET status = 'failed' WHERE status IN ('pending', 'running')")
             .execute(&pool)
             .await

@@ -22,7 +22,7 @@ impl ModelEngine for ErnieEngine {
     /// or a legacy token as `?access_token=`; reply `{result, usage}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // ernie's system is a top-level field (system turns are filtered above)
+        // ernie's system is a top-level field
         let system = self.base.system_text();
         let messages = simple_turns(&mut self.base, ("assistant", "user"), ("role", "content"));
         let mut body = json!({});
