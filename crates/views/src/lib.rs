@@ -4290,13 +4290,14 @@ async fn admit_video_job(
             format!("account {} is no longer configured", job.account),
         ));
     };
-    let poll = poll_and_settle_video(s, &job, &account).await?;
+    let poll = poll_and_settle_video(s, ak, &job, &account).await?;
     Ok((job, account, poll))
 }
 
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn poll_and_settle_video(
     s: &AppState,
+    poller: &AkInfo,
     job: &VideoJob,
     account: &Arc<gw_models::Account>,
 ) -> Result<gw_engines::families::VideoPoll, Response> {
@@ -4317,7 +4318,7 @@ async fn poll_and_settle_video(
         false
     };
     if claimed {
-        admission::settle_and_bill(
+        let settled = admission::settle_and_bill(
             &state,
             &cfg,
             admission::SettleInput {
@@ -4348,6 +4349,16 @@ async fn poll_and_settle_video(
                 reserved_at: gw_state::epoch_secs(),
                 model_quota_key: None,
             },
+        )
+        .await;
+        let submitter = state.auth.authenticate(&job.ak).await;
+        admission::consume_budgets(
+            &state,
+            &cfg,
+            submitter.as_deref().unwrap_or(poller),
+            &job.user_id,
+            settled.total_tokens,
+            settled.cost_micros,
         )
         .await;
     }

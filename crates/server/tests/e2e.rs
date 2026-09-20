@@ -1443,6 +1443,47 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
 }
 
 #[tokio::test]
+async fn an_async_video_completion_counts_against_the_cost_budget() {
+    let yaml = gw_config::DEFAULT_YAML.replace(
+        "tenants:\n",
+        "tenants:\n  - name: default\n    daily_cost_quota_micros: 100000\n",
+    );
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let submit = || {
+        post(
+            "/v1/videos/generations",
+            Some("ak-demo-123"),
+            r#"{"model":"grok-imagine-video","prompt":"a cat on a skateboard","duration":2}"#,
+        )
+    };
+    let resp = app.clone().oneshot(submit()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let id = body_json(resp).await["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let resp = app
+        .clone()
+        .oneshot(get_authed(&format!("/v1/videos/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "done");
+
+    let resp = app.clone().oneshot(submit()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"]["code"],
+        "service_quota_exceeded_exception"
+    );
+}
+
+#[tokio::test]
 async fn async_video_bills_once_on_the_first_done_poll() {
     let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
