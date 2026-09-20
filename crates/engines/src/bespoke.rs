@@ -260,14 +260,28 @@ base_engine!(DashScopeEngine);
 
 impl DashScopeEngine {
     fn build_body(&mut self, stream: bool) -> GResult<Value> {
-        let system = self
-            .base
-            .chat_params()
-            .and_then(|p| p.system.as_deref())
-            .map(|system| gw_models::ChatMsg::text(gw_consts::role::SYSTEM, system));
-        let messages: Vec<Value> = system
+        let mut parameters = json!({"result_format": "message"});
+        if stream {
+            // deltas instead of the full-text-so-far in every frame
+            parameters["incremental_output"] = json!(true);
+        }
+        let system = match self.base.take_typed() {
+            Some(TypedParams::Chat(p)) => {
+                if let Some(t) = p.temperature {
+                    parameters["temperature"] = json!(t);
+                }
+                if let Some(t) = p.top_p {
+                    parameters["top_p"] = json!(t);
+                }
+                if let Some(mt) = p.max_tokens {
+                    parameters["max_tokens"] = json!(mt);
+                }
+                p.system.map(|text| ("system", text))
+            }
+            _ => None,
+        };
+        let messages = std::mem::take(&mut self.base.request.message)
             .into_iter()
-            .chain(std::mem::take(&mut self.base.request.message))
             .map(|m| {
                 let role = if m.role == gw_consts::role::AI {
                     "assistant"
@@ -276,25 +290,13 @@ impl DashScopeEngine {
                 } else {
                     "user"
                 };
-                object([("role", role.into()), ("content", m.content.into())])
-            })
+                (role, m.content)
+            });
+        let messages = system
+            .into_iter()
+            .chain(messages)
+            .map(|(role, content)| object([("role", role.into()), ("content", content.into())]))
             .collect();
-        let mut parameters = json!({"result_format": "message"});
-        if stream {
-            // deltas instead of the full-text-so-far in every frame
-            parameters["incremental_output"] = json!(true);
-        }
-        if let Some(p) = self.base.chat_params() {
-            if let Some(t) = p.temperature {
-                parameters["temperature"] = json!(t);
-            }
-            if let Some(t) = p.top_p {
-                parameters["top_p"] = json!(t);
-            }
-            if let Some(mt) = p.max_tokens {
-                parameters["max_tokens"] = json!(mt);
-            }
-        }
         let input = object([("messages", Value::Array(messages))]);
         Ok(object([
             ("model", self.base.model_name()?.into()),

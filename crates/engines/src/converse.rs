@@ -156,7 +156,12 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         Some(Value::Array(messages)) => messages.into_iter().map(message).collect(),
         _ => Vec::new(),
     };
-    let replays_tools = messages.iter().any(carries_tool_block);
+    // Bedrock refuses the flag next to toolConfig.toolChoice, so the whole choice rides in the extras
+    let choice_in_extras = claude
+        && body.get("tool_choice").is_some_and(|choice| {
+            choice.get("disable_parallel_tool_use").is_some()
+                || (choice["type"] == "none" && messages.iter().any(carries_tool_block))
+        });
     out.insert("messages".into(), Value::Array(messages));
 
     let mut inference = Map::new();
@@ -183,12 +188,6 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
             .collect(),
         _ => Vec::new(),
     };
-    // Bedrock refuses the flag next to toolConfig.toolChoice, so the whole choice rides in the extras
-    let choice_in_extras = claude
-        && body.get("tool_choice").is_some_and(|choice| {
-            choice.get("disable_parallel_tool_use").is_some()
-                || (choice["type"] == "none" && replays_tools)
-        });
     let (disable_tools, tool_choice) = if choice_in_extras {
         (false, None)
     } else {
@@ -196,7 +195,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
             .map(converse_tool_choice)
             .unwrap_or_default()
     };
-    if !tools.is_empty() && (!disable_tools || replays_tools) {
+    if !tools.is_empty() && !disable_tools {
         let mut config = Map::with_capacity(2);
         config.insert("tools".into(), Value::Array(tools));
         if let Some(choice) = tool_choice {
@@ -716,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_none_keeps_tool_config_for_a_tool_history() {
+    fn tool_choice_none_with_history_keeps_tools_only_for_claude() {
         let body = || -> Map<String, Value> {
             serde_json::from_value(json!({
                 "messages": [
@@ -731,11 +730,7 @@ mod tests {
             .unwrap()
         };
         let nova = request(body(), "us.amazon.nova-lite-v1:0");
-        assert_eq!(
-            nova["toolConfig"]["tools"][0]["toolSpec"]["name"],
-            "get_weather"
-        );
-        assert!(nova["toolConfig"].get("toolChoice").is_none());
+        assert!(nova.get("toolConfig").is_none());
         assert!(nova.get("additionalModelRequestFields").is_none());
 
         let claude = request(body(), "us.anthropic.claude-haiku-4-5-20251001-v1:0");
