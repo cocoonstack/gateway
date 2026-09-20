@@ -486,7 +486,7 @@ struct RealtimeAdmit {
     user: String,
     reserved: i64,
     /// Tokens reserved in the AK TPM window; `None` when the key has no TPM cap.
-    tpm_reserved: Option<i64>,
+    tpm_reserved: Option<admission::TpmReserve>,
     at: i64,
     /// Per-turn correlation id for the ledger row.
     request_id: String,
@@ -1081,7 +1081,12 @@ async fn realtime_bridge(
                                         .unwrap_or_else(|| ak.clone());
                                     let user = billed.attributed_user(&hint).to_owned();
                                     Some(RealtimeAdmit {
-                                        tpm_reserved: billed.tokens_per_minute.map(|_| 0),
+                                        tpm_reserved: billed.tokens_per_minute.map(|_| {
+                                            admission::TpmReserve {
+                                                est: 0,
+                                                window: None,
+                                            }
+                                        }),
                                         ak: billed,
                                         user,
                                         reserved: 0,
@@ -6191,7 +6196,7 @@ mod tests {
         let a1 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
             .await
             .expect("first admits");
-        assert_eq!(a1.tpm_reserved, Some(REALTIME_TURN_RESERVE));
+        assert_eq!(a1.tpm_reserved.map(|r| r.est), Some(REALTIME_TURN_RESERVE));
         let daily_before = gov.quota_used(&ak.ak).await;
 
         assert!(

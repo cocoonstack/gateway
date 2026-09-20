@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -527,23 +527,32 @@ fn serves(a: &Arc<Account>, p: Protocol, provider: Option<&str>) -> bool {
     a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want)
 }
 
+#[derive(Debug)]
+struct Window {
+    since: Instant,
+    id: i64,
+    used: i64,
+}
+
 /// Fixed-window token accounting, for AK-level TPM and (at amount 1) QPM.
 #[derive(Debug, Default)]
 pub struct TokenWindow {
-    entries: DashMap<String, (Instant, i64)>,
+    entries: DashMap<String, Window>,
+    opened: AtomicI64,
 }
 
 impl TokenWindow {
-    /// Windowed admission with reservation, atomic under the entry guard.
-    pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: std::time::Duration) -> bool {
-        reserve_on(&mut self.slot(key, window).1, amount, limit)
+    /// Windowed admission with reservation, atomic under the entry guard; returns the admitting window's id.
+    pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: Duration) -> Option<i64> {
+        let mut w = self.slot(key, window);
+        reserve_on(&mut w.used, amount, limit).then_some(w.id)
     }
 
-    /// Apply the settle delta to the window its reserve opened `reserved_age` ago; a newer window is left alone.
-    pub fn settle(&self, key: &str, delta: i64, window: Duration, reserved_age: Duration) {
-        let mut e = self.slot(key, window);
-        if e.0.elapsed() >= reserved_age {
-            settle_on(&mut e.1, delta);
+    /// Apply the settle delta to window `id` (`None` = the live window); a newer window is left alone.
+    pub fn settle(&self, key: &str, delta: i64, window: Duration, id: Option<i64>) {
+        let mut w = self.slot(key, window);
+        if id.is_none_or(|id| id == w.id) {
+            settle_on(&mut w.used, delta);
         }
     }
 
@@ -552,13 +561,21 @@ impl TokenWindow {
     fn slot(
         &self,
         key: &str,
-        window: std::time::Duration,
-    ) -> dashmap::mapref::one::RefMut<'_, String, (Instant, i64)> {
-        let mut e = slot_mut(&self.entries, key, || (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
+        window: Duration,
+    ) -> dashmap::mapref::one::RefMut<'_, String, Window> {
+        let mut w = slot_mut(&self.entries, key, || self.open());
+        if w.since.elapsed() >= window {
+            *w = self.open();
         }
-        e
+        w
+    }
+
+    fn open(&self) -> Window {
+        Window {
+            since: Instant::now(),
+            id: self.opened.fetch_add(1, Ordering::Relaxed) + 1,
+            used: 0,
+        }
     }
 }
 
@@ -952,11 +969,6 @@ impl std::fmt::Debug for SharedConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SharedConfig")
     }
-}
-
-pub fn reserved_age(at_epoch_secs: i64) -> Duration {
-    let reserved_by_ms = at_epoch_secs.saturating_add(2).saturating_mul(1_000);
-    Duration::from_millis(epoch_millis().saturating_sub(reserved_by_ms).max(0) as u64)
 }
 
 /// Current unix seconds (0 if the clock reads before the epoch).

@@ -84,8 +84,9 @@ storage:
   the next flush loses rows: the queue plus the batch in flight, 4352 rows at
   the defaults (4096 queued + 256 in flight). A full queue falls back to the
   awaited write, so an accepted request never loses its row under overload.
-- **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
-  namespaced under `gw:`, windows self-expire), otherwise in-process. Without
+- **Rate limits & quotas**: shared in Redis (7.0 or newer — the TPM settle
+  reads `PEXPIRETIME`) when `redis_url` is set (keys namespaced under `gw:`,
+  windows self-expire), otherwise in-process. Without
   Redis, each replica limits independently. A configured Redis that is
   unreachable **fails open**: every limit, quota and budget passes with a
   warning until it returns ([Governance](governance.md#limits)).

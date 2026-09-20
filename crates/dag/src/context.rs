@@ -8,6 +8,7 @@ use std::sync::Arc;
 use gw_config::GatewayConfig;
 use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{GResult, GatewayError, GatewayRequest, ModelParamV2};
+use gw_state::admission::TpmReserve;
 use gw_state::{AkInfo, GatewayState};
 
 pub struct DagContext {
@@ -43,7 +44,7 @@ pub struct DagContext {
     /// same UTC-day bucket the reserve did even if the request crosses midnight.
     pub quota_at: i64,
     /// Tokens reserved in the AK TPM window at admission (same lifecycle).
-    pub tpm_reserved: Option<i64>,
+    pub tpm_reserved: Option<TpmReserve>,
     /// Outbound DLP buffered this stream, so billing waits for the view's
     /// delivery result instead of settling inside the DAG.
     pub billing_deferred: bool,

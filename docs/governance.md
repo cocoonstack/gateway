@@ -94,9 +94,8 @@ estimate (prompt heuristic + requested `max_tokens`) is reserved atomically, so
 concurrent in-flight requests count against the budget instead of all passing a
 stale check and jointly overshooting. Billing settles the reservation to actual
 usage; a failed request refunds it. The daily reserve settles on its admission
-day; the TPM reserve settles only while the minute window it opened is still
-live — a request that outlives its window leaves the next window's reservations
-alone. Charged price is the model's list price, or
+day; the TPM reserve settles only into the minute window that admitted it — a
+request that outlives its window leaves the next window's reservations alone. Charged price is the model's list price, or
 a tenant's `model_prices` override; when an account declares `cost_*_price` the
 ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
 Surfaces that meter no tokens bill per unit instead — TTS characters,

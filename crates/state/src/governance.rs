@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::admission::TpmReserve;
 use crate::{QuotaStore, RateLimiter, TokenWindow};
 
 /// Day-keyed quota buckets linger at most this long before self-expiring.
 const QUOTA_TTL_MS: i64 = 2 * 24 * 60 * 60 * 1000;
+const UNRECORDED_WINDOW: i64 = 0;
 
 /// The governance operations the request pipeline calls.
 #[async_trait]
@@ -45,22 +47,16 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     /// Fixed-window request limit (QPM): take one permit.
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool;
 
-    /// Windowed admission with reservation (see [`Governance::quota_reserve`]).
+    /// Windowed admission with reservation; returns the admitting window's id, `None` = nothing reserved.
     async fn token_window_reserve(
         &self,
         key: &str,
         amount: i64,
         limit: i64,
         window: Duration,
-    ) -> bool;
-    /// Apply the settle delta to the window its reserve opened `reserved_age` ago, if still live.
-    async fn token_window_settle(
-        &self,
-        key: &str,
-        delta: i64,
-        window: Duration,
-        reserved_age: Duration,
-    );
+    ) -> Option<i64>;
+    /// Apply the settle delta to window `id` (`None` = the live window); a window that rolled over is left alone.
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, id: Option<i64>);
 
     /// Refund an admission reservation whole (daily quota + optional TPM
     /// window) — for a request/turn that never reached billing.
@@ -68,15 +64,14 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
         &self,
         ak: &str,
         reserved: i64,
-        tpm_reserved: Option<i64>,
+        tpm_reserved: Option<TpmReserve>,
         at_epoch_secs: i64,
     ) {
         if reserved != 0 {
             self.quota_settle(ak, -reserved, at_epoch_secs).await;
         }
         if let Some(tpm) = tpm_reserved {
-            let age = crate::reserved_age(at_epoch_secs);
-            self.token_window_settle(ak, -tpm, gw_consts::MINUTE, age)
+            self.token_window_settle(ak, -tpm.est, gw_consts::MINUTE, tpm.window)
                 .await;
         }
     }
@@ -125,7 +120,7 @@ impl Governance for MemoryGovernance {
         self.counters.retain_prefixed(prefixes);
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
-        self.qpm.reserve(key, 1, limit, window)
+        self.qpm.reserve(key, 1, limit, window).is_some()
     }
     async fn token_window_reserve(
         &self,
@@ -133,11 +128,11 @@ impl Governance for MemoryGovernance {
         amount: i64,
         limit: i64,
         window: Duration,
-    ) -> bool {
+    ) -> Option<i64> {
         self.tpm.reserve(key, amount, limit, window)
     }
-    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, age: Duration) {
-        self.tpm.settle(key, delta, window, age);
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, id: Option<i64>) {
+        self.tpm.settle(key, delta, window, id);
     }
 }
 
@@ -162,9 +157,15 @@ impl RedisGovernance {
 
     /// Reserve `amount` against `limit` on a self-expiring key: admit while
     /// spent-before < limit (the reservation may overshoot once; the settle
-    /// corrects), rolling the increment back on denial. A failed round-trip
-    /// admits — limits fail open on a Redis blip.
-    async fn reserve_capped(&self, key: String, amount: i64, limit: i64, ttl_ms: i64) -> bool {
+    /// corrects), rolling the increment back on denial; returns the key's expiry
+    /// as the window id. A failed round-trip admits — limits fail open on a Redis blip.
+    async fn reserve_capped(
+        &self,
+        key: String,
+        amount: i64,
+        limit: i64,
+        ttl_ms: i64,
+    ) -> Option<i64> {
         static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
             redis::Script::new(
                 "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
@@ -173,7 +174,7 @@ impl RedisGovernance {
                    redis.call('DECRBY', KEYS[1], ARGV[1])
                    return 0
                  end
-                 return 1",
+                 return redis.call('PEXPIRETIME', KEYS[1])",
             )
         });
         let mut conn = self.conn.clone();
@@ -185,11 +186,11 @@ impl RedisGovernance {
             .invoke_async::<i64>(&mut conn)
             .await
         {
-            Ok(v) => v == 1,
+            Ok(id) => (id != 0).then_some(id),
             Err(e) => {
                 let key_id = crate::access_key_fingerprint(&key);
                 tracing::warn!(error = %e, key_id, "redis reserve failed; admitting");
-                true
+                Some(UNRECORDED_WINDOW)
             }
         }
     }
@@ -259,6 +260,7 @@ impl Governance for RedisGovernance {
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> bool {
         self.reserve_capped(quota_key_at(key, at), amount, limit, QUOTA_TTL_MS)
             .await
+            .is_some()
     }
     async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
@@ -270,7 +272,7 @@ impl Governance for RedisGovernance {
             &quota_key_at(key, at),
             delta,
             Duration::from_millis(QUOTA_TTL_MS as u64),
-            Duration::ZERO,
+            None,
         )
         .await;
     }
@@ -312,15 +314,15 @@ impl Governance for RedisGovernance {
         amount: i64,
         limit: i64,
         window: Duration,
-    ) -> bool {
+    ) -> Option<i64> {
         self.reserve_capped(tpm_key(key), amount, limit, window.as_millis() as i64)
             .await
     }
-    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, age: Duration) {
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, id: Option<i64>) {
         if delta == 0 {
             return;
         }
-        settle_floored(&self.conn, &tpm_key(key), delta, window, age).await;
+        settle_floored(&self.conn, &tpm_key(key), delta, window, id).await;
     }
 }
 
@@ -350,15 +352,12 @@ async fn settle_floored(
     key: &str,
     delta: i64,
     window: Duration,
-    reserved_age: Duration,
+    id: Option<i64>,
 ) {
     static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
         redis::Script::new(
-            "local age = tonumber(ARGV[3])
-             if age > 0 then
-               local pttl = redis.call('PTTL', KEYS[1])
-               if pttl < 0 or tonumber(ARGV[2]) - pttl < age then return 0 end
-             end
+            "local id = tonumber(ARGV[3])
+             if id >= 0 and redis.call('PEXPIRETIME', KEYS[1]) ~= id then return 0 end
              local v = redis.call('INCRBY', KEYS[1], ARGV[1])
              if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
              if redis.call('PTTL', KEYS[1]) < 0 then
@@ -372,7 +371,7 @@ async fn settle_floored(
         .key(key)
         .arg(delta)
         .arg(window.as_millis() as i64)
-        .arg(reserved_age.as_millis() as i64)
+        .arg(id.unwrap_or(-1))
         .invoke_async::<i64>(&mut conn)
         .await
     {
@@ -429,42 +428,41 @@ mod tests {
         assert!(!g.quota_reserve(&rkey, 300, 100, now).await);
         g.quota_settle(&rkey, 15 - 300, now).await;
         assert_eq!(g.quota_used(&rkey).await, 15);
+        let minute = Duration::from_secs(60);
+        let held = g.token_window_reserve(&rkey, 300, 100, minute).await;
+        assert!(held.is_some());
         assert!(
-            g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
+            g.token_window_reserve(&rkey, 300, 100, minute)
                 .await
+                .is_none()
         );
+        g.token_window_settle(&rkey, -300, minute, held).await;
         assert!(
-            !g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
+            g.token_window_reserve(&rkey, 300, 100, minute)
                 .await
+                .is_some()
         );
-        g.token_window_settle(
-            &rkey,
-            -300,
-            Duration::from_secs(60),
-            Duration::from_secs(61),
-        )
-        .await;
+
+        let wkey = format!("w{}", std::process::id());
+        let w = Duration::from_secs(1);
+        let earlier = g.token_window_reserve(&wkey, 80, 100, w).await;
+        assert!(earlier.is_some());
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        assert!(g.token_window_reserve(&wkey, 90, 100, w).await.is_some());
+        g.token_window_settle(&wkey, -80, w, earlier).await;
+        assert!(g.token_window_reserve(&wkey, 20, 100, w).await.is_some());
         assert!(
-            !g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
-                .await,
-            "a refund older than the window must not drain it"
-        );
-        g.token_window_settle(&rkey, -300, Duration::from_secs(60), Duration::ZERO)
-            .await;
-        assert!(
-            g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
-                .await
+            g.token_window_reserve(&wkey, 1, 100, w).await.is_none(),
+            "the earlier window's refund must not drain this window's reservations"
         );
 
         let mkey = format!("m{}", std::process::id());
         assert!(g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
 
-        g.token_window_settle(&ak, 10, Duration::from_secs(60), Duration::ZERO)
-            .await;
+        g.token_window_settle(&ak, 10, minute, None).await;
         assert!(
-            !g.token_window_reserve(&ak, 1, 10, Duration::from_secs(60))
-                .await,
+            g.token_window_reserve(&ak, 1, 10, minute).await.is_none(),
             "an unreserved settle fills the window"
         );
         g.quota_reset_all().await;
@@ -492,24 +490,25 @@ mod tests {
         assert_eq!(g.quota_used("k").await, 15, "refund restores");
 
         let w = Duration::from_secs(60);
-        assert!(g.token_window_reserve("t", 300, 100, w).await);
-        assert!(!g.token_window_reserve("t", 300, 100, w).await);
-        g.token_window_settle("t", -300, w, Duration::ZERO).await;
-        assert!(g.token_window_reserve("t", 300, 100, w).await);
+        let held = g.token_window_reserve("t", 300, 100, w).await;
+        assert!(held.is_some());
+        assert!(g.token_window_reserve("t", 300, 100, w).await.is_none());
+        g.token_window_settle("t", -300, w, held).await;
+        assert!(g.token_window_reserve("t", 300, 100, w).await.is_some());
     }
 
     #[tokio::test]
     async fn a_settle_from_an_earlier_window_leaves_the_current_one_alone() {
         let g = MemoryGovernance::default();
         let w = Duration::from_millis(300);
-        assert!(g.token_window_reserve("k", 80, 100, w).await);
+        let earlier = g.token_window_reserve("k", 80, 100, w).await;
+        assert!(earlier.is_some());
         tokio::time::sleep(Duration::from_millis(350)).await;
-        assert!(g.token_window_reserve("k", 90, 100, w).await);
-        g.token_window_settle("k", -80, w, Duration::from_millis(350))
-            .await;
-        assert!(g.token_window_reserve("k", 20, 100, w).await);
+        assert!(g.token_window_reserve("k", 90, 100, w).await.is_some());
+        g.token_window_settle("k", -80, w, earlier).await;
+        assert!(g.token_window_reserve("k", 20, 100, w).await.is_some());
         assert!(
-            !g.token_window_reserve("k", 1, 100, w).await,
+            g.token_window_reserve("k", 1, 100, w).await.is_none(),
             "the earlier window's refund must not drain this window's reservations"
         );
     }
@@ -527,11 +526,12 @@ mod tests {
         assert!(g.window_allow("m", 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow("m", 1, Duration::from_secs(60)).await);
 
-        g.token_window_settle("ak", 10, Duration::from_secs(60), Duration::ZERO)
+        g.token_window_settle("ak", 10, Duration::from_secs(60), None)
             .await;
         assert!(
-            !g.token_window_reserve("ak", 1, 10, Duration::from_secs(60))
-                .await,
+            g.token_window_reserve("ak", 1, 10, Duration::from_secs(60))
+                .await
+                .is_none(),
             "an unreserved settle fills the window"
         );
     }
