@@ -225,6 +225,13 @@ mod tests {
     }
 
     #[test]
+    fn key_and_pooled_limits_render_as_the_same_throttling() {
+        for code in [ErrCode::STOP_LIMIT_MSG, ErrCode::POOLED_LIMIT_MSG] {
+            assert_eq!(ErrClass::classify(code, 429), Some(ErrClass::Throttling));
+        }
+    }
+
+    #[test]
     fn client_closed_is_not_rendered() {
         assert!(ErrClass::classify(ErrCode::SYSTEM_ERROR, 499).is_none());
         assert!(ErrClass::from_status(499).is_none());

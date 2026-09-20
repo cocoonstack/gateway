@@ -93,13 +93,12 @@ Key QPS is checked before tenant QPS in the model pipeline, realtime turns,
 MCP requests and video polls. A request denied by tenant QPS has already spent
 a key-QPS permit; a request denied by key QPS spends no tenant permit.
 
-`abuse.tiers` counts only REST model-pipeline rejections for the key's own QPS
-or TPM limit toward its daily suspension threshold. Tenant QPS, product QPM
-and model QPM are pooled limits: their denials use the internal
-`POOLED_LIMIT_MSG` code and never count against the rejected key. Key QPS/TPM
-denials retain `STOP_LIMIT_MSG`; both codes render the same `429` throttling
-error. A key that exceeds neither its own QPS nor TPM limit never accumulates
-abuse rejects (`qps` is required; `0` denies all requests, not unlimited).
+`abuse.tiers` counts a key's REST rejections for its own limits only: key QPS
+and key TPM. Tenant QPS, product QPM and model QPM are pooled; their rejections
+answer the same `429` and never count, so a sibling's traffic cannot suspend a
+key. A key that stays inside its own limits is never counted — including one
+whose `qps` is set above its tenant's, which can drain the pool without ever
+reaching a limit of its own: keep a key's `qps` at or under the tenant's.
 Batch items, realtime turns, MCP requests and video polls do not count.
 
 Daily-token and TPM admission **reserve then settle**: on admission a cheap

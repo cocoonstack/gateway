@@ -268,14 +268,10 @@ products:
   - name: myproduct
     qpm: 120                   # product-level request rate
 
-abuse:                         # automatic suspension; omit = off; counts REST key-QPS/key-TPM denials only
+abuse:                         # automatic suspension; omit = off; counts a key's REST 429s for its own qps/tokens_per_minute, never a pooled limit or a batch item
   tiers:                       # highest tier at or under the day's reject count wins
     - {rejects: 20, suspend_hours: 2}
     - {rejects: 30, suspend_hours: 24}
-
-# Tenant QPS, product QPM and model QPM denials never count toward suspension.
-# A key that exceeds neither its own QPS nor TPM limit never accumulates abuse rejects.
-# Batch items, realtime turns, MCP requests and video polls do not count.
 
 mcp_servers:                   # Model Context Protocol servers proxied at /mcp/{name}
   - name: tools

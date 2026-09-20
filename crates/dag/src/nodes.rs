@@ -353,7 +353,7 @@ impl DagNode for RateLimit {
         }
         admission::check_ak_rate(ctx.state.governance.as_ref(), &ctx.ak)
             .await
-            .map_err(limit_denied)
+            .map_err(key_limit_denied)
     }
 }
 
@@ -407,7 +407,7 @@ impl DagNode for AkTpmLimit {
             .unwrap_or_else(|| reserve_estimate(&ctx.request));
         ctx.tpm_reserved = admission::reserve_tpm(ctx.state.governance.as_ref(), &ctx.ak, est)
             .await
-            .map_err(limit_denied)?;
+            .map_err(key_limit_denied)?;
         Ok(())
     }
 }
@@ -1008,7 +1008,7 @@ fn requested_model(param: Option<&gw_models::ModelParamV2>) -> &str {
         .unwrap_or_default()
 }
 
-fn limit_denied(msg: String) -> GatewayError {
+fn key_limit_denied(msg: String) -> GatewayError {
     GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
 }
 

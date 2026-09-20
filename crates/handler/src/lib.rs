@@ -1551,6 +1551,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pooled_limit_rejections_do_not_trip_the_abuse_tier() {
+        for (tenant_qps, product_qpm, model_qpm, reason) in [
+            (0, 100, 100, "tenant rate limit"),
+            (100, 0, 100, "product qpm limit"),
+            (100, 100, 0, "model qpm limit"),
+        ] {
+            let yaml = format!(
+                "listen: {{host: h, port: 1}}\nabuse: {{tiers: [{{rejects: 1, suspend_hours: 2}}]}}\ntenants: [{{name: t, qps: {tenant_qps}}}]\nproducts: [{{name: p, qpm: {product_qpm}}}]\nmodels: [{{name: gpt-4o, protocol: openai-chat, qpm: {model_qpm}}}]\naccounts: [{{name: a1, provider: openai, protocols: ['openai-chat']}}]\naccess_keys: [{{ak: k1, tenant: t, product: p, qps: 100, daily_token_quota: 100000}}]"
+            );
+            let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(gw_engines::MockTransport),
+            );
+            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let err = h
+                .run(chat_req("gpt-4o", "hi"), key)
+                .await
+                .err()
+                .expect(reason);
+            assert_eq!(err.code, gw_consts::ErrCode::POOLED_LIMIT_MSG, "{reason}");
+            assert!(err.message.contains(reason), "{err}");
+            let fresh = h.state().auth.authenticate("k1").await.unwrap();
+            assert_eq!(
+                fresh.status_at(gw_state::epoch_secs()),
+                gw_state::KeyStatus::Active,
+                "{reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tpm_rejection_trips_the_abuse_tier() {
+        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, tokens_per_minute: 0, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let err = h
+            .run(chat_req("gpt-4o", "hi"), key)
+            .await
+            .err()
+            .expect("tpm 0 rejects");
+        assert_eq!(err.code, gw_consts::ErrCode::STOP_LIMIT_MSG);
+        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            fresh.status_at(gw_state::epoch_secs()),
+            gw_state::KeyStatus::Suspended
+        );
+    }
+
+    #[tokio::test]
     async fn quota_fallback_skips_variant_select() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}, {name: fb-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
