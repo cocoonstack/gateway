@@ -1366,7 +1366,10 @@ impl ResponsesEngine {
                 }
                 body.insert("tool_choice".to_owned(), responses_tool_choice(v));
             }
-            if let Some(effort) = p.reasoning.and_then(|r| r.effort) {
+            if let Some(effort) = p
+                .reasoning
+                .and_then(|r| crate::openai_engine::reasoning_effort(*r))
+            {
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }
@@ -2117,6 +2120,32 @@ mod tests {
                 "call_id": "c", "name": "now", "arguments": "{}"})),
             serde_json::json!({"id": "c", "type": "function", "function": {"name": "now", "arguments": "{}"}})
         );
+    }
+
+    #[test]
+    fn a_thinking_budget_reaches_a_responses_model_as_an_effort() {
+        for reasoning in [
+            gw_models::ReasoningParam {
+                thinking: Some(serde_json::json!({"type": "enabled", "budget_tokens": 16384})),
+                ..Default::default()
+            },
+            gw_models::ReasoningParam {
+                budget_tokens: Some(16384),
+                ..Default::default()
+            },
+            gw_models::ReasoningParam {
+                output_config: Some(serde_json::json!({"effort": "high"})),
+                ..Default::default()
+            },
+        ] {
+            let typed = TypedParams::Chat(gw_models::ChatParams {
+                reasoning: Some(Box::new(reasoning)),
+                ..Default::default()
+            });
+            let r = req(Protocol::Responses, "gpt-5.6-responses", Some(typed));
+            let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+            assert_eq!(body["reasoning"]["effort"], "high");
+        }
     }
 
     #[tokio::test]
