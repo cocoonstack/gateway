@@ -160,7 +160,8 @@ breakpoints, so each turn of a conversation re-reads its prefix at the
 cache-read rate; it is per model and off by default because a long one-shot
 prompt would pay the cache-write premium for nothing. A `/v1/messages` client
 that sends `system` as blocks with its own `cache_control` (including
-`ttl: 1h`) keeps them as sent — the gateway adds no second breakpoint there. `variants` splits a
+`ttl: 1h`) keeps them as sent; the gateway only marks the last system block
+when that block carries no breakpoint of its own. `variants` splits a
 public name across other declared same-protocol models (one level):
 entitlement and the per-(AK, model) daily counter judge the public name,
 billing prices the served variant, and the response echoes the requested
@@ -249,7 +250,7 @@ moderation:                    # the external moderator behind security.moderate
   kind: bedrock_guardrail      # AWS Bedrock Guardrails ApplyGuardrail
   endpoint: https://bedrock-runtime.us-east-1.amazonaws.com
   api_key_env: AWS_BEARER_TOKEN_BEDROCK   # Bedrock API key, sent as a bearer token
-  guardrail_id: k714dscw77j5
+  guardrail_id: your-guardrail-id
   guardrail_version: "1"       # default DRAFT
   source: INPUT                # INPUT (default) | OUTPUT — Bedrock anonymizes PII only under OUTPUT
   timeout_seconds: 10
@@ -267,7 +268,7 @@ products:
   - name: myproduct
     qpm: 120                   # product-level request rate
 
-abuse:                         # automatic suspension; omit = off
+abuse:                         # automatic suspension; omit = off; counts a key's REST 429s, never batch items
   tiers:                       # highest tier at or under the day's reject count wins
     - {rejects: 20, suspend_hours: 2}
     - {rejects: 30, suspend_hours: 24}

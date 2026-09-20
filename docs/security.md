@@ -25,8 +25,12 @@ response, log line, audit row or trace.
   missing or unknown key is a `401`. Keys have a lifecycle: `expires_at_epoch_secs`,
   `banned`, and an automatic abuse suspension (`abuse.tiers`) each fail
   authentication with a distinct `403`, on every surface (REST, realtime — where
-  the key is re-checked per turn — batches, MCP). Logs, traces and the ledger
-  carry `ak_id`, a SHA-256 fingerprint of the key, never the credential.
+  the key is re-checked per turn and a turn denied for the key's status ends
+  the session — batches, where a running batch re-checks the key before every
+  item and fails once it is no longer active — and MCP). Logs and traces carry
+  `ak_id`, a SHA-256 fingerprint of the key, never the credential; the ledger,
+  security-event and retained-content rows store the access key itself so usage
+  joins by it (see the review record below).
 - Admin routes are absent (`404`) until an admin token is configured. Two
   tiers apply: the global token (`admin.token_env`) manages everything; a
   tenant's `admin_token_env` token manages only that tenant. A tenant token on
