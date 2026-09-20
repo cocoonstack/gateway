@@ -2441,9 +2441,7 @@ async fn admin_usage_series(
     for idx in 0..points {
         let start = first.saturating_add(idx * bucket_secs);
         let end = start.saturating_add(bucket_secs - 1).min(until);
-        let totals = by_bucket
-            .remove(&start)
-            .unwrap_or_else(|| gw_state::UserUsageRow::zero(String::new(), String::new()));
+        let totals = by_bucket.remove(&start).unwrap_or_default();
         series.push(json!({
             "start": start,
             "end": end,

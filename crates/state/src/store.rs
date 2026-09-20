@@ -322,7 +322,7 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
 }
 
 /// One row of the per-(tenant, model) usage rollup.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct UsageRow {
     pub tenant: String,
     pub model: String,
@@ -336,7 +336,7 @@ pub struct UsageRow {
 }
 
 /// One row of the per-(user, model) usage rollup over a billing period.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct UserUsageRow {
     pub user_id: String,
     pub model: String,
@@ -350,20 +350,6 @@ pub struct UserUsageRow {
 }
 
 impl UserUsageRow {
-    pub fn zero(user_id: String, model: String) -> Self {
-        Self {
-            user_id,
-            model,
-            requests: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            cost_micros: 0,
-            vendor_cost_micros: 0,
-            billed_units: 0,
-        }
-    }
-
     /// Fold `o`'s counters into self (saturating).
     fn absorb(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.saturating_add(o.requests);
@@ -877,13 +863,7 @@ impl Store for MemoryStore {
                 .or_insert_with(|| UsageRow {
                     tenant: r.tenant.clone(),
                     model: r.model.clone(),
-                    requests: 0,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                    cost_micros: 0,
-                    vendor_cost_micros: 0,
-                    billed_units: 0,
+                    ..Default::default()
                 });
             // saturating: a hostile record can carry i64::MAX counts (usage is floored, not capped)
             e.requests += 1;
@@ -952,9 +932,7 @@ impl Store for MemoryStore {
                     && tenant.is_none_or(|f| f == t)
                     && user.is_none_or(|f| f == u)
                 {
-                    map.entry(bucket(*minute))
-                        .or_insert_with(|| UserUsageRow::zero(String::new(), String::new()))
-                        .absorb(row);
+                    map.entry(bucket(*minute)).or_default().absorb(row);
                 }
             }
             rollup_watermark(&rollup)
@@ -968,7 +946,7 @@ impl Store for MemoryStore {
                 && user.is_none_or(|u| u == r.user_id)
         }) {
             map.entry(bucket(r.created_at_epoch_secs))
-                .or_insert_with(|| UserUsageRow::zero(String::new(), String::new()))
+                .or_default()
                 .add_record(r);
         }
         Ok(map.into_iter().collect())
@@ -994,7 +972,11 @@ impl Store for MemoryStore {
                         r.user_id.clone(),
                         r.model.clone(),
                     ))
-                    .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
+                    .or_insert_with(|| UserUsageRow {
+                        user_id: r.user_id.clone(),
+                        model: r.model.clone(),
+                        ..Default::default()
+                    })
                     .add_record(r);
             }
         }
