@@ -156,9 +156,11 @@ both directions between OpenAI and Messages wires (`anthropic-messages` /
 `tool_choice` in `additionalModelRequestFields` (Bedrock refuses the flag next
 to `toolConfig.toolChoice`); other families keep `parallel_tool_calls` there
 for the model to accept or reject. Converse has no `tool_choice: none`: the
-gateway drops `toolConfig` for it, unless a Claude conversation already carries
-`tool_use`/`tool_result` turns — Bedrock then requires the tools, so they stay
-and a Claude model takes the `none` through `additionalModelRequestFields`.
+gateway drops `toolConfig` for it. Once the conversation carries
+`tool_use`/`tool_result` turns Bedrock requires the tools: a Claude model keeps
+them and takes the `none` through `additionalModelRequestFields`; any other
+family gets Bedrock's 400, because keeping the tools would let the model call
+one the client disabled.
 The chat surface's top-level `user` never reaches an Anthropic wire, which
 rejects it; every other unrecognized field still passes through as sent. A reply that carries `tool_use` blocks
 reports
