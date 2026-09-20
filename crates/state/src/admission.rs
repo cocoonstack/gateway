@@ -31,6 +31,12 @@ pub enum FallbackSwap {
     Unconfigured,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpmReserve {
+    pub est: i64,
+    pub window: Option<i64>,
+}
+
 /// One settled call: identity + reserves to close.
 pub struct SettleInput<'a> {
     pub billing: BillingInput<'a>,
@@ -38,7 +44,7 @@ pub struct SettleInput<'a> {
     /// (the settle degenerates to a plain add).
     pub reserved: i64,
     /// Tokens reserved in the TPM window; `None` = no TPM cap at admission.
-    pub tpm_reserved: Option<i64>,
+    pub tpm_reserved: Option<TpmReserve>,
     /// Admission day bucket, so the settle lands where the reserve did.
     pub reserved_at: i64,
     /// Per-(AK, model) counter to accrue; `None` = no cap configured.
@@ -455,20 +461,22 @@ pub async fn reserve_tpm(
     gov: &dyn Governance,
     ak: &AkInfo,
     amount: i64,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<TpmReserve>, String> {
     let Some(tpm) = ak.tokens_per_minute else {
         return Ok(None);
     };
-    if gov
+    match gov
         .token_window_reserve(&ak.ak, amount, tpm, gw_consts::MINUTE)
         .await
     {
-        Ok(Some(amount))
-    } else {
-        Err(format!(
+        Some(window) => Ok(Some(TpmReserve {
+            est: amount,
+            window: Some(window),
+        })),
+        None => Err(format!(
             "token-per-minute limit exceeded for key {} (tpm {tpm})",
             ak.ak_id
-        ))
+        )),
     }
 }
 
@@ -495,14 +503,13 @@ pub async fn settle_and_bill(
     let settle_daily = gov.quota_settle(s.billing.ak, total - s.reserved, s.reserved_at);
     let consume_model = async {
         if let Some(key) = &s.model_quota_key {
-            // accrues to the CURRENT day: this counter has no paired reserve on the admission
-            // bucket
+            // accrues to the current day: no reserve pins this counter to the admission bucket
             gov.quota_consume(key, total).await;
         }
     };
     let settle_tpm = async {
-        if let Some(est) = s.tpm_reserved {
-            gov.token_window_settle(s.billing.ak, total - est, gw_consts::MINUTE)
+        if let Some(tpm) = s.tpm_reserved {
+            gov.token_window_settle(s.billing.ak, total - tpm.est, gw_consts::MINUTE, tpm.window)
                 .await;
         }
     };

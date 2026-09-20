@@ -486,7 +486,7 @@ struct RealtimeAdmit {
     user: String,
     reserved: i64,
     /// Tokens reserved in the AK TPM window; `None` when the key has no TPM cap.
-    tpm_reserved: Option<i64>,
+    tpm_reserved: Option<admission::TpmReserve>,
     at: i64,
     /// Per-turn correlation id for the ledger row.
     request_id: String,
@@ -775,6 +775,9 @@ async fn realtime_session(
                     Ok(a) => a,
                     Err((class, denied)) => {
                         let _ = socket.send(send(rt_error(class, denied))).await;
+                        if class == ErrClass::AccessDenied {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -934,65 +937,74 @@ async fn realtime_bridge(
                     Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
-                if let Some(mut frame) = frame {
-                    if gemini {
-                        // pin the entitled model: the socket carries no model, the setup frame does
-                        if let Some(setup) = frame.get_mut("setup").and_then(Value::as_object_mut) {
-                            setup.insert("model".into(), format!("models/{}", rtm.served).into());
+                let Some(mut frame) = frame else {
+                    if cl_tx
+                        .send(rt_error_frame(ErrClass::Validation, "invalid json event"))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                };
+                if gemini {
+                    // pin the entitled model: the socket carries no model, the setup frame does
+                    if let Some(setup) = frame.get_mut("setup").and_then(Value::as_object_mut) {
+                        setup.insert("model".into(), format!("models/{}", rtm.served).into());
+                        forward = UMsg::text(frame.to_string());
+                    }
+                    // audio-driven turns and barge-in have no admission point yet: refuse, keep the session
+                    let ungoverned = frame.get("realtimeInput").is_some()
+                        || frame.get("realtime_input").is_some()
+                        || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
+                    if ungoverned {
+                        if cl_tx
+                            .send(rt_error_frame(
+                                ErrClass::Validation,
+                                "one governed clientContent turn at a time; realtimeInput is not wired",
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
+                    Err(reason) => {
+                        if cl_tx
+                            .send(rt_error_frame(ErrClass::AccessDenied, reason))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(redacted) => {
+                        if redacted > 0 {
                             forward = UMsg::text(frame.to_string());
                         }
-                        // audio-driven turns and barge-in have no admission point yet: refuse, keep the session
-                        let ungoverned = frame.get("realtimeInput").is_some()
-                            || frame.get("realtime_input").is_some()
-                            || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
-                        if ungoverned {
+                    }
+                }
+                // dup triggers relay ungated: upstream rejects them, response.created gates a raced accept
+                if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
+                    match realtime_gate(&s, &ak, &rtm, &hint).await {
+                        Ok(admit) => {
+                            pending = Some(RealtimeTurn::new(admit));
+                            generations += 1;
+                        }
+                        Err((class, denied)) => {
                             if cl_tx
-                                .send(rt_error_frame(
-                                    ErrClass::Validation,
-                                    "one governed clientContent turn at a time; realtimeInput is not wired",
-                                ))
+                                .send(rt_error_frame(class, denied))
                                 .await
                                 .is_err()
+                                || class == ErrClass::AccessDenied
                             {
                                 break;
                             }
                             continue;
-                        }
-                    }
-                    match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
-                        Err(reason) => {
-                            if cl_tx
-                                .send(rt_error_frame(ErrClass::AccessDenied, reason))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                        Ok(redacted) => {
-                            if redacted > 0 {
-                                forward = UMsg::text(frame.to_string());
-                            }
-                        }
-                    }
-                    // dup triggers relay ungated: upstream rejects them, response.created gates a raced accept
-                    if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
-                        match realtime_gate(&s, &ak, &rtm, &hint).await {
-                            Ok(admit) => {
-                                pending = Some(RealtimeTurn::new(admit));
-                                generations += 1;
-                            }
-                            Err((class, denied)) => {
-                                if cl_tx
-                                    .send(rt_error_frame(class, denied))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
                         }
                     }
                 }
@@ -1041,6 +1053,9 @@ async fn realtime_bridge(
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
                                         .await;
                                     let _ = cl_tx.send(rt_error_frame(class, denied)).await;
+                                    if class == ErrClass::AccessDenied {
+                                        break;
+                                    }
                                     suppress = true;
                                     relay = false;
                                 }
@@ -1069,7 +1084,12 @@ async fn realtime_bridge(
                                         .unwrap_or_else(|| ak.clone());
                                     let user = billed.attributed_user(&hint).to_owned();
                                     Some(RealtimeAdmit {
-                                        tpm_reserved: billed.tokens_per_minute.map(|_| 0),
+                                        tpm_reserved: billed.tokens_per_minute.map(|_| {
+                                            admission::TpmReserve {
+                                                est: 0,
+                                                window: None,
+                                            }
+                                        }),
                                         ak: billed,
                                         user,
                                         reserved: 0,
@@ -2193,8 +2213,7 @@ async fn admin_config_rollback(
         Ok(None) => return error_response(404, format!("config version {source_id} not found")),
         Err(e) => return gateway_error(e),
     };
-    // a retained document can predate stricter validation; republished unvalidated it would brick
-    // reloads
+    // a retained document can predate stricter validation; unvalidated, it would brick reloads
     if let Err(e) = GatewayConfig::from_yaml(&yaml) {
         return error_response(
             400,
@@ -2430,9 +2449,7 @@ async fn admin_usage_series(
     for idx in 0..points {
         let start = first.saturating_add(idx * bucket_secs);
         let end = start.saturating_add(bucket_secs - 1).min(until);
-        let totals = by_bucket
-            .remove(&start)
-            .unwrap_or_else(|| gw_state::UserUsageRow::zero(String::new(), String::new()));
+        let totals = by_bucket.remove(&start).unwrap_or_default();
         series.push(json!({
             "start": start,
             "end": end,
@@ -4291,13 +4308,14 @@ async fn admit_video_job(
             format!("account {} is no longer configured", job.account),
         ));
     };
-    let poll = poll_and_settle_video(s, &job, &account).await?;
+    let poll = poll_and_settle_video(s, ak, &job, &account).await?;
     Ok((job, account, poll))
 }
 
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn poll_and_settle_video(
     s: &AppState,
+    poller: &AkInfo,
     job: &VideoJob,
     account: &Arc<gw_models::Account>,
 ) -> Result<gw_engines::families::VideoPoll, Response> {
@@ -4318,7 +4336,7 @@ async fn poll_and_settle_video(
         false
     };
     if claimed {
-        admission::settle_and_bill(
+        let settled = admission::settle_and_bill(
             &state,
             &cfg,
             admission::SettleInput {
@@ -4349,6 +4367,16 @@ async fn poll_and_settle_video(
                 reserved_at: gw_state::epoch_secs(),
                 model_quota_key: None,
             },
+        )
+        .await;
+        let submitter = state.auth.authenticate(&job.ak).await;
+        admission::consume_budgets(
+            &state,
+            &cfg,
+            submitter.as_deref().unwrap_or(poller),
+            &job.user_id,
+            settled.total_tokens,
+            settled.cost_micros,
         )
         .await;
     }
@@ -4464,29 +4492,29 @@ async fn audio_speech(
 /// POST /v1/audio/transcriptions (STT; JSON carries b64 audio, not multipart).
 async fn audio_transcriptions(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
-    audio_transcribe(s, headers, ak, body, false).await
+    audio_transcribe(s, hint, ak, body, false).await
 }
 
 /// POST /v1/audio/translations — the transcriptions shape, translated to
 /// English by the upstream (OpenAI translations semantics).
 async fn audio_translations(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
-    audio_transcribe(s, headers, ak, body, true).await
+    audio_transcribe(s, hint, ak, body, true).await
 }
 
 /// The shared STT body: transcriptions and translations differ only in the
 /// upstream path the `translate` flag selects.
 async fn audio_transcribe(
     s: AppState,
-    headers: HeaderMap,
+    hint: Option<String>,
     ak: Arc<AkInfo>,
     mut body: Value,
     translate: bool,
@@ -4509,7 +4537,7 @@ async fn audio_transcribe(
         gw_consts::Protocol::Stt,
         typed,
         vec![],
-        user_hint(user_header(&headers), &body["user"]),
+        user_hint(hint, &body["user"]),
     )
     .await
     {
@@ -4650,14 +4678,13 @@ fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
 /// POST /v1/batches (inline `items` or an uploaded JSONL `input_file_id`).
 async fn batches_submit(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let mut model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
-    let hint = user_header(&headers);
     let item_user =
         |v: &Value| cap_user_hint(v["user"].as_str().or(hint.as_deref()).unwrap_or_default());
 
@@ -6172,7 +6199,7 @@ mod tests {
         let a1 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
             .await
             .expect("first admits");
-        assert_eq!(a1.tpm_reserved, Some(REALTIME_TURN_RESERVE));
+        assert_eq!(a1.tpm_reserved.map(|r| r.est), Some(REALTIME_TURN_RESERVE));
         let daily_before = gov.quota_used(&ak.ak).await;
 
         assert!(

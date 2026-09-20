@@ -22,7 +22,7 @@ impl ModelEngine for ErnieEngine {
     /// or a legacy token as `?access_token=`; reply `{result, usage}`.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // ernie's system is a top-level field (system turns are filtered above)
+        // ernie's system is a top-level field
         let system = self.base.system_text();
         let messages = simple_turns(&mut self.base, ("assistant", "user"), ("role", "content"));
         let mut body = json!({});
@@ -175,7 +175,8 @@ impl ModelEngine for LlamaEngine {
     /// prompt_token_count, generation_token_count, stop_reason}`, streamed per delta.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        let prompt = llama_prompt(&model, &self.base.request.message);
+        let system = self.base.chat_params().and_then(|p| p.system.as_deref());
+        let prompt = llama_prompt(&model, system, &self.base.request.message);
         let mut body = json!({});
         body["prompt"] = prompt.into();
         if let Some(p) = self.base.chat_params() {
@@ -259,7 +260,27 @@ base_engine!(DashScopeEngine);
 
 impl DashScopeEngine {
     fn build_body(&mut self, stream: bool) -> GResult<Value> {
-        let messages: Vec<Value> = std::mem::take(&mut self.base.request.message)
+        let mut parameters = json!({"result_format": "message"});
+        if stream {
+            // deltas instead of the full-text-so-far in every frame
+            parameters["incremental_output"] = json!(true);
+        }
+        let system = match self.base.take_typed() {
+            Some(TypedParams::Chat(p)) => {
+                if let Some(t) = p.temperature {
+                    parameters["temperature"] = json!(t);
+                }
+                if let Some(t) = p.top_p {
+                    parameters["top_p"] = json!(t);
+                }
+                if let Some(mt) = p.max_tokens {
+                    parameters["max_tokens"] = json!(mt);
+                }
+                p.system.map(|text| ("system", text))
+            }
+            _ => None,
+        };
+        let messages = std::mem::take(&mut self.base.request.message)
             .into_iter()
             .map(|m| {
                 let role = if m.role == gw_consts::role::AI {
@@ -269,25 +290,13 @@ impl DashScopeEngine {
                 } else {
                     "user"
                 };
-                object([("role", role.into()), ("content", m.content.into())])
-            })
+                (role, m.content)
+            });
+        let messages = system
+            .into_iter()
+            .chain(messages)
+            .map(|(role, content)| object([("role", role.into()), ("content", content.into())]))
             .collect();
-        let mut parameters = json!({"result_format": "message"});
-        if stream {
-            // deltas instead of the full-text-so-far in every frame
-            parameters["incremental_output"] = json!(true);
-        }
-        if let Some(p) = self.base.chat_params() {
-            if let Some(t) = p.temperature {
-                parameters["temperature"] = json!(t);
-            }
-            if let Some(t) = p.top_p {
-                parameters["top_p"] = json!(t);
-            }
-            if let Some(mt) = p.max_tokens {
-                parameters["max_tokens"] = json!(mt);
-            }
-        }
         let input = object([("messages", Value::Array(messages))]);
         Ok(object([
             ("model", self.base.model_name()?.into()),
@@ -455,15 +464,22 @@ fn simple_turns(
 
 /// The Llama 3/4 chat template for Bedrock's raw prompt; a bare `role: text`
 /// prompt makes the model invent turns until max_gen_len.
-fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
+fn llama_prompt(model: &str, system: Option<&str>, messages: &[gw_models::ChatMsg]) -> String {
     let (start, end, eot) = if model.contains("llama4") {
         ("<|header_start|>", "<|header_end|>", "<|eot|>")
     } else {
         ("<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>")
     };
     let mut prompt = String::from("<|begin_of_text|>");
-    for m in messages {
-        let role = match m.role.as_str() {
+    let turns = messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_str()));
+    for (role, content) in system
+        .map(|s| (gw_consts::role::SYSTEM, s))
+        .into_iter()
+        .chain(turns)
+    {
+        let role = match role {
             gw_consts::role::SYSTEM => "system",
             gw_consts::role::AI => "assistant",
             _ => "user",
@@ -472,7 +488,7 @@ fn llama_prompt(model: &str, messages: &[gw_models::ChatMsg]) -> String {
         prompt.push_str(role);
         prompt.push_str(end);
         prompt.push_str("\n\n");
-        prompt.push_str(&m.content);
+        prompt.push_str(content);
         prompt.push_str(eot);
     }
     prompt.push_str(start);

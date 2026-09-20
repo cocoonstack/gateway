@@ -13,7 +13,7 @@ make docker      # build the container image
 make run         # cargo run -p gw-server
 ```
 
-CI runs fmt/clippy/test and `cargo deny` on every push to `main` and every pull request. A `v*` tag cuts one
+CI runs fmt/clippy/test (against live Postgres and Redis services, so the env-gated suites run), `cargo deny`, and the control-plane Go, web and Playwright gates on every push to `main` and every pull request. A `v*` tag cuts one
 GitHub release (`.github/workflows/release.yml`): native runners build `gw`
 for linux/darwin × amd64/arm64 and `npm run build` packs the web assets;
 goreleaser builds the `control-plane` binaries, attaches the `gw` and
@@ -29,7 +29,7 @@ images for both components go to ghcr on the same tag
 Crates are strictly layered — lower layers never depend on higher ones:
 
 ```
-server → views → handler → {dag, engines} → {models, state} → {protocol, config} → consts
+server → {views, task} → handler → {dag, engines} → {models, state} → {protocol, config} → consts
 ```
 
 | Crate | Role |
@@ -65,8 +65,8 @@ Unit tests live beside their code; integration tests are in `crates/*/tests/`.
 Engine golden tests assert exact request wire shapes and response parsing
 against recorded fixtures. `crates/server/tests/e2e.rs` boots the full router
 in-process and exercises every surface offline. Tests that need real
-infrastructure gate on an env var (e.g. `GW_TEST_REDIS_URL`) and no-op when it
-is unset. A release micro-benchmark lives in `crates/server/tests/bench.rs`:
+infrastructure gate on an env var (`GW_TEST_REDIS_URL`, `GW_TEST_PG_URL`) and
+no-op when it is unset; CI provisions both services so they run there. A release micro-benchmark lives in `crates/server/tests/bench.rs`:
 
 ```bash
 cargo test --release -p gw-server --test bench -- --ignored --nocapture

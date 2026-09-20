@@ -4,7 +4,7 @@ Cargo workspace, 11 crates, strictly layered — lower layers never depend
 on higher ones:
 
 ```
-server → views → handler → {dag, engines} → {models, state} → {protocol, config} → consts
+server → {views, task} → handler → {dag, engines} → {models, state} → {protocol, config} → consts
 ```
 
 | Crate       | Layer | Role |
@@ -40,9 +40,9 @@ away. Spawned background work (offline batches) likewise outlives the
 submitting request.
 
 The DAG executes four fixed layers; nodes within a layer run
-sequentially in declaration order. `account_select` and
-`model_access` form a retry loop: an upstream 5xx excludes the failed
-account and reselects once; a PTU→paygo switch is recorded as
+sequentially in declaration order. Within `model_access`, `call_engine`
+reselects once on an upstream 5xx: the failed account is excluded and another
+of the model's accounts is tried; a PTU→paygo switch is recorded as
 `ptu_spillover` in the ledger. Around the DAG, the handler re-runs all four
 layers for the next entry of the model's `fallback_models` chain when a run
 ends in an upstream fault before any byte was sent.

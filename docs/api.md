@@ -31,7 +31,10 @@ A terminal upstream failure (account failover and the model's
 last upstream tried returned a status) and `resource_name` (the requested
 model) inside the error object. Retry on 408/429/500/503 with backoff (honor
 `retry-after`); never on the rest. Mid-stream failures arrive as a terminal
-SSE error frame carrying the same `code` field.
+SSE error frame carrying the same `code` field (`model_stream_error_exception`
+for a generic upstream break after the stream committed). An unknown route
+answers the envelope's `404`; a wrong method on a known route is a `400`
+`validation_exception`, not a `405`.
 
 For per-user attribution on a shared key, send `x-gw-user: <id>` (it also reads
 OpenAI's body `user` field and Anthropic's `metadata.user_id`). A key's own
@@ -44,7 +47,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/chat/completions` | streaming + non-streaming |
 | POST | `/v1/completions` | legacy text completion (`prompt`) |
-| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort`) and streams as that surface's own frames |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort` from an effort or a thinking budget) and streams as that surface's own frames — image parts and `response_format` do not cross onto that wire; a model on any other wire is not served from `/v1/responses`, whose body has no normalized turns |
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
@@ -52,7 +55,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 | GET | `/v1/videos/{id}` | the vendor's poll, proxied in its own dialect; see Video |
 | GET | `/v1/videos/{id}/content` | the finished clip's bytes, proxied (Sora and Hailuo) |
 | POST | `/v1/audio/speech` | TTS, returns audio bytes |
-| POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio |
+| POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio: `{"model":"...","audio_b64":"<base64>","language":"en"}` |
 | POST | `/v1/audio/translations` | STT translated to English (same request shape) |
 | POST | `/v1/moderations` | content moderation; `input` string or array, native results pass through |
 | GET | `/v1/models` | configured public model names |
@@ -98,7 +101,7 @@ mapping per model family:
 
 | Family | Request | Response |
 |--------|---------|----------|
-| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400). An OpenAI id OpenAI serves itself is clamped to the tiers its generation takes on that wire, since either end is a 400: no generation takes `max` on chat completions (5.0/5.1 stop at `high`, 5.2 on at `xhigh`), Responses takes it from 5.6 on, GPT-6 always reasons so `none`/`minimal` become `low`, and 5.0 knows `minimal` but not `none`. The clamp runs on the assembled body, so a native `/v1/responses` passthrough gets it too. A vendor-prefixed id is left alone — OpenRouter (`openai/gpt-…`) normalizes tiers itself, and Bedrock (`openai.gpt-…`) takes `max` from every generation through `reasoning_config`, but never `minimal` | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
+| OpenAI / compatible | `reasoning_effort` forwarded; `max_tokens` becomes `max_completion_tokens` when reasoning is engaged; an Anthropic-dialect budget (`thinking.budget_tokens`, OpenRouter `max_tokens`) maps to the nearest tier — 1024 `low`, 4096 `medium`, 16384 `high`, 24576 `xhigh`, 32768 `max` — and vendors accept different subsets (live: gpt-5-mini `minimal`–`high`, gpt-5.4-mini `none`–`xhigh`; past the last tier the vendor answers 400). An OpenAI id OpenAI serves itself is clamped to the tiers its generation takes on that wire, since either end is a 400: no generation takes `max` on chat completions (5.0/5.1 stop at `high`, 5.2 on at `xhigh`), Responses takes it from 5.6 on, GPT-6 always reasons so `none`/`minimal` become `low`, and 5.0 knows `minimal` but not `none`. The clamp runs on the assembled body, so a native `/v1/responses` passthrough gets it too. A vendor-prefixed id keeps its ceiling — OpenRouter (`openai/gpt-…`) normalizes tiers itself, and Bedrock (`openai.gpt-…`) takes `max` from every generation through `reasoning_config` — but a `gpt-6` id anywhere still turns `none`/`minimal` into `low`, and Bedrock never takes `minimal` | `reasoning_content` / `reasoning` string and `reasoning_details` units forwarded |
 | Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024, `medium` 4096, `high` 16384, `xhigh` 24576, `max` 32768), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
 | Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on; `xhigh` clamps to `high` on 4.6, which predates it); `temperature` / `top_p` / `top_k` are dropped for 4.7+, which rejects them | same |
 
@@ -152,7 +155,14 @@ both directions between OpenAI and Messages wires (`anthropic-messages` /
 `aws-anthropic`). On Converse a Claude model takes the policy as a whole
 `tool_choice` in `additionalModelRequestFields` (Bedrock refuses the flag next
 to `toolConfig.toolChoice`); other families keep `parallel_tool_calls` there
-for the model to accept or reject. A reply that carries `tool_use` blocks
+for the model to accept or reject. Converse has no `tool_choice: none`: the
+gateway drops `toolConfig` for it. Once the conversation carries
+`tool_use`/`tool_result` turns Bedrock requires the tools: a Claude model keeps
+them and takes the `none` through `additionalModelRequestFields`; any other
+family gets Bedrock's 400, because keeping the tools would let the model call
+one the client disabled.
+The chat surface's top-level `user` never reaches an Anthropic wire, which
+rejects it; every other unrecognized field still passes through as sent. A reply that carries `tool_use` blocks
 reports
 `stop_reason: tool_use` even where the vendor said `stop` (OpenAI does for a
 forced tool). On an OpenAI-protocol
@@ -216,7 +226,7 @@ days.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's static bearer or an OAuth access token the gateway fetched (nothing when the server declares neither) is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; replies stream back as the server sends them unless the key's tool allowlist filters a `tools/list` or the tenant's `security.moderate` reviews a result, which buffer the reply whole (up to `max_reply_bytes`); `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded in time and counted against `max_live_streams_per_key` (and refused for a tenant under `security.moderate`) |
+| POST / GET / DELETE | `/mcp/{server}` | Model Context Protocol (Streamable HTTP) proxy to the configured `mcp_servers[]` entry: the JSON-RPC message goes up with `Accept`, `Content-Type`, `Mcp-Session-Id`, `MCP-Protocol-Version` and `Last-Event-ID`, the server's static bearer or an OAuth access token the gateway fetched (nothing when the server declares neither) is attached upstream, and `Content-Type` and `Mcp-Session-Id` come back; replies stream back as the server sends them unless the key's tool allowlist filters a `tools/list` or the tenant's `security.moderate` reviews a result, which buffer the reply whole (up to `max_reply_bytes`); `timeout_seconds` bounds POST and DELETE, the GET listen stream is unbounded in time and counted against `max_live_streams_per_key` (and refused for a tenant under `security.moderate`) |
 
 The access key rides as usual (`Authorization: Bearer` or `x-api-key`); a
 server the key is not entitled to (`access_keys[].mcp_servers`) answers like an
@@ -254,7 +264,7 @@ identity provider's error text stay in the gateway log.
 | GET | `/v1/files/{id}` | file metadata |
 | GET | `/v1/files/{id}/content` | raw content |
 | DELETE | `/v1/files/{id}` | delete an uploaded file (tenant-owned) |
-| POST | `/v1/batches` | `{"input_file_id":"..."}` or inline `{"items":[...]}` |
+| POST | `/v1/batches` | `{"input_file_id":"..."}` or inline `{"items":[...]}`; answers `202` with `{id, status, total}` |
 | GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results |
 
 Each JSONL line is `{"body": {"model": ..., "messages": [...]}}`. A batch runs
@@ -288,9 +298,12 @@ applies, so the WebSocket is not a bypass: the blocklist, regex recognizers, and
 phone numbers, and credential masking — redacts text fields in both directions
 (per frame — a PII span straddling two deltas is beyond a relay that cannot
 buffer). Every hit is audited without prompt text; per-user attribution comes
-from the `x-gw-user` hint captured at connect. Each generation re-checks the
-key, so a key banned, expired, or revoked (or a model de-entitled) mid-session
-stops generating. If a turn delivers output but disconnects before its usage
+from the `x-gw-user` hint captured at connect. A client frame the gateway
+cannot parse as JSON answers an in-band `validation_exception` and is not
+relayed, since no control could read it. Each generation re-checks the
+key: a key banned, expired, suspended or revoked mid-session gets its
+`access_denied_exception` and the session closes, and a model de-entitled
+mid-session stops generating. If a turn delivers output but disconnects before its usage
 boundary, the delivered text or audio is billed from an estimate; a turn that
 delivered nothing is refunded. An endpoint-less account serves a local mock
 session (OpenAI Realtime event shape) for offline development.
@@ -334,7 +347,7 @@ regardless.
 | GET | `/admin/config` | current fleet config version and raw YAML (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/validate` | validate a config document without publishing it (global token) |
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed; `?expected_version=` publishes only while that is still the head — a moved head answers 409 (global token; needs `storage.postgres_url`) |
-| GET | `/admin/config/versions` | retained config versions, newest first; `?limit=` (default 20) (global token; needs `storage.postgres_url`) |
+| GET | `/admin/config/versions` | retained config versions, newest first (the store keeps the newest 20); `?limit=` (default 20) (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/versions/{id}/rollback` | republish a retained document as a new head and reload (global token; needs `storage.postgres_url`) |
 | GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200, every listing caps `limit` at 10 000; a tenant token sees only its own tenant's); `?ak=` exact lookup answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
@@ -343,7 +356,7 @@ regardless.
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 (operator-only margin basis) |
 | GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; `?tenant=` filter for the global token; tenant-scoped (vendor cost redacted like `/admin/usage/users`), maximum 400 points |
-| GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per billed turn and on session-fatal upstream errors; tenant-scoped |
+| GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per vendor-metered turn (a turn billed from an estimate is not sampled) and on session-fatal upstream errors; tenant-scoped |
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
 | GET | `/admin/audit/content/{request_id}` | retained prompt/response and terminal result for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |

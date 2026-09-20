@@ -36,7 +36,7 @@ export default function AvailabilityPage(): ReactElement {
               <article key={instance.id} className="instance-card">
                 <div className="instance-top"><div><strong>{instance.id}</strong><code>{instance.url}</code></div><Status value={instance.status} /></div>
                 <div className="instance-meta"><span>Latency <b>{instance.latency_ms} ms</b></span><span>Accounts <b>{instance.accounts.length}</b></span>{instance.error && <span className="error-text">{instance.error}</span>}</div>
-                <div className="account-list">{instance.accounts.map((account) => <div key={account.name}><span className={`health-dot health-${account.health}`} /><div><strong>{account.name}</strong><small>{account.provider} · {account.tier} · {account.protocols.join(", ")}</small></div><span>{account.health}</span></div>)}</div>
+                <div className="account-list">{instance.accounts.map((account) => <div key={account.name}><span className={`health-dot health-${account.health}`} aria-hidden="true" /><div><strong>{account.name}</strong><small>{account.provider} · {account.tier} · {account.protocols.join(", ")}</small></div><span>{account.health}</span></div>)}</div>
               </article>
             ))}</div>
           </Card>

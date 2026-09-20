@@ -818,6 +818,52 @@ async fn dashscope_request_shape() {
     assert!(t.url().contains("dashscope"), "url: {}", t.url());
 }
 
+#[tokio::test]
+async fn a_messages_surface_system_prompt_reaches_the_dashscope_and_llama_wires() {
+    let messages_surface = |mt, name| {
+        let mut r = typed_req(
+            mt,
+            name,
+            TypedParams::Chat(ChatParams {
+                system: Some("answer in one word".into()),
+                ..Default::default()
+            }),
+        );
+        r.message = vec![ChatMsg::text("user", "capital of France?")];
+        r
+    };
+    let t = RecordingTransport::new(
+        r#"{"output":{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}}"#,
+    );
+    let _ = DashScopeEngine::new(messages_surface(Protocol::Dashscope, "qwen-max"), t.clone())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(
+        t.body_json()["input"]["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "answer in one word"},
+            {"role": "user", "content": "capital of France?"},
+        ])
+    );
+
+    let t = RecordingTransport::new(r#"{"generation":"ok","stop_reason":"stop"}"#);
+    let _ = LlamaEngine::new(
+        messages_surface(Protocol::AwsLlama, "meta.llama3-70b-instruct-v1:0"),
+        t.clone(),
+    )
+    .run()
+    .await
+    .unwrap();
+    assert!(
+        t.body_json()["prompt"].as_str().unwrap().starts_with(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nanswer in one word<|eot_id|>"
+        ),
+        "{}",
+        t.body_json()["prompt"]
+    );
+}
+
 fn typed_req(mt: Protocol, name: &str, typed: TypedParams) -> GatewayRequest {
     let mut p = ModelParamV2::with_name(mt, name);
     p.typed = Some(typed);

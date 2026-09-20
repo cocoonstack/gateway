@@ -61,10 +61,14 @@ One structured line per successfully served request goes to stdout (via
 `user_id`, `model`, `protocol`, `account`, `prompt_tokens`,
 `completion_tokens`, `total_tokens`, `latency_ms`, and `decisions` — the
 pipeline's routing trail for that request (quota fallback, variant pick,
-degrade, DLP/moderation outcomes). Errored requests are
-counted by `gateway_requests_total{status}` rather than logged. `request_id`
-joins the access log to the ledger row and the audit events for the same
-request.
+degrade, DLP/moderation outcomes). A streaming request whose pipeline fails
+answers `200` with an error frame, so it is logged too: one `request failed`
+warning on the same `access` target with `surface`, `request_id`, `ak_id`,
+`product`, `tenant`, `latency_ms`, the external `code` and the message (never
+the prompt); a client that closed the connection logs nothing. Non-streaming
+errors are counted by `gateway_requests_total{status}` rather than logged.
+`request_id` joins the access log to the ledger row and the audit events for
+the same request.
 
 ## Billing ledger
 

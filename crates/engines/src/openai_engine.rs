@@ -430,7 +430,7 @@ pub(crate) fn parallel_tool_calls(choice: &Value) -> Option<Value> {
 /// The request's `reasoning_effort`: the client's own, else derived from
 /// `output_config.effort`, a `thinking` budget or an OpenRouter budget;
 /// `adaptive` without an effort and `disabled` leave the vendor default.
-fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static, str>> {
+pub(crate) fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static, str>> {
     if let Some(effort) = reasoning.effort {
         return Some(effort);
     }

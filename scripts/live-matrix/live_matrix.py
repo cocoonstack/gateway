@@ -107,6 +107,13 @@ class Gateway:
     def call_raw(self, path: str) -> tuple[int, bytes]:
         return self._open(urllib.request.Request(self.base + path, headers={"Authorization": f"Bearer {self.ak}"}), 300)
 
+    def ledger(self) -> tuple[int, dict[str, Any]]:
+        """(row count, newest row) — read after a short settle so the async ledger write has landed."""
+        time.sleep(0.3)
+        _, body = self.call("/internal/ledger?limit=1", admin=True)
+        j = json.loads(body)
+        return j["count"], (j["records"][-1] if j["records"] else {})
+
     def _open(self, req: urllib.request.Request, timeout: int) -> tuple[int, bytes]:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -115,13 +122,6 @@ class Gateway:
             return e.code, e.read()
         except OSError as e:
             return 0, f"transport error: {e}".encode()
-
-    def ledger(self) -> tuple[int, dict[str, Any]]:
-        """(row count, newest row) — read after a short settle so the async ledger write has landed."""
-        time.sleep(0.3)
-        _, body = self.call("/internal/ledger?limit=1", admin=True)
-        j = json.loads(body)
-        return j["count"], (j["records"][-1] if j["records"] else {})
 
 
 def load_models(yaml_path: str) -> None:
@@ -296,8 +296,7 @@ def case_chat(
 
 
 def case_vendor_cost(gw: Gateway, model: str, **extra: Any) -> None:
-    """Ledger cost against the vendor's own reported charge — the one oracle a misread usage cannot satisfy,
-    since the wire the client sees and the ledger both come from that same reading. Needs list pricing."""
+    """Ledger cost against the vendor's own reported charge, the one oracle a misread usage cannot satisfy; needs list pricing."""
     name = f"{model} vendor cost"
     before, _ = gw.ledger()
     body: dict[str, Any] = {
@@ -781,8 +780,7 @@ def case_response_cache(gw: Gateway, model: str) -> None:
 def case_prompt_cache(
     gw: Gateway, model: str, native: bool = False, words: int = 1300, expect_write: bool = False
 ) -> None:
-    """Two calls sharing a long prefix (haiku 4.5 needs >= 4096 tokens): the second must read the cache;
-    on Anthropic wires the first must also write it."""
+    """Two calls sharing a long prefix (haiku 4.5 needs >= 4096 tokens): the second reads the cache, on Anthropic wires the first writes it."""
     surface = "messages" if native else "chat"
     name = f"{model} prompt cache ({surface})"
     prefix = f"Run nonce {int(time.time())}. " + PREFIX_SENTENCE * words
@@ -994,8 +992,7 @@ def case_codex(gw: Gateway, model: str) -> None:
 
 
 def case_thinking_tiers(gw: Gateway, model: str, native: bool, tiers: list[Any], expect_reasoning: bool) -> None:
-    """Every effort/budget tier through one model: budgets on /v1/messages (max_tokens above the budget,
-    as Anthropic requires), efforts on chat; the reasoning share per tier lands in the note."""
+    """Every effort/budget tier through one model: budgets on /v1/messages, efforts on chat; the reasoning share lands in the note."""
     prompt = "Solve 23*47 step by step briefly."
     for tier in tiers:
         if native:

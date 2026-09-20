@@ -22,6 +22,5 @@ pub use params::{
 };
 pub use request::domain::{Account, ChatMsg};
 pub use request::{BatchItem, GatewayRequest, ModelParamV2};
-pub use response::GatewayResponse;
-pub use response::{StreamChunk, StreamError};
+pub use response::{GatewayResponse, StreamChunk, StreamError};
 pub use usage::CommonUsage;

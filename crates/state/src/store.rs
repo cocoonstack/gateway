@@ -322,7 +322,7 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
 }
 
 /// One row of the per-(tenant, model) usage rollup.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct UsageRow {
     pub tenant: String,
     pub model: String,
@@ -336,7 +336,7 @@ pub struct UsageRow {
 }
 
 /// One row of the per-(user, model) usage rollup over a billing period.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct UserUsageRow {
     pub user_id: String,
     pub model: String,
@@ -350,20 +350,6 @@ pub struct UserUsageRow {
 }
 
 impl UserUsageRow {
-    pub fn zero(user_id: String, model: String) -> Self {
-        Self {
-            user_id,
-            model,
-            requests: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            cost_micros: 0,
-            vendor_cost_micros: 0,
-            billed_units: 0,
-        }
-    }
-
     /// Fold `o`'s counters into self (saturating).
     fn absorb(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.saturating_add(o.requests);
@@ -877,13 +863,7 @@ impl Store for MemoryStore {
                 .or_insert_with(|| UsageRow {
                     tenant: r.tenant.clone(),
                     model: r.model.clone(),
-                    requests: 0,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                    cost_micros: 0,
-                    vendor_cost_micros: 0,
-                    billed_units: 0,
+                    ..Default::default()
                 });
             // saturating: a hostile record can carry i64::MAX counts (usage is floored, not capped)
             e.requests += 1;
@@ -952,9 +932,7 @@ impl Store for MemoryStore {
                     && tenant.is_none_or(|f| f == t)
                     && user.is_none_or(|f| f == u)
                 {
-                    map.entry(bucket(*minute))
-                        .or_insert_with(|| UserUsageRow::zero(String::new(), String::new()))
-                        .absorb(row);
+                    map.entry(bucket(*minute)).or_default().absorb(row);
                 }
             }
             rollup_watermark(&rollup)
@@ -968,7 +946,7 @@ impl Store for MemoryStore {
                 && user.is_none_or(|u| u == r.user_id)
         }) {
             map.entry(bucket(r.created_at_epoch_secs))
-                .or_insert_with(|| UserUsageRow::zero(String::new(), String::new()))
+                .or_default()
                 .add_record(r);
         }
         Ok(map.into_iter().collect())
@@ -994,7 +972,11 @@ impl Store for MemoryStore {
                         r.user_id.clone(),
                         r.model.clone(),
                     ))
-                    .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
+                    .or_insert_with(|| UserUsageRow {
+                        user_id: r.user_id.clone(),
+                        model: r.model.clone(),
+                        ..Default::default()
+                    })
                     .add_record(r);
             }
         }
@@ -1236,6 +1218,15 @@ impl Store for MemoryStore {
     }
 }
 
+/// First epoch second NOT yet folded into the rollup: rows at or above it are
+/// still the ledger's to report.
+fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
+    rollup
+        .keys()
+        .next_back()
+        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+}
+
 /// Positional row → record mappers shared by the SQL backends (fields decode in
 /// the SELECT's column order).
 macro_rules! row_mapper {
@@ -1253,15 +1244,6 @@ macro_rules! row_mapper {
             $ty { $($field),+ }
         }
     };
-}
-
-/// First epoch second NOT yet folded into the rollup: rows at or above it are
-/// still the ledger's to report.
-fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
-    rollup
-        .keys()
-        .next_back()
-        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
 }
 
 fn next_col(col: &mut usize) -> usize {
@@ -1300,6 +1282,7 @@ row_mapper!(video_job_row -> VideoJob {
     id, tenant, ak, product, user_id, model, served_model, account, unit_price_micros,
     created_at_epoch_secs,
 });
+
 row_mapper!(content_row -> crate::ContentRecord {
     created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
     sealed, expires_at_epoch_secs,
@@ -1444,8 +1427,7 @@ impl SqliteStore {
                 return Err(crate::sqlx_err("migrate billing schema", e));
             }
         }
-        // a dead process's jobs can never progress single-instance — fail them, don't let clients
-        // poll forever
+        // a dead process's jobs never progress single-instance: fail them or clients poll forever
         sqlx::query("UPDATE batches SET status = 'failed' WHERE status IN ('pending', 'running')")
             .execute(&pool)
             .await
@@ -2883,6 +2865,7 @@ sql_store_impl!(PostgresStore, postgres, {
 mod tests {
     use super::*;
 
+    static RECORD_RUN: std::sync::LazyLock<i64> = std::sync::LazyLock::new(crate::epoch_millis);
     static RECORD_SEQ: AtomicUsize = AtomicUsize::new(1);
 
     #[test]
@@ -3122,7 +3105,11 @@ mod tests {
             product: "p".into(),
             tenant: "default".into(),
             user_id: "u1".into(),
-            request_id: format!("req-{}", RECORD_SEQ.fetch_add(1, Ordering::Relaxed)),
+            request_id: format!(
+                "req-{}-{}",
+                *RECORD_RUN,
+                RECORD_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
             created_at_epoch_secs: 1_000,
             model: model.into(),
             served_model: model.into(),

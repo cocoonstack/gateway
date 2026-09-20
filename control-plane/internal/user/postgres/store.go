@@ -162,8 +162,8 @@ func (s *Store) migrate(ctx context.Context) error {
 }
 
 func isDuplicate(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && pgErr.Code == "23505"
 }
 
 func scanUser(row pgx.Row) (user.User, error) {

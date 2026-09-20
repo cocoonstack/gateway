@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -527,21 +527,33 @@ fn serves(a: &Arc<Account>, p: Protocol, provider: Option<&str>) -> bool {
     a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want)
 }
 
+#[derive(Debug)]
+struct Window {
+    since: Instant,
+    id: i64,
+    used: i64,
+}
+
 /// Fixed-window token accounting, for AK-level TPM and (at amount 1) QPM.
 #[derive(Debug, Default)]
 pub struct TokenWindow {
-    entries: DashMap<String, (Instant, i64)>,
+    entries: DashMap<String, Window>,
+    opened: AtomicI64,
 }
 
 impl TokenWindow {
-    /// Windowed admission with reservation, atomic under the entry guard.
-    pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: std::time::Duration) -> bool {
-        reserve_on(&mut self.slot(key, window).1, amount, limit)
+    /// Windowed admission with reservation, atomic under the entry guard; returns the admitting window's id.
+    pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: Duration) -> Option<i64> {
+        let mut w = self.slot(key, window);
+        reserve_on(&mut w.used, amount, limit).then_some(w.id)
     }
 
-    /// Apply the settle delta to the current window; never below zero.
-    pub fn settle(&self, key: &str, delta: i64, window: std::time::Duration) {
-        settle_on(&mut self.slot(key, window).1, delta);
+    /// Apply the settle delta to window `id` (`None` = the live window); a newer window is left alone.
+    pub fn settle(&self, key: &str, delta: i64, window: Duration, id: Option<i64>) {
+        let mut w = self.slot(key, window);
+        if id.is_none_or(|id| id == w.id) {
+            settle_on(&mut w.used, delta);
+        }
     }
 
     /// The current window's entry, rotated if elapsed — under one entry guard so
@@ -549,13 +561,21 @@ impl TokenWindow {
     fn slot(
         &self,
         key: &str,
-        window: std::time::Duration,
-    ) -> dashmap::mapref::one::RefMut<'_, String, (Instant, i64)> {
-        let mut e = slot_mut(&self.entries, key, || (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
+        window: Duration,
+    ) -> dashmap::mapref::one::RefMut<'_, String, Window> {
+        let mut w = slot_mut(&self.entries, key, || self.open());
+        if w.since.elapsed() >= window {
+            *w = self.open();
         }
-        e
+        w
+    }
+
+    fn open(&self) -> Window {
+        Window {
+            since: Instant::now(),
+            id: self.opened.fetch_add(1, Ordering::Relaxed) + 1,
+            used: 0,
+        }
     }
 }
 
@@ -974,37 +994,9 @@ pub fn access_key_fingerprint(ak: &str) -> String {
     format!("sha256:{}", hex::encode(&digest[..16]))
 }
 
-/// The entry for `key`, inserting `init()` on first use — the key String is
-/// allocated only on the miss path.
-fn slot_mut<'a, V>(
-    map: &'a DashMap<String, V>,
-    key: &str,
-    init: impl FnOnce() -> V,
-) -> dashmap::mapref::one::RefMut<'a, String, V> {
-    if let Some(e) = map.get_mut(key) {
-        return e;
-    }
-    map.entry(key.to_owned()).or_insert_with(init)
-}
-
-/// Admit while spent-before < `limit`, adding `amount` so in-flight work counts
-/// (Redis mirrors it in `reserve_capped`).
-fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
-    if *counter >= limit {
-        return false;
-    }
-    *counter = counter.saturating_add(amount);
-    true
-}
-
 /// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
-fn settle_on(counter: &mut i64, delta: i64) {
-    *counter = counter.saturating_add(delta).max(0);
 }
 
 /// Wrap a sqlx error as an internal gateway error with context.
@@ -1043,6 +1035,34 @@ pub(crate) async fn redis_connect(url: &str) -> Result<redis::aio::ConnectionMan
     redis::aio::ConnectionManager::new(client)
         .await
         .map_err(|e| format!("redis connect: {e}"))
+}
+
+/// The entry for `key`, inserting `init()` on first use — the key String is
+/// allocated only on the miss path.
+fn slot_mut<'a, V>(
+    map: &'a DashMap<String, V>,
+    key: &str,
+    init: impl FnOnce() -> V,
+) -> dashmap::mapref::one::RefMut<'a, String, V> {
+    if let Some(e) = map.get_mut(key) {
+        return e;
+    }
+    map.entry(key.to_owned()).or_insert_with(init)
+}
+
+/// Admit while spent-before < `limit`, adding `amount` so in-flight work counts
+/// (Redis mirrors it in `reserve_capped`).
+fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
+    if *counter >= limit {
+        return false;
+    }
+    *counter = counter.saturating_add(amount);
+    true
+}
+
+/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
+fn settle_on(counter: &mut i64, delta: i64) {
+    *counter = counter.saturating_add(delta).max(0);
 }
 
 #[cfg(test)]
@@ -1403,7 +1423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_prefers_priority_then_round_robins() {
+    async fn pool_prefers_priority_and_honors_the_provider_binding() {
         let s = state();
         let h = s.health.as_ref();
         let a = s

@@ -3,6 +3,7 @@
 //! short-TTL cache so the hot auth path stays off the network.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,7 +51,7 @@ pub struct PostgresKeyStore {
     /// Bumped on every write: an authenticate that overlapped a write evicts
     /// its (possibly pre-write) fetch instead of leaving the cache poisoned.
     /// A write landing after the re-check still self-heals within [`AUTH_CACHE_TTL`].
-    write_epoch: std::sync::atomic::AtomicU64,
+    write_epoch: AtomicU64,
 }
 
 impl PostgresKeyStore {
@@ -95,13 +96,12 @@ impl PostgresKeyStore {
                 .max_capacity(AUTH_CACHE_MAX)
                 .time_to_live(AUTH_CACHE_TTL)
                 .build(),
-            write_epoch: std::sync::atomic::AtomicU64::new(0),
+            write_epoch: AtomicU64::new(0),
         })
     }
 
     async fn note_write(&self, ak: &str) {
-        self.write_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.write_epoch.fetch_add(1, Ordering::Release);
         self.cache.invalidate(ak).await;
     }
 
@@ -120,22 +120,18 @@ impl PostgresKeyStore {
 #[async_trait]
 impl KeyStore for PostgresKeyStore {
     async fn authenticate(&self, ak: &str) -> Option<Arc<AkInfo>> {
-        let fetched_at = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let fetched_at = AtomicU64::new(u64::MAX);
         let loaded = self
             .cache
             .try_get_with_by_ref(ak, async {
-                fetched_at.store(
-                    self.write_epoch.load(std::sync::atomic::Ordering::Acquire),
-                    std::sync::atomic::Ordering::Release,
-                );
+                fetched_at.store(self.write_epoch.load(Ordering::Acquire), Ordering::Release);
                 let info = self.fetch(ak).await?;
                 Ok::<_, sqlx::Error>(info)
             })
             .await;
         // checked after publication: a write landing before the insert would find no entry to evict
-        let start = fetched_at.load(std::sync::atomic::Ordering::Acquire);
-        if start != u64::MAX && self.write_epoch.load(std::sync::atomic::Ordering::Acquire) != start
-        {
+        let start = fetched_at.load(Ordering::Acquire);
+        if start != u64::MAX && self.write_epoch.load(Ordering::Acquire) != start {
             self.cache.invalidate(ak).await;
         }
         match loaded {
@@ -249,8 +245,7 @@ impl KeyStore for PostgresKeyStore {
         tx.commit()
             .await
             .map_err(|e| crate::sqlx_err("commit reload", e))?;
-        self.write_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.write_epoch.fetch_add(1, Ordering::Release);
         self.cache.invalidate_all();
         Ok(())
     }
@@ -312,12 +307,10 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
         tokens_per_minute: row.get(5),
         expires_at_epoch_secs: row.get(6),
         banned: row.get(7),
-        model_quotas: std::sync::Arc::new(
-            serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default(),
-        ),
+        model_quotas: Arc::new(serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default()),
         owner: row.get(9),
         suspended_until_epoch_secs: row.get(10),
-        mcp: std::sync::Arc::new(crate::McpAccess {
+        mcp: Arc::new(crate::McpAccess {
             servers: serde_json::from_str(row.get::<&str, _>(11)).unwrap_or_default(),
             tools: serde_json::from_str(row.get::<&str, _>(12)).unwrap_or_default(),
         }),
@@ -440,7 +433,7 @@ mod tests {
         assert_eq!(k.mcp.tools["srv"], vec!["t1".to_owned()]);
 
         let mut admin = info("pk-plain", 1.0);
-        admin.mcp = std::sync::Arc::new(crate::McpAccess {
+        admin.mcp = Arc::new(crate::McpAccess {
             servers: vec!["srv".into()],
             tools: Default::default(),
         });

@@ -42,7 +42,7 @@ curl -sN localhost:8080/v1/messages \
 
 # Your own config
 GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
-gw --version                       # the built binary takes no other arguments
+gw --version                       # --help lists the env vars; there are no other flags
 
 # Go live: give an account `endpoint` + `api_key_env` in the config — that's it.
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
@@ -76,7 +76,9 @@ make release  # optimized `gw` binary (--locked)
 make docker   # build the container image
 ```
 
-CI runs fmt/clippy/test + `cargo deny` on every push to `main` and every PR;
+CI runs fmt/clippy/test (with live Postgres and Redis for the gated suites),
+`cargo deny` and the control-plane Go, web and browser gates on every push to
+`main` and every PR;
 tagged `v*` pushes build multi-arch binaries (release) and a multi-arch image
 (docker).
 

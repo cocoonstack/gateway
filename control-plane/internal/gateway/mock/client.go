@@ -28,8 +28,6 @@ type Client struct {
 
 func New() *Client {
 	now := time.Now().Unix()
-	owner := "alice"
-	expires := now + 30*86_400
 	return &Client{
 		yaml:    "listen: {host: 0.0.0.0, port: 8080}\nstorage: {}\nmodels:\n  - {name: gpt-4o, protocol: openai-chat}\naccounts:\n  - {name: primary-openai, provider: openai, protocols: [openai-chat]}\ntenants:\n  - {name: acme}\naccess_keys: []\n",
 		version: 3,
@@ -40,12 +38,12 @@ func New() *Client {
 		},
 		keys: map[string]gateway.Key{
 			"ak-acme-alice": {
-				AK: "ak-acme-alice", Product: "standard", Tenant: "acme", Owner: &owner,
+				AK: "ak-acme-alice", Product: "standard", Tenant: "acme", Owner: new("alice"),
 				QPS: 10, DailyTokenQuota: 1_000_000, Status: "active", Available: true,
 			},
 			"ak-acme-batch": {
 				AK: "ak-acme-batch", Product: "batch", Tenant: "acme", QPS: 2,
-				DailyTokenQuota: 500_000, ExpiresAtEpochSecs: &expires, Status: "active", Available: true,
+				DailyTokenQuota: 500_000, ExpiresAtEpochSecs: new(now + 30*86_400), Status: "active", Available: true,
 			},
 			"ak-labs-paused": {
 				AK: "ak-labs-paused", Product: "research", Tenant: "labs", QPS: 1,
@@ -60,10 +58,7 @@ func New() *Client {
 }
 
 func (c *Client) Usage(_ context.Context, scope gateway.Scope, _, _ int64) ([]gateway.UsageRow, error) {
-	userID := scope.User
-	if userID == "" {
-		userID = "alice"
-	}
+	userID := cmp.Or(scope.User, "alice")
 	rows := []gateway.UsageRow{
 		{UserID: userID, Model: "gpt-4o", Requests: 184, PromptTokens: 128_400, CompletionTokens: 42_700, TotalTokens: 171_100, CostMicros: 748_000, VendorCostMicros: 422_000},
 		{UserID: userID, Model: "claude-sonnet", Requests: 62, PromptTokens: 84_200, CompletionTokens: 19_600, TotalTokens: 103_800, CostMicros: 512_000, VendorCostMicros: 331_000},
@@ -240,9 +235,7 @@ func (c *Client) Audit(context.Context) ([]gateway.AuditEntry, error) {
 
 func (c *Client) SecurityEvents(_ context.Context, tenant string) ([]gateway.SecurityEvent, error) {
 	now := time.Now().Unix()
-	if tenant == "" {
-		tenant = "acme"
-	}
+	tenant = cmp.Or(tenant, "acme")
 	return []gateway.SecurityEvent{
 		{CreatedAtEpochSecs: now - 120, RequestID: "req-42", AK: "ak-acme-alice", UserID: "alice", Tenant: tenant, Surface: "chat", Rule: "dlp", Action: "redact", Hits: 1},
 		{CreatedAtEpochSecs: now - 500, RequestID: "req-39", AK: "ak-acme-batch", UserID: "bob", Tenant: tenant, Surface: "batch", Rule: "blocklist", Action: "flag", Hits: 2},

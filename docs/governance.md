@@ -93,7 +93,9 @@ Daily-token and TPM admission **reserve then settle**: on admission a cheap
 estimate (prompt heuristic + requested `max_tokens`) is reserved atomically, so
 concurrent in-flight requests count against the budget instead of all passing a
 stale check and jointly overshooting. Billing settles the reservation to actual
-usage; a failed request refunds it. Charged price is the model's list price, or
+usage; a failed request refunds it. The daily reserve settles on its admission
+day; the TPM reserve settles only into the minute window that admitted it — a
+request that outlives its window leaves the next window's reservations alone. Charged price is the model's list price, or
 a tenant's `model_prices` override; when an account declares `cost_*_price` the
 ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
 Surfaces that meter no tokens bill per unit instead — TTS characters,
@@ -105,7 +107,9 @@ sees `done`: the submit row carries 0 units, the completion row (its
 `request_id` is the video id) the clip's seconds at the price quoted at submit
 and, when the vendor reports
 one (xAI's `cost_in_usd_ticks`), the exact vendor cost instead of the account's
-unit price. Audio
+unit price; that completion row also accrues the cost budgets of the
+submitting key — of the polling key when the submitter no longer exists (the
+tenant and user budgets are the same either way). Audio
 tokens and 1-hour cache writes take their own `token_rate` weights, a
 `long_context` tier re-prices calls past a prompt size, and `batch_discount`
 scales what `/v1/batches` items cost.
@@ -137,7 +141,8 @@ A server that takes OAuth 2.0 instead of a static bearer declares
 `mcp_servers[].oauth`: the gateway runs the client-credentials grant (or the
 refresh-token grant from a seeded refresh token, keeping a rotated one in
 memory) against `token_url`, caches the access token per server until 30 s
-before its `expires_in`, and on a `401` from the server fetches a fresh token
+before its `expires_in` (half its lifetime for a token shorter than a minute; a
+reply without `expires_in` counts as an hour), and on a `401` from the server fetches a fresh token
 and retries the call once. Tokens are dropped on config reload. The client
 secret and refresh-token seed are read from the environment at fetch time.
 
@@ -195,14 +200,15 @@ security:
 ```
 
 Outbound redaction needs the whole message (a masked span may straddle two SSE
-deltas), so **with `dlp_redact` enabled a streaming response is buffered and the
-redacted text replayed** rather than forwarded token-by-token — DLP trades
+deltas), so **whenever a tenant redacts output — `dlp_redact` or
+`detect_secrets` — a streaming response is buffered and the redacted text
+replayed** rather than forwarded token-by-token — DLP trades
 incremental delivery for a guarantee that no unmasked text reaches the client.
 Billing is settled after that replay: a disconnect before the first redacted
 chunk refunds the reservation, while a partial replay bills only an estimate of
 the delivered text.
-Turn `dlp_redact` off to keep incremental delivery; note the embedded demo
-config ships with it on.
+Turn both `dlp_redact` and `detect_secrets` off to keep incremental delivery;
+note the embedded demo config ships with `dlp_redact` on.
 
 `security.moderate` routes the inbound text through the external moderator
 named by the top-level `moderation:` section — today AWS Bedrock Guardrails

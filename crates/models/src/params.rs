@@ -137,7 +137,7 @@ pub struct TtsParams {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SttParams {
-    /// base64 audio (the real API uses multipart upload; this local milestone carries it as b64)
+    /// base64 audio; the engine uploads it as multipart.
     pub audio_b64: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,

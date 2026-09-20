@@ -793,6 +793,10 @@ impl GatewayConfig {
         Ok(cfg)
     }
 
+    pub fn embedded_default() -> Result<Self, ConfigError> {
+        Self::from_yaml(DEFAULT_YAML)
+    }
+
     fn build_indices(&mut self) {
         self.model_idx = index_by(&self.models, |m| &m.name);
         self.product_idx = index_by(&self.products, |p| &p.name);
@@ -891,10 +895,6 @@ impl GatewayConfig {
             m.kind = Protocol::from_wire(&m.protocol);
         }
         Ok(())
-    }
-
-    pub fn embedded_default() -> Result<Self, ConfigError> {
-        Self::from_yaml(DEFAULT_YAML)
     }
 
     /// Structural and value invariants checked before use: wire types, prices,

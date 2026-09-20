@@ -505,7 +505,7 @@ async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_jso
 /// Count one admission rejection and suspend the key when a configured abuse tier trips.
 async fn note_abuse(ctx: &DagContext) {
     let tiers = &ctx.cfg.abuse.tiers;
-    if tiers.is_empty() {
+    if tiers.is_empty() || !ctx.request.is_online {
         return;
     }
     let now = gw_state::epoch_secs();
@@ -516,8 +516,7 @@ async fn note_abuse(ctx: &DagContext) {
     }
     // ':' is banned in ak names, so the prefix cannot collide with a real key
     let counter = format!("abuse:{}", ctx.ak.ak);
-    ctx.state.governance.quota_consume(&counter, 1).await;
-    let rejects = ctx.state.governance.quota_used(&counter).await;
+    let rejects = ctx.state.governance.quota_consume(&counter, 1).await;
     let Some(tier) = tiers
         .iter()
         .filter(|t| rejects >= t.rejects)
@@ -1507,6 +1506,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_item_rejections_do_not_trip_the_abuse_tier() {
+        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let mut item = chat_req("gpt-4o", "hi");
+        item.is_online = false;
+        let err = h.run(item, key).await.err().expect("qps 0 rejects");
+        assert_eq!(err.http_status, 429);
+        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            fresh.status_at(gw_state::epoch_secs()),
+            gw_state::KeyStatus::Active
+        );
+    }
+
+    #[tokio::test]
     async fn hard_quota_rejection_does_not_trip_abuse_tier() {
         let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 1}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -1639,12 +1659,7 @@ mod tests {
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let key = h.state().auth.authenticate("k1").await.unwrap();
-        let req = |content: &str| GatewayRequest {
-            is_online: true,
-            message: vec![ChatMsg::text("user", content)],
-            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
-            ..Default::default()
-        };
+        let req = |content: &str| chat_req("gpt-4o", content);
         h.run(req("first spends past one micro"), key.clone())
             .await
             .unwrap();
@@ -1680,12 +1695,7 @@ mod tests {
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let key = h.state().auth.authenticate("k1").await.unwrap();
-        let req = |content: &str| GatewayRequest {
-            is_online: true,
-            message: vec![ChatMsg::text("user", content)],
-            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
-            ..Default::default()
-        };
+        let req = |content: &str| chat_req("gpt-4o", content);
         h.run(req("first spends past one micro"), key.clone())
             .await
             .unwrap();
@@ -2686,6 +2696,37 @@ mod tests {
         assert_eq!(
             h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_banned_key_stops_its_running_batch() {
+        let h = handler();
+        let off = OfflineHandler::new(h.clone());
+        let key = ak(&h).await;
+        let ban = gw_state::KeyPatch {
+            banned: Some(true),
+            ..Default::default()
+        };
+        h.state().auth.patch(&key.ak, &ban).await.unwrap();
+        let job = off
+            .submit(
+                key,
+                "gpt-4o-mini".into(),
+                vec![BatchItem {
+                    messages: vec![ChatMsg::text("user", "one")],
+                    user: String::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, gw_state::BatchStatus::Failed);
+        assert!(j.results.is_empty(), "no item may run for a banned key");
+        assert_eq!(
+            h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
+            0
         );
     }
 

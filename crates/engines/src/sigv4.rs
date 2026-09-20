@@ -26,26 +26,6 @@ pub struct SigV4Params<'a> {
     pub payload: &'a [u8],
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    // any key length is valid for HMAC-SHA256 (RFC 2104), so this cannot fire
-    #[allow(clippy::expect_used)]
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
-}
-
-/// The derived signing key: kSecret → kDate → kRegion → kService → kSigning.
-fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac(&k_date, region.as_bytes());
-    let k_service = hmac(&k_region, service.as_bytes());
-    hmac(&k_service, b"aws4_request")
-}
-
 /// Compute the SigV4 signature (hex) and the full Authorization header value.
 pub fn sign(p: &SigV4Params) -> (String, String) {
     let signed_headers: Vec<&str> = p.headers.iter().map(|(n, _)| *n).collect();
@@ -82,6 +62,26 @@ pub fn sign(p: &SigV4Params) -> (String, String) {
         p.access_key
     );
     (signature, authorization)
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // any key length is valid for HMAC-SHA256 (RFC 2104), so this cannot fire
+    #[allow(clippy::expect_used)]
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(Sha256::digest(data))
+}
+
+/// The derived signing key: kSecret → kDate → kRegion → kService → kSigning.
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k_region = hmac(&k_date, region.as_bytes());
+    let k_service = hmac(&k_region, service.as_bytes());
+    hmac(&k_service, b"aws4_request")
 }
 
 #[cfg(test)]

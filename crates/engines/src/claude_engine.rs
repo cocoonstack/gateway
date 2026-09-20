@@ -172,6 +172,9 @@ impl ClaudeEngine {
             if sampling_rejected {
                 extra.remove("top_k");
             }
+            if !self.base.request.preserve_anthropic_wire {
+                extra.remove("user");
+            }
             if bedrock {
                 extra.remove("model");
                 extra.remove("stream");
@@ -956,6 +959,23 @@ mod tests {
         param.raw = raw;
         r.model_param_v2 = Some(param);
         r
+    }
+
+    #[test]
+    fn the_chat_surface_user_field_stays_off_the_anthropic_wire() {
+        let raw = || json!({"user": "u-1", "top_k": 5});
+        let mut chat = ClaudeEngine::new(
+            chat_req("claude-sonnet-4-5-20250929", ChatParams::default(), raw()),
+            Arc::new(MockTransport),
+        );
+        let body = chat.build_body().unwrap();
+        assert!(!body.contains_key("user"));
+        assert!(body.contains_key("top_k"));
+
+        let mut native = chat_req("claude-sonnet-4-5-20250929", ChatParams::default(), raw());
+        native.preserve_anthropic_wire = true;
+        let mut native = ClaudeEngine::new(native, Arc::new(MockTransport));
+        assert!(native.build_body().unwrap().contains_key("user"));
     }
 
     #[test]

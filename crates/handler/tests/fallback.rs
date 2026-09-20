@@ -218,12 +218,14 @@ async fn fallback_consumes_each_request_limit_once() {
                     .governance
                     .token_window_reserve("k", 1, 3, gw_consts::MINUTE)
                     .await
+                    .is_some()
             );
             assert!(
-                !state
+                state
                     .governance
                     .token_window_reserve("k", 1, 3, gw_consts::MINUTE)
                     .await
+                    .is_none()
             );
             let (_, rows) = state.store.ledger_snapshot(10).await.expect("ledger");
             assert_eq!(rows.len(), 1);
@@ -279,6 +281,7 @@ async fn fallback_keeps_model_qpm_and_refunds_token_reservations() {
             .governance
             .token_window_reserve("k", 1, 1, gw_consts::MINUTE)
             .await
+            .is_some()
     );
     assert_eq!(state.store.ledger_snapshot(10).await.expect("ledger").0, 0);
 }
