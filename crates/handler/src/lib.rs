@@ -2700,6 +2700,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_banned_key_stops_its_running_batch() {
+        let h = handler();
+        let off = OfflineHandler::new(h.clone());
+        let key = ak(&h).await;
+        let ban = gw_state::KeyPatch {
+            banned: Some(true),
+            ..Default::default()
+        };
+        h.state().auth.patch(&key.ak, &ban).await.unwrap();
+        let job = off
+            .submit(
+                key,
+                "gpt-4o-mini".into(),
+                vec![BatchItem {
+                    messages: vec![ChatMsg::text("user", "one")],
+                    user: String::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, gw_state::BatchStatus::Failed);
+        assert!(j.results.is_empty(), "no item may run for a banned key");
+        assert_eq!(
+            h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn batch_submitted_after_an_erasure_still_runs() {
         let h = handler();
         let off = OfflineHandler::new(h.clone());

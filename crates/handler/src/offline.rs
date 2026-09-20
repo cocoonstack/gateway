@@ -112,6 +112,9 @@ impl OfflineHandler {
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
             }
+            if self.active_key(&ak.ak).await.is_none() {
+                break;
+            }
             // fence per item, fail CLOSED: at most the in-flight item double-runs (claim 0: none)
             if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
@@ -219,21 +222,13 @@ impl OfflineHandler {
             match claimed {
                 Ok(Some((job, claim))) => {
                     // a key revoked/banned/expired since submit stops its queued work
-                    let ak = match self.online.state().auth.authenticate(&job.ak).await {
-                        Some(ak)
-                            if ak.status_at(gw_state::epoch_secs())
-                                == gw_state::KeyStatus::Active =>
-                        {
-                            ak
-                        }
-                        _ => {
-                            let ak_id = gw_state::access_key_fingerprint(&job.ak);
-                            tracing::warn!(batch = %job.id, ak_id, "claimed batch's key is gone or inactive; failing it");
-                            let _ = store
-                                .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
-                                .await;
-                            continue;
-                        }
+                    let Some(ak) = self.active_key(&job.ak).await else {
+                        let ak_id = gw_state::access_key_fingerprint(&job.ak);
+                        tracing::warn!(batch = %job.id, ak_id, "claimed batch's key is gone or inactive; failing it");
+                        let _ = store
+                            .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
+                            .await;
+                        continue;
                     };
                     // a load failure must fail the job, not silently complete with zero results
                     let items = match store.batch_load_items(&job.id).await {
@@ -269,6 +264,11 @@ impl OfflineHandler {
                 }
             }
         }
+    }
+
+    async fn active_key(&self, ak: &str) -> Option<Arc<AkInfo>> {
+        let key = self.online.state().auth.authenticate(ak).await?;
+        (key.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active).then_some(key)
     }
 }
 
