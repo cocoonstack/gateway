@@ -4463,29 +4463,29 @@ async fn audio_speech(
 /// POST /v1/audio/transcriptions (STT; JSON carries b64 audio, not multipart).
 async fn audio_transcriptions(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
-    audio_transcribe(s, headers, ak, body, false).await
+    audio_transcribe(s, hint, ak, body, false).await
 }
 
 /// POST /v1/audio/translations — the transcriptions shape, translated to
 /// English by the upstream (OpenAI translations semantics).
 async fn audio_translations(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
-    audio_transcribe(s, headers, ak, body, true).await
+    audio_transcribe(s, hint, ak, body, true).await
 }
 
 /// The shared STT body: transcriptions and translations differ only in the
 /// upstream path the `translate` flag selects.
 async fn audio_transcribe(
     s: AppState,
-    headers: HeaderMap,
+    hint: Option<String>,
     ak: Arc<AkInfo>,
     mut body: Value,
     translate: bool,
@@ -4508,7 +4508,7 @@ async fn audio_transcribe(
         gw_consts::Protocol::Stt,
         typed,
         vec![],
-        user_hint(user_header(&headers), &body["user"]),
+        user_hint(hint, &body["user"]),
     )
     .await
     {
@@ -4649,14 +4649,13 @@ fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
 /// POST /v1/batches (inline `items` or an uploaded JSONL `input_file_id`).
 async fn batches_submit(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    UserHint(hint): UserHint,
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
     let mut model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let mut batch_items = Vec::new();
     // batch-level attribution hint; a per-item body `user` overrides it
-    let hint = user_header(&headers);
     let item_user =
         |v: &Value| cap_user_hint(v["user"].as_str().or(hint.as_deref()).unwrap_or_default());
 
