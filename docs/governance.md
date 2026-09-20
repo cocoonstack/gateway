@@ -107,8 +107,9 @@ sees `done`: the submit row carries 0 units, the completion row (its
 `request_id` is the video id) the clip's seconds at the price quoted at submit
 and, when the vendor reports
 one (xAI's `cost_in_usd_ticks`), the exact vendor cost instead of the account's
-unit price; that completion row also accrues the submitting key's cost
-budgets. Audio
+unit price; that completion row also accrues the cost budgets of the
+submitting key — of the polling key when the submitter no longer exists (the
+tenant and user budgets are the same either way). Audio
 tokens and 1-hour cache writes take their own `token_rate` weights, a
 `long_context` tier re-prices calls past a prompt size, and `batch_discount`
 scales what `/v1/batches` items cost.
