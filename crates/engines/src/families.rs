@@ -12,7 +12,6 @@ use serde_json::{Map, Value, json};
 use crate::base::{Base, VENDOR_SENTINEL, base_engine, parse_json_reply, versioned_url};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_error};
 use crate::multipart::{Form, audio_kind, image_kind};
-use crate::sse::SseDecoder;
 use crate::transport::{Headers, SharedTransport, Transport, UpstreamBody, UpstreamRequest};
 
 /// Gemini `parts` from a unified message: text and data-URI images (`inlineData`);
@@ -1380,27 +1379,21 @@ impl ResponsesEngine {
         self.base.openai_url("mock://api.openai.com", "responses")
     }
 
-    /// Streaming Responses pumped live: delta frames forwarded through
+    /// An SSE reply through the shared pump: delta frames forwarded through
     /// `stream_tx` as they arrive; `response.completed` carries final usage.
-    async fn run_stream(&mut self) -> GResult<EngineOutcome> {
-        let body = self.build_body()?;
-        let reply = self
-            .base
-            .send_upstream_raw(&self.url(), self.base.bearer_headers(), body, true)
-            .await?;
-        let status = reply.status;
+    async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
         let mut resp = GatewayResponse {
             model: self.model_name(),
             finish_reason: "completed".to_owned(),
             ..Default::default()
         };
-        crate::pump::reject_json_error("responses", status, &reply.body)?;
+        crate::pump::reject_json_error("responses", status, &body)?;
         let mut full = String::new();
         let model_override = self.base.model_override();
         let native = self.base.request.preserve_responses_wire;
         let r = crate::pump::pump_sse(
             "responses",
-            reply.body,
+            body,
             self.base.request.stream_tx.clone(),
             |v| responses_apply_frame(v, status, model_override, native, &mut resp, &mut full),
         )
@@ -1460,41 +1453,6 @@ impl ResponsesEngine {
         };
         Ok(EngineOutcome::with_status(resp, status))
     }
-
-    /// Buffered Responses SSE: the same [`responses_apply_frame`] semantics the
-    /// live pump drives, over pre-decoded events.
-    fn parse_sse(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let (events, _done) = SseDecoder::decode_all(bytes)
-            .map_err(|e| GatewayError::internal(format!("decode responses sse body: {e}")))?;
-        let mut resp = GatewayResponse {
-            model: self.model_name(),
-            finish_reason: "completed".to_owned(),
-            ..Default::default()
-        };
-        let mut full = String::new();
-        let mut chunks = Vec::new();
-        let model_override = self.base.model_override();
-        let native = self.base.request.preserve_responses_wire;
-        for ev in events {
-            let v: Value = serde_json::from_slice(ev.as_bytes())
-                .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
-            chunks.extend(responses_apply_frame(
-                v,
-                status,
-                model_override,
-                native,
-                &mut resp,
-                &mut full,
-            )?);
-        }
-        resp.message = full;
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks,
-            ..Default::default()
-        })
-    }
 }
 
 #[async_trait::async_trait]
@@ -1502,20 +1460,15 @@ impl ModelEngine for ResponsesEngine {
     /// OpenAI Responses API (POST /v1/responses): native body passthrough with
     /// the `model` field ensured; usage normalized to the openai shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
-        if self.base.request.stream {
-            return self.run_stream().await;
-        }
+        let stream = self.base.request.stream;
         let body = self.build_body()?;
         let reply = self
             .base
-            .send_upstream(&self.url(), self.base.bearer_headers(), body, false)
+            .send_upstream_raw(&self.url(), self.base.bearer_headers(), body, stream)
             .await?;
-        match &reply.body {
-            UpstreamBody::Json(b) => self.parse_json(reply.status, b),
-            UpstreamBody::Sse(b) => self.parse_sse(reply.status, b),
-            UpstreamBody::SseStream(_) => Err(GatewayError::internal(
-                "unbuffered stream reached responses engine",
-            )),
+        match reply.body {
+            UpstreamBody::Json(b) if !stream => self.parse_json(reply.status, &b),
+            body => self.run_sse(reply.status, body).await,
         }
     }
 }
