@@ -53,8 +53,14 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
         limit: i64,
         window: Duration,
     ) -> bool;
-    /// Apply the settle delta to the current window (negative refunds).
-    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration);
+    /// Apply the settle delta to the window its reserve opened `reserved_age` ago, if still live.
+    async fn token_window_settle(
+        &self,
+        key: &str,
+        delta: i64,
+        window: Duration,
+        reserved_age: Duration,
+    );
 
     /// Refund an admission reservation whole (daily quota + optional TPM
     /// window) — for a request/turn that never reached billing.
@@ -69,7 +75,9 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
             self.quota_settle(ak, -reserved, at_epoch_secs).await;
         }
         if let Some(tpm) = tpm_reserved {
-            self.token_window_settle(ak, -tpm, gw_consts::MINUTE).await;
+            let age = crate::reserved_age(at_epoch_secs);
+            self.token_window_settle(ak, -tpm, gw_consts::MINUTE, age)
+                .await;
         }
     }
 }
@@ -128,8 +136,8 @@ impl Governance for MemoryGovernance {
     ) -> bool {
         self.tpm.reserve(key, amount, limit, window)
     }
-    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
-        self.tpm.settle(key, delta, window);
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, age: Duration) {
+        self.tpm.settle(key, delta, window, age);
     }
 }
 
@@ -262,6 +270,7 @@ impl Governance for RedisGovernance {
             &quota_key_at(key, at),
             delta,
             Duration::from_millis(QUOTA_TTL_MS as u64),
+            Duration::ZERO,
         )
         .await;
     }
@@ -307,11 +316,11 @@ impl Governance for RedisGovernance {
         self.reserve_capped(tpm_key(key), amount, limit, window.as_millis() as i64)
             .await
     }
-    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
+    async fn token_window_settle(&self, key: &str, delta: i64, window: Duration, age: Duration) {
         if delta == 0 {
             return;
         }
-        settle_floored(&self.conn, &tpm_key(key), delta, window).await;
+        settle_floored(&self.conn, &tpm_key(key), delta, window, age).await;
     }
 }
 
@@ -341,10 +350,16 @@ async fn settle_floored(
     key: &str,
     delta: i64,
     window: Duration,
+    reserved_age: Duration,
 ) {
     static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
         redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+            "local age = tonumber(ARGV[3])
+             if age > 0 then
+               local pttl = redis.call('PTTL', KEYS[1])
+               if pttl < 0 or tonumber(ARGV[2]) - pttl < age then return 0 end
+             end
+             local v = redis.call('INCRBY', KEYS[1], ARGV[1])
              if v < 0 then redis.call('SET', KEYS[1], 0, 'KEEPTTL'); v = 0 end
              if redis.call('PTTL', KEYS[1]) < 0 then
                redis.call('PEXPIRE', KEYS[1], ARGV[2])
@@ -357,6 +372,7 @@ async fn settle_floored(
         .key(key)
         .arg(delta)
         .arg(window.as_millis() as i64)
+        .arg(reserved_age.as_millis() as i64)
         .invoke_async::<i64>(&mut conn)
         .await
     {
@@ -421,7 +437,19 @@ mod tests {
             !g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
                 .await
         );
-        g.token_window_settle(&rkey, -300, Duration::from_secs(60))
+        g.token_window_settle(
+            &rkey,
+            -300,
+            Duration::from_secs(60),
+            Duration::from_secs(61),
+        )
+        .await;
+        assert!(
+            !g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
+                .await,
+            "a refund older than the window must not drain it"
+        );
+        g.token_window_settle(&rkey, -300, Duration::from_secs(60), Duration::ZERO)
             .await;
         assert!(
             g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
@@ -432,7 +460,7 @@ mod tests {
         assert!(g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
 
-        g.token_window_settle(&ak, 10, Duration::from_secs(60))
+        g.token_window_settle(&ak, 10, Duration::from_secs(60), Duration::ZERO)
             .await;
         assert!(
             !g.token_window_reserve(&ak, 1, 10, Duration::from_secs(60))
@@ -466,8 +494,24 @@ mod tests {
         let w = Duration::from_secs(60);
         assert!(g.token_window_reserve("t", 300, 100, w).await);
         assert!(!g.token_window_reserve("t", 300, 100, w).await);
-        g.token_window_settle("t", -300, w).await;
+        g.token_window_settle("t", -300, w, Duration::ZERO).await;
         assert!(g.token_window_reserve("t", 300, 100, w).await);
+    }
+
+    #[tokio::test]
+    async fn a_settle_from_an_earlier_window_leaves_the_current_one_alone() {
+        let g = MemoryGovernance::default();
+        let w = Duration::from_millis(300);
+        assert!(g.token_window_reserve("k", 80, 100, w).await);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(g.token_window_reserve("k", 90, 100, w).await);
+        g.token_window_settle("k", -80, w, Duration::from_millis(350))
+            .await;
+        assert!(g.token_window_reserve("k", 20, 100, w).await);
+        assert!(
+            !g.token_window_reserve("k", 1, 100, w).await,
+            "the earlier window's refund must not drain this window's reservations"
+        );
     }
 
     #[tokio::test]
@@ -483,7 +527,7 @@ mod tests {
         assert!(g.window_allow("m", 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow("m", 1, Duration::from_secs(60)).await);
 
-        g.token_window_settle("ak", 10, Duration::from_secs(60))
+        g.token_window_settle("ak", 10, Duration::from_secs(60), Duration::ZERO)
             .await;
         assert!(
             !g.token_window_reserve("ak", 1, 10, Duration::from_secs(60))

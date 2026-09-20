@@ -501,7 +501,8 @@ pub async fn settle_and_bill(
     };
     let settle_tpm = async {
         if let Some(est) = s.tpm_reserved {
-            gov.token_window_settle(s.billing.ak, total - est, gw_consts::MINUTE)
+            let age = crate::reserved_age(s.reserved_at);
+            gov.token_window_settle(s.billing.ak, total - est, gw_consts::MINUTE, age)
                 .await;
         }
     };

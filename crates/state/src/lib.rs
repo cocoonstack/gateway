@@ -539,9 +539,12 @@ impl TokenWindow {
         reserve_on(&mut self.slot(key, window).1, amount, limit)
     }
 
-    /// Apply the settle delta to the current window; never below zero.
-    pub fn settle(&self, key: &str, delta: i64, window: std::time::Duration) {
-        settle_on(&mut self.slot(key, window).1, delta);
+    /// Apply the settle delta to the window its reserve opened `reserved_age` ago; a newer window is left alone.
+    pub fn settle(&self, key: &str, delta: i64, window: Duration, reserved_age: Duration) {
+        let mut e = self.slot(key, window);
+        if e.0.elapsed() >= reserved_age {
+            settle_on(&mut e.1, delta);
+        }
     }
 
     /// The current window's entry, rotated if elapsed — under one entry guard so
@@ -949,6 +952,11 @@ impl std::fmt::Debug for SharedConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SharedConfig")
     }
+}
+
+pub fn reserved_age(at_epoch_secs: i64) -> Duration {
+    let reserved_by_ms = at_epoch_secs.saturating_add(2).saturating_mul(1_000);
+    Duration::from_millis(epoch_millis().saturating_sub(reserved_by_ms).max(0) as u64)
 }
 
 /// Current unix seconds (0 if the clock reads before the epoch).
