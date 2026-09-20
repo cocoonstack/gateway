@@ -239,12 +239,23 @@ async fn fallback_consumes_each_request_limit_once() {
 
 #[tokio::test]
 async fn no_account_fallback_does_not_bypass_initial_request_limits() {
-    for (qps, limits, denial) in [
-        (0.0, "tenants: [{name: t}]", "rate limit exceeded for key"),
-        (100.0, "tenants: [{name: t, qps: 0}]", "tenant rate limit"),
+    for (qps, limits, code, denial) in [
+        (
+            0.0,
+            "tenants: [{name: t}]",
+            ErrCode::STOP_LIMIT_MSG,
+            "rate limit exceeded for key",
+        ),
+        (
+            100.0,
+            "tenants: [{name: t, qps: 0}]",
+            ErrCode::POOLED_LIMIT_MSG,
+            "tenant rate limit",
+        ),
         (
             100.0,
             "tenants: [{name: t}]\nproducts: [{name: p, qpm: 0}]",
+            ErrCode::POOLED_LIMIT_MSG,
             "product qpm limit",
         ),
     ] {
@@ -256,7 +267,7 @@ async fn no_account_fallback_does_not_bypass_initial_request_limits() {
             .await
             .err()
             .expect("fallback must still pass initial admission");
-        assert_eq!(err.code, ErrCode::STOP_LIMIT_MSG);
+        assert_eq!(err.code, code);
         assert!(err.message.contains(denial), "{err}");
         assert_eq!(vendor.calls(), 0);
         assert_eq!(state.governance.quota_used("k").await, 0);

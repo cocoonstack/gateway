@@ -268,7 +268,7 @@ products:
   - name: myproduct
     qpm: 120                   # product-level request rate
 
-abuse:                         # automatic suspension; omit = off; counts a key's REST 429s, never batch items
+abuse:                         # automatic suspension; omit = off; counts a key's REST 429s for its own qps/tokens_per_minute, never a pooled limit or a batch item
   tiers:                       # highest tier at or under the day's reject count wins
     - {rejects: 20, suspend_hours: 2}
     - {rejects: 30, suspend_hours: 24}

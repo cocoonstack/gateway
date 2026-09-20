@@ -142,7 +142,7 @@ impl ErrClass {
                 503 => ErrClass::ServiceUnavailable,
                 _ => ErrClass::ModelError,
             },
-            ErrCode::STOP_LIMIT_MSG => ErrClass::Throttling,
+            ErrCode::STOP_LIMIT_MSG | ErrCode::POOLED_LIMIT_MSG => ErrClass::Throttling,
             ErrCode::QUOTA_EXHAUSTED => ErrClass::ServiceQuotaExceeded,
             ErrCode::PERMISSION_CHECK => ErrClass::AccessDenied,
             ErrCode::REQ_JSON | ErrCode::REQ_NON_CHAT => ErrClass::Validation,
@@ -222,6 +222,13 @@ mod tests {
         assert_eq!((c, c.status()), (ErrClass::ModelTimeout, 408));
         let c = ErrClass::classify(ErrCode::QUOTA_EXHAUSTED, 400).unwrap();
         assert_eq!(c, ErrClass::ServiceQuotaExceeded);
+    }
+
+    #[test]
+    fn key_and_pooled_limits_render_as_the_same_throttling() {
+        for code in [ErrCode::STOP_LIMIT_MSG, ErrCode::POOLED_LIMIT_MSG] {
+            assert_eq!(ErrClass::classify(code, 429), Some(ErrClass::Throttling));
+        }
     }
 
     #[test]

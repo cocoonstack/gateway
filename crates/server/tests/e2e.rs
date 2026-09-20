@@ -1209,6 +1209,50 @@ async fn tenant_rate_limit_pools_across_keys() {
 }
 
 #[tokio::test]
+async fn a_flooded_tenant_pool_suspends_only_the_flooding_key() {
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+abuse: {tiers: [{rejects: 2, suspend_hours: 1}]}
+tenants: [{name: t, qps: 0.001}]
+access_keys:
+  - {ak: flooder, tenant: t, product: p, qps: 0.001, daily_token_quota: 100000}
+  - {ak: bystander, tenant: t, product: p, qps: 100, daily_token_quota: 100000}
+models: [{name: m, protocol: openai-chat}]
+accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let app = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let call = |ak: &'static str| {
+        app.clone()
+            .oneshot(post("/v1/chat/completions", Some(ak), body))
+    };
+
+    assert_eq!(call("flooder").await.unwrap().status(), StatusCode::OK);
+    for ak in ["bystander", "flooder", "bystander", "flooder", "bystander"] {
+        let resp = call(ak).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{ak}");
+    }
+    assert_eq!(
+        call("flooder").await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "two rejections for its own limit suspend the flooder"
+    );
+    assert_eq!(state.governance.quota_used("abuse:bystander").await, 0);
+    let bystander = state.auth.authenticate("bystander").await.unwrap();
+    assert_eq!(
+        bystander.status_at(gw_state::epoch_secs()),
+        gw_state::KeyStatus::Active,
+        "three pooled rejections never count against the bystander"
+    );
+}
+
+#[tokio::test]
 async fn auth_is_enforced() {
     let app = app();
     let resp = app

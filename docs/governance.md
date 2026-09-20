@@ -89,6 +89,18 @@ window below); the token/window counters are fixed windows. When Redis is
 configured and unreachable, limits fail open (requests pass) and a warning is
 logged — a persistent outage never silently wedges the gateway.
 
+Key QPS is checked before tenant QPS in the model pipeline, realtime turns,
+MCP requests and video polls. A request denied by tenant QPS has already spent
+a key-QPS permit; a request denied by key QPS spends no tenant permit.
+
+`abuse.tiers` counts a key's REST rejections for its own limits only: key QPS
+and key TPM. Tenant QPS, product QPM and model QPM are pooled; their rejections
+answer the same `429` and never count, so a sibling's traffic cannot suspend a
+key. A key that stays inside its own limits is never counted — including one
+whose `qps` is set above its tenant's, which can drain the pool without ever
+reaching a limit of its own: keep a key's `qps` at or under the tenant's.
+Batch items, realtime turns, MCP requests and video polls do not count.
+
 Daily-token and TPM admission **reserve then settle**: on admission a cheap
 estimate (prompt heuristic + requested `max_tokens`) is reserved atomically, so
 concurrent in-flight requests count against the budget instead of all passing a

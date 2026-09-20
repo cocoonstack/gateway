@@ -73,10 +73,10 @@ pub(crate) async fn proxy(
         return error_response(404, format!("unknown mcp server: {server}"));
     };
     let gov = snap.state.governance.as_ref();
-    if let Err(e) = admission::check_tenant_rate(gov, &snap.cfg, &ak.tenant).await {
+    if let Err(e) = admission::check_ak_rate(gov, &ak).await {
         return error_response(429, e);
     }
-    if let Err(e) = admission::check_ak_rate(gov, &ak).await {
+    if let Err(e) = admission::check_tenant_rate(gov, &snap.cfg, &ak.tenant).await {
         return error_response(429, e);
     }
     let session = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
