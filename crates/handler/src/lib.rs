@@ -505,7 +505,7 @@ async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_jso
 /// Count one admission rejection and suspend the key when a configured abuse tier trips.
 async fn note_abuse(ctx: &DagContext) {
     let tiers = &ctx.cfg.abuse.tiers;
-    if tiers.is_empty() {
+    if tiers.is_empty() || !ctx.request.is_online {
         return;
     }
     let now = gw_state::epoch_secs();
@@ -1503,6 +1503,27 @@ mod tests {
             ledger[0]
         );
         assert!(ledger[0].cost_micros >= 0);
+    }
+
+    #[tokio::test]
+    async fn batch_item_rejections_do_not_trip_the_abuse_tier() {
+        let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let mut item = chat_req("gpt-4o", "hi");
+        item.is_online = false;
+        let err = h.run(item, key).await.err().expect("qps 0 rejects");
+        assert_eq!(err.http_status, 429);
+        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            fresh.status_at(gw_state::epoch_secs()),
+            gw_state::KeyStatus::Active
+        );
     }
 
     #[tokio::test]
