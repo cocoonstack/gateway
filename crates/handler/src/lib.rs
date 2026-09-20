@@ -516,8 +516,7 @@ async fn note_abuse(ctx: &DagContext) {
     }
     // ':' is banned in ak names, so the prefix cannot collide with a real key
     let counter = format!("abuse:{}", ctx.ak.ak);
-    ctx.state.governance.quota_consume(&counter, 1).await;
-    let rejects = ctx.state.governance.quota_used(&counter).await;
+    let rejects = ctx.state.governance.quota_consume(&counter, 1).await;
     let Some(tier) = tiers
         .iter()
         .filter(|t| rejects >= t.rejects)
