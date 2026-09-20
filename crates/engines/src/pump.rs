@@ -38,26 +38,6 @@ pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) ->
     Ok(())
 }
 
-/// Deliver the terminal error frame for a committed abort (best effort) and mark
-/// the pump result aborted; committed implies `tx` is attached.
-async fn abort_frame(
-    tx: &Option<tokio::sync::mpsc::Sender<StreamChunk>>,
-    out: &mut PumpResult,
-    error: StreamError,
-) {
-    debug_assert!(tx.is_some(), "committed abort implies a live channel");
-    out.terminal_error = Some(error.clone());
-    if let Some(sender) = tx {
-        let _ = sender
-            .send(StreamChunk {
-                error: Some(Box::new(error)),
-                ..Default::default()
-            })
-            .await;
-    }
-    out.aborted = true;
-}
-
 pub async fn pump_sse<F>(
     vendor: &'static str,
     body: UpstreamBody,
@@ -165,6 +145,26 @@ where
         }
     }
     Ok(out)
+}
+
+/// Deliver the terminal error frame for a committed abort (best effort) and mark
+/// the pump result aborted; committed implies `tx` is attached.
+async fn abort_frame(
+    tx: &Option<tokio::sync::mpsc::Sender<StreamChunk>>,
+    out: &mut PumpResult,
+    error: StreamError,
+) {
+    debug_assert!(tx.is_some(), "committed abort implies a live channel");
+    out.terminal_error = Some(error.clone());
+    if let Some(sender) = tx {
+        let _ = sender
+            .send(StreamChunk {
+                error: Some(Box::new(error)),
+                ..Default::default()
+            })
+            .await;
+    }
+    out.aborted = true;
 }
 
 #[cfg(test)]

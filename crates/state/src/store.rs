@@ -1236,6 +1236,15 @@ impl Store for MemoryStore {
     }
 }
 
+/// First epoch second NOT yet folded into the rollup: rows at or above it are
+/// still the ledger's to report.
+fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
+    rollup
+        .keys()
+        .next_back()
+        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+}
+
 /// Positional row → record mappers shared by the SQL backends (fields decode in
 /// the SELECT's column order).
 macro_rules! row_mapper {
@@ -1253,15 +1262,6 @@ macro_rules! row_mapper {
             $ty { $($field),+ }
         }
     };
-}
-
-/// First epoch second NOT yet folded into the rollup: rows at or above it are
-/// still the ledger's to report.
-fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
-    rollup
-        .keys()
-        .next_back()
-        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
 }
 
 fn next_col(col: &mut usize) -> usize {
@@ -1300,6 +1300,7 @@ row_mapper!(video_job_row -> VideoJob {
     id, tenant, ak, product, user_id, model, served_model, account, unit_price_micros,
     created_at_epoch_secs,
 });
+
 row_mapper!(content_row -> crate::ContentRecord {
     created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
     sealed, expires_at_epoch_secs,
@@ -2882,8 +2883,8 @@ sql_store_impl!(PostgresStore, postgres, {
 mod tests {
     use super::*;
 
-    static RECORD_SEQ: AtomicUsize = AtomicUsize::new(1);
     static RECORD_RUN: std::sync::LazyLock<i64> = std::sync::LazyLock::new(crate::epoch_millis);
+    static RECORD_SEQ: AtomicUsize = AtomicUsize::new(1);
 
     #[test]
     fn shared_sql_renders_the_pre_share_text_per_dialect() {

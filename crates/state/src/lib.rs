@@ -974,37 +974,9 @@ pub fn access_key_fingerprint(ak: &str) -> String {
     format!("sha256:{}", hex::encode(&digest[..16]))
 }
 
-/// The entry for `key`, inserting `init()` on first use — the key String is
-/// allocated only on the miss path.
-fn slot_mut<'a, V>(
-    map: &'a DashMap<String, V>,
-    key: &str,
-    init: impl FnOnce() -> V,
-) -> dashmap::mapref::one::RefMut<'a, String, V> {
-    if let Some(e) = map.get_mut(key) {
-        return e;
-    }
-    map.entry(key.to_owned()).or_insert_with(init)
-}
-
-/// Admit while spent-before < `limit`, adding `amount` so in-flight work counts
-/// (Redis mirrors it in `reserve_capped`).
-fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
-    if *counter >= limit {
-        return false;
-    }
-    *counter = counter.saturating_add(amount);
-    true
-}
-
 /// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
-fn settle_on(counter: &mut i64, delta: i64) {
-    *counter = counter.saturating_add(delta).max(0);
 }
 
 /// Wrap a sqlx error as an internal gateway error with context.
@@ -1043,6 +1015,34 @@ pub(crate) async fn redis_connect(url: &str) -> Result<redis::aio::ConnectionMan
     redis::aio::ConnectionManager::new(client)
         .await
         .map_err(|e| format!("redis connect: {e}"))
+}
+
+/// The entry for `key`, inserting `init()` on first use — the key String is
+/// allocated only on the miss path.
+fn slot_mut<'a, V>(
+    map: &'a DashMap<String, V>,
+    key: &str,
+    init: impl FnOnce() -> V,
+) -> dashmap::mapref::one::RefMut<'a, String, V> {
+    if let Some(e) = map.get_mut(key) {
+        return e;
+    }
+    map.entry(key.to_owned()).or_insert_with(init)
+}
+
+/// Admit while spent-before < `limit`, adding `amount` so in-flight work counts
+/// (Redis mirrors it in `reserve_capped`).
+fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
+    if *counter >= limit {
+        return false;
+    }
+    *counter = counter.saturating_add(amount);
+    true
+}
+
+/// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
+fn settle_on(counter: &mut i64, delta: i64) {
+    *counter = counter.saturating_add(delta).max(0);
 }
 
 #[cfg(test)]
