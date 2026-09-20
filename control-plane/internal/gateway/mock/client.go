@@ -28,8 +28,6 @@ type Client struct {
 
 func New() *Client {
 	now := time.Now().Unix()
-	owner := "alice"
-	expires := now + 30*86_400
 	return &Client{
 		yaml:    "listen: {host: 0.0.0.0, port: 8080}\nstorage: {}\nmodels:\n  - {name: gpt-4o, protocol: openai-chat}\naccounts:\n  - {name: primary-openai, provider: openai, protocols: [openai-chat]}\ntenants:\n  - {name: acme}\naccess_keys: []\n",
 		version: 3,
@@ -40,12 +38,12 @@ func New() *Client {
 		},
 		keys: map[string]gateway.Key{
 			"ak-acme-alice": {
-				AK: "ak-acme-alice", Product: "standard", Tenant: "acme", Owner: &owner,
+				AK: "ak-acme-alice", Product: "standard", Tenant: "acme", Owner: new("alice"),
 				QPS: 10, DailyTokenQuota: 1_000_000, Status: "active", Available: true,
 			},
 			"ak-acme-batch": {
 				AK: "ak-acme-batch", Product: "batch", Tenant: "acme", QPS: 2,
-				DailyTokenQuota: 500_000, ExpiresAtEpochSecs: &expires, Status: "active", Available: true,
+				DailyTokenQuota: 500_000, ExpiresAtEpochSecs: new(now + 30*86_400), Status: "active", Available: true,
 			},
 			"ak-labs-paused": {
 				AK: "ak-labs-paused", Product: "research", Tenant: "labs", QPS: 1,

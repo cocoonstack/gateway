@@ -45,7 +45,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		TotalTokens      int64 `json:"total_tokens"`
 		BilledUnits      int64 `json:"billed_units"`
 		CostMicros       int64 `json:"cost_micros"`
-		VendorCostMicros int64 `json:"vendor_cost_micros,omitempty"`
+		VendorCostMicros int64 `json:"vendor_cost_micros,omitzero"`
 	}
 	for _, row := range usage {
 		totals.Requests += row.Requests

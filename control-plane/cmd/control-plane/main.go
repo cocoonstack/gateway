@@ -86,15 +86,14 @@ func run(ctx context.Context, cfg config.Config) (err error) {
 		IdleTimeout:       60 * time.Second,
 	}
 	done := make(chan struct{})
-	go func() {
+	context.AfterFunc(ctx, func() {
 		defer close(done)
-		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.WithFunc("main.run").Error(shutdownCtx, err, "drain HTTP server")
 		}
-	}()
+	})
 	log.WithFunc("main.run").Infof(ctx, "control plane listening on http://%s", cfg.ListenAddr)
 	err = server.ListenAndServe()
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
