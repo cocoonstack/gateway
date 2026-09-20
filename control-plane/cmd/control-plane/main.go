@@ -83,6 +83,7 @@ func run(ctx context.Context, cfg config.Config) (err error) {
 		Addr:              cfg.ListenAddr,
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	done := make(chan struct{})
