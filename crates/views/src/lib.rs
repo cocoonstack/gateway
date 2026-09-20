@@ -775,6 +775,9 @@ async fn realtime_session(
                     Ok(a) => a,
                     Err((class, denied)) => {
                         let _ = socket.send(send(rt_error(class, denied))).await;
+                        if class == ErrClass::AccessDenied {
+                            break;
+                        }
                         continue;
                     }
                 };

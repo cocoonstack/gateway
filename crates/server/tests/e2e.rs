@@ -4437,6 +4437,81 @@ models:
         "only the admitted turn bills; the denied one does not"
     );
     assert_eq!(records[0].total_tokens, 13);
+
+    let ban = gw_state::KeyPatch {
+        banned: Some(true),
+        ..Default::default()
+    };
+    state.auth.patch("ak-vad", &ban).await.unwrap();
+    ws.send(append()).await.unwrap();
+    let mut denied = Value::Null;
+    let ended = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => denied = serde_json::from_str(t.as_str()).unwrap(),
+            Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => break true,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break false,
+        }
+    };
+    assert_eq!(
+        denied["error"]["code"], "access_denied_exception",
+        "{denied}"
+    );
+    assert!(ended, "a banned key's session must end");
+}
+
+#[tokio::test]
+async fn realtime_mock_session_ends_once_its_key_is_banned() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys:
+  - {ak: ak-rt, product: rt, qps: 100, daily_token_quota: 1000000}
+accounts:
+  - {name: rt-mock, provider: openai, protocols: ["realtime"]}
+models:
+  - {name: rt-model, protocol: realtime}
+"#;
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let addr = serve_app(application).await;
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-rt".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    let _ = ws.next().await.unwrap().unwrap();
+
+    let ban = gw_state::KeyPatch {
+        banned: Some(true),
+        ..Default::default()
+    };
+    state.auth.patch("ak-rt", &ban).await.unwrap();
+    ws.send(Message::text(r#"{"type":"input_text","text":"hi"}"#))
+        .await
+        .unwrap();
+    let denied: Value =
+        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(
+        denied["error"]["code"], "access_denied_exception",
+        "{denied}"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await;
+    assert!(
+        matches!(ended, Ok(Some(Ok(Message::Close(_)) | Err(_)) | None)),
+        "a banned key's session must end: {ended:?}"
+    );
 }
 
 #[tokio::test]
