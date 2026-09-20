@@ -934,65 +934,74 @@ async fn realtime_bridge(
                     Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
-                if let Some(mut frame) = frame {
-                    if gemini {
-                        // pin the entitled model: the socket carries no model, the setup frame does
-                        if let Some(setup) = frame.get_mut("setup").and_then(Value::as_object_mut) {
-                            setup.insert("model".into(), format!("models/{}", rtm.served).into());
+                let Some(mut frame) = frame else {
+                    if cl_tx
+                        .send(rt_error_frame(ErrClass::Validation, "invalid json event"))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                };
+                if gemini {
+                    // pin the entitled model: the socket carries no model, the setup frame does
+                    if let Some(setup) = frame.get_mut("setup").and_then(Value::as_object_mut) {
+                        setup.insert("model".into(), format!("models/{}", rtm.served).into());
+                        forward = UMsg::text(frame.to_string());
+                    }
+                    // audio-driven turns and barge-in have no admission point yet: refuse, keep the session
+                    let ungoverned = frame.get("realtimeInput").is_some()
+                        || frame.get("realtime_input").is_some()
+                        || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
+                    if ungoverned {
+                        if cl_tx
+                            .send(rt_error_frame(
+                                ErrClass::Validation,
+                                "one governed clientContent turn at a time; realtimeInput is not wired",
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
+                    Err(reason) => {
+                        if cl_tx
+                            .send(rt_error_frame(ErrClass::AccessDenied, reason))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(redacted) => {
+                        if redacted > 0 {
                             forward = UMsg::text(frame.to_string());
                         }
-                        // audio-driven turns and barge-in have no admission point yet: refuse, keep the session
-                        let ungoverned = frame.get("realtimeInput").is_some()
-                            || frame.get("realtime_input").is_some()
-                            || (pending.is_some() && is_client_turn(account.wire_kind(), &frame));
-                        if ungoverned {
+                    }
+                }
+                // dup triggers relay ungated: upstream rejects them, response.created gates a raced accept
+                if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
+                    match realtime_gate(&s, &ak, &rtm, &hint).await {
+                        Ok(admit) => {
+                            pending = Some(RealtimeTurn::new(admit));
+                            generations += 1;
+                        }
+                        Err((class, denied)) => {
                             if cl_tx
-                                .send(rt_error_frame(
-                                    ErrClass::Validation,
-                                    "one governed clientContent turn at a time; realtimeInput is not wired",
-                                ))
+                                .send(rt_error_frame(class, denied))
                                 .await
                                 .is_err()
+                                || class == ErrClass::AccessDenied
                             {
                                 break;
                             }
                             continue;
-                        }
-                    }
-                    match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
-                        Err(reason) => {
-                            if cl_tx
-                                .send(rt_error_frame(ErrClass::AccessDenied, reason))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                        Ok(redacted) => {
-                            if redacted > 0 {
-                                forward = UMsg::text(frame.to_string());
-                            }
-                        }
-                    }
-                    // dup triggers relay ungated: upstream rejects them, response.created gates a raced accept
-                    if is_client_turn(account.wire_kind(), &frame) && pending.is_none() {
-                        match realtime_gate(&s, &ak, &rtm, &hint).await {
-                            Ok(admit) => {
-                                pending = Some(RealtimeTurn::new(admit));
-                                generations += 1;
-                            }
-                            Err((class, denied)) => {
-                                if cl_tx
-                                    .send(rt_error_frame(class, denied))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
                         }
                     }
                 }
@@ -1041,6 +1050,9 @@ async fn realtime_bridge(
                                         .send(UMsg::text(json!({"type":"response.cancel"}).to_string()))
                                         .await;
                                     let _ = cl_tx.send(rt_error_frame(class, denied)).await;
+                                    if class == ErrClass::AccessDenied {
+                                        break;
+                                    }
                                     suppress = true;
                                     relay = false;
                                 }

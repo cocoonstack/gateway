@@ -4108,6 +4108,86 @@ models:
 }
 
 #[tokio::test]
+async fn realtime_bridge_refuses_unparseable_frames_and_ends_a_banned_session() {
+    use axum::routing::any;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    async fn vendor_ws(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
+        ws.on_upgrade(|mut socket| async move {
+            use axum::extract::ws::Message as M;
+            while let Some(Ok(M::Text(t))) = socket.recv().await {
+                let echo = serde_json::json!({"type": "echo", "raw": t.as_str()});
+                let _ = socket.send(M::Text(echo.to_string().into())).await;
+            }
+        })
+    }
+    let vendor_addr = serve_app(Router::new().route("/v1/realtime", any(vendor_ws))).await;
+    let yaml = format!(
+        r#"
+listen: {{host: 127.0.0.1, port: 0}}
+access_keys:
+  - {{ak: ak-rt, product: rt, qps: 100, daily_token_quota: 1000000}}
+accounts:
+  - {{name: rt-vendor, provider: openai, endpoint: "http://{vendor_addr}", protocols: ["realtime"]}}
+models:
+  - {{name: rt-model, protocol: realtime}}
+"#
+    );
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let addr = serve_app(application).await;
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-rt".parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    let (mut tx, mut rx) = ws.split();
+    let mut next = async || -> Option<Value> {
+        let msg = rx.next().await?.ok()?;
+        serde_json::from_str(msg.to_text().ok()?).ok()
+    };
+
+    tx.send(Message::text(r#"{"type":"response.create","n":1e999}"#))
+        .await
+        .unwrap();
+    tx.send(Message::text(r#"{"type":"session.update"}"#))
+        .await
+        .unwrap();
+    let refused = next().await.unwrap();
+    assert_eq!(
+        refused["error"]["code"], "validation_exception",
+        "{refused}"
+    );
+    let echoed = next().await.unwrap();
+    assert_eq!(echoed["raw"], r#"{"type":"session.update"}"#, "{echoed}");
+
+    let ban = gw_state::KeyPatch {
+        banned: Some(true),
+        ..Default::default()
+    };
+    state.auth.patch("ak-rt", &ban).await.unwrap();
+    tx.send(Message::text(r#"{"type":"response.create"}"#))
+        .await
+        .unwrap();
+    let denied = next().await.unwrap();
+    assert_eq!(
+        denied["error"]["code"], "access_denied_exception",
+        "{denied}"
+    );
+    assert!(next().await.is_none(), "a banned key's session must end");
+}
+
+#[tokio::test]
 async fn realtime_second_create_during_a_turn_cannot_desync_billing() {
     use axum::routing::any;
     use futures::{SinkExt, StreamExt};
