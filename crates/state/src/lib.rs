@@ -1403,7 +1403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_prefers_priority_then_round_robins() {
+    async fn pool_prefers_priority_and_honors_the_provider_binding() {
         let s = state();
         let h = s.health.as_ref();
         let a = s

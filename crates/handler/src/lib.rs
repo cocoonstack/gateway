@@ -1638,12 +1638,7 @@ mod tests {
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let key = h.state().auth.authenticate("k1").await.unwrap();
-        let req = |content: &str| GatewayRequest {
-            is_online: true,
-            message: vec![ChatMsg::text("user", content)],
-            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
-            ..Default::default()
-        };
+        let req = |content: &str| chat_req("gpt-4o", content);
         h.run(req("first spends past one micro"), key.clone())
             .await
             .unwrap();
@@ -1679,12 +1674,7 @@ mod tests {
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let key = h.state().auth.authenticate("k1").await.unwrap();
-        let req = |content: &str| GatewayRequest {
-            is_online: true,
-            message: vec![ChatMsg::text("user", content)],
-            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
-            ..Default::default()
-        };
+        let req = |content: &str| chat_req("gpt-4o", content);
         h.run(req("first spends past one micro"), key.clone())
             .await
             .unwrap();

@@ -2883,6 +2883,7 @@ mod tests {
     use super::*;
 
     static RECORD_SEQ: AtomicUsize = AtomicUsize::new(1);
+    static RECORD_RUN: std::sync::LazyLock<i64> = std::sync::LazyLock::new(crate::epoch_millis);
 
     #[test]
     fn shared_sql_renders_the_pre_share_text_per_dialect() {
@@ -3121,7 +3122,11 @@ mod tests {
             product: "p".into(),
             tenant: "default".into(),
             user_id: "u1".into(),
-            request_id: format!("req-{}", RECORD_SEQ.fetch_add(1, Ordering::Relaxed)),
+            request_id: format!(
+                "req-{}-{}",
+                *RECORD_RUN,
+                RECORD_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
             created_at_epoch_secs: 1_000,
             model: model.into(),
             served_model: model.into(),

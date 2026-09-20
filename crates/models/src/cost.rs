@@ -161,6 +161,10 @@ mod tests {
         };
         assert_eq!(weighted_prompt(&hostile, &rate), 8);
         assert_eq!(weighted_completion(&hostile, &rate), 8);
+    }
+
+    #[test]
+    fn long_context_scales_only_past_the_threshold() {
         assert_eq!(
             long_context_scale(250_000, 200_000, (2.0, 1.5), (100, 10)),
             (200, 15)

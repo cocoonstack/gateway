@@ -3965,16 +3965,7 @@ async fn realtime_bridges_to_a_real_upstream_websocket() {
             }
         })
     }
-    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let vendor_addr = vendor_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            vendor_listener,
-            axum::Router::new().route("/v1/realtime", any(vendor_ws)),
-        )
-        .await
-        .unwrap();
-    });
+    let vendor_addr = serve_app(Router::new().route("/v1/realtime", any(vendor_ws))).await;
 
     let yaml = format!(
         r#"
@@ -4125,16 +4116,7 @@ async fn realtime_second_create_during_a_turn_cannot_desync_billing() {
         })
     }
 
-    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let vendor_addr = vendor_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            vendor_listener,
-            axum::Router::new().route("/v1/realtime", any(vendor_ws)),
-        )
-        .await
-        .unwrap();
-    });
+    let vendor_addr = serve_app(Router::new().route("/v1/realtime", any(vendor_ws))).await;
 
     let yaml = format!(
         r#"
@@ -4256,16 +4238,7 @@ async fn realtime_bridge_gates_server_vad_turns() {
             }
         })
     }
-    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let vendor_addr = vendor_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            vendor_listener,
-            axum::Router::new().route("/v1/realtime", any(vendor_ws)),
-        )
-        .await
-        .unwrap();
-    });
+    let vendor_addr = serve_app(Router::new().route("/v1/realtime", any(vendor_ws))).await;
 
     let yaml = format!(
         r#"
