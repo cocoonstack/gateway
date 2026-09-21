@@ -1326,7 +1326,7 @@ async fn accounts(State(s): State<AppState>, _: GlobalAdmin) -> Response {
             "provider": a.provider,
             "priority": a.priority,
             "tier": if a.tier.is_empty() { gw_consts::account_tier::PAYGO } else { a.tier.as_str() },
-            "health": health.status(&a.name).await,
+            "health": if health.available(&a.name).await { "ok" } else { "cooling" },
             "protocols": a.protocols,
         }));
     }

@@ -22,14 +22,6 @@ pub trait HealthStore: Send + Sync + std::fmt::Debug {
     async fn record_success(&self, name: &str);
     /// Available = not in an active cooldown (auto-recovers on expiry).
     async fn available(&self, name: &str) -> bool;
-    /// Health label for the accounts view: "ok" | "cooling".
-    async fn status(&self, name: &str) -> &'static str {
-        if self.available(name).await {
-            "ok"
-        } else {
-            "cooling"
-        }
-    }
 }
 
 #[async_trait]

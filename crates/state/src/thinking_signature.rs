@@ -203,7 +203,9 @@ impl ThinkingSignatureAudit {
 
     /// Remember protected blocks from a complete successful JSON response.
     pub fn remember_content(&self, context: &AuditContext, content: &[Value]) {
-        self.remember_sequence(context, &ProtectedSequence::from_content(content));
+        let mut sequence = ProtectedSequence::default();
+        sequence.append_content(content);
+        self.remember_sequence(context, &sequence);
     }
 
     /// Capture native Anthropic events. Registration happens only after a
@@ -450,12 +452,6 @@ struct ProtectedSequence<'a> {
 }
 
 impl<'a> ProtectedSequence<'a> {
-    fn from_content(content: &'a [Value]) -> Self {
-        let mut sequence = Self::default();
-        sequence.append_content(content);
-        sequence
-    }
-
     fn append_content(&mut self, content: &'a [Value]) {
         for block in content {
             match block.get("type").and_then(Value::as_str) {
@@ -530,7 +526,6 @@ enum CapturedBlock {
         id: String,
         complete: bool,
     },
-    Ignored,
 }
 
 impl CapturedBlock {
@@ -539,7 +534,6 @@ impl CapturedBlock {
             Self::Thinking { complete, .. }
             | Self::RedactedThinking { complete, .. }
             | Self::ToolUse { complete, .. } => *complete = true,
-            Self::Ignored => {}
         }
     }
 
@@ -548,7 +542,6 @@ impl CapturedBlock {
             Self::Thinking { complete, .. }
             | Self::RedactedThinking { complete, .. }
             | Self::ToolUse { complete, .. } => *complete,
-            Self::Ignored => true,
         }
     }
 
@@ -561,7 +554,6 @@ impl CapturedBlock {
             } => thinking.len().saturating_add(signature.len()),
             Self::RedactedThinking { data, .. } => data.len(),
             Self::ToolUse { id, .. } => id.len(),
-            Self::Ignored => 0,
         }
     }
 }
@@ -610,6 +602,12 @@ impl ThinkingStreamCapture {
         }
     }
 
+    fn block_len(&self, index: u64) -> usize {
+        self.blocks
+            .get(&index)
+            .map_or(0, CapturedBlock::captured_len)
+    }
+
     fn start_block(&mut self, event: &Value) {
         let Some(index) = event.get("index").and_then(Value::as_u64) else {
             return;
@@ -644,17 +642,13 @@ impl ThinkingStreamCapture {
                 id: bounded_string(block.get("id")).to_owned(),
                 complete: false,
             },
-            _ => CapturedBlock::Ignored,
+            _ => return,
         };
         if !self.blocks.contains_key(&index) && self.blocks.len() >= MAX_STREAM_BLOCKS {
             self.disable();
             return;
         }
-        let prior_len = self
-            .blocks
-            .get(&index)
-            .map(CapturedBlock::captured_len)
-            .unwrap_or_default();
+        let prior_len = self.block_len(index);
         let next_bytes = self
             .captured_bytes
             .saturating_sub(prior_len)
@@ -674,11 +668,7 @@ impl ThinkingStreamCapture {
         let Some(delta) = event.get("delta") else {
             return;
         };
-        let prior_len = self
-            .blocks
-            .get(&index)
-            .map(CapturedBlock::captured_len)
-            .unwrap_or_default();
+        let prior_len = self.block_len(index);
         let updated = match (
             self.blocks.get_mut(&index),
             delta.get("type").and_then(Value::as_str),
@@ -691,11 +681,7 @@ impl ThinkingStreamCapture {
             }
             _ => Some(()),
         };
-        let next_len = self
-            .blocks
-            .get(&index)
-            .map(CapturedBlock::captured_len)
-            .unwrap_or_default();
+        let next_len = self.block_len(index);
         let next_bytes = self
             .captured_bytes
             .saturating_sub(prior_len)
@@ -735,7 +721,7 @@ impl ThinkingStreamCapture {
                 CapturedBlock::ToolUse { id, .. } if !id.is_empty() => {
                     sequence.tool_ids.push(id);
                 }
-                CapturedBlock::ToolUse { .. } | CapturedBlock::Ignored => {}
+                CapturedBlock::ToolUse { .. } => {}
             }
         }
         self.audit.remember_sequence(&self.context, &sequence);
