@@ -60,19 +60,16 @@ impl DagNode for ModelQuotaGate {
             .model_param_v2
             .as_mut()
             .map(|p| admission::swap_to_fallback(cfg, tenant, p));
-        match swapped {
+        let note = match swapped {
             Some(admission::FallbackSwap::Swapped(from, fb)) => {
-                ctx.decide("model_quota", format!("{from} over {limit}, serving {fb}"))
+                format!("{from} over {limit}, serving {fb}")
             }
-            Some(admission::FallbackSwap::AlreadyServing) => ctx.decide(
-                "model_quota",
-                format!("{requested} over {limit}, already the fallback"),
-            ),
-            _ => ctx.decide(
-                "model_quota",
-                format!("{requested} over {limit}, no fallback"),
-            ),
-        }
+            Some(admission::FallbackSwap::AlreadyServing) => {
+                format!("{requested} over {limit}, already the fallback")
+            }
+            _ => format!("{requested} over {limit}, no fallback"),
+        };
+        ctx.decide("model_quota", note);
         Ok(())
     }
 }
@@ -771,19 +768,11 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
     match delivery {
         StreamDelivery::Complete => CostCalc.execute(ctx).await,
         StreamDelivery::Partial(completion) => {
-            {
-                let outcome = ctx
-                    .outcome
-                    .as_mut()
-                    .ok_or_else(|| GatewayError::internal("stream delivery without an outcome"))?;
-                let response = &mut outcome.response;
-                response.message.clear();
-                response.completion_tokens = 0;
-                response.total_tokens = response.prompt_tokens;
-                response.common_usage = None;
-                response.raw_usage = None;
-                response.aborted = true;
-            }
+            let outcome = ctx
+                .outcome
+                .as_mut()
+                .ok_or_else(|| GatewayError::internal("stream delivery without an outcome"))?;
+            blank_stream_response(&mut outcome.response);
             bill_aborted_stream(ctx, Some(completion)).await
         }
         StreamDelivery::None => {
@@ -797,18 +786,22 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
                 )
                 .await;
             if let Some(outcome) = ctx.outcome.as_mut() {
-                outcome.response.message.clear();
                 outcome.response.prompt_tokens = 0;
-                outcome.response.completion_tokens = 0;
-                outcome.response.total_tokens = 0;
-                outcome.response.common_usage = None;
-                outcome.response.raw_usage = None;
-                outcome.response.aborted = true;
+                blank_stream_response(&mut outcome.response);
             }
             ctx.decide("delivery", "client closed before buffered stream");
             Ok(())
         }
     }
+}
+
+fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
+    response.message.clear();
+    response.completion_tokens = 0;
+    response.total_tokens = response.prompt_tokens;
+    response.common_usage = None;
+    response.raw_usage = None;
+    response.aborted = true;
 }
 
 /// Settle reserves and write the ledger through [`admission::settle_and_bill`];
