@@ -708,6 +708,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_drops_a_cache_point_from_its_nested_content() {
+        let body: Map<String, Value> = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "sunny", "cache_control": {"type": "ephemeral"}}]},
+                {"type": "text", "text": "summarise"}]}]
+        }))
+        .unwrap();
+        let out = request(body, "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        let content = &out["messages"][0]["content"][0]["toolResult"]["content"];
+        assert_eq!(content, &json!([{"text": "sunny"}]), "{out}");
+    }
+
+    #[test]
     fn tool_choice_none_with_history_keeps_tools_only_for_claude() {
         let body = || -> Map<String, Value> {
             serde_json::from_value(json!({
