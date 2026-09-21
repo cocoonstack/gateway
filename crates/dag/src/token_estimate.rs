@@ -17,7 +17,6 @@ struct TiktokenEncoder {
 }
 
 impl TiktokenEncoder {
-    /// Fails only if the embedded vocabulary fails to load.
     fn new() -> Result<Self, String> {
         let bpe = tiktoken_rs::cl100k_base().map_err(|e| format!("load cl100k_base: {e}"))?;
         Ok(Self { bpe })
@@ -73,7 +72,6 @@ impl TokenEncoder for HeuristicEncoder {
     }
 }
 
-/// The kind of character run currently being accumulated.
 enum Run {
     None,
     Letters(usize),

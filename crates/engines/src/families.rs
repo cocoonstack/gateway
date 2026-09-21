@@ -14,8 +14,7 @@ use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_erro
 use crate::multipart::{Form, audio_kind, image_kind};
 use crate::transport::{Headers, SharedTransport, Transport, UpstreamBody, UpstreamRequest};
 
-/// Gemini `parts` from a unified message: text and data-URI images (`inlineData`);
-/// remote image URLs cannot be inlined without a fetch and are skipped.
+/// Gemini `parts` from a unified message; remote image URLs cannot be inlined without a fetch and are skipped.
 fn gemini_parts(mut m: gw_models::ChatMsg) -> Vec<Value> {
     if let Some(Value::Array(parts)) = m.parts.take() {
         let mut out = Vec::new();
@@ -41,7 +40,6 @@ fn gemini_parts(mut m: gw_models::ChatMsg) -> Vec<Value> {
     vec![object([("text", Value::String(m.content))])]
 }
 
-/// Parse a `data:<mime>;base64,<payload>` URI into `(mime, payload)`.
 fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(',')?;
@@ -55,8 +53,7 @@ fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
 base_engine!(VertexEngine);
 
 impl VertexEngine {
-    /// Gemini API auth: the x-goog-api-key header — an API key is not an OAuth
-    /// Bearer token and Google rejects it as one.
+    /// An API key is not an OAuth Bearer token and Google rejects it as one.
     fn gemini_headers(&self) -> Headers {
         vec![
             ("content-type", "application/json".into()),
@@ -107,8 +104,6 @@ impl VertexEngine {
         body
     }
 
-    /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames decoded
-    /// as they arrive and forwarded through `stream_tx` (the live-pump contract).
     async fn run_stream(&mut self) -> GResult<EngineOutcome> {
         let body = self.build_body();
         let url = format!(
@@ -180,8 +175,6 @@ impl ModelEngine for VertexEngine {
     }
 }
 
-/// Gemini finishReason in the shared vocabulary: safety-family values become
-/// `content_filter`, the rest lowercase.
 fn vertex_finish_reason(fr: &str) -> String {
     match fr {
         "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" => {
@@ -191,8 +184,7 @@ fn vertex_finish_reason(fr: &str) -> String {
     }
 }
 
-/// Apply one `streamGenerateContent` frame to the accumulating response;
-/// returns the chunks it yields. usageMetadata is cumulative — last frame wins.
+/// Apply one `streamGenerateContent` frame; usageMetadata is cumulative — last frame wins.
 fn vertex_apply_frame(
     v: &Value,
     status: u16,
@@ -225,9 +217,8 @@ fn vertex_apply_frame(
     Ok(chunks)
 }
 
-/// Fold a cumulative `usageMetadata` into the response (last frame wins);
-/// `thoughtsTokenCount` sits outside `candidatesTokenCount`, so thoughts fold
-/// into completion or billing loses them.
+/// Fold a cumulative `usageMetadata` into the response; `thoughtsTokenCount` sits outside
+/// `candidatesTokenCount`, so thoughts fold into completion or billing loses them.
 fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if um.is_null() {
         return;
@@ -407,8 +398,7 @@ impl ModelEngine for ImageEngine {
     }
 }
 
-/// Decode a client-supplied base64 payload; a bad payload is the client's 400,
-/// not an upstream failure.
+/// Decode client base64; a bad payload is the client's 400, not an upstream failure.
 fn decode_b64(payload: &str, what: &str) -> GResult<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(payload)
@@ -598,8 +588,7 @@ enum VideoDialect {
     Kling,
 }
 
-/// The vendor label decides; `kind` only names an account's chat wire, so a
-/// `kind: openai` DashScope/MiniMax account must not read as Sora.
+/// The vendor label decides; a `kind: openai` DashScope/MiniMax account must not read as Sora.
 fn video_dialect(vendor: &str, wire: &str) -> VideoDialect {
     fn known(key: &str) -> Option<VideoDialect> {
         Some(match key {
@@ -1361,8 +1350,6 @@ impl ResponsesEngine {
         self.base.openai_url("mock://api.openai.com", "responses")
     }
 
-    /// An SSE reply through the shared pump: delta frames forwarded through
-    /// `stream_tx` as they arrive; `response.completed` carries final usage.
     async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
         let mut resp = GatewayResponse {
             model: self.model_name(),
@@ -1451,8 +1438,6 @@ impl ModelEngine for ResponsesEngine {
     }
 }
 
-/// Extract assistant text from a Responses `output` array (message items'
-/// `output_text` content), plus any function_call items.
 fn responses_output(v: &Value) -> (String, Vec<Value>) {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -1547,7 +1532,6 @@ fn function_call_to_tool_call(mut item: Value) -> Value {
     ])
 }
 
-/// Normalize a Responses `usage` object; returns (input, output, common usage).
 fn responses_usage(usage: &Value) -> (i64, i64, Option<gw_models::CommonUsage>) {
     if usage.is_null() {
         return (0, 0, None);

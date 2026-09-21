@@ -141,7 +141,6 @@ impl ThinkingSignatureAudit {
         let messages = &request.message;
 
         // only the latest logical assistant turn is validated upstream, so older thinking may be omitted
-        // consecutive same-role messages form one turn
         let mut trailing_user_start = messages.len();
         while trailing_user_start > 0
             && messages[trailing_user_start - 1].role == gw_consts::role::USER

@@ -216,7 +216,6 @@ impl RedisGovernance {
         {
             Ok(v) => v,
             Err(e) => {
-                // fail open, loudly: a persistent outage would otherwise silently disable limits
                 let key_id = crate::access_key_fingerprint(key);
                 tracing::warn!(error = %e, key_id, "redis governance unavailable; limit skipped");
                 0
@@ -266,7 +265,6 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        // floor at 0 on the SAME day bucket the reserve used (a request may straddle midnight)
         settle_floored(
             &self.conn,
             &quota_key_at(key, at),

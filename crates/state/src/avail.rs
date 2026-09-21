@@ -118,8 +118,7 @@ impl AvailStore for RedisAvail {
         }
     }
 
-    /// Increments landing mid-drain are either taken now or survive for the
-    /// next flush.
+    /// Increments landing mid-drain are either taken now or survive for the next flush.
     async fn flush(&self) {
         let minute = crate::epoch_secs() / 60;
         let models: Vec<String> = self.buffer.iter().map(|e| e.key().clone()).collect();

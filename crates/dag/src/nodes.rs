@@ -574,8 +574,7 @@ fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
     e
 }
 
-/// Record an account failure and, on the cooldown transition, alert and note
-/// the decision — shared by both engine attempts.
+/// Record an account failure; alert only on the cooldown transition.
 async fn note_failure(ctx: &mut DagContext, account: &str) {
     let threshold = ctx.cfg.stability.failure_threshold;
     let secs = ctx.cfg.stability.cooldown_seconds;

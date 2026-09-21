@@ -2725,7 +2725,6 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
     }
 }
 
-/// finish_reason mapping, anthropic → openai.
 fn finish_openai(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => Cow::Borrowed("stop"),
@@ -2735,7 +2734,6 @@ fn finish_openai(fr: String) -> Cow<'static, str> {
     }
 }
 
-/// finish_reason mapping, openai → anthropic.
 fn finish_anthropic(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "stop" => Cow::Borrowed("end_turn"),
@@ -2843,7 +2841,6 @@ fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Bo
     (param.effort.is_some() || param.budget_tokens.is_some()).then(|| Box::new(param))
 }
 
-/// POST /v1/chat/completions (OpenAI-compatible surface)
 async fn chat_completions(
     State(s): State<AppState>,
     UserHint(hint): UserHint,
@@ -3305,7 +3302,6 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
     if let Some(content) = resp.anthropic_content.take() {
         return gw_engines::anthropic_native_chunks(resp, content, None);
     }
-    // the raw pre-redaction deltas are never replayed: synth_chunks rebuilds from the redacted text
     outcome.chunks.clear();
     synth_chunks(outcome)
 }
@@ -3786,8 +3782,7 @@ async fn run_family(
     }
 }
 
-/// The shared tail of the message-less typed-param families (embeddings,
-/// images, moderations, rerank): pipeline, access log, native payload.
+/// The shared tail of the message-less typed-param families: pipeline, access log, native payload.
 #[allow(clippy::too_many_arguments)] // mirrors run_family; all call sites are literal
 async fn family_response(
     s: &AppState,
@@ -4085,7 +4080,6 @@ fn responses_stream_response(
     )
 }
 
-/// POST /v1/embeddings (OpenAI-compatible surface)
 async fn embeddings(
     State(s): State<AppState>,
     UserHint(hint): UserHint,
@@ -4116,7 +4110,6 @@ async fn embeddings(
     .await
 }
 
-/// POST /v1/images/generations (OpenAI-compatible image generation surface)
 async fn images_generations(
     State(s): State<AppState>,
     UserHint(hint): UserHint,
@@ -4222,8 +4215,7 @@ async fn videos_generations(
     };
     log_access("videos", &ctx, started);
     let outcome = ctx.outcome.take();
-    // async iff the reply carries a handle and no delivered video (a sync Kling
-    // reply has a task_id too, next to the finished video_url)
+    // async iff a handle and no delivered video: a sync Kling reply carries a task_id too
     let handle = outcome
         .as_ref()
         .filter(|o| o.response.message.is_empty())
@@ -4788,7 +4780,6 @@ async fn files_delete(
     }
 }
 
-/// GET /v1/files/{id}/content (download raw content: batch output, etc).
 async fn files_content(
     State(s): State<AppState>,
     Authed(ak): Authed,

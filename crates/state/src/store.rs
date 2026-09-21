@@ -28,7 +28,6 @@ const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 // scan the in-process ledger on 1 in N inserts past the cap, so the cost amortizes
 const LEDGER_PRUNE_EVERY: usize = 64;
 
-/// Usage-rollup bucket width.
 const ROLLUP_BUCKET_SECS: i64 = 60;
 
 /// Each rollup advance recomputes at least this trailing window (more when the

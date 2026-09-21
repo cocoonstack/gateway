@@ -599,7 +599,6 @@ pub fn redact_retained(text: &str) -> String {
     s
 }
 
-/// Redact one string in place and return the hit count.
 fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     let mut hits = 0;
     if pii && let Some((redacted, n)) = redact(s) {
