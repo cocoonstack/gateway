@@ -143,11 +143,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let reasoning = reasoning_family(model);
     let mut out = Map::with_capacity(6);
     if let Some(system) = body.remove("system") {
-        let blocks = match system {
-            Value::String(text) => vec![object([("text", text.into())])],
-            Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
-            _ => Vec::new(),
-        };
+        let blocks = text_blocks(system);
         if !blocks.is_empty() {
             out.insert("system".into(), Value::Array(blocks));
         }
@@ -289,11 +285,7 @@ fn block_event(kind: &str, index: u64, key: &str, payload: Value) -> Value {
 }
 
 fn message(mut m: Value) -> Value {
-    let content = match m["content"].take() {
-        Value::String(text) => vec![object([("text", text.into())])],
-        Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
-        _ => Vec::new(),
-    };
+    let content = text_blocks(m["content"].take());
     object([
         ("role", m["role"].take()),
         ("content", Value::Array(content)),
@@ -310,6 +302,14 @@ fn carries_tool_block(message: &Value) -> bool {
 
 /// One Messages content block as Converse blocks; a `cache_control` marker
 /// becomes a following `cachePoint`.
+fn text_blocks(content: Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => vec![object([("text", text.into())])],
+        Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn content_block(mut block: Value) -> Vec<Value> {
     let cache_control = block.get_mut("cache_control").map(Value::take);
     let mapped = match block["type"].as_str() {
@@ -341,15 +341,8 @@ fn content_block(mut block: Value) -> Vec<Value> {
             object([("toolUse", tool)])
         }
         Some("tool_result") => {
-            let mut content = match block["content"].take() {
-                Value::String(text) => vec![object([("text", text.into())])],
-                Value::Array(blocks) => blocks
-                    .into_iter()
-                    .flat_map(content_block)
-                    .filter(|b| b.get("cachePoint").is_none())
-                    .collect(),
-                _ => Vec::new(),
-            };
+            let mut content = text_blocks(block["content"].take());
+            content.retain(|b| b.get("cachePoint").is_none());
             if content.is_empty() {
                 content.push(json!({"json": {}}));
             }

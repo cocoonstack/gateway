@@ -484,17 +484,9 @@ fn llama_prompt(model: &str, system: Option<&str>, messages: &[gw_models::ChatMs
             gw_consts::role::AI => "assistant",
             _ => "user",
         };
-        prompt.push_str(start);
-        prompt.push_str(role);
-        prompt.push_str(end);
-        prompt.push_str("\n\n");
-        prompt.push_str(content);
-        prompt.push_str(eot);
+        prompt.extend([start, role, end, "\n\n", content, eot]);
     }
-    prompt.push_str(start);
-    prompt.push_str("assistant");
-    prompt.push_str(end);
-    prompt.push_str("\n\n");
+    prompt.extend([start, "assistant", end, "\n\n"]);
     prompt
 }
 

@@ -252,28 +252,22 @@ impl ModelEngine for EmbeddingsEngine {
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         // the batch moves: json! would re-copy every input string
-        let (input, dimensions) = match self.base.take_typed() {
+        let (input, dimensions): (Vec<Value>, _) = match self.base.take_typed() {
             Some(TypedParams::Embeddings(p)) => (
-                Value::Array(p.input.into_iter().map(Value::String).collect()),
+                p.input.into_iter().map(Value::String).collect(),
                 p.dimensions,
             ),
             _ => (
-                Value::Array(
-                    std::mem::take(&mut self.base.request.message)
-                        .into_iter()
-                        .map(|m| Value::String(m.content))
-                        .collect(),
-                ),
+                std::mem::take(&mut self.base.request.message)
+                    .into_iter()
+                    .map(|m| Value::String(m.content))
+                    .collect(),
                 None,
             ),
         };
-        if input.as_array().is_none_or(|a| a.is_empty()) {
-            return Err(GatewayError::bad_request(
-                "embeddings input must not be empty",
-            ));
-        }
+        reject_if_empty(input.is_empty(), "embeddings input")?;
         let mut body = json!({"model": model});
-        body["input"] = input;
+        body["input"] = Value::Array(input);
         if let Some(d) = dimensions {
             body["dimensions"] = json!(d);
         }
@@ -318,8 +312,8 @@ fn family_outcome(
     )
 }
 
-fn require_non_empty(v: &str, what: &str) -> GResult<()> {
-    if v.is_empty() {
+fn reject_if_empty(empty: bool, what: &str) -> GResult<()> {
+    if empty {
         return Err(GatewayError::bad_request(format!(
             "{what} must not be empty"
         )));
@@ -343,7 +337,7 @@ impl ModelEngine for ImageEngine {
                 None,
             ),
         };
-        require_non_empty(&prompt, "image prompt")?;
+        reject_if_empty(prompt.is_empty(), "image prompt")?;
         let (status, v, is_edit) = if let Some(image) = image {
             let image = decode_b64(&image, "image")?;
             let mut form = Form::new(&image);
@@ -459,7 +453,7 @@ impl ModelEngine for AudioEngine {
                     ),
                     _ => (self.base.last_message_text(), None, None),
                 };
-                require_non_empty(input, "tts input")?;
+                reject_if_empty(input.is_empty(), "tts input")?;
                 units = input.chars().count() as i64;
                 let mut b = json!({"model": model, "input": input});
                 if let Some(v) = voice {
@@ -498,7 +492,7 @@ impl ModelEngine for AudioEngine {
                     Some(TypedParams::AudioStt(p)) => (p.audio_b64, p.language, p.translate),
                     _ => (String::new(), None, false),
                 };
-                require_non_empty(&audio, "stt audio_b64")?;
+                reject_if_empty(audio.is_empty(), "stt audio_b64")?;
                 let audio = decode_b64(&audio, "audio_b64")?;
                 local_seconds = crate::multipart::audio_seconds(&audio);
                 let path = if translate {
@@ -662,7 +656,7 @@ impl ModelEngine for VideoEngine {
                 ..Default::default()
             },
         };
-        require_non_empty(&p.prompt, "video prompt")?;
+        reject_if_empty(p.prompt.is_empty(), "video prompt")?;
         let dialect = video_dialect(self.base.provider(), self.base.wire_kind());
         let model = self.base.model_name()?;
         let mut body = Map::new();
@@ -1016,7 +1010,7 @@ impl ModelEngine for SearchEngine {
             Some(TypedParams::Search(p)) => (p.query.as_str(), p.count),
             _ => (self.base.last_message_text(), 3),
         };
-        require_non_empty(query, "search query")?;
+        reject_if_empty(query.is_empty(), "search query")?;
         let q = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
         let (status, v, results) = match self.base.provider() {
             "brave" => {
@@ -1079,11 +1073,7 @@ impl ModelEngine for ModerationsEngine {
         let Some(TypedParams::Moderation(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("moderations params are required"));
         };
-        if p.input.is_empty() {
-            return Err(GatewayError::bad_request(
-                "moderations input must not be empty",
-            ));
-        }
+        reject_if_empty(p.input.is_empty(), "moderations input")?;
         let model = self.base.model_name()?;
         let input = Value::Array(p.input.into_iter().map(Value::String).collect());
         let body = object([("model", model.into()), ("input", input)]);
@@ -1094,14 +1084,11 @@ impl ModelEngine for ModerationsEngine {
                 body,
             )
             .await?;
-        let flagged = v["results"]
-            .as_array()
-            .map(|rs| {
-                rs.iter()
-                    .filter(|r| r["flagged"].as_bool().unwrap_or(false))
-                    .count()
-            })
-            .unwrap_or(0);
+        let flagged = v["results"].as_array().map_or(0, |rs| {
+            rs.iter()
+                .filter(|r| r["flagged"].as_bool().unwrap_or(false))
+                .count()
+        });
         Ok(family_outcome(
             format!("{flagged} flagged"),
             model.to_owned(),
@@ -1122,12 +1109,8 @@ impl ModelEngine for RerankEngine {
         let Some(TypedParams::Rerank(p)) = self.base.take_typed() else {
             return Err(GatewayError::bad_request("rerank params are required"));
         };
-        require_non_empty(&p.query, "rerank query")?;
-        if p.documents.is_empty() {
-            return Err(GatewayError::bad_request(
-                "rerank documents must not be empty",
-            ));
-        }
+        reject_if_empty(p.query.is_empty(), "rerank query")?;
+        reject_if_empty(p.documents.is_empty(), "rerank documents")?;
         // the document set moves — json! would re-copy every string
         let mut body = json!({"model": model});
         body["query"] = p.query.into();
@@ -1433,11 +1416,7 @@ impl ResponsesEngine {
         let raw_usage = (!v["usage"].is_null()).then(|| v["usage"].clone());
         let resp = GatewayResponse {
             message: text,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(Value::Array(tool_calls))
-            },
+            tool_calls: (!tool_calls.is_empty()).then_some(Value::Array(tool_calls)),
             model: v["model"]
                 .as_str()
                 .map(str::to_owned)
