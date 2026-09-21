@@ -59,6 +59,7 @@ const STREAM_CHANNEL_CAP: usize = 64;
 pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
 const ADMIN_PAGE_MAX: usize = 10_000;
+const NO_CONFIG_STORE: &str = "config store not configured (set storage.postgres_url)";
 /// Longest `x-gw-user` accepted: the hint keys governance counters.
 const USER_HINT_MAX_BYTES: usize = 256;
 const MCP_SESSION_CAP: u64 = 100_000;
@@ -1826,16 +1827,6 @@ fn require_global_admin(s: &AppState, headers: &HeaderMap) -> Result<(), Respons
     }
 }
 
-#[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
-fn require_config_store(s: &AppState) -> Result<&Arc<gw_state::PostgresConfigStore>, Response> {
-    s.config_store.as_ref().ok_or_else(|| {
-        error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        )
-    })
-}
-
 /// Key lookup under an admin scope: another tenant's key answers 404 (not
 /// 403), so a tenant admin can't probe which keys exist outside its scope.
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
@@ -2085,9 +2076,8 @@ async fn admin_key_delete(
 
 /// GET /admin/config — the current fleet config document. Global admin only.
 async fn admin_config_get(State(s): State<AppState>, _: GlobalAdmin) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     match store.load_latest().await {
         Ok(Some((version, yaml))) => {
@@ -2122,9 +2112,8 @@ async fn admin_config_versions(
     _: GlobalAdmin,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match store.list_versions(limit).await {
@@ -2142,9 +2131,8 @@ async fn admin_config_put(
     Query(q): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     if let Err(e) = GatewayConfig::from_yaml(&body) {
         return error_response(400, format!("invalid config: {e}"));
@@ -2204,9 +2192,8 @@ async fn admin_config_rollback(
     AuditSourceIp(source): AuditSourceIp,
     Path(source_id): Path<i64>,
 ) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     let yaml = match store.load_version(source_id).await {
         Ok(Some(y)) => y,
@@ -3004,7 +2991,7 @@ fn spawn_stream_pipeline(
                     if !dlp {
                         log_access(surface, &ctx, started);
                     }
-                    if let Some(outcome) = ctx.outcome.as_mut() {
+                    let delivery = if let Some(outcome) = ctx.outcome.as_mut() {
                         let usage_totals = (
                             outcome.response.prompt_tokens,
                             outcome.response.completion_tokens,
@@ -3034,25 +3021,20 @@ fn spawn_stream_pipeline(
                                 }
                                 delivered = delivered.saturating_add(tokens);
                             }
-                            let delivery = if complete {
+                            Some(if complete {
                                 gw_dag::StreamDelivery::Complete
                             } else if delivered > 0 {
                                 gw_dag::StreamDelivery::Partial(delivered)
                             } else {
                                 gw_dag::StreamDelivery::None
-                            };
-                            if let Err(e) =
-                                gw_handler::complete_buffered_stream(&mut ctx, delivery).await
-                            {
-                                tracing::error!(error = %e, "buffered stream settlement failed");
-                            }
-                            log_access(surface, &ctx, started);
+                            })
                         } else {
                             for chunk in tail {
                                 if tx.send(chunk).await.is_err() {
                                     break;
                                 }
                             }
+                            None
                         }
                     } else {
                         let _ = tx
@@ -3065,17 +3047,15 @@ fn spawn_stream_pipeline(
                                 ..Default::default()
                             })
                             .await;
-                        if dlp {
-                            if let Err(e) = gw_handler::complete_buffered_stream(
-                                &mut ctx,
-                                gw_dag::StreamDelivery::None,
-                            )
-                            .await
-                            {
-                                tracing::error!(error = %e, "buffered stream settlement failed");
-                            }
-                            log_access(surface, &ctx, started);
+                        dlp.then_some(gw_dag::StreamDelivery::None)
+                    };
+                    if let Some(delivery) = delivery {
+                        if let Err(e) =
+                            gw_handler::complete_buffered_stream(&mut ctx, delivery).await
+                        {
+                            tracing::error!(error = %e, "buffered stream settlement failed");
                         }
+                        log_access(surface, &ctx, started);
                     }
                 }
                 Err(e) => {
