@@ -1288,23 +1288,6 @@ row_mapper!(content_row -> crate::ContentRecord {
     sealed, expires_at_epoch_secs,
 });
 
-fn batch_item_row<'r, R>(row: &'r R) -> BatchItemResult
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    BatchItemResult {
-        index: row.get::<i64, _>(0) as usize,
-        ok: row.get(1),
-        message: row.get(2),
-        total_tokens: row.get(3),
-        user: row.get(4),
-    }
-}
-
 /// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
 /// file; ids derive from rowids so they stay unique across restarts.
 #[derive(Debug)]
@@ -2121,7 +2104,16 @@ macro_rules! sql_store_impl {
                     model: row.get(3),
                     status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
                     total: row.get::<i64, _>(5) as usize,
-                    results: results.iter().map(batch_item_row).collect(),
+                    results: results
+                        .iter()
+                        .map(|r| BatchItemResult {
+                            index: r.get::<i64, _>(0) as usize,
+                            ok: r.get(1),
+                            message: r.get(2),
+                            total_tokens: r.get(3),
+                            user: r.get(4),
+                        })
+                        .collect(),
                 }))
             }
         }
