@@ -28,7 +28,6 @@ const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 // scan the in-process ledger on 1 in N inserts past the cap, so the cost amortizes
 const LEDGER_PRUNE_EVERY: usize = 64;
 
-/// Usage-rollup bucket width.
 const ROLLUP_BUCKET_SECS: i64 = 60;
 
 /// Each rollup advance recomputes at least this trailing window (more when the
@@ -467,11 +466,11 @@ pub struct SecurityEvent {
     pub ak: String,
     pub user_id: String,
     pub tenant: String,
-    /// Which surface: chat/messages/responses/realtime/…
+    /// Which surface issued the call.
     pub surface: String,
-    /// The rule family that fired: "blocklist" | "dlp" | a recognizer name.
+    /// The rule family that fired.
     pub rule: String,
-    /// What the gateway did: "block" | "redact" | "flag".
+    /// What the gateway did.
     pub action: String,
     pub hits: i64,
 }
@@ -494,8 +493,7 @@ pub struct AdminAudit {
     pub actor: String,
     /// The presented scope: "global" | "tenant".
     pub scope: String,
-    /// The mutation: "key_create" | "key_patch" | "key_delete" |
-    /// "config_publish" | "reload" | "content_erase".
+    /// The mutation kind performed (e.g. `key_create`, `config_publish`).
     pub action: String,
     /// The object acted on (an ak, a config version, …).
     pub target: String,
@@ -1287,23 +1285,6 @@ row_mapper!(content_row -> crate::ContentRecord {
     created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
     sealed, expires_at_epoch_secs,
 });
-
-fn batch_item_row<'r, R>(row: &'r R) -> BatchItemResult
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    BatchItemResult {
-        index: row.get::<i64, _>(0) as usize,
-        ok: row.get(1),
-        message: row.get(2),
-        total_tokens: row.get(3),
-        user: row.get(4),
-    }
-}
 
 /// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
 /// file; ids derive from rowids so they stay unique across restarts.
@@ -2121,7 +2102,16 @@ macro_rules! sql_store_impl {
                     model: row.get(3),
                     status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
                     total: row.get::<i64, _>(5) as usize,
-                    results: results.iter().map(batch_item_row).collect(),
+                    results: results
+                        .iter()
+                        .map(|r| BatchItemResult {
+                            index: r.get::<i64, _>(0) as usize,
+                            ok: r.get(1),
+                            message: r.get(2),
+                            total_tokens: r.get(3),
+                            user: r.get(4),
+                        })
+                        .collect(),
                 }))
             }
         }

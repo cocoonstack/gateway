@@ -1,7 +1,5 @@
-//! OpenAI-protocol engine: builds the vendor chat request (full param
-//! passthrough), sends it via [`Transport`], parses the JSON or SSE reply into
-//! `GatewayResponse` + stream chunks, and keeps the raw usage subtree on
-//! `raw_usage` for the CommonUsage DAG node.
+//! OpenAI-protocol engine: the vendor chat request with full param passthrough, the JSON or SSE
+//! reply parsed into `GatewayResponse` + chunks, the raw usage subtree kept for the CommonUsage node.
 
 use std::borrow::Cow;
 
@@ -17,8 +15,7 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 base_engine!(OpenAiEngine);
 
 impl OpenAiEngine {
-    /// The OpenAI wire messages, each turn's payload moved out: parts win over
-    /// flat text, tool_calls and tool results pass through.
+    /// The OpenAI wire messages, each turn's payload moved out; parts win over flat text.
     fn wire_messages(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
         for m in std::mem::take(&mut self.base.request.message) {
@@ -255,8 +252,7 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
     }
 }
 
-/// Apply one decoded SSE event to the accumulating response; returns the
-/// chunks the event yields.
+/// Apply one decoded SSE event to the accumulating response.
 fn apply_sse_event(
     mut v: Value,
     status: u16,
@@ -376,8 +372,6 @@ fn reemit_withheld_arguments(acc: Option<&mut Value>) -> Option<StreamChunk> {
     })
 }
 
-/// Tool definitions in the OpenAI wire shape: anthropic-shaped defs are wrapped
-/// into the function envelope, native defs pass through.
 fn normalize_tools_openai(tools: Value) -> Value {
     let arr = match tools {
         Value::Array(arr) => arr,
@@ -427,8 +421,7 @@ pub(crate) fn parallel_tool_calls(choice: &Value) -> Option<Value> {
         .map(|disabled| (!disabled).into())
 }
 
-/// The request's `reasoning_effort`: the client's own, else derived from
-/// `output_config.effort`, a `thinking` budget or an OpenRouter budget;
+/// The client's `reasoning_effort`, else one derived from `output_config.effort` or a budget;
 /// `adaptive` without an effort and `disabled` leave the vendor default.
 pub(crate) fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static, str>> {
     if let Some(effort) = reasoning.effort {
@@ -466,9 +459,7 @@ fn is_native_block(block: &Value) -> bool {
         )
 }
 
-/// A Messages-surface turn on the OpenAI wire: thinking → `reasoning_content`,
-/// `tool_use` → `tool_calls`, `tool_result` → leading `role: tool` messages,
-/// `image` → `image_url` parts.
+/// A Messages-surface turn on the OpenAI wire; `tool_result` becomes leading `role: tool` messages.
 fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &mut Vec<Value>) {
     let mut msg = Map::new();
     msg.insert("role".into(), role.into());

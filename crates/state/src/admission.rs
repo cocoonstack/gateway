@@ -398,9 +398,10 @@ pub async fn check_tenant_rate(
     let Some(qps) = cfg.find_tenant(tenant).and_then(|t| t.qps) else {
         return Ok(());
     };
-    admit(gov.rate_allow(&tenant_rate_key(tenant), qps).await, || {
-        format!("tenant rate limit exceeded for `{tenant}` (qps {qps})")
-    })
+    admit(
+        gov.rate_allow(&format!("tenant:{tenant}"), qps).await,
+        || format!("tenant rate limit exceeded for `{tenant}` (qps {qps})"),
+    )
 }
 
 /// Per-AK QPS.
@@ -420,7 +421,7 @@ pub async fn check_product_qpm(
         return Ok(());
     };
     admit(
-        gov.window_allow(&product_qpm_key(product), qpm, gw_consts::MINUTE)
+        gov.window_allow(&format!("product:{product}"), qpm, gw_consts::MINUTE)
             .await,
         || format!("product qpm limit exceeded for `{product}` (qpm {qpm})"),
     )
@@ -436,7 +437,7 @@ pub async fn check_model_qpm(
         return Ok(());
     };
     admit(
-        gov.window_allow(&model_qpm_key(model), qpm, gw_consts::MINUTE)
+        gov.window_allow(&format!("model:{model}"), qpm, gw_consts::MINUTE)
             .await,
         || format!("model qpm limit exceeded for `{model}` (qpm {qpm})"),
     )
@@ -522,18 +523,6 @@ fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(deny()) }
 }
 
-fn tenant_rate_key(tenant: &str) -> String {
-    format!("tenant:{tenant}")
-}
-
-fn product_qpm_key(product: &str) -> String {
-    format!("product:{product}")
-}
-
-fn model_qpm_key(model: &str) -> String {
-    format!("model:{model}")
-}
-
 /// The tenant's budgets that apply to `ak` and `user`; empty when none is
 /// configured. With rollover on, a month's cap grows by what the previous
 /// month left unspent, at most one month's cap (one counter read per scope).
@@ -543,45 +532,19 @@ async fn budgets(
     ak: &AkInfo,
     user: &str,
 ) -> Vec<Budget> {
+    use BudgetScope::{KeyCost, TenantCost, UserCost, UserTokens};
+    use Window::{Day, Month};
     let Some(t) = cfg.find_tenant(&ak.tenant) else {
         return Vec::new();
     };
     let scopes = [
-        (
-            BudgetScope::UserTokens,
-            Window::Day,
-            t.user_daily_token_quota,
-        ),
-        (
-            BudgetScope::TenantCost,
-            Window::Day,
-            t.daily_cost_quota_micros,
-        ),
-        (
-            BudgetScope::KeyCost,
-            Window::Day,
-            t.key_daily_cost_quota_micros,
-        ),
-        (
-            BudgetScope::UserCost,
-            Window::Day,
-            t.user_daily_cost_quota_micros,
-        ),
-        (
-            BudgetScope::TenantCost,
-            Window::Month,
-            t.monthly_cost_quota_micros,
-        ),
-        (
-            BudgetScope::KeyCost,
-            Window::Month,
-            t.key_monthly_cost_quota_micros,
-        ),
-        (
-            BudgetScope::UserCost,
-            Window::Month,
-            t.user_monthly_cost_quota_micros,
-        ),
+        (UserTokens, Day, t.user_daily_token_quota),
+        (TenantCost, Day, t.daily_cost_quota_micros),
+        (KeyCost, Day, t.key_daily_cost_quota_micros),
+        (UserCost, Day, t.user_daily_cost_quota_micros),
+        (TenantCost, Month, t.monthly_cost_quota_micros),
+        (KeyCost, Month, t.key_monthly_cost_quota_micros),
+        (UserCost, Month, t.user_monthly_cost_quota_micros),
     ];
     let month = civil_month(crate::epoch_secs());
     let mut out = Vec::new();

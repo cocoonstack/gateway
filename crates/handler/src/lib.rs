@@ -126,7 +126,7 @@ impl OnlineHandler {
             ak,
         );
         ctx.billing_deferred = dlp && ctx.request.is_online && ctx.request.stream;
-        // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
+        // every fired rule is recorded; only a block-action hit denies
         deferred.extend(
             scan.hits
                 .iter()

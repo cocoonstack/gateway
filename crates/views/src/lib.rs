@@ -59,11 +59,12 @@ const STREAM_CHANNEL_CAP: usize = 64;
 pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
 const ADMIN_PAGE_MAX: usize = 10_000;
+const NO_CONFIG_STORE: &str = "config store not configured (set storage.postgres_url)";
 /// Longest `x-gw-user` accepted: the hint keys governance counters.
 const USER_HINT_MAX_BYTES: usize = 256;
 const MCP_SESSION_CAP: u64 = 100_000;
 const MCP_SESSION_TTL: Duration = Duration::from_secs(24 * 3_600);
-/// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
+/// Per-turn token reserve against the AK daily quota and TPM window; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1326,7 +1327,7 @@ async fn accounts(State(s): State<AppState>, _: GlobalAdmin) -> Response {
             "provider": a.provider,
             "priority": a.priority,
             "tier": if a.tier.is_empty() { gw_consts::account_tier::PAYGO } else { a.tier.as_str() },
-            "health": health.status(&a.name).await,
+            "health": if health.available(&a.name).await { "ok" } else { "cooling" },
             "protocols": a.protocols,
         }));
     }
@@ -1826,16 +1827,6 @@ fn require_global_admin(s: &AppState, headers: &HeaderMap) -> Result<(), Respons
     }
 }
 
-#[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
-fn require_config_store(s: &AppState) -> Result<&Arc<gw_state::PostgresConfigStore>, Response> {
-    s.config_store.as_ref().ok_or_else(|| {
-        error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        )
-    })
-}
-
 /// Key lookup under an admin scope: another tenant's key answers 404 (not
 /// 403), so a tenant admin can't probe which keys exist outside its scope.
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
@@ -2085,9 +2076,8 @@ async fn admin_key_delete(
 
 /// GET /admin/config — the current fleet config document. Global admin only.
 async fn admin_config_get(State(s): State<AppState>, _: GlobalAdmin) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     match store.load_latest().await {
         Ok(Some((version, yaml))) => {
@@ -2122,9 +2112,8 @@ async fn admin_config_versions(
     _: GlobalAdmin,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     match store.list_versions(limit).await {
@@ -2142,9 +2131,8 @@ async fn admin_config_put(
     Query(q): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     if let Err(e) = GatewayConfig::from_yaml(&body) {
         return error_response(400, format!("invalid config: {e}"));
@@ -2204,9 +2192,8 @@ async fn admin_config_rollback(
     AuditSourceIp(source): AuditSourceIp,
     Path(source_id): Path<i64>,
 ) -> Response {
-    let store = match require_config_store(&s) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let Some(store) = s.config_store.as_ref() else {
+        return error_response(400, NO_CONFIG_STORE);
     };
     let yaml = match store.load_version(source_id).await {
         Ok(Some(y)) => y,
@@ -2738,7 +2725,6 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
     }
 }
 
-/// finish_reason mapping, anthropic → openai.
 fn finish_openai(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => Cow::Borrowed("stop"),
@@ -2748,7 +2734,6 @@ fn finish_openai(fr: String) -> Cow<'static, str> {
     }
 }
 
-/// finish_reason mapping, openai → anthropic.
 fn finish_anthropic(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "stop" => Cow::Borrowed("end_turn"),
@@ -2856,7 +2841,6 @@ fn chat_reasoning(effort: Option<String>, reasoning: Option<Value>) -> Option<Bo
     (param.effort.is_some() || param.budget_tokens.is_some()).then(|| Box::new(param))
 }
 
-/// POST /v1/chat/completions (OpenAI-compatible surface)
 async fn chat_completions(
     State(s): State<AppState>,
     UserHint(hint): UserHint,
@@ -3004,7 +2988,7 @@ fn spawn_stream_pipeline(
                     if !dlp {
                         log_access(surface, &ctx, started);
                     }
-                    if let Some(outcome) = ctx.outcome.as_mut() {
+                    let delivery = if let Some(outcome) = ctx.outcome.as_mut() {
                         let usage_totals = (
                             outcome.response.prompt_tokens,
                             outcome.response.completion_tokens,
@@ -3034,25 +3018,20 @@ fn spawn_stream_pipeline(
                                 }
                                 delivered = delivered.saturating_add(tokens);
                             }
-                            let delivery = if complete {
+                            Some(if complete {
                                 gw_dag::StreamDelivery::Complete
                             } else if delivered > 0 {
                                 gw_dag::StreamDelivery::Partial(delivered)
                             } else {
                                 gw_dag::StreamDelivery::None
-                            };
-                            if let Err(e) =
-                                gw_handler::complete_buffered_stream(&mut ctx, delivery).await
-                            {
-                                tracing::error!(error = %e, "buffered stream settlement failed");
-                            }
-                            log_access(surface, &ctx, started);
+                            })
                         } else {
                             for chunk in tail {
                                 if tx.send(chunk).await.is_err() {
                                     break;
                                 }
                             }
+                            None
                         }
                     } else {
                         let _ = tx
@@ -3065,17 +3044,15 @@ fn spawn_stream_pipeline(
                                 ..Default::default()
                             })
                             .await;
-                        if dlp {
-                            if let Err(e) = gw_handler::complete_buffered_stream(
-                                &mut ctx,
-                                gw_dag::StreamDelivery::None,
-                            )
-                            .await
-                            {
-                                tracing::error!(error = %e, "buffered stream settlement failed");
-                            }
-                            log_access(surface, &ctx, started);
+                        dlp.then_some(gw_dag::StreamDelivery::None)
+                    };
+                    if let Some(delivery) = delivery {
+                        if let Err(e) =
+                            gw_handler::complete_buffered_stream(&mut ctx, delivery).await
+                        {
+                            tracing::error!(error = %e, "buffered stream settlement failed");
                         }
+                        log_access(surface, &ctx, started);
                     }
                 }
                 Err(e) => {
@@ -3325,7 +3302,6 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
     if let Some(content) = resp.anthropic_content.take() {
         return gw_engines::anthropic_native_chunks(resp, content, None);
     }
-    // the raw pre-redaction deltas are never replayed: synth_chunks rebuilds from the redacted text
     outcome.chunks.clear();
     synth_chunks(outcome)
 }
@@ -3806,8 +3782,7 @@ async fn run_family(
     }
 }
 
-/// The shared tail of the message-less typed-param families (embeddings,
-/// images, moderations, rerank): pipeline, access log, native payload.
+/// The shared tail of the message-less typed-param families: pipeline, access log, native payload.
 #[allow(clippy::too_many_arguments)] // mirrors run_family; all call sites are literal
 async fn family_response(
     s: &AppState,
@@ -4105,7 +4080,6 @@ fn responses_stream_response(
     )
 }
 
-/// POST /v1/embeddings (OpenAI-compatible surface)
 async fn embeddings(
     State(s): State<AppState>,
     UserHint(hint): UserHint,
@@ -4136,7 +4110,6 @@ async fn embeddings(
     .await
 }
 
-/// POST /v1/images/generations (OpenAI-compatible image generation surface)
 async fn images_generations(
     State(s): State<AppState>,
     UserHint(hint): UserHint,
@@ -4242,8 +4215,7 @@ async fn videos_generations(
     };
     log_access("videos", &ctx, started);
     let outcome = ctx.outcome.take();
-    // async iff the reply carries a handle and no delivered video (a sync Kling
-    // reply has a task_id too, next to the finished video_url)
+    // async iff a handle and no delivered video: a sync Kling reply carries a task_id too
     let handle = outcome
         .as_ref()
         .filter(|o| o.response.message.is_empty())
@@ -4383,7 +4355,7 @@ async fn poll_and_settle_video(
     Ok(poll)
 }
 
-/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
+/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills the poll's billable units.
 async fn videos_get(
     State(s): State<AppState>,
     Authed(ak): Authed,
@@ -4808,7 +4780,6 @@ async fn files_delete(
     }
 }
 
-/// GET /v1/files/{id}/content (download raw content: batch output, etc).
 async fn files_content(
     State(s): State<AppState>,
     Authed(ak): Authed,

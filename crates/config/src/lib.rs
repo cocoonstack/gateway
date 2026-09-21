@@ -703,7 +703,6 @@ pub struct RetentionConf {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConf {
     pub name: String,
-    /// openai | anthropic | gemini | deepseek | openrouter | moonshot | xai | siliconflow
     pub kind: String,
     #[serde(default)]
     pub api_key_env: String,

@@ -320,13 +320,10 @@ fn ensure_json_content_type(headers: &mut Headers) {
 /// Decode a buffered JSON reply, surfacing vendor error envelopes instead of
 /// parsing them as broken success.
 pub(crate) fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)> {
-    let bytes = match &reply.body {
-        UpstreamBody::Json(b) => b,
-        UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
-            return Err(GatewayError::internal(
-                "unexpected sse body for json engine",
-            ));
-        }
+    let UpstreamBody::Json(bytes) = &reply.body else {
+        return Err(GatewayError::internal(
+            "unexpected sse body for json engine",
+        ));
     };
     let v: Value = serde_json::from_slice(bytes)
         .map_err(|e| GatewayError::internal("parse upstream response").with_source(e))?;

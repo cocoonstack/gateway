@@ -287,7 +287,10 @@ async fn upsert(
     .bind(info.banned)
     .bind(&quotas)
     .bind(&info.owner)
-    .bind(source_str(source))
+    .bind(match source {
+        KeySource::Config => "config",
+        KeySource::Admin => "admin",
+    })
     .bind(&servers)
     .bind(&tools)
     .execute(exec)
@@ -314,13 +317,6 @@ fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
             servers: serde_json::from_str(row.get::<&str, _>(11)).unwrap_or_default(),
             tools: serde_json::from_str(row.get::<&str, _>(12)).unwrap_or_default(),
         }),
-    }
-}
-
-fn source_str(s: KeySource) -> &'static str {
-    match s {
-        KeySource::Config => "config",
-        KeySource::Admin => "admin",
     }
 }
 
