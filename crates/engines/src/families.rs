@@ -584,7 +584,7 @@ fn is_json_like(bytes: &[u8]) -> bool {
 /// keying the realtime bridge uses for its Gemini dialect).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum VideoDialect {
-    /// xAI/Kling `videos/generations`: `request_id` or an inline `video_url`.
+    /// xAI `videos/generations`: `request_id` or an inline `video_url`.
     Generations,
     /// OpenAI Sora `/v1/videos`: a video object, `seconds` as a string.
     Sora,
@@ -630,8 +630,7 @@ pub fn video_handle(v: &Value) -> Option<&str> {
         .or_else(|| v["id"].as_str().filter(|_| v["object"] == "video"))
 }
 
-/// One normalized poll of an async video job: the vendor body passes through,
-/// `done`/`failed`/`units`/`vendor_cost` drive the gateway's one-shot settle.
+/// A normalized async-video poll: `done`/`units`/`vendor_cost` drive the one-shot settle.
 pub struct VideoPoll {
     pub status: u16,
     pub body: Value,

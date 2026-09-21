@@ -166,7 +166,7 @@ impl ErrClass {
             499 => return None,
             503 => ErrClass::ServiceUnavailable,
             s if s >= 500 => ErrClass::InternalServer,
-            // 400, 405, 415, 422, 501 and the 4xx tail: the request as sent cannot be served
+            // 400, 405, 415, 422 and the 4xx tail: the request as sent cannot be served
             _ => ErrClass::Validation,
         };
         Some(class)

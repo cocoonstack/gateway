@@ -311,7 +311,7 @@ impl KeyStore for AkAuth {
     }
 }
 
-/// Rate limiter (GCRA via governor), one limiter per AK.
+/// Rate limiter (GCRA via governor), one bucket per rate key (an AK or a tenant).
 #[derive(Default)]
 pub struct RateLimiter {
     buckets: DashMap<String, (f64, Arc<governor::DefaultDirectRateLimiter>)>,
@@ -356,7 +356,7 @@ fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
     Arc::new(governor::RateLimiter::direct(quota))
 }
 
-/// Daily token quota accounting per AK; reset daily by the gw-task job.
+/// Saturating counters per governance key; the daily-quota instance is reset by the gw-task job.
 #[derive(Debug, Default)]
 pub struct QuotaStore {
     used: DashMap<String, i64>,

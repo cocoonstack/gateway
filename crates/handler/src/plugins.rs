@@ -904,7 +904,7 @@ fn has_signed_unit(units: Option<&[serde_json::Value]>) -> bool {
     })
 }
 
-/// Cheap byte gate on the full scanner: clean text pays no allocation.
+/// Cheap byte gate on the full scanner: clean text pays one pass instead of two.
 fn has_pii_candidate(b: &[u8]) -> bool {
     let mut digits = 0;
     for &c in b {

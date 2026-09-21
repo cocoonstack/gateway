@@ -64,7 +64,7 @@ const NO_CONFIG_STORE: &str = "config store not configured (set storage.postgres
 const USER_HINT_MAX_BYTES: usize = 256;
 const MCP_SESSION_CAP: u64 = 100_000;
 const MCP_SESSION_TTL: Duration = Duration::from_secs(24 * 3_600);
-/// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
+/// Per-turn token reserve against the AK daily quota and TPM window; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -4363,7 +4363,7 @@ async fn poll_and_settle_video(
     Ok(poll)
 }
 
-/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills `video.duration` seconds.
+/// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills the poll's billable units.
 async fn videos_get(
     State(s): State<AppState>,
     Authed(ak): Authed,

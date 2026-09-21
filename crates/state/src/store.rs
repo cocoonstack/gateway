@@ -467,11 +467,11 @@ pub struct SecurityEvent {
     pub ak: String,
     pub user_id: String,
     pub tenant: String,
-    /// Which surface: chat/messages/responses/realtime/…
+    /// Which surface issued the call.
     pub surface: String,
-    /// The rule family that fired: "blocklist" | "dlp" | a recognizer name.
+    /// The rule family that fired.
     pub rule: String,
-    /// What the gateway did: "block" | "redact" | "flag".
+    /// What the gateway did.
     pub action: String,
     pub hits: i64,
 }
@@ -494,8 +494,7 @@ pub struct AdminAudit {
     pub actor: String,
     /// The presented scope: "global" | "tenant".
     pub scope: String,
-    /// The mutation: "key_create" | "key_patch" | "key_delete" |
-    /// "config_publish" | "reload" | "content_erase".
+    /// The mutation kind performed (e.g. `key_create`, `config_publish`).
     pub action: String,
     /// The object acted on (an ak, a config version, …).
     pub target: String,
