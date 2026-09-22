@@ -4712,6 +4712,16 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
             "tts",
         ),
         (
+            "/v1/audio/transcriptions",
+            r#"{"model":"chat-only","audio_b64":"aGk="}"#,
+            "stt",
+        ),
+        (
+            "/v1/audio/translations",
+            r#"{"model":"chat-only","audio_b64":"aGk="}"#,
+            "stt",
+        ),
+        (
             "/v1/responses",
             r#"{"model":"chat-only","input":"hi"}"#,
             "responses",

@@ -4547,18 +4547,23 @@ async fn audio_transcribe(
         "audio_transcriptions"
     };
     log_access(surface, &ctx, started);
-    let response = match ctx.outcome.take() {
+    let outcome = ctx.outcome.take();
+    let response = match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
         // the vendor body verbatim (text plus usage/segments/language when sent)
-        Some(o) => {
-            let mut r = o.response;
-            let body = r
-                .response_v2
-                .take()
-                .unwrap_or_else(|| object([("text", take(&mut r.message).into())]));
-            (StatusCode::OK, Json(body)).into_response()
-        }
-        None => error_response(500, "stt engine returned no outcome"),
+        Some(o) => match o.response.response_v2 {
+            Some(body) => (StatusCode::OK, Json(body)).into_response(),
+            None => no_payload(
+                &ctx,
+                gw_consts::Protocol::Stt,
+                "stt engine returned no payload",
+            ),
+        },
+        None => no_payload(
+            &ctx,
+            gw_consts::Protocol::Stt,
+            "stt engine returned no outcome",
+        ),
     };
     terminal_response(&ctx, response).await
 }
