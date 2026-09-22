@@ -3813,8 +3813,7 @@ async fn family_response(
     match run_family(s, ak, model, mt, typed, vec![], user_id).await {
         Ok(mut ctx) => {
             log_access(surface, &ctx, started);
-            let outcome = ctx.outcome.take();
-            let response = response_v2_or_500(&ctx, outcome, mt, engine);
+            let response = response_v2_or_500(ctx.outcome.take(), engine);
             terminal_response(&ctx, response).await
         }
         Err(resp) => resp,
@@ -3839,32 +3838,14 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
 
 /// The engine's native payload; a content block answers 400 with the block
 /// message (these surfaces have no in-band content_filter shape).
-fn response_v2_or_500(
-    ctx: &DagContext,
-    outcome: Option<gw_engines::EngineOutcome>,
-    mt: gw_consts::Protocol,
-    engine: &str,
-) -> Response {
+fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
         Some(o) => match o.response.response_v2 {
             Some(v) => (StatusCode::OK, Json(v)).into_response(),
-            None => no_payload(ctx, mt, &format!("{engine} engine returned no payload")),
+            None => error_response(500, format!("{engine} engine returned no payload")),
         },
-        None => no_payload(ctx, mt, &format!("{engine} engine returned no payload")),
-    }
-}
-
-/// A typed surface whose engine produced nothing: the client naming a model of
-/// another protocol is its mistake, not ours, so it answers 400 the way the
-/// realtime surface already does. A matching protocol keeps the 500.
-fn no_payload(ctx: &DagContext, mt: gw_consts::Protocol, internal: &str) -> Response {
-    match ctx.model_param() {
-        Ok(p) if p.protocol != mt => error_response(
-            400,
-            format!("`{}` is not a {} model", p.model_name, mt.as_str()),
-        ),
-        _ => error_response(500, internal.to_owned()),
+        None => error_response(500, format!("{engine} engine returned no payload")),
     }
 }
 
@@ -3981,8 +3962,7 @@ async fn responses(
         Err(e) => return gateway_error(e),
     };
     log_access("responses", &ctx, started);
-    let outcome = ctx.outcome.take();
-    let response = response_v2_or_500(&ctx, outcome, gw_consts::Protocol::Responses, "responses");
+    let response = response_v2_or_500(ctx.outcome.take(), "responses");
     terminal_response(&ctx, response).await
 }
 
@@ -4281,8 +4261,7 @@ async fn videos_generations(
             return gateway_error(e);
         }
     }
-    let response = response_v2_or_500(&ctx, outcome, gw_consts::Protocol::Video, "video");
-    terminal_response(&ctx, response).await
+    terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
 }
 
 /// The shared head of both video read routes: spend the caller's rate limits,
@@ -4490,11 +4469,7 @@ async fn audio_speech(
     }
     let payload = ctx.outcome.take().and_then(|o| o.response.response_v2);
     let Some(b64) = payload.as_ref().and_then(|v| v["audio_b64"].as_str()) else {
-        let response = no_payload(
-            &ctx,
-            gw_consts::Protocol::Tts,
-            "tts engine returned no audio",
-        );
+        let response = error_response(500, "tts engine returned no audio");
         return terminal_response(&ctx, response).await;
     };
     let response = match base64::engine::general_purpose::STANDARD.decode(b64) {
@@ -4571,17 +4546,9 @@ async fn audio_transcribe(
         // the vendor body verbatim (text plus usage/segments/language when sent)
         Some(o) => match o.response.response_v2 {
             Some(body) => (StatusCode::OK, Json(body)).into_response(),
-            None => no_payload(
-                &ctx,
-                gw_consts::Protocol::Stt,
-                "stt engine returned no payload",
-            ),
+            None => error_response(500, "stt engine returned no payload"),
         },
-        None => no_payload(
-            &ctx,
-            gw_consts::Protocol::Stt,
-            "stt engine returned no outcome",
-        ),
+        None => error_response(500, "stt engine returned no outcome"),
     };
     terminal_response(&ctx, response).await
 }
