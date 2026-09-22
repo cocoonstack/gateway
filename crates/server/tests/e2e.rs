@@ -1487,6 +1487,69 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
 }
 
 #[tokio::test]
+async fn an_async_video_job_settles_under_the_requested_model_when_a_variant_served_it() {
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_ADMIN_TOKEN}
+access_keys: [{ak: ak-t, product: p, qps: 100, daily_token_quota: 1000000}]
+providers: [{name: xai, kind: xai}]
+models:
+  - {name: vid-pub, protocol: video, provider: xai, unit_price_micros: 100000,
+     variants: [{model: vid-canary, weight: 1}]}
+  - {name: vid-canary, protocol: video, provider: xai, unit_price_micros: 100000}
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/videos/generations",
+            Some("ak-t"),
+            r#"{"model":"vid-pub","prompt":"a canary singing"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let id = body_json(resp).await["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/videos/{id}"))
+                .header("authorization", "Bearer ak-t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+    let rows: Vec<&Value> = j["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["protocol"] == "video")
+        .collect();
+    assert_eq!(rows.len(), 2, "one submit row and one settle row: {rows:?}");
+    for row in rows {
+        assert_eq!(row["served_model"], "vid-canary", "{row}");
+        assert_eq!(
+            row["model"], "vid-pub",
+            "the ledger records the public name the caller asked for: {row}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_async_video_completion_counts_against_the_cost_budget() {
     let yaml = gw_config::DEFAULT_YAML.replace(
         "tenants:\n",
