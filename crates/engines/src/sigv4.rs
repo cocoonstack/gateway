@@ -64,12 +64,15 @@ pub fn sign(p: &SigV4Params) -> (String, String) {
     (signature, authorization)
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     // any key length is valid for HMAC-SHA256 (RFC 2104), so this cannot fire
     #[allow(clippy::expect_used)]
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0; 32];
+    out.copy_from_slice(&bytes);
+    out
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -77,7 +80,7 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// The derived signing key: kSecret → kDate → kRegion → kService → kSigning.
-fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
     let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, service.as_bytes());

@@ -5566,8 +5566,8 @@ mod tests {
             sealed: false,
             expires_at_epoch_secs: 0,
         };
-        store.content_add(&rec("r1", "t1")).await.unwrap();
-        store.content_add(&rec("r2", "t2")).await.unwrap();
+        store.content_add(rec("r1", "t1")).await.unwrap();
+        store.content_add(rec("r2", "t2")).await.unwrap();
         let router = app(app_state);
 
         let erase = |token: &'static str| {
@@ -5654,27 +5654,15 @@ mod tests {
             sealed: false,
             expires_at_epoch_secs: 0,
         };
-        store
-            .content_add(&rec("r1", "u1", "t1", 100))
-            .await
-            .unwrap();
-        store
-            .content_add(&rec("r2", "u1", "t1", 200))
-            .await
-            .unwrap();
-        store
-            .content_add(&rec("rx", "u2", "t1", 250))
-            .await
-            .unwrap();
-        store
-            .content_add(&rec("r3", "u1", "t2", 300))
-            .await
-            .unwrap();
+        store.content_add(rec("r1", "u1", "t1", 100)).await.unwrap();
+        store.content_add(rec("r2", "u1", "t1", 200)).await.unwrap();
+        store.content_add(rec("rx", "u2", "t1", 250)).await.unwrap();
+        store.content_add(rec("r3", "u1", "t2", 300)).await.unwrap();
         let mut terminal = rec("rt", "u1", "t1", 400);
         terminal.kind = "terminal".into();
         terminal.content =
             r#"{"state":"success","http_status":200,"stream_committed":false}"#.into();
-        store.content_terminal_put(&terminal).await.unwrap();
+        store.content_terminal_put(terminal).await.unwrap();
         let router = app(app_state);
 
         let list = |uri: &str, token: &str| {
