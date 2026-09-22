@@ -60,6 +60,11 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 | POST | `/v1/moderations` | content moderation; `input` string or array, native results pass through |
 | GET | `/v1/models` | configured public model names |
 
+A typed surface serves the model its protocol names: naming a model of another
+protocol answers `400 "`<model>` is not a <surface> model"`, the same shape the
+realtime upgrade uses. A model whose own protocol differs but whose engine does
+serve the surface — an `aws-embed` model on `/v1/embeddings` — is served normally.
+
 ## Rerank
 
 | Method | Path | Notes |
