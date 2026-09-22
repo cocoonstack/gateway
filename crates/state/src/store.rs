@@ -567,10 +567,10 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>>;
 
     /// Store one retained prompt/response record (per-tenant retention policy).
-    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()>;
+    async fn content_add(&self, r: crate::ContentRecord) -> GResult<()>;
     /// Store one terminal request marker. First writer wins for the same
     /// tenant, attributed user, and request id.
-    async fn content_terminal_put(&self, r: &crate::ContentRecord) -> GResult<()>;
+    async fn content_terminal_put(&self, r: crate::ContentRecord) -> GResult<()>;
     /// Delete content whose `expires_at_epoch_secs` is in `(0, now]`; returns the
     /// number deleted. Rows with `expires_at = 0` are kept until manual purge.
     async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
@@ -720,9 +720,9 @@ struct MemoryContent {
 }
 
 impl MemoryContent {
-    fn push_terminal(&mut self, record: &crate::ContentRecord) {
-        if self.terminal_keys.insert(Self::terminal_key(record)) {
-            self.rows.push(record.clone());
+    fn push_terminal(&mut self, record: crate::ContentRecord) {
+        if self.terminal_keys.insert(Self::terminal_key(&record)) {
+            self.rows.push(record);
         }
     }
 
@@ -1022,12 +1022,12 @@ impl Store for MemoryStore {
         Ok(audit.iter().rev().take(limit).cloned().collect())
     }
 
-    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
-        lock(&self.content).rows.push(r.clone());
+    async fn content_add(&self, r: crate::ContentRecord) -> GResult<()> {
+        lock(&self.content).rows.push(r);
         Ok(())
     }
 
-    async fn content_terminal_put(&self, r: &crate::ContentRecord) -> GResult<()> {
+    async fn content_terminal_put(&self, r: crate::ContentRecord) -> GResult<()> {
         debug_assert_eq!(r.kind, "terminal");
         lock(&self.content).push_terminal(r);
         Ok(())
@@ -1916,7 +1916,7 @@ macro_rules! sql_store_impl {
                 Ok(rows.iter().map(admin_audit_row).collect())
             }
 
-            async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
+            async fn content_add(&self, r: crate::ContentRecord) -> GResult<()> {
                 sqlx::query(dialect_sql!(
                     $dialect,
                     "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
@@ -1938,7 +1938,7 @@ macro_rules! sql_store_impl {
                 Ok(())
             }
 
-            async fn content_terminal_put(&self, r: &crate::ContentRecord) -> GResult<()> {
+            async fn content_terminal_put(&self, r: crate::ContentRecord) -> GResult<()> {
                 debug_assert_eq!(r.kind, "terminal");
                 sqlx::query(dialect_sql!(
                     $dialect,
@@ -3353,8 +3353,8 @@ mod tests {
             sealed: false,
             expires_at_epoch_secs: expires,
         };
-        store.content_add(&rec("prompt", 200)).await.unwrap();
-        store.content_add(&rec("response", 0)).await.unwrap();
+        store.content_add(rec("prompt", 200)).await.unwrap();
+        store.content_add(rec("response", 0)).await.unwrap();
         let got = store.content_for("req-1").await.unwrap();
         assert_eq!(got.len(), 2);
 
@@ -3545,9 +3545,9 @@ mod tests {
             expires_at_epoch_secs: 0,
         };
         let (r1, r2, r3) = (format!("r1{ns}"), format!("r2{ns}"), format!("r3{ns}"));
-        store.content_add(&rec(&r1, u1, t1)).await.unwrap();
-        store.content_add(&rec(&r2, u1, t2)).await.unwrap();
-        store.content_add(&rec(&r3, u2, t1)).await.unwrap();
+        store.content_add(rec(&r1, u1, t1)).await.unwrap();
+        store.content_add(rec(&r2, u1, t2)).await.unwrap();
+        store.content_add(rec(&r3, u2, t1)).await.unwrap();
         let job = store.batch_create("ak", t1, "m", 1).await.unwrap();
         store
             .batch_push_result(
@@ -3623,13 +3623,13 @@ mod tests {
             expires_at_epoch_secs: 0,
         };
         let (r1, r2, r3) = (format!("lr1{ns}"), format!("lr2{ns}"), format!("lr3{ns}"));
-        store.content_add(&rec(&r1, &u1, &t1, 100)).await.unwrap();
-        store.content_add(&rec(&r2, &u1, &t1, 200)).await.unwrap();
+        store.content_add(rec(&r1, &u1, &t1, 100)).await.unwrap();
+        store.content_add(rec(&r2, &u1, &t1, 200)).await.unwrap();
         store
-            .content_add(&rec(&format!("lrx{ns}"), &u2, &t1, 250))
+            .content_add(rec(&format!("lrx{ns}"), &u2, &t1, 250))
             .await
             .unwrap();
-        store.content_add(&rec(&r3, &u1, &t2, 300)).await.unwrap();
+        store.content_add(rec(&r3, &u1, &t2, 300)).await.unwrap();
 
         let ids = |rows: &[crate::ContentRecord]| -> Vec<String> {
             rows.iter().map(|r| r.request_id.clone()).collect()
@@ -3680,11 +3680,11 @@ mod tests {
             expires_at_epoch_secs: expires,
         };
         store
-            .content_terminal_put(&rec(&user, r#"{"state":"success"}"#, 200))
+            .content_terminal_put(rec(&user, r#"{"state":"success"}"#, 200))
             .await
             .unwrap();
         store
-            .content_terminal_put(&rec(&user, r#"{"state":"error"}"#, 200))
+            .content_terminal_put(rec(&user, r#"{"state":"error"}"#, 200))
             .await
             .unwrap();
         let rows = store
@@ -3699,7 +3699,7 @@ mod tests {
 
         let other = format!("terminal-other{ns}");
         store
-            .content_terminal_put(&rec(&other, r#"{"state":"error"}"#, 0))
+            .content_terminal_put(rec(&other, r#"{"state":"error"}"#, 0))
             .await
             .unwrap();
         assert_eq!(
@@ -3714,7 +3714,7 @@ mod tests {
 
         assert_eq!(store.content_purge(200).await.unwrap(), 1);
         store
-            .content_terminal_put(&rec(&other, r#"{"state":"success"}"#, 0))
+            .content_terminal_put(rec(&other, r#"{"state":"success"}"#, 0))
             .await
             .unwrap();
         let other_rows = store
@@ -3724,7 +3724,7 @@ mod tests {
         assert_eq!(other_rows.len(), 1, "purge keeps surviving keys indexed");
         assert_eq!(other_rows[0].content, r#"{"state":"error"}"#);
         store
-            .content_terminal_put(&rec(&user, r#"{"state":"error"}"#, 0))
+            .content_terminal_put(rec(&user, r#"{"state":"error"}"#, 0))
             .await
             .unwrap();
         let rows = store
@@ -3751,7 +3751,7 @@ mod tests {
             1
         );
         store
-            .content_terminal_put(&rec(&other, r#"{"state":"success"}"#, 0))
+            .content_terminal_put(rec(&other, r#"{"state":"success"}"#, 0))
             .await
             .unwrap();
         assert_eq!(
@@ -3764,7 +3764,7 @@ mod tests {
             "erasing one owner keeps another owner's terminal"
         );
         store
-            .content_terminal_put(&rec(&user, r#"{"state":"success"}"#, 0))
+            .content_terminal_put(rec(&user, r#"{"state":"success"}"#, 0))
             .await
             .unwrap();
         let rows = store

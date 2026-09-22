@@ -473,17 +473,25 @@ impl<'a> SseState<'a> {
                 }
             }
             "content_block_delta" => {
-                if let Some(t) = v["delta"]["text"].as_str() {
-                    self.full.push_str(t);
-                    // native consumers read the event; the delta would be dead weight
-                    if !self.preserve_native {
-                        native_chunk.delta = t.to_owned();
+                // the native event is forwarded whole, so its text is read; the chat
+                // surface renders from the chunk instead, so its text is moved
+                if self.preserve_native {
+                    if let Some(t) = v["delta"]["text"].as_str() {
+                        self.full.push_str(t);
+                        if let Some(block) = self.open_native.as_mut()
+                            && let Some(Value::String(text)) = block.get_mut("text")
+                        {
+                            text.push_str(t);
+                        }
                     }
+                } else if let Value::String(t) = v["delta"]["text"].take() {
+                    self.full.push_str(&t);
                     if let Some(block) = self.open_native.as_mut()
                         && let Some(Value::String(text)) = block.get_mut("text")
                     {
-                        text.push_str(t);
+                        text.push_str(&t);
                     }
+                    native_chunk.delta = t;
                 }
                 // the native event keeps its delta; the chat surface moves it out
                 if self.preserve_native {

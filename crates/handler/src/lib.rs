@@ -96,7 +96,7 @@ impl OnlineHandler {
         };
         if settled_here && let Some((retention, subject)) = terminal {
             let body = terminal_result_body(result.as_ref());
-            persist_terminal(snap.state.store.as_ref(), &subject, retention, body).await;
+            persist_terminal(snap.state.store.as_ref(), subject, retention, body).await;
         }
         result
     }
@@ -499,7 +499,7 @@ async fn persist_ctx_terminal(ctx: &DagContext, body: impl FnOnce() -> serde_jso
         return;
     };
     let subject = TerminalSubject::new(&ctx.ak, &ctx.request);
-    persist_terminal(ctx.state.store.as_ref(), &subject, retention, body()).await;
+    persist_terminal(ctx.state.store.as_ref(), subject, retention, body()).await;
 }
 
 /// Count one admission rejection and suspend the key when a configured abuse tier trips.
@@ -662,24 +662,25 @@ fn security_event(
 /// Persist one lifecycle result row (no provider message or user content).
 async fn persist_terminal(
     store: &dyn gw_state::Store,
-    subject: &TerminalSubject,
+    subject: TerminalSubject,
     retention: gw_config::RetentionConf,
     body: serde_json::Value,
 ) {
     let now = gw_state::epoch_secs();
     let record = gw_state::ContentRecord {
         created_at_epoch_secs: now,
-        request_id: subject.request_id.clone(),
+        request_id: subject.request_id,
         ak: subject.ak.ak.clone(),
-        user_id: subject.user_id.clone(),
+        user_id: subject.user_id,
         tenant: subject.ak.tenant.clone(),
         kind: "terminal".to_owned(),
         content: body.to_string(),
         sealed: false,
         expires_at_epoch_secs: retention_expiry(retention, now),
     };
-    if let Err(error) = store.content_terminal_put(&record).await {
-        tracing::warn!(error = %error, request_id = %subject.request_id, "terminal retention write failed");
+    let request_id = record.request_id.clone();
+    if let Err(error) = store.content_terminal_put(record).await {
+        tracing::warn!(error = %error, request_id, "terminal retention write failed");
     }
 }
 
@@ -804,7 +805,7 @@ async fn persist_content(
                 expires_at_epoch_secs: expires,
             };
             async move {
-                if let Err(e) = ctx.state.store.content_add(&record).await {
+                if let Err(e) = ctx.state.store.content_add(record).await {
                     tracing::warn!(error = %e, kind, "content retention write failed");
                 }
             }
