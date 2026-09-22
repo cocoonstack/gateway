@@ -296,8 +296,8 @@ impl OnlineHandler {
         if let Some(requested) = ctx
             .request
             .model_param_v2
-            .as_mut()
-            .and_then(|p| p.fallback_from.take())
+            .as_ref()
+            .and_then(|p| p.fallback_from.clone())
             && let Some(outcome) = ctx.outcome.as_mut()
         {
             outcome.response.model = requested;
