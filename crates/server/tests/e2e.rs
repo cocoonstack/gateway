@@ -4661,6 +4661,92 @@ async fn bespoke_dashscope_native_wire() {
 }
 
 #[tokio::test]
+async fn a_typed_surface_names_the_wrong_model_and_gets_a_400() {
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-t, product: p, qps: 100, daily_token_quota: 1000000}]
+models: [{name: chat-only, protocol: openai-chat}]
+accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let app = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    for (path, body, surface) in [
+        (
+            "/v1/embeddings",
+            r#"{"model":"chat-only","input":["hi"]}"#,
+            "embeddings",
+        ),
+        (
+            "/v1/moderations",
+            r#"{"model":"chat-only","input":["hi"]}"#,
+            "moderations",
+        ),
+        (
+            "/v1/rerank",
+            r#"{"model":"chat-only","query":"q","documents":["a"]}"#,
+            "rerank",
+        ),
+        (
+            "/v1/images/generations",
+            r#"{"model":"chat-only","prompt":"x"}"#,
+            "image",
+        ),
+        (
+            "/v1/search",
+            r#"{"model":"chat-only","query":"q"}"#,
+            "search",
+        ),
+        (
+            "/v1/videos/generations",
+            r#"{"model":"chat-only","prompt":"x"}"#,
+            "video",
+        ),
+        (
+            "/v1/audio/speech",
+            r#"{"model":"chat-only","input":"hi"}"#,
+            "tts",
+        ),
+        (
+            "/v1/audio/transcriptions",
+            r#"{"model":"chat-only","audio_b64":"aGk="}"#,
+            "stt",
+        ),
+        (
+            "/v1/audio/translations",
+            r#"{"model":"chat-only","audio_b64":"aGk="}"#,
+            "stt",
+        ),
+        (
+            "/v1/responses",
+            r#"{"model":"chat-only","input":"hi"}"#,
+            "responses",
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post(path, Some("ak-t"), body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{path}: a chat model on a typed surface is the client's mistake"
+        );
+        let j = body_json(resp).await;
+        let msg = j["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("chat-only") && msg.contains(surface),
+            "{path}: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn product_qpm_limit_third_call_429() {
     let app = app();
     let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"p"}]}"#;
