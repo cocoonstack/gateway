@@ -62,8 +62,10 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 
 A typed surface serves the model its protocol names: naming a model of another
 protocol answers `400 "`<model>` is not a <surface> model"`, the same shape the
-realtime upgrade uses. A model whose own protocol differs but whose engine does
-serve the surface — an `aws-embed` model on `/v1/embeddings` — is served normally.
+realtime upgrade uses, and the request is refused before dispatch so no engine
+builds a body for it and no upstream call is made. Two pairings are not identity
+and are served normally: an `aws-embed` model answers `/v1/embeddings`, and
+`/v1/completions` carries its prompt as a turn, so any wire answers it.
 
 ## Rerank
 
