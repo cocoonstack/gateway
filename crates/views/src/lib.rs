@@ -339,10 +339,7 @@ fn rt_error(class: ErrClass, message: impl Into<Cow<'static, str>>) -> Value {
         "type": class.openai_type(),
         "code": class.code(),
     }});
-    event["error"]["message"] = match message.into() {
-        Cow::Borrowed(s) => Value::from(s),
-        Cow::Owned(s) => Value::String(s),
-    };
+    event["error"]["message"] = Value::String(message.into().into_owned());
     event
 }
 
