@@ -484,7 +484,7 @@ impl<'a> SseState<'a> {
                             text.push_str(t);
                         }
                     }
-                } else if let Value::String(t) = v["delta"]["text"].take() {
+                } else if let Some(t) = crate::engine::take_string(&mut v, "/delta/text") {
                     self.full.push_str(&t);
                     if let Some(block) = self.open_native.as_mut()
                         && let Some(Value::String(text)) = block.get_mut("text")
