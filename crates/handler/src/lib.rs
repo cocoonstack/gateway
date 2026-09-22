@@ -669,7 +669,7 @@ async fn persist_terminal(
     let now = gw_state::epoch_secs();
     let record = gw_state::ContentRecord {
         created_at_epoch_secs: now,
-        request_id: subject.request_id,
+        request_id: subject.request_id.clone(),
         ak: subject.ak.ak.clone(),
         user_id: subject.user_id,
         tenant: subject.ak.tenant.clone(),
@@ -678,9 +678,8 @@ async fn persist_terminal(
         sealed: false,
         expires_at_epoch_secs: retention_expiry(retention, now),
     };
-    let request_id = record.request_id.clone();
     if let Err(error) = store.content_terminal_put(record).await {
-        tracing::warn!(error = %error, request_id, "terminal retention write failed");
+        tracing::warn!(error = %error, request_id = %subject.request_id, "terminal retention write failed");
     }
 }
 
