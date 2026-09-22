@@ -115,6 +115,13 @@ impl Protocol {
     pub fn from_wire(s: &str) -> Option<Protocol> {
         Protocol::ALL.iter().copied().find(|p| p.as_str() == s)
     }
+
+    /// Whether this protocol's model answers a `surface` protocol; completions takes any wire.
+    pub fn serves(self, surface: Protocol) -> bool {
+        self == surface
+            || surface == Protocol::Completions
+            || (surface == Protocol::Embeddings && self == Protocol::AwsEmbed)
+    }
 }
 
 impl fmt::Display for Protocol {

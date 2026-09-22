@@ -4661,6 +4661,123 @@ async fn bespoke_dashscope_native_wire() {
 }
 
 #[tokio::test]
+async fn a_typed_surface_refuses_the_wrong_model_without_calling_upstream() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingVendor(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for CountingVendor {
+        async fn send(
+            &self,
+            _request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(gw_models::GatewayError::internal(
+                "the vendor must not be called",
+            ))
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-t, product: p, qps: 100, daily_token_quota: 1000000}]
+models:
+  - {name: chat-only, protocol: openai-chat}
+  - {name: titan-embed, protocol: aws-embed}
+accounts:
+  - {name: a, provider: openai, endpoint: "https://example.invalid", protocols: ["openai-chat"]}
+  - {name: b, provider: bedrock, endpoint: "https://example.invalid", protocols: ["aws-embed"]}
+"#;
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state,
+        Arc::new(CountingVendor(calls.clone())),
+    ));
+
+    for (path, body) in [
+        ("/v1/embeddings", r#"{"model":"chat-only","input":["hi"]}"#),
+        ("/v1/moderations", r#"{"model":"chat-only","input":["hi"]}"#),
+        (
+            "/v1/rerank",
+            r#"{"model":"chat-only","query":"q","documents":["a"]}"#,
+        ),
+        (
+            "/v1/images/generations",
+            r#"{"model":"chat-only","prompt":"x"}"#,
+        ),
+        ("/v1/search", r#"{"model":"chat-only","query":"q"}"#),
+        (
+            "/v1/videos/generations",
+            r#"{"model":"chat-only","prompt":"x"}"#,
+        ),
+        ("/v1/audio/speech", r#"{"model":"chat-only","input":"hi"}"#),
+        (
+            "/v1/audio/transcriptions",
+            r#"{"model":"chat-only","audio_b64":"aGk="}"#,
+        ),
+        (
+            "/v1/audio/translations",
+            r#"{"model":"chat-only","audio_b64":"aGk="}"#,
+        ),
+        ("/v1/responses", r#"{"model":"chat-only","input":"hi"}"#),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post(path, Some("ak-t"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    // a bare wire name resolves to its own protocol, so it must be refused the same way
+    for path in ["/v1/embeddings", "/v1/rerank", "/v1/responses"] {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                path,
+                Some("ak-t"),
+                r#"{"model":"openai-chat","input":["hi"],"query":"q","documents":["a"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "wire name on {path}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a model the surface cannot serve must be refused before any upstream call"
+    );
+
+    // the one cross-protocol pairing that is legitimate still reaches the vendor
+    let resp = app
+        .oneshot(post(
+            "/v1/embeddings",
+            Some("ak-t"),
+            r#"{"model":"titan-embed","input":["hi"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "aws-embed serves /v1/embeddings"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the legitimate pairing is dispatched"
+    );
+}
+
+#[tokio::test]
 async fn a_typed_surface_names_the_wrong_model_and_gets_a_400() {
     let yaml = r#"
 listen: {host: 127.0.0.1, port: 0}

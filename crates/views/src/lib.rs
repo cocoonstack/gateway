@@ -3755,8 +3755,20 @@ fn messages_stream_response(
     )
 }
 
-/// Run a non-chat family request through the pipeline. `mt` is only a
-/// placeholder protocol — the resolve_model DAG node maps the real one.
+/// A model the surface cannot serve, refused before the pipeline spends an upstream call.
+fn wrong_surface(s: &AppState, model: &str, mt: gw_consts::Protocol) -> Option<Response> {
+    let cfg = s.handler.cfg();
+    // resolve_model reads a bare wire name as its own protocol, so this must too
+    let p = match cfg.find_model(model) {
+        Some(conf) => conf.protocol()?,
+        None => gw_consts::Protocol::from_wire(model)?,
+    };
+    (!p.serves(mt))
+        .then(|| error_response(400, format!("`{model}` is not a {} model", mt.as_str())))
+}
+
+/// Run a non-chat family request through the pipeline. `mt` is the surface's
+/// own protocol; the resolve_model DAG node maps the model's.
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn run_family(
     s: &AppState,
@@ -3767,6 +3779,9 @@ async fn run_family(
     messages: Vec<ChatMsg>,
     user_id: Option<String>,
 ) -> Result<DagContext, Response> {
+    if let Some(refusal) = wrong_surface(s, &model, mt) {
+        return Err(refusal);
+    }
     let mut param = ModelParamV2::with_name(mt, model);
     param.typed = Some(typed);
     let request = GatewayRequest {
@@ -3939,6 +3954,9 @@ async fn responses(
     }
     if body["input"].is_null() {
         return error_response(400, "input is required");
+    }
+    if let Some(refusal) = wrong_surface(&s, &model, gw_consts::Protocol::Responses) {
+        return refusal;
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
     let user_id = user_hint(hint, &body["user"]);
