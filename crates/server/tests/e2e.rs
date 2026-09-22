@@ -4733,6 +4733,23 @@ accounts:
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
     }
+    // a bare wire name resolves to its own protocol, so it must be refused the same way
+    for path in ["/v1/embeddings", "/v1/rerank", "/v1/responses"] {
+        let resp = app
+            .clone()
+            .oneshot(post(
+                path,
+                Some("ak-t"),
+                r#"{"model":"openai-chat","input":["hi"],"query":"q","documents":["a"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "wire name on {path}"
+        );
+    }
     assert_eq!(
         calls.load(Ordering::Relaxed),
         0,

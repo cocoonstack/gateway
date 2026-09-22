@@ -3757,11 +3757,12 @@ fn messages_stream_response(
 
 /// A model the surface cannot serve, refused before the pipeline spends an upstream call.
 fn wrong_surface(s: &AppState, model: &str, mt: gw_consts::Protocol) -> Option<Response> {
-    let p = s
-        .handler
-        .cfg()
-        .find_model(model)
-        .and_then(|m| m.protocol())?;
+    let cfg = s.handler.cfg();
+    // resolve_model reads a bare wire name as its own protocol, so this must too
+    let p = match cfg.find_model(model) {
+        Some(conf) => conf.protocol()?,
+        None => gw_consts::Protocol::from_wire(model)?,
+    };
     (!p.serves(mt))
         .then(|| error_response(400, format!("`{model}` is not a {} model", mt.as_str())))
 }
