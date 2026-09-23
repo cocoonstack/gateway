@@ -30,7 +30,7 @@ pub struct PumpResult {
 pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) -> GResult<()> {
     if let UpstreamBody::Json(b) = body {
         let v: Value = serde_json::from_slice(b)
-            .map_err(|e| GatewayError::internal(format!("parse {what} reply")).with_source(e))?;
+            .map_err(|e| crate::engine::unparsed_reply(status, format!("parse {what} reply"), e))?;
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }

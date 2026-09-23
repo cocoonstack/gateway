@@ -2,13 +2,13 @@
 //! blocks, and streaming (the standard anthropic SSE event sequence). Marks
 //! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
-use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_models::{GResult, GatewayResponse};
 use gw_protocol::object;
 use gw_protocol::reasoning::{ThinkingDialect, is_thinking_block};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
-use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
+use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, unparsed_reply};
 use crate::transport::{UpstreamBody, UpstreamRequest};
 
 const DEFAULT_MAX_TOKENS: i64 = 1024;
@@ -238,7 +238,7 @@ impl ClaudeEngine {
 
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
         let v: Value = serde_json::from_slice(bytes)
-            .map_err(|e| GatewayError::internal("parse anthropic response").with_source(e))?;
+            .map_err(|e| unparsed_reply(status, "parse anthropic response", e))?;
         self.parse_value(status, v)
     }
 
@@ -367,7 +367,7 @@ impl ModelEngine for ClaudeEngine {
                 match reply.body {
                     UpstreamBody::Json(b) => {
                         let v: Value = serde_json::from_slice(&b).map_err(|e| {
-                            GatewayError::internal("parse converse response").with_source(e)
+                            unparsed_reply(reply.status, "parse converse response", e)
                         })?;
                         if let Some(err) = crate::engine::vendor_error(reply.status, &v) {
                             return Err(err);
@@ -490,8 +490,7 @@ impl<'a> SseState<'a> {
                 }
             }
             "content_block_delta" => {
-                // the native event is forwarded whole, so its text is read; the chat
-                // surface renders from the chunk instead, so its text is moved
+                // the native event keeps its delta; the chat surface moves it out
                 if self.preserve_native {
                     if let Some(t) = v["delta"]["text"].as_str() {
                         self.full.push_str(t);
@@ -510,7 +509,6 @@ impl<'a> SseState<'a> {
                     }
                     native_chunk.delta = t;
                 }
-                // the native event keeps its delta; the chat surface moves it out
                 if self.preserve_native {
                     if let Some(t) = v["delta"]["thinking"].as_str() {
                         self.append_thinking(t);

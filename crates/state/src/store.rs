@@ -67,13 +67,10 @@ pub struct BillingRecord {
     pub tenant: String,
     /// Effective end user: the key's `owner` if set, else request metadata; empty
     /// when neither is present. The precise per-user billing dimension.
-    #[serde(default)]
     pub user_id: String,
     /// Ingress correlation id, joins this row to the access log and audit events.
-    #[serde(default)]
     pub request_id: String,
     /// Unix seconds the call was billed — the billing-period axis.
-    #[serde(default)]
     pub created_at_epoch_secs: i64,
     /// Public model the caller requested.
     pub model: String,
@@ -88,18 +85,14 @@ pub struct BillingRecord {
     pub total_tokens: i64,
     pub cost_micros: i64,
     /// What the serving account's vendor charged us (zero = untracked).
-    #[serde(default)]
     pub vendor_cost_micros: i64,
     /// Non-token units billed (TTS characters, transcription seconds, rerank
     /// search units); their price is folded into `cost_micros`.
-    #[serde(default)]
     pub billed_units: i64,
     /// PTU spilled over to a paygo account (a failover occurred).
-    #[serde(default)]
     pub ptu_spillover: bool,
     /// Token counts were estimated (an aborted stream billed from delivered
     /// text), not read from a vendor usage payload.
-    #[serde(default)]
     pub estimated: bool,
 }
 

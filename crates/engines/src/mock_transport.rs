@@ -908,8 +908,6 @@ impl Transport for MockTransport {
             self.ernie_reply(&req)
         } else if u.contains("minimax") {
             self.minimax_reply(&req)
-        } else if u.contains("meta.llama") {
-            self.llama_reply(&req)
         } else if u.contains("/messages") {
             self.anthropic_reply(&req)
         } else if u.contains(":generateContent") || u.contains(":streamGenerateContent") {
