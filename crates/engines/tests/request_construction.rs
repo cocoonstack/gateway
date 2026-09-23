@@ -1427,7 +1427,10 @@ async fn anthropic_budget_and_client_thinking_precedence() {
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["output_config"], serde_json::json!({"effort":"high"}));
-    assert_eq!(b["max_tokens"], 12000 + 1024);
+    assert_eq!(
+        b["max_tokens"], 16384,
+        "a model that thinks by default already has room past the budget"
+    );
 
     let t = RecordingTransport::new(CLAUDE_OK);
     let mut req = reasoning_req(

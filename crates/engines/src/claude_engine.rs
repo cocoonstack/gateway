@@ -11,6 +11,9 @@ use crate::base::base_engine;
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::transport::{UpstreamBody, UpstreamRequest};
 
+const DEFAULT_MAX_TOKENS: i64 = 1024;
+const THINKING_DEFAULT_MAX_TOKENS: i64 = 16384;
+
 base_engine!(ClaudeEngine);
 
 impl ClaudeEngine {
@@ -93,8 +96,14 @@ impl ClaudeEngine {
             body.insert("stream".into(), self.base.request.stream.into());
         }
         body.insert("messages".into(), Value::Array(messages));
-        let mut max_tokens = 1024;
         let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
+        let mut max_tokens =
+            if gw_protocol::reasoning::anthropic_thinks_by_default(dialect, &param.model_name) {
+                THINKING_DEFAULT_MAX_TOKENS
+            } else {
+                DEFAULT_MAX_TOKENS
+            };
+        let mut client_cap = false;
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
         let mut native_system = None;
@@ -103,6 +112,7 @@ impl ClaudeEngine {
             native_system = p.system_blocks.filter(Value::is_array);
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
+                client_cap = true;
             }
             if let Some(reasoning) = p.reasoning {
                 let reasoning = *reasoning;
@@ -121,10 +131,10 @@ impl ClaudeEngine {
                         body.insert("output_config".into(), output_config);
                     }
                     // the answer budget rides on top of the thinking budget
-                    if max_tokens <= budget {
+                    if anthropic_fields && max_tokens <= budget {
                         max_tokens = budget.saturating_add(max_tokens);
                     }
-                    sampling_rejected = true;
+                    sampling_rejected |= anthropic_fields;
                 } else if !anthropic_fields && reasoning.effort.as_deref() == Some("none") {
                     body.insert("output_config".into(), object([("effort", "none".into())]));
                 }
@@ -158,7 +168,9 @@ impl ClaudeEngine {
                 body.insert("stop_sequences".into(), stop);
             }
         }
-        body.insert("max_tokens".into(), json!(max_tokens));
+        if anthropic_fields || client_cap {
+            body.insert("max_tokens".into(), json!(max_tokens));
+        }
         let mut raw = self.base.take_raw();
         let system = match native_system {
             Some(blocks) if prompt_cache => Some(Value::Array(cached_blocks(blocks))),
@@ -1040,6 +1052,77 @@ mod tests {
             assert_eq!(fields["reasoning_config"].as_str(), want, "{model}");
             assert!(fields["output_config"].is_null(), "{model}");
         }
+    }
+
+    #[test]
+    fn max_tokens_default_to_the_model_and_the_budget_top_up_stays_on_the_anthropic_wire() {
+        let body = |protocol, model: &str, typed: ChatParams| {
+            let mut param = ModelParamV2::with_name(protocol, model);
+            param.typed = Some(TypedParams::Chat(typed));
+            let mut r = base_req();
+            r.model_param_v2 = Some(param);
+            ClaudeEngine::new(r, Arc::new(MockTransport))
+                .build_body()
+                .unwrap()
+        };
+        let high = |max_tokens: Option<i64>| ChatParams {
+            max_tokens,
+            temperature: Some(0.3),
+            reasoning: Some(Box::new(ReasoningParam {
+                effort: Some("high".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for (protocol, model, typed, want) in [
+            (
+                Protocol::AnthropicMessages,
+                "claude-opus-5-5",
+                ChatParams::default(),
+                Some(16384),
+            ),
+            (
+                Protocol::AnthropicMessages,
+                "claude-haiku-4-5",
+                ChatParams::default(),
+                Some(1024),
+            ),
+            (
+                Protocol::AnthropicMessages,
+                "claude-opus-4-8",
+                high(Some(4000)),
+                Some(20384),
+            ),
+            (
+                Protocol::AwsConverse,
+                "us.openai.gpt-6-sol",
+                high(Some(4000)),
+                Some(4000),
+            ),
+            (
+                Protocol::AwsConverse,
+                "us.openai.gpt-6-sol",
+                high(None),
+                None,
+            ),
+        ] {
+            let got = body(protocol, model, typed);
+            assert_eq!(
+                got.get("max_tokens").and_then(Value::as_i64),
+                want,
+                "{model}"
+            );
+        }
+        let nova = body(
+            Protocol::AwsConverse,
+            "us.amazon.nova-lite-v1:0",
+            high(Some(500)),
+        );
+        assert_eq!(
+            nova["temperature"], 0.3,
+            "an effort on a family without reasoning changes nothing"
+        );
+        assert_eq!(nova["max_tokens"], 500);
     }
 
     #[test]

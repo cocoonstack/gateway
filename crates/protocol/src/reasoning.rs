@@ -187,6 +187,10 @@ pub fn anthropic_thinking_dialect(model: &str) -> ThinkingDialect {
     }
 }
 
+pub fn anthropic_thinks_by_default(dialect: ThinkingDialect, model: &str) -> bool {
+    dialect == ThinkingDialect::AdaptiveSummarized && !model.contains("-4-")
+}
+
 /// Whether a content block is Anthropic thinking (`thinking` /
 /// `redacted_thinking`).
 pub fn is_thinking_block(block: &Value) -> bool {

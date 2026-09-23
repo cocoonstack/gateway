@@ -112,6 +112,11 @@ mapping per model family:
 | Anthropic ≤ 4.5 | `thinking: {type: enabled, budget_tokens}` — fixed budget per effort level (`low` 1024, `medium` 4096, `high` 16384, `xhigh` 24576, `max` 32768), `max_tokens` topped up by the budget | thinking blocks → `reasoning_content` + `reasoning_details` |
 | Anthropic 4.6+ | `thinking: {type: adaptive}` + `output_config.effort` (`display: summarized` from 4.7 on; `xhigh` clamps to `high` on 4.6, which predates it); `temperature` / `top_p` / `top_k` are dropped for 4.7+, which rejects them | same |
 
+A request without `max_tokens` gets 1024 on the Anthropic wire, or 16384 on the
+models that think by default (the 5 family, Fable, Mythos), and the thinking
+budget tops the cap up only there; a non-Claude model on Bedrock Converse gets
+no cap unless the client sets one.
+
 Sampling knobs the client sent along a gateway-mapped effort (`temperature`,
 `top_p`, `top_k`) are dropped for Anthropic, which rejects them with thinking on.
 OpenAI refuses `temperature` other than its default, `top_p` and both penalties
