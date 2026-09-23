@@ -72,7 +72,12 @@ pub enum EffortWire {
 /// The GPT generation of an id OpenAI serves itself (`gpt-5.6-luna` → `(5, 6)`); a
 /// vendor-prefixed id is `None`, since OpenRouter and Bedrock normalize the request themselves.
 fn openai_generation(model: &str) -> Option<(u32, u32)> {
-    let version = model.strip_prefix("gpt-")?.split('-').next()?;
+    let version = model
+        .strip_prefix("ft:")
+        .unwrap_or(model)
+        .strip_prefix("gpt-")?
+        .split('-')
+        .next()?;
     let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
     let (major, minor) = (major.parse().ok()?, minor.parse().ok()?);
     (major >= 5).then_some((major, minor))
@@ -272,6 +277,7 @@ mod tests {
             ("gpt-6-sol", Chat, "max", "xhigh"),
             ("gpt-6-luna", Chat, "minimal", "low"),
             ("gpt-6-luna", Responses, "none", "none"),
+            ("ft:gpt-5.4-mini:org::abc", Chat, "max", "xhigh"),
             ("openai/gpt-5.6-luna", Chat, "max", "max"),
             ("openai/gpt-5.6-luna", Chat, "minimal", "minimal"),
             ("openai/gpt-6-astra", Chat, "none", "low"),

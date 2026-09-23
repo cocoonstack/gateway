@@ -183,7 +183,9 @@ impl MockTransport {
                 "id": "msg-mock", "type": "message", "role": "assistant", "model": model,
                 "content": [{"type":"tool_use","id":"tu-mock-1","name":name,"input":{"echo":user}}],
                 "stop_reason": "tool_use",
-                "usage": {"input_tokens": it, "output_tokens": ot}
+                "stop_sequence": null,
+                "usage": {"input_tokens": it, "output_tokens": ot,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
             }));
         }
 
@@ -215,7 +217,9 @@ impl MockTransport {
             "id": "msg-mock", "type": "message", "role": "assistant", "model": model,
             "content": [{"type":"text","text":reply}],
             "stop_reason": "end_turn",
-            "usage": {"input_tokens": it, "output_tokens": ot}
+            "stop_sequence": null,
+            "usage": {"input_tokens": it, "output_tokens": ot,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
         }))
     }
 

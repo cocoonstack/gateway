@@ -78,6 +78,7 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
+    pub max_completion_tokens: Option<i64>,
     #[serde(default)]
     pub stop: Option<Value>, // string | [string]
     pub presence_penalty: Option<f64>,
@@ -166,13 +167,14 @@ impl ChatCompletionResponse {
         )
     }
 
-    /// Tool-call assistant turn (finish_reason=tool_calls); accompanying text rides in `content`.
+    /// Tool-call assistant turn; accompanying text rides in `content`.
     pub fn tool_calls(
         id: impl Into<String>,
         created: i64,
         model: impl Into<String>,
         content: String,
         calls: Vec<Value>,
+        finish_reason: Cow<'static, str>,
         usage: Usage,
     ) -> Self {
         Self::with_message(
@@ -185,7 +187,7 @@ impl ChatCompletionResponse {
                 tool_calls: Some(calls),
                 ..Default::default()
             },
-            "tool_calls".into(),
+            finish_reason,
             usage,
         )
     }
@@ -385,6 +387,7 @@ mod tests {
             "m",
             String::new(),
             calls,
+            "tool_calls".into(),
             Usage::default(),
         );
         let v = serde_json::to_value(&resp).unwrap();
@@ -422,6 +425,7 @@ mod tests {
             String::new(),
             vec![serde_json::json!({"id":"call-1","type":"function",
                 "function":{"name":"get_weather","arguments":"{}"}})],
+            "tool_calls".into(),
             Usage::default(),
         );
         let v = serde_json::to_value(&resp).unwrap();
@@ -438,6 +442,7 @@ mod tests {
             "m",
             "Looking first.".into(),
             vec![],
+            "tool_calls".into(),
             Usage::default(),
         );
         let v = serde_json::to_value(&with_text).unwrap();

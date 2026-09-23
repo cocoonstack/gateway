@@ -1759,6 +1759,40 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     assert_eq!(b["reasoning_effort"], "high");
     assert_eq!(b["max_tokens"], 700, "compatible vendors keep max_tokens");
     assert!(b.get("max_completion_tokens").is_none());
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = reasoning_req(
+        Protocol::OpenaiChat,
+        "ft:o4-mini-2025-04-16:org::abc123",
+        gw_models::ReasoningParam::default(),
+    );
+    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().and_then(|p| p.typed.as_mut()) {
+        p.max_tokens = Some(700);
+    }
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["max_completion_tokens"],
+        700,
+        "a fine-tuned reasoning model keeps its family's cap"
+    );
+
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = reasoning_req(
+        Protocol::OpenaiChat,
+        "prod-reasoner",
+        gw_models::ReasoningParam::default(),
+    );
+    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().and_then(|p| p.typed.as_mut()) {
+        p.max_tokens = Some(700);
+        p.client_sent_max_completion_tokens = true;
+    }
+    let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["max_completion_tokens"], 700,
+        "the client's own field name reaches OpenAI"
+    );
+    assert!(b.get("max_tokens").is_none());
 }
 
 #[tokio::test]

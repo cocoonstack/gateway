@@ -2725,7 +2725,7 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
 fn finish_openai(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => Cow::Borrowed("stop"),
-        "max_tokens" => Cow::Borrowed("length"),
+        "max_tokens" | "model_context_window_exceeded" => Cow::Borrowed("length"),
         "tool_use" => Cow::Borrowed("tool_calls"),
         _ => Cow::Owned(fr),
     }
@@ -2871,7 +2871,9 @@ async fn chat_completions(
     let typed = TypedParams::Chat(ChatParams {
         temperature: body.temperature,
         top_p: body.top_p,
-        max_tokens: body.max_tokens,
+        max_tokens: body.max_tokens.or(body.max_completion_tokens),
+        client_sent_max_completion_tokens: body.max_tokens.is_none()
+            && body.max_completion_tokens.is_some(),
         stop: body.stop,
         presence_penalty: body.presence_penalty,
         frequency_penalty: body.frequency_penalty,
@@ -2928,12 +2930,17 @@ async fn chat_completions(
     let model_out = outcome.response.model;
 
     let mut resp = if let Some(tc) = outcome.response.tool_calls.take() {
+        let finish = match finish_openai(outcome.response.finish_reason) {
+            length if length == "length" => length,
+            _ => Cow::Borrowed("tool_calls"),
+        };
         ChatCompletionResponse::tool_calls(
             id,
             created,
             model_out,
             outcome.response.message,
             openai_tool_calls(tc, &mut 0),
+            finish,
             usage,
         )
     } else {
@@ -3441,11 +3448,14 @@ async fn messages(
         let response = anthropic_error(500, NO_OUTCOME);
         return terminal_response(&ctx, response).await;
     };
-    let usage = anthropic_usage(
-        outcome.response.prompt_tokens,
-        outcome.response.completion_tokens,
-        outcome.response.common_usage,
-    );
+    let usage = match outcome.response.raw_usage.take() {
+        Some(raw) if outcome.response.anthropic_content.is_some() => raw,
+        _ => json!(anthropic_usage(
+            outcome.response.prompt_tokens,
+            outcome.response.completion_tokens,
+            outcome.response.common_usage,
+        )),
+    };
     let content = match outcome.response.anthropic_content.take() {
         Some(Value::Array(blocks)) => blocks,
         _ => {
@@ -3475,14 +3485,18 @@ async fn messages(
         content.iter().any(|b| b["type"] == "tool_use"),
     );
     // built by hand: json! would deep-copy the content blocks
-    let mut body = serde_json::Map::with_capacity(7);
+    let mut body = serde_json::Map::with_capacity(8);
     body.insert("id".into(), next_id("msg").into());
     body.insert("type".into(), "message".into());
     body.insert("role".into(), "assistant".into());
     body.insert("model".into(), Value::String(outcome.response.model));
     body.insert("content".into(), Value::Array(content));
     body.insert("stop_reason".into(), stop.into());
-    body.insert("usage".into(), json!(usage));
+    body.insert(
+        "stop_sequence".into(),
+        outcome.response.stop_sequence.into(),
+    );
+    body.insert("usage".into(), usage);
     let response = (StatusCode::OK, Json(Value::Object(body))).into_response();
     terminal_response(&ctx, response).await
 }
@@ -6335,6 +6349,10 @@ mod tests {
         assert_eq!(finish_openai("stop_sequence".into()), "stop");
         assert_eq!(finish_openai(String::new()), "stop");
         assert_eq!(finish_openai("max_tokens".into()), "length");
+        assert_eq!(
+            finish_openai("model_context_window_exceeded".into()),
+            "length"
+        );
         assert_eq!(finish_openai("tool_use".into()), "tool_calls");
         assert_eq!(finish_openai("refusal".into()), "refusal");
 

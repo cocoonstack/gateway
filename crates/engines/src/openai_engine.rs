@@ -78,7 +78,7 @@ impl OpenAiEngine {
             put!("temperature", p.temperature);
             put!("top_p", p.top_p);
             // reasoning families 400 on max_tokens; compatible vendors know only max_tokens
-            if reasoning_model {
+            if reasoning_model || p.client_sent_max_completion_tokens {
                 put!("max_completion_tokens", p.max_tokens);
             } else {
                 put!("max_tokens", p.max_tokens);
@@ -444,7 +444,7 @@ pub(crate) fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<C
 
 /// OpenAI's own reasoning families — o-series and GPT-5 onward.
 fn is_openai_reasoning_model(model: &str) -> bool {
-    match model.as_bytes() {
+    match model.strip_prefix("ft:").unwrap_or(model).as_bytes() {
         [b'o', minor, ..] => minor.is_ascii_digit(),
         [b'g', b'p', b't', b'-', major, ..] => (b'5'..=b'9').contains(major),
         _ => false,

@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 
+use base64::Engine as _;
 use gw_protocol::object;
 use gw_protocol::reasoning::{EffortWire, budget_effort, openai_effort};
 use serde_json::{Map, Value, json};
@@ -13,13 +14,12 @@ use serde_json::{Map, Value, json};
 /// Markers of the Bedrock ids whose family takes `reasoning_config`.
 const REASONING_CONFIG_MARKERS: [&str; 2] = ["openai.gpt-", "xai.grok-"];
 
-/// Converse stream events as the Anthropic sequence: implicit text/reasoning
-/// blocks get a synthesized `content_block_start`, the trailing `metadata`
-/// becomes the `message_delta` usage overlay plus `message_stop`.
+/// Converse stream events as the Anthropic event sequence.
 #[derive(Debug)]
 pub(crate) struct Events {
     model: String,
     open: Vec<u64>,
+    stop_reason: &'static str,
 }
 
 impl Events {
@@ -27,6 +27,7 @@ impl Events {
         Self {
             model,
             open: Vec::new(),
+            stop_reason: stop_reason(None),
         }
     }
 
@@ -119,14 +120,17 @@ impl Events {
                 self.open.retain(|i| *i != index);
                 vec![json!({"type": "content_block_stop", "index": index})]
             }
-            "messageStop" => vec![json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason(ev["stopReason"].as_str()), "stop_sequence": null}
-            })],
+            "messageStop" => {
+                self.stop_reason = stop_reason(ev["stopReason"].as_str());
+                Vec::new()
+            }
             "metadata" => vec![
                 object([
                     ("type", "message_delta".into()),
-                    ("delta", json!({})),
+                    (
+                        "delta",
+                        json!({"stop_reason": self.stop_reason, "stop_sequence": null}),
+                    ),
                     ("usage", usage(&mut ev["usage"])),
                 ]),
                 json!({"type": "message_stop"}),
@@ -142,10 +146,14 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let claude = claude_model(model);
     let reasoning = reasoning_family(model);
     let mut out = Map::with_capacity(6);
+    let mut documents = 0;
     if let Some(system) = body.remove("system") {
         let blocks = match system {
             Value::String(text) => vec![object([("text", text.into())])],
-            Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
+            Value::Array(blocks) => blocks
+                .into_iter()
+                .flat_map(|b| content_block(b, &mut documents))
+                .collect(),
             _ => Vec::new(),
         };
         if !blocks.is_empty() {
@@ -153,7 +161,10 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         }
     }
     let messages: Vec<Value> = match body.remove("messages") {
-        Some(Value::Array(messages)) => messages.into_iter().map(message).collect(),
+        Some(Value::Array(messages)) => messages
+            .into_iter()
+            .map(|m| message(m, &mut documents))
+            .collect(),
         _ => Vec::new(),
     };
     // Bedrock refuses the flag next to toolConfig.toolChoice, so the whole choice rides in the extras
@@ -288,10 +299,13 @@ fn block_event(kind: &str, index: u64, key: &str, payload: Value) -> Value {
     ])
 }
 
-fn message(mut m: Value) -> Value {
+fn message(mut m: Value, documents: &mut usize) -> Value {
     let content = match m["content"].take() {
         Value::String(text) => vec![object([("text", text.into())])],
-        Value::Array(blocks) => blocks.into_iter().flat_map(content_block).collect(),
+        Value::Array(blocks) => blocks
+            .into_iter()
+            .flat_map(|b| content_block(b, documents))
+            .collect(),
         _ => Vec::new(),
     };
     object([
@@ -310,7 +324,7 @@ fn carries_tool_block(message: &Value) -> bool {
 
 /// One Messages content block as Converse blocks; a `cache_control` marker
 /// becomes a following `cachePoint`.
-fn content_block(mut block: Value) -> Vec<Value> {
+fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
     let cache_control = block.get_mut("cache_control").map(Value::take);
     let mapped = match block["type"].as_str() {
         Some("text") => object([("text", block["text"].take())]),
@@ -332,6 +346,28 @@ fn content_block(mut block: Value) -> Vec<Value> {
             ]);
             object([("image", image)])
         }
+        Some("document") => {
+            *documents += 1;
+            let mut source = block["source"].take();
+            let (format, bytes) = match source["type"].as_str() {
+                Some("text") => (
+                    "txt",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(source["data"].as_str().unwrap_or_default())
+                        .into(),
+                ),
+                _ => (
+                    "pdf",
+                    source.get_mut("data").map(Value::take).unwrap_or_default(),
+                ),
+            };
+            let document = object([
+                ("format", format.into()),
+                ("name", format!("document {documents}").into()),
+                ("source", object([("bytes", bytes)])),
+            ]);
+            object([("document", document)])
+        }
         Some("tool_use") => {
             let tool = object([
                 ("toolUseId", block["id"].take()),
@@ -345,7 +381,7 @@ fn content_block(mut block: Value) -> Vec<Value> {
                 Value::String(text) => vec![object([("text", text.into())])],
                 Value::Array(blocks) => blocks
                     .into_iter()
-                    .flat_map(content_block)
+                    .flat_map(|b| content_block(b, documents))
                     .filter(|b| b.get("cachePoint").is_none())
                     .collect(),
                 _ => Vec::new(),
@@ -473,15 +509,17 @@ fn usage(u: &mut Value) -> Value {
             out.insert(to.into(), n);
         }
     }
-    if let Some(tokens) = u["cacheDetails"].as_array().and_then(|details| {
-        details
-            .iter()
-            .find(|detail| detail["ttl"] == "1h")
-            .and_then(|detail| detail["inputTokens"].as_i64())
-    }) {
+    if let Some(details) = u["cacheDetails"].as_array() {
+        let ttl = |ttl: &str| -> i64 {
+            details
+                .iter()
+                .filter(|detail| detail["ttl"] == ttl)
+                .filter_map(|detail| detail["inputTokens"].as_i64())
+                .sum()
+        };
         out.insert(
             "cache_creation".into(),
-            json!({"ephemeral_1h_input_tokens": tokens}),
+            json!({"ephemeral_5m_input_tokens": ttl("5m"), "ephemeral_1h_input_tokens": ttl("1h")}),
         );
     }
     Value::Object(out)
@@ -780,6 +818,7 @@ mod tests {
         assert_eq!(m["usage"]["cache_read_input_tokens"], 3);
         assert_eq!(m["usage"]["cache_creation_input_tokens"], 5);
         assert_eq!(m["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 3);
+        assert_eq!(m["usage"]["cache_creation"]["ephemeral_5m_input_tokens"], 2);
         let usage = crate::usage_extract::extract_common_usage(&m["usage"], true).unwrap();
         assert_eq!((usage.write_cache, usage.write_cache_1h), (5, 3));
         assert_eq!(m["model"], "eu.amazon.nova-micro-v1:0");
@@ -833,7 +872,6 @@ mod tests {
                 "content_block_delta",
                 "content_block_stop",
                 "message_delta",
-                "message_delta",
                 "message_stop"
             ]
         );
@@ -842,7 +880,39 @@ mod tests {
         assert_eq!(out[5]["content_block"]["type"], "text");
         assert_eq!(out[10]["delta"]["partial_json"], "{\"a\":1}");
         assert_eq!(out[12]["delta"]["stop_reason"], "tool_use");
-        assert_eq!(out[13]["usage"]["output_tokens"], 9);
+        assert_eq!(out[12]["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn documents_become_uniquely_named_converse_documents() {
+        let body: Map<String, Value> = serde_json::from_value(json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0"}},
+                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "notes"}},
+                {"type": "text", "text": "q"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi1"}}]},
+                {"type": "document", "source": "not an object"}]}
+        ]}))
+        .unwrap();
+        let out = request(body, "jp.anthropic.claude-sonnet-4-6");
+        assert_eq!(
+            out["messages"][0]["content"],
+            json!([
+                {"document": {"format": "pdf", "name": "document 1", "source": {"bytes": "JVBERi0"}}},
+                {"document": {"format": "txt", "name": "document 2", "source": {"bytes": "bm90ZXM="}}},
+                {"text": "q"}
+            ])
+        );
+        assert_eq!(
+            out["messages"][2]["content"][0]["toolResult"]["content"],
+            json!([{"document": {"format": "pdf", "name": "document 3", "source": {"bytes": "JVBERi1"}}}])
+        );
+        assert_eq!(
+            out["messages"][2]["content"][1],
+            json!({"document": {"format": "pdf", "name": "document 4", "source": {"bytes": null}}})
+        );
     }
 
     #[test]

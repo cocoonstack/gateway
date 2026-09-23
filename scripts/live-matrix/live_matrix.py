@@ -58,6 +58,7 @@ GROUPS = [
 MODELS: dict[str, dict[str, Any]] = {}
 RESULTS: list[tuple[str, bool, str]] = []
 PREFIX_SENTENCE = "The gateway is a Rust service that fronts many model vendors. "
+SECRET_PDF_B64 = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA2MCA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcwMCBUZCAoVGhlIHNlY3JldCB3b3JkIGlzIFBJTkVBUFBMRS4pIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNSAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2EgPj4KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzUxIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDIxCiUlRU9GCg=="
 
 WEATHER_TOOL_ANTHROPIC = [
     {
@@ -352,7 +353,7 @@ def case_messages(
     if st != 200:
         record(name, False, f"HTTP {st}: {txt[:300]}")
         return
-    thinking_blocks = signatures = 0
+    thinking_blocks = signatures = bare_deltas = 0
     text = ""
     if stream:
         wire: dict[str, Any] = {}
@@ -364,6 +365,7 @@ def case_messages(
                 wire.update(e["message"].get("usage") or {})
             elif t == "message_delta":
                 wire.update(e.get("usage") or {})
+                bare_deltas += "usage" not in e
             elif t == "content_block_start" and e["content_block"].get("type") == "thinking":
                 thinking_blocks += 1
             elif t == "content_block_delta":
@@ -386,8 +388,22 @@ def case_messages(
                 text += b.get("text", "")
     note = f"text={text[:30]!r} thinking_blocks={thinking_blocks} signatures={signatures}"
     check_ledger(gw, name, model, wire, True, before, note)
+    if bare_deltas:
+        record(name + " [every message_delta carries usage]", False, f"{bare_deltas} without usage")
     if expect_thinking:
         record(name + " [thinking present]", thinking_blocks > 0, note)
+
+
+def case_document(gw: Gateway, model: str) -> None:
+    """A PDF document block on /v1/messages must reach the model: it reads back the word inside."""
+    name = f"{model} messages document"
+    content = [
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": SECRET_PDF_B64}},
+        {"type": "text", "text": "What is the secret word in the document? Reply with the word only."},
+    ]
+    st, txt = gw.call("/v1/messages", {"model": model, "max_tokens": 64, "messages": [{"role": "user", "content": content}]})
+    answer = "".join(b.get("text", "") for b in json.loads(txt).get("content", [])) if st == 200 else txt[:200]
+    record(name, st == 200 and "PINEAPPLE" in answer.upper(), f"HTTP {st} answer={answer[:60]!r}")
 
 
 def case_embeddings(gw: Gateway, model: str, inputs: list[str] | None = None) -> None:
@@ -1119,6 +1135,7 @@ def run_group(gw: Gateway, group: str) -> None:
             expect_thinking=True,
         )
         case_chat(gw, haiku, "reasoning_effort low", prompt=prime, expect_reasoning=True, reasoning_effort="low")
+        case_chat(gw, haiku, "max_completion_tokens", max_completion_tokens=300)
         case_chat(
             gw, haiku, "reasoning_effort", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
         )
@@ -1195,6 +1212,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_prompt_cache(gw, sol, words=400, expect_write=True)
         case_responses_surfaces(gw, luna)
         case_chat(gw, luna, "responses effort none", prompt=arith, reasoning_effort="none", max_tokens=4000, forbid_reasoning=True)
+        case_chat(gw, luna, "responses max_completion_tokens", max_completion_tokens=300)
     elif group == "gemini":
         # free tier: 5 RPM per model, so pace the calls
         for model in ("gemini-3.6-flash",):
@@ -1419,6 +1437,8 @@ def run_group(gw: Gateway, group: str) -> None:
             expect_thinking=True,
         )
         case_prompt_cache(gw, sonnet46, native=True, words=220, expect_write=True)
+        case_document(gw, sonnet46)
+        case_document(gw, haiku)
         case_messages(gw, sonnet5, "aws-anthropic")
         case_messages(
             gw,
