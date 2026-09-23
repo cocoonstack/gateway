@@ -28,7 +28,7 @@ client ──► views (auth, parse, protocol normalize)
        ──► handler (pre plugins: blocklist, moderation, then DLP redact)
        ──► dag: preprocess        resolve model, quota check, cache lookup
               account_select      priority / PTU-first / cooldown-aware selection, latency-ranked tiers when enabled
-              model_access        rate limits, engine call, retry-on-5xx failover
+              model_access        rate limits, engine call, failover on an upstream fault
               post_process        usage → billing ledger, cache store
        ──► handler (post plugins) ──► views (JSON or SSE re-emit)
 ```
@@ -41,7 +41,8 @@ submitting request.
 
 The DAG executes four fixed layers; nodes within a layer run
 sequentially in declaration order. Within `model_access`, `call_engine`
-reselects once on an upstream 5xx: the failed account is excluded and another
+reselects once on an upstream 5xx or a 401/402/403 credential or billing
+refusal: the failed account is excluded and another
 of the model's accounts is tried; a PTU→paygo switch is recorded as
 `ptu_spillover` in the ledger. Around the DAG, the handler re-runs all four
 layers for the next entry of the model's `fallback_models` chain when a run
@@ -72,7 +73,8 @@ default, so the whole pipeline is testable offline:
 - **`HealthStore`** — account cooldown/recovery. In-process breaker by
   default; `RedisHealth` with `storage.redis_url` — a tripped account is
   skipped by every instance. Only upstream faults count (5xx, timeouts,
-  broken streams), never a client-caused or rate-limit error.
+  broken streams, a 401/402/403 credential or billing refusal), never a
+  client-caused or rate-limit error.
 - **`Governance`** — rate/quota/TPM counters. In-process by default;
   `RedisGovernance` shares them (including pooled tenant QPS) fleet-wide.
 - **`Moderator`** — the external content review behind `security.moderate`;

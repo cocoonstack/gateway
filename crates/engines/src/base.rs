@@ -224,6 +224,7 @@ impl Base {
             stream,
             account: self.account(),
             replay_account: self.replay_account(),
+            output_cap: 0,
         };
         self.transport.send(up).await
     }

@@ -193,12 +193,14 @@ unmodified, including from compatible upstreams that ignore `stream: true`.
 
 Requests that engage reasoning on any surface (`thinking: {"type": "enabled"
 | "adaptive"}`, a `reasoning_effort`, or a continuation carrying signed
-blocks or `reasoning_details`) are pinned to their requested model: variant
-splits, over-quota fallback, and moderation degrade will not move them,
-because a signature only replays against the model that produced it. A request
-with a user id keeps its variant split instead: the split is sticky per user,
-so every turn lands on the variant that produced the reasoning, including a
-model that thinks without being asked.
+blocks or `reasoning_details`) are pinned to their requested model: over-quota
+fallback and moderation degrade will not move them, because a signature only
+replays against the model that produced it. A variant split is sticky instead:
+per user id when the request carries one, else per conversation, keyed on the
+first user turn that a signed replay keeps verbatim, so every turn lands on the
+variant that produced the reasoning, including on a model that thinks without
+being asked. Only a reasoning continuation with neither (a native Responses
+`input`) stays pinned to the requested model.
 
 Tool-loop continuations are audited against what the gateway served for the
 same key, model, and tool id within the last ten minutes: a modified protected

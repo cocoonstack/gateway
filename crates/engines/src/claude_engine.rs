@@ -210,6 +210,7 @@ impl ClaudeEngine {
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let body = self.build_body()?;
+        let output_cap = body.get("max_tokens").and_then(Value::as_i64).unwrap_or(0);
         let mut headers = vec![
             ("content-type", "application/json".into()),
             ("x-api-key", self.base.api_key()),
@@ -231,6 +232,7 @@ impl ClaudeEngine {
             stream: self.base.request.stream,
             account: self.base.account(),
             replay_account: self.base.replay_account(),
+            output_cap,
         })
     }
 

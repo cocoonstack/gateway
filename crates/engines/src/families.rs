@@ -971,6 +971,7 @@ fn video_upstream(
         stream: false,
         account: account.name.clone(),
         replay_account: Some(Arc::clone(account)),
+        output_cap: 0,
     }
 }
 
@@ -1022,6 +1023,7 @@ impl ModelEngine for SearchEngine {
                         stream: false,
                         account: self.base.account(),
                         replay_account: self.base.replay_account(),
+                        output_cap: 0,
                     })
                     .await?;
                 let (status, v) = parse_json_reply(reply)?;

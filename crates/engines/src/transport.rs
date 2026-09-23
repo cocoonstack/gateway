@@ -34,6 +34,8 @@ pub struct UpstreamRequest {
     pub account: String,
     /// Selected account snapshot when it permits status replay.
     pub replay_account: Option<Arc<gw_models::Account>>,
+    /// The request's output token cap, 0 when unknown; a non-streaming deadline grows with it.
+    pub output_cap: i64,
 }
 
 /// A live-stream item failure: a transport fault or one of our deadlines.

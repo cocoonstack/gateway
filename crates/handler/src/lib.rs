@@ -574,11 +574,11 @@ async fn note_abuse(ctx: &DagContext) {
         .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
 }
 
-/// Whether a pipeline error came from upstream: a vendor 5xx or 429, or a
-/// 502/503 the gateway raised for a connection failure or an exhausted pool.
+/// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403
+/// refusal, or a 502/503 the gateway raised for a connection failure or an exhausted pool.
 fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
-        Some(status) => status >= 500 || status == 429,
+        Some(status) => status >= 500 || matches!(status, 401..=403 | 429),
         None => {
             e.http_status >= 502
                 || (e.http_status == 429 && e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO)
@@ -1172,6 +1172,63 @@ mod tests {
         assert_eq!(avail.window("m", minute - 5, minute).await, (1, 0));
     }
 
+    #[derive(Debug)]
+    struct RefusingAccount(u16);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for RefusingAccount {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            if request.account != "a-bad" {
+                return gw_engines::transport::Transport::send(&gw_engines::MockTransport, request)
+                    .await;
+            }
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: self.0,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    br#"{"error":{"type":"authentication_error","message":"invalid api key"}}"#
+                        .to_vec()
+                        .into(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_refusal_fails_over_and_cools_the_account() {
+        for status in [401u16, 402, 403] {
+            let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-bad, provider: p, priority: 1, protocols: ['openai-chat']}, {name: a-good, provider: p, priority: 2, protocols: ['openai-chat']}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+            let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(RefusingAccount(status)),
+            );
+            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let first = h.run(chat_req("m", "hi"), key.clone()).await.unwrap();
+            assert!(
+                first
+                    .decisions
+                    .iter()
+                    .any(|(_, w)| w.contains("failover a-bad -> a-good")),
+                "{status}: {:?}",
+                first.decisions
+            );
+            let second = h.run(chat_req("m", "hi again"), key).await.unwrap();
+            assert!(
+                second
+                    .decisions
+                    .iter()
+                    .any(|(n, w)| *n == "select_account" && w == "a-good"),
+                "{status}: the refused account is cooled: {:?}",
+                second.decisions
+            );
+        }
+    }
+
     #[tokio::test]
     async fn variant_split_bills_requested_serves_target() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
@@ -1702,7 +1759,7 @@ mod tests {
         assert_eq!(rec.served_model, "fb-m");
     }
 
-    async fn assert_thinking_route_pinned(thinking_type: &str) {
+    async fn assert_thinking_conversation_sticky(thinking_type: &str) {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
@@ -1720,11 +1777,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !seed
-                .decisions
+            seed.decisions
                 .iter()
-                .any(|(node, _)| *node == "variant_select"),
-            "{thinking_type} thinking must stay on the requested model"
+                .any(|(node, w)| *node == "variant_select" && w.contains("-> canary-m")),
+            "{thinking_type} thinking joins the split like any conversation: {:?}",
+            seed.decisions
         );
 
         let mut assistant = ChatMsg::text("assistant", String::new());
@@ -1736,9 +1793,9 @@ mod tests {
         tool_result.parts = Some(serde_json::json!([
             {"type":"tool_result","tool_use_id":"tool-1","content":"done"}
         ]));
-        let mut continuation = chat_req("pub-m", "");
+        let mut continuation = chat_req("pub-m", "start thinking");
         continuation.preserve_anthropic_wire = true;
-        continuation.message = vec![assistant, tool_result];
+        continuation.message.extend([assistant, tool_result]);
         let continued = h.run(continuation, key).await.unwrap();
         assert!(
             continued.decisions.iter().any(|(node, decision)| {
@@ -1747,23 +1804,43 @@ mod tests {
             "over-quota continuation must not fall back: {:?}",
             continued.decisions
         );
-        assert!(
-            !continued
-                .decisions
-                .iter()
-                .any(|(node, _)| *node == "variant_select")
-        );
-
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 2);
-        assert!(ledger.iter().all(|record| record.served_model == "pub-m"));
+        assert!(
+            ledger
+                .iter()
+                .all(|record| record.served_model == "canary-m"),
+            "both turns land on the variant that produced the thinking: {ledger:?}"
+        );
     }
 
     #[tokio::test]
-    async fn thinking_modes_stay_off_variants_and_quota_fallbacks() {
+    async fn thinking_conversations_stay_on_one_variant_and_off_quota_fallbacks() {
         for thinking_type in ["enabled", "adaptive"] {
-            assert_thinking_route_pinned(thinking_type).await;
+            assert_thinking_conversation_sticky(thinking_type).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_conversation_without_a_user_id_sticks_to_one_variant() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: v-a, weight: 1}, {model: v-b, weight: 1}]}, {name: v-a, protocol: openai-chat}, {name: v-b, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        for _ in 0..8 {
+            h.run(chat_req("pub-m", "the same opening turn"), key.clone())
+                .await
+                .unwrap();
+        }
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let served: std::collections::HashSet<&str> =
+            ledger.iter().map(|r| r.served_model.as_str()).collect();
+        assert_eq!(served.len(), 1, "one conversation, one variant: {served:?}");
+        assert!(served.contains("v-a") || served.contains("v-b"));
     }
 
     #[tokio::test]

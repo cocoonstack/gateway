@@ -135,8 +135,8 @@ impl DagNode for TenantEntitlement {
 }
 
 /// preprocess/variant_select: weighted split of a public model across its
-/// variants, sticky by effective user; after entitlement (on the public name),
-/// before the cache (each variant caches separately); a degraded request is left alone.
+/// variants, sticky per user id, else per conversation (its first user turn);
+/// after entitlement (on the public name), before the cache; a degraded request is left alone.
 pub struct VariantSelect;
 
 #[async_trait::async_trait]
@@ -152,13 +152,18 @@ impl DagNode for VariantSelect {
         let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
             return Ok(());
         };
-        let user = ctx.effective_user_id();
-        if conf.variants.is_empty() || (user.is_empty() && ctx.request.pins_reasoning_route()) {
+        if conf.variants.is_empty() {
             return Ok(());
         }
-        let key = match user {
-            "" => ctx.request.request_id.as_str(),
-            user => user,
+        let user = ctx.effective_user_id();
+        let key = if !user.is_empty() {
+            user
+        } else if let Some(turn) = first_user_turn(&ctx.request.message) {
+            turn
+        } else if ctx.request.pins_reasoning_route() {
+            return Ok(());
+        } else {
+            ctx.request.request_id.as_str()
         };
         let Some(target) = gw_config::pick_variant(&conf.variants, key) else {
             return Ok(());
@@ -457,7 +462,7 @@ impl DagNode for CallEngine {
                 ctx.outcome = Some(outcome);
                 Ok(())
             }
-            Err(first_err) if first_err.http_status >= 500 => {
+            Err(first_err) if account_fault_status(&first_err) => {
                 let mt = ctx
                     .request
                     .protocol()
@@ -510,7 +515,7 @@ impl DagNode for CallEngine {
                     }
                     Err(e) => {
                         note_unavailable(ctx);
-                        if e.http_status >= 500 {
+                        if account_fault_status(&e) {
                             note_failure(ctx, &next.name).await;
                         }
                         Err(named(e, ctx))
@@ -577,6 +582,10 @@ fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
         e.resource = Some(requested_model(ctx.request.model_param_v2.as_ref()).to_owned());
     }
     e
+}
+
+fn account_fault_status(e: &GatewayError) -> bool {
+    e.http_status >= 500 || matches!(e.original_status(), Some(401..=403))
 }
 
 fn account_fault(class: gw_consts::ErrClass) -> bool {
@@ -992,6 +1001,13 @@ pub fn default_layers() -> Vec<Layer> {
 
 fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {
     cfg.find_model(model_name).and_then(|m| m.cache_ttl_seconds)
+}
+
+fn first_user_turn(messages: &[gw_models::ChatMsg]) -> Option<&str> {
+    messages
+        .iter()
+        .find(|m| m.role == gw_consts::role::USER && !m.content.is_empty())
+        .map(|m| m.content.as_str())
 }
 
 fn model_provider(ctx: &DagContext) -> Option<&str> {
