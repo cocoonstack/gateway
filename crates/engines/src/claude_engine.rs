@@ -74,7 +74,7 @@ impl ClaudeEngine {
         }
         let param = self.base.param()?;
         let converse = param.protocol == gw_consts::Protocol::AwsConverse;
-        let carries_parallel = !converse || crate::converse::claude_model(&param.model_name);
+        let anthropic_fields = !converse || crate::converse::claude_model(&param.model_name);
         let bedrock = matches!(
             param.protocol,
             gw_consts::Protocol::AwsAnthropic | gw_consts::Protocol::AwsConverse
@@ -125,6 +125,8 @@ impl ClaudeEngine {
                         max_tokens = budget.saturating_add(max_tokens);
                     }
                     sampling_rejected = true;
+                } else if !anthropic_fields && reasoning.effort.as_deref() == Some("none") {
+                    body.insert("output_config".into(), object([("effort", "none".into())]));
                 }
                 if let Some(thinking) = reasoning.thinking {
                     body.insert("thinking".into(), thinking);
@@ -179,7 +181,7 @@ impl ClaudeEngine {
                 extra.remove("model");
                 extra.remove("stream");
             }
-            if carries_parallel
+            if anthropic_fields
                 && let Some(Value::Bool(parallel)) = extra.remove("parallel_tool_calls")
                 && let Some(choice) = body
                     .entry("tool_choice")
@@ -886,7 +888,9 @@ mod tests {
     use std::sync::Arc;
 
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2, TypedParams};
+    use gw_models::{
+        ChatMsg, ChatParams, GatewayRequest, ModelParamV2, ReasoningParam, TypedParams,
+    };
 
     use super::*;
     use crate::transport::MockTransport;
@@ -1007,6 +1011,33 @@ mod tests {
             for knob in ["temperature", "top_p", "top_k"] {
                 assert_eq!(body.contains_key(knob), kept, "{model} {knob}");
             }
+        }
+    }
+
+    #[test]
+    fn effort_none_reaches_the_converse_reasoning_config_of_other_families() {
+        for (model, want) in [
+            ("us.openai.gpt-6-sol", Some("none")),
+            ("us.openai.gpt-6-astra", Some("low")),
+            ("us.xai.grok-4.6", Some("none")),
+            ("global.anthropic.claude-opus-5-5", None),
+        ] {
+            let mut param = ModelParamV2::with_name(Protocol::AwsConverse, model);
+            param.typed = Some(TypedParams::Chat(ChatParams {
+                reasoning: Some(Box::new(ReasoningParam {
+                    effort: Some("none".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }));
+            let mut r = base_req();
+            r.model_param_v2 = Some(param);
+            let body = ClaudeEngine::new(r, Arc::new(MockTransport))
+                .build_body()
+                .unwrap();
+            let fields = &crate::converse::request(body, model)["additionalModelRequestFields"];
+            assert_eq!(fields["reasoning_config"].as_str(), want, "{model}");
+            assert!(fields["output_config"].is_null(), "{model}");
         }
     }
 

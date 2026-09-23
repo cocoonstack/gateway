@@ -66,6 +66,7 @@ WEATHER_TOOL_ANTHROPIC = [
         "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
     }
 ]
+WEATHER_QUESTION = [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]
 WEATHER_TOOL_OPENAI = [
     {
         "type": "function",
@@ -241,6 +242,7 @@ def case_chat(
     stream: bool = False,
     prompt: str = "Reply with exactly one word: hello",
     expect_reasoning: bool = False,
+    forbid_reasoning: bool = False,
     **extra: Any,
 ) -> None:
     name = f"{model} chat{' stream' if stream else ''}{(' ' + label) if label else ''}"
@@ -293,6 +295,9 @@ def case_chat(
     check_ledger(gw, name, model, wire, False, before, note)
     if expect_reasoning:
         record(name + " [reasoning present]", bool(reasoning), f"reasoning_len={len(reasoning)}")
+    if forbid_reasoning:
+        spent = (wire.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        record(name + " [no reasoning]", not spent and not reasoning, f"reasoning_tokens={spent} reasoning_len={len(reasoning)}")
 
 
 def case_vendor_cost(gw: Gateway, model: str, **extra: Any) -> None:
@@ -827,7 +832,7 @@ def case_prompt_cache(
 def case_thinking_replay(gw: Gateway, model: str, native: bool = True) -> None:
     """Tool loop with thinking: turn 1 yields signed thinking + a tool call, turn 2 replays both with the result."""
     name = f"{model} signed thinking replay ({'messages' if native else 'chat'})"
-    question = [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]
+    question = WEATHER_QUESTION
     before, _ = gw.ledger()
     if native:
         b1: dict[str, Any] = {
@@ -1047,19 +1052,32 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
         check_vendor_cost(name, gw.ledger()[1], usage)
     case_chat(gw, model, "responses model", stream=True, prompt=prompt)
     case_messages(gw, model, "responses model", stream=True, prompt=prompt)
-    name = f"{model} responses model tool loop (chat)"
-    question = [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]
+    case_tool_loop(gw, model, "responses model")
+    name = f"{model} responses model anthropic tools (messages)"
+    st, txt = gw.call(
+        "/v1/messages",
+        {"model": model, "max_tokens": 200, "tools": WEATHER_TOOL_ANTHROPIC, "messages": WEATHER_QUESTION},
+    )
+    blocks = json.loads(txt).get("content", []) if st == 200 else []
+    tool_use = [b for b in blocks if b.get("type") == "tool_use"]
+    record(name, st == 200 and bool(tool_use), f"HTTP {st} tool_use={len(tool_use)} {txt[:120]!r}")
+
+
+def case_tool_loop(gw: Gateway, model: str, label: str = "", **extra: Any) -> None:
+    """A chat tool loop: turn 1 calls the tool, turn 2 answers from its result."""
+    name = f"{model}{(' ' + label) if label else ''} tool loop (chat)"
+    body = {"model": model, "tools": WEATHER_TOOL_OPENAI, **extra}
     before, _ = gw.ledger()
-    st, t1 = gw.call("/v1/chat/completions", {"model": model, "tools": WEATHER_TOOL_OPENAI, "messages": question})
+    st, t1 = gw.call("/v1/chat/completions", {**body, "messages": WEATHER_QUESTION})
     calls = json.loads(t1)["choices"][0]["message"].get("tool_calls") or [] if st == 200 else []
     if not calls:
         record(name, False, f"turn1 HTTP {st}: {t1[:200]}")
         return
-    replay = question + [
+    replay = WEATHER_QUESTION + [
         {"role": "assistant", "content": None, "tool_calls": calls},
         {"role": "tool", "tool_call_id": calls[0]["id"], "content": "Sunny, 25C"},
     ]
-    st2, t2 = gw.call("/v1/chat/completions", {"model": model, "tools": WEATHER_TOOL_OPENAI, "messages": replay})
+    st2, t2 = gw.call("/v1/chat/completions", {**body, "messages": replay})
     answer = (json.loads(t2)["choices"][0]["message"].get("content") or "") if st2 == 200 else t2[:200]
     after, _ = gw.ledger()
     record(
@@ -1067,13 +1085,6 @@ def case_responses_surfaces(gw: Gateway, model: str) -> None:
         st2 == 200 and after == before + 2,
         f"turn1 tool_calls={len(calls)}; turn2 HTTP {st2} text={answer[:40]!r}",
     )
-    name = f"{model} responses model anthropic tools (messages)"
-    st, txt = gw.call(
-        "/v1/messages", {"model": model, "max_tokens": 200, "tools": WEATHER_TOOL_ANTHROPIC, "messages": question}
-    )
-    blocks = json.loads(txt).get("content", []) if st == 200 else []
-    tool_use = [b for b in blocks if b.get("type") == "tool_use"]
-    record(name, st == 200 and bool(tool_use), f"HTTP {st} tool_use={len(tool_use)} {txt[:120]!r}")
 
 
 def run_group(gw: Gateway, group: str) -> None:
@@ -1129,6 +1140,18 @@ def run_group(gw: Gateway, group: str) -> None:
             prompt="Solve 23*47 step by step briefly.",
             expect_thinking=True,
         )
+        opus55 = "claude-opus-5-5"
+        case_thinking_tiers(gw, opus55, native=False, tiers=["none", "low", "max"], expect_reasoning=False)
+        case_messages(
+            gw,
+            opus55,
+            "thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt=arith,
+            expect_thinking=True,
+        )
+        case_prompt_cache(gw, opus55, native=True, words=400, expect_write=True)
     elif group == "openai":
         case_chat(gw, "gpt-4o-mini")
         case_chat(gw, "gpt-4o-mini", stream=True)
@@ -1165,6 +1188,13 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, astra, "knobs", prompt=prime, max_tokens=4000, temperature=0.4, top_p=0.9, presence_penalty=0.3)
         case_prompt_cache(gw, "gpt-5.6-luna", words=400, expect_write=True)
         case_chat(gw, "gpt-5-mini", "effort none on the 5.0 floor", prompt=prime, reasoning_effort="none", max_tokens=4000)
+        sol, luna = "gpt-6-sol", "gpt-6-luna"
+        case_chat(gw, sol, "effort none", prompt=arith, reasoning_effort="none", max_tokens=4000, forbid_reasoning=True)
+        case_tool_loop(gw, sol, "effort none", reasoning_effort="none", max_tokens=4000)
+        case_chat(gw, sol, "effort max + knobs", stream=True, prompt=arith, reasoning_effort="max", max_tokens=4000, temperature=0.4, top_p=0.9)
+        case_prompt_cache(gw, sol, words=400, expect_write=True)
+        case_responses_surfaces(gw, luna)
+        case_chat(gw, luna, "responses effort none", prompt=arith, reasoning_effort="none", max_tokens=4000, forbid_reasoning=True)
     elif group == "gemini":
         # free tier: 5 RPM per model, so pace the calls
         for model in ("gemini-3.6-flash",):
@@ -1259,6 +1289,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, "openai/gpt-6-astra", "effort xhigh", prompt=prime, reasoning_effort="xhigh", max_tokens=600)
         case_chat(gw, "openai/gpt-6-astra", "effort none clamps, the route refuses it", prompt=prime, reasoning_effort="none", max_tokens=600)
         case_chat(gw, "openai/gpt-5.6-luna", "max and knobs ride through", prompt=prime, reasoning_effort="max", max_tokens=600, temperature=0.4, top_p=0.9)
+        case_chat(gw, "openai/gpt-6-luna", "effort none rides through", prompt=arith, reasoning_effort="none", max_tokens=600, forbid_reasoning=True)
     elif group == "rerank":
         case_rerank(gw, "rerank-v3.5", unit_priced=True)
         case_rerank(gw, "jina-reranker-v3")
@@ -1420,9 +1451,21 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, astra, "converse effort xhigh", prompt=arith, reasoning_effort="xhigh", max_tokens=4000)
         case_messages(gw, astra, "converse thinking budget 32768", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
         luna = "global.openai.gpt-5.6-luna"
-        case_chat(gw, luna, "converse effort none + knobs", prompt=prime, reasoning_effort="none", max_tokens=4000, temperature=0.4, top_p=0.9)
+        case_chat(gw, luna, "converse effort none + knobs", prompt=arith, reasoning_effort="none", max_tokens=4000, temperature=0.4, top_p=0.9, forbid_reasoning=True)
         case_messages(gw, luna, "converse budget 32768 keeps max", thinking={"type": "enabled", "budget_tokens": 32768}, prompt=arith)
         case_chat(gw, astra, "converse stream", stream=True, prompt=prime, max_tokens=4000)
+        case_chat(gw, "global.openai.gpt-6-luna", "converse effort none", stream=True, prompt=arith, reasoning_effort="none", max_tokens=4000, forbid_reasoning=True)
+        opus55 = "jp.anthropic.claude-opus-5-5"
+        case_messages(
+            gw,
+            opus55,
+            "aws-anthropic thinking adaptive summarized",
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            prompt=arith,
+            expect_thinking=True,
+        )
+        case_chat(gw, opus55, "aws-anthropic chat effort max", prompt=arith, reasoning_effort="max", max_tokens=8000)
     elif group == "agents":
         case_claude_code(gw, "claude-haiku-4-5-20251001")
         case_codex(gw, "gpt-5.4")

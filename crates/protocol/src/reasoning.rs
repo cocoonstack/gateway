@@ -78,8 +78,7 @@ fn openai_generation(model: &str) -> Option<(u32, u32)> {
     (major >= 5).then_some((major, minor))
 }
 
-/// Whether the request reasons: an effort other than `none`, or a generation that cannot
-/// turn reasoning off (GPT-5.0 knows `minimal` but not `none`; GPT-6 onward always reasons).
+/// Whether the request reasons: any effort but `none`, or no effort on GPT-5.0 or GPT-6 onward.
 fn reasoning_engaged(generation: (u32, u32), effort: Option<&str>) -> bool {
     match effort {
         Some(effort) => effort != "none",
@@ -91,7 +90,7 @@ fn reasoning_engaged(generation: (u32, u32), effort: Option<&str>) -> bool {
 /// clamps up, since either is a vendor 400.
 pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) -> Cow<'a, str> {
     let generation = openai_generation(model);
-    let always_reasons = model.contains("gpt-6");
+    let always_reasons = model.contains("gpt-6-astra");
     let takes_minimal =
         !always_reasons && matches!(generation, None | Some((5, 0))) && wire != EffortWire::Bedrock;
     let takes_none = !always_reasons && generation != Some((5, 0));
@@ -269,6 +268,10 @@ mod tests {
             ("gpt-6-astra", Chat, "max", "xhigh"),
             ("gpt-6-astra", Chat, "none", "low"),
             ("gpt-6-astra", Responses, "max", "max"),
+            ("gpt-6-sol", Chat, "none", "none"),
+            ("gpt-6-sol", Chat, "max", "xhigh"),
+            ("gpt-6-luna", Chat, "minimal", "low"),
+            ("gpt-6-luna", Responses, "none", "none"),
             ("openai/gpt-5.6-luna", Chat, "max", "max"),
             ("openai/gpt-5.6-luna", Chat, "minimal", "minimal"),
             ("openai/gpt-6-astra", Chat, "none", "low"),
@@ -276,6 +279,8 @@ mod tests {
             ("us.openai.gpt-5.6-luna", Bedrock, "none", "none"),
             ("us.openai.gpt-5.6-luna", Bedrock, "minimal", "low"),
             ("us.openai.gpt-6-astra", Bedrock, "none", "low"),
+            ("us.openai.gpt-6-sol", Bedrock, "none", "none"),
+            ("openai/gpt-6-luna", Chat, "none", "none"),
             ("deepseek-v4", Chat, "max", "max"),
             ("claude-sonnet-5", Chat, "max", "max"),
         ] {
@@ -314,6 +319,7 @@ mod tests {
             ("gpt-5", Some("minimal")),
             ("gpt-6-astra", None),
             ("gpt-6-astra", Some("none")),
+            ("gpt-6-sol", None),
         ] {
             assert!(!kept(model, effort), "{model} reasons at {effort:?}");
         }
@@ -323,6 +329,7 @@ mod tests {
             ("gpt-5.4", Some("none")),
             ("gpt-5.5", Some("none")),
             ("gpt-5.6-terra", None),
+            ("gpt-6-luna", Some("none")),
             ("openai/gpt-6-astra", Some("high")),
             ("us.openai.gpt-5.6-luna", Some("high")),
             ("deepseek-v4", Some("high")),
@@ -355,6 +362,7 @@ mod tests {
             ("claude-fable-5", AdaptiveSummarized),
             ("claude-mythos-5", AdaptiveSummarized),
             ("claude-opus-5-1", AdaptiveSummarized),
+            ("claude-opus-5-5", AdaptiveSummarized),
             ("MiniMax-M3", Budget),
             ("anthropic.claude-3-5-sonnet-20241022-v2:0", Budget),
             ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", Budget),
