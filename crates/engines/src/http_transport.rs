@@ -19,6 +19,9 @@ use crate::transport::{
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // a hung connect must surface as a (retryable) connect error, not burn the request timeout
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// the non-streaming output rate the Anthropic SDK budgets for, and its ten-minute ceiling
+const OUTPUT_TOKENS_PER_HOUR: u64 = 128_000;
+const MAX_OUTPUT_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Live per-account request timeout and connect-phase retry budget.
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +118,7 @@ impl Transport for HttpTransport {
             let mut builder = self.client.request(method.clone(), &req.url);
             // reqwest's timeout is a total deadline: streams get a header deadline + idle cap
             if !req.stream {
-                builder = builder.timeout(timeout);
+                builder = builder.timeout(timeout.max(output_deadline(req.output_cap)));
             }
             for (k, v) in &req.headers {
                 builder = builder.header(*k, v);
@@ -280,6 +283,11 @@ impl Transport for DispatchTransport {
     }
 }
 
+fn output_deadline(cap: i64) -> Duration {
+    let secs = (cap.max(0) as u64).saturating_mul(3600) / OUTPUT_TOKENS_PER_HOUR;
+    Duration::from_secs(secs).min(MAX_OUTPUT_DEADLINE)
+}
+
 /// The vendor's retry delay, capped; standard `Retry-After` takes precedence,
 /// then seconds-until-reset, else the connect path's linear backoff.
 fn status_backoff(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
@@ -396,6 +404,7 @@ mod tests {
             stream: false,
             account: "acct".into(),
             replay_account: None,
+            output_cap: 0,
         }
     }
 

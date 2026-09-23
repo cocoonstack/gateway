@@ -67,6 +67,7 @@ impl OpenAiEngine {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
+        let mut output_cap = 0;
         if let Some(gw_models::TypedParams::Chat(p)) = typed {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
@@ -83,6 +84,7 @@ impl OpenAiEngine {
             } else {
                 put!("max_tokens", p.max_tokens);
             }
+            output_cap = p.max_tokens.unwrap_or_default();
             put!(
                 "reasoning_effort",
                 p.reasoning
@@ -135,6 +137,7 @@ impl OpenAiEngine {
             stream: self.base.request.stream,
             account: self.base.account(),
             replay_account: self.base.replay_account(),
+            output_cap,
         })
     }
 

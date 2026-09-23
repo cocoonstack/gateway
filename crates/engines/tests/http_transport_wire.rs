@@ -81,6 +81,7 @@ async fn http_transport_json_over_real_socket() {
         stream: false,
         account: "real-local".into(),
         replay_account: None,
+        output_cap: 0,
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
@@ -131,6 +132,7 @@ async fn non_stream_body_timeout_classifies_as_model_timeout() {
             stream: false,
             account: "slow-body".into(),
             replay_account: None,
+            output_cap: 0,
         })
         .await
         .expect_err("the non-stream body must share the request deadline");
@@ -141,6 +143,26 @@ async fn non_stream_body_timeout_classifies_as_model_timeout() {
         Some(gw_consts::ErrClass::ModelTimeout)
     );
     assert!(err.message.contains("read upstream body"));
+}
+
+#[tokio::test]
+async fn non_stream_deadline_grows_with_the_output_cap() {
+    let transport = HttpTransport::new(Duration::from_millis(300)).expect("transport");
+    let resp = transport
+        .send(UpstreamRequest {
+            protocol: Protocol::OpenaiChat,
+            method: "POST",
+            url: spawn_stalled_json_vendor().await,
+            headers: vec![("content-type", "application/json".into())],
+            body: b"{}".to_vec(),
+            stream: false,
+            account: "slow-body".into(),
+            replay_account: None,
+            output_cap: 128_000,
+        })
+        .await
+        .expect("a 128k-token cap budgets an hour, so a 2s stall is inside the deadline");
+    assert_eq!(resp.status, 200);
 }
 
 async fn spawn_breaking_json_vendor() -> String {
@@ -174,6 +196,7 @@ async fn non_stream_body_break_classifies_as_model_error() {
             stream: false,
             account: "broken-body".into(),
             replay_account: None,
+            output_cap: 0,
         })
         .await
         .expect_err("a mid-body break must surface as an error");
@@ -200,6 +223,7 @@ async fn http_transport_sse_over_real_socket() {
         stream: true,
         account: "real-local".into(),
         replay_account: None,
+        output_cap: 0,
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
@@ -229,6 +253,7 @@ async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
         stream: false,
         account: "dispatch-test".into(),
         replay_account: None,
+        output_cap: 0,
     };
 
     let resp = transport
@@ -340,6 +365,7 @@ async fn per_account_policy_and_connect_retry() {
             stream: false,
             account: "tight".into(),
             replay_account: None,
+            output_cap: 0,
         })
         .await
         .unwrap_err();
@@ -387,6 +413,7 @@ fn paced_req(url: String) -> UpstreamRequest {
         stream: true,
         account: "paced".into(),
         replay_account: None,
+        output_cap: 0,
     }
 }
 
@@ -621,6 +648,7 @@ async fn an_error_status_under_an_sse_content_type_is_a_body_not_a_stream() {
             stream: true,
             account: "gemini".into(),
             replay_account: None,
+            output_cap: 0,
         })
         .await
         .unwrap();

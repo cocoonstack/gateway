@@ -204,8 +204,9 @@ accounts:
                                # `provider` names a declared one; real base URL → real
                                # upstream; explicit "mock://…" → stays on the mock
     timeout_seconds: 60        # per-attempt timeout (default 60): bounds a non-streaming
-                               # attempt whole; a streaming one gets it on the headers and
-                               # then per gap between chunks
+                               # attempt whole, grown to the request's max_tokens at 128k
+                               # tokens/hour (at most 10 min); a streaming one gets it on
+                               # the headers and then per gap between chunks
     connect_retries: 1         # connect-phase retries; also bounds retry_status replays
     retry_status: []           # statuses this vendor issues BEFORE the model runs, so a
                                # replay cannot double-bill — e.g. [429, 502] for a relay
