@@ -2727,8 +2727,8 @@ fn finish_openai(fr: String) -> Cow<'static, str> {
 
 fn chat_finish(fr: String, tool_calls: bool) -> Cow<'static, str> {
     match finish_openai(fr) {
-        finish if !tool_calls || finish == "length" => finish,
-        _ => Cow::Borrowed("tool_calls"),
+        finish if tool_calls && finish == "stop" => Cow::Borrowed("tool_calls"),
+        finish => finish,
     }
 }
 
@@ -6368,6 +6368,10 @@ mod tests {
 
     #[test]
     fn finish_reason_mapping_both_directions() {
+        assert_eq!(chat_finish("end_turn".into(), true), "tool_calls");
+        assert_eq!(chat_finish("content_filter".into(), true), "content_filter");
+        assert_eq!(chat_finish("max_tokens".into(), true), "length");
+        assert_eq!(chat_finish("end_turn".into(), false), "stop");
         assert_eq!(finish_openai("end_turn".into()), "stop");
         assert_eq!(finish_openai("stop_sequence".into()), "stop");
         assert_eq!(finish_openai(String::new()), "stop");
