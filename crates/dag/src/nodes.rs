@@ -158,7 +158,7 @@ impl DagNode for VariantSelect {
         let user = ctx.effective_user_id();
         let key = if !user.is_empty() {
             user
-        } else if let Some(turn) = first_user_turn(&ctx.request.message) {
+        } else if let Some(turn) = first_user_turn(&ctx.request) {
             turn
         } else if ctx.request.pins_reasoning_route() {
             return Ok(());
@@ -1003,11 +1003,26 @@ fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option
     cfg.find_model(model_name).and_then(|m| m.cache_ttl_seconds)
 }
 
-fn first_user_turn(messages: &[gw_models::ChatMsg]) -> Option<&str> {
-    messages
+/// The first user text: a normalized turn, else the native Responses `input`.
+fn first_user_turn(request: &gw_models::GatewayRequest) -> Option<&str> {
+    if let Some(m) = request
+        .message
         .iter()
         .find(|m| m.role == gw_consts::role::USER && !m.content.is_empty())
-        .map(|m| m.content.as_str())
+    {
+        return Some(&m.content);
+    }
+    let input = &request.model_param_v2.as_ref()?.raw["input"];
+    let item = match input {
+        serde_json::Value::String(s) => return Some(s),
+        serde_json::Value::Array(items) => items.iter().find(|i| i["role"] == "user")?,
+        _ => return None,
+    };
+    match &item["content"] {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Array(parts) => parts.iter().find_map(|p| p["text"].as_str()),
+        _ => None,
+    }
 }
 
 fn model_provider(ctx: &DagContext) -> Option<&str> {

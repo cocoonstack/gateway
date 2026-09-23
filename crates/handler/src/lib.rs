@@ -1180,6 +1180,41 @@ mod tests {
         assert_eq!(avail.window("m", minute - 5, minute).await, (1, 0));
     }
 
+    #[tokio::test]
+    async fn a_native_responses_conversation_without_a_user_id_sticks_to_one_variant() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-r, protocol: responses, variants: [{model: canary-r, weight: 1}]}, {name: canary-r, protocol: responses}]\naccounts: [{name: a1, provider: openai, protocols: ['responses']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let turn = |input: serde_json::Value| {
+            let mut request = chat_req("pub-r", "");
+            request.message.clear();
+            request.preserve_responses_wire = true;
+            if let Some(param) = request.model_param_v2.as_mut() {
+                param.protocol = Protocol::Responses;
+                param.raw = serde_json::json!({"input": input});
+            }
+            request
+        };
+        h.run(turn(serde_json::json!("the opening turn")), key.clone())
+            .await
+            .unwrap();
+        let replay = serde_json::json!([
+            {"role": "user", "content": "the opening turn"},
+            {"type": "reasoning", "id": "rs_1", "summary": []}
+        ]);
+        h.run(turn(replay), key).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert!(
+            ledger.iter().all(|r| r.served_model == "canary-r"),
+            "both turns land on the variant that served the first: {ledger:?}"
+        );
+    }
+
     #[derive(Debug)]
     struct RefusingAccount(u16);
 
