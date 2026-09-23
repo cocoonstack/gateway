@@ -165,7 +165,7 @@ pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
         .map_err(|e| crate::sqlx_err("listen on config channel", e))?;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
-        while let Ok(n) = listener.recv().await {
+        while let Ok(Some(n)) = listener.try_recv().await {
             let version = n.payload().parse().unwrap_or(0);
             if tx.send(version).await.is_err() {
                 return;
@@ -235,5 +235,30 @@ mod tests {
             1,
             "concurrent guarded publishes admit exactly one"
         );
+    }
+
+    #[tokio::test]
+    async fn subscribe_closes_when_the_listener_connection_drops() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let mut versions = subscribe(&format!("{url}{sep}application_name=gw_feed_drop"))
+            .await
+            .expect("subscribe");
+        let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+        let killed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE application_name = 'gw_feed_drop') t",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("terminate");
+        assert_eq!(killed, 1, "exactly one listener backend");
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while versions.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "feed must close on a dropped connection");
     }
 }

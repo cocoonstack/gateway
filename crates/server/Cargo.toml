@@ -30,6 +30,7 @@ metrics-exporter-prometheus = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 gw-models = { workspace = true }
 gw-consts = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
