@@ -2727,8 +2727,8 @@ fn finish_openai(fr: String) -> Cow<'static, str> {
 
 fn chat_finish(fr: String, tool_calls: bool) -> Cow<'static, str> {
     match finish_openai(fr) {
-        finish if !tool_calls || finish == "length" => finish,
-        _ => Cow::Borrowed("tool_calls"),
+        finish if tool_calls && finish == "stop" => Cow::Borrowed("tool_calls"),
+        finish => finish,
     }
 }
 
@@ -3317,7 +3317,14 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         return gw_engines::anthropic_native_chunks(resp, content, None);
     }
     outcome.chunks.clear();
-    synth_chunks(outcome)
+    let mut chunks = synth_chunks(outcome);
+    if let Some(error) = outcome.terminal_error.clone() {
+        chunks.push(gw_engines::StreamChunk {
+            error: Some(Box::new(error)),
+            ..Default::default()
+        });
+    }
+    chunks
 }
 
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
@@ -6361,6 +6368,10 @@ mod tests {
 
     #[test]
     fn finish_reason_mapping_both_directions() {
+        assert_eq!(chat_finish("end_turn".into(), true), "tool_calls");
+        assert_eq!(chat_finish("content_filter".into(), true), "content_filter");
+        assert_eq!(chat_finish("max_tokens".into(), true), "length");
+        assert_eq!(chat_finish("end_turn".into(), false), "stop");
         assert_eq!(finish_openai("end_turn".into()), "stop");
         assert_eq!(finish_openai("stop_sequence".into()), "stop");
         assert_eq!(finish_openai(String::new()), "stop");

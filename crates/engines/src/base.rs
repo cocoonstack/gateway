@@ -15,11 +15,16 @@ pub const VENDOR_SENTINEL: &str = "mock://api.vendor.com";
 pub(crate) struct Base {
     pub request: gw_models::GatewayRequest,
     pub transport: SharedTransport,
+    pub output_cap: i64,
 }
 
 impl Base {
     pub fn new(request: gw_models::GatewayRequest, transport: SharedTransport) -> Self {
-        Self { request, transport }
+        Self {
+            request,
+            transport,
+            output_cap: 0,
+        }
     }
 
     pub fn account(&self) -> String {
@@ -224,7 +229,7 @@ impl Base {
             stream,
             account: self.account(),
             replay_account: self.replay_account(),
-            output_cap: 0,
+            output_cap: self.output_cap,
         };
         self.transport.send(up).await
     }

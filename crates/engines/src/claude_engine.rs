@@ -170,6 +170,7 @@ impl ClaudeEngine {
         }
         if anthropic_fields || client_cap {
             body.insert("max_tokens".into(), json!(max_tokens));
+            self.base.output_cap = max_tokens;
         }
         let mut raw = self.base.take_raw();
         let system = match native_system {
@@ -210,7 +211,6 @@ impl ClaudeEngine {
 
     fn build_upstream(&mut self) -> GResult<UpstreamRequest> {
         let body = self.build_body()?;
-        let output_cap = body.get("max_tokens").and_then(Value::as_i64).unwrap_or(0);
         let mut headers = vec![
             ("content-type", "application/json".into()),
             ("x-api-key", self.base.api_key()),
@@ -232,7 +232,7 @@ impl ClaudeEngine {
             stream: self.base.request.stream,
             account: self.base.account(),
             replay_account: self.base.replay_account(),
-            output_cap,
+            output_cap: self.base.output_cap,
         })
     }
 
@@ -1053,6 +1053,26 @@ mod tests {
             let fields = &crate::converse::request(body, model)["additionalModelRequestFields"];
             assert_eq!(fields["reasoning_config"].as_str(), want, "{model}");
             assert!(fields["output_config"].is_null(), "{model}");
+        }
+    }
+
+    #[test]
+    fn the_output_cap_rides_the_base_on_every_claude_wire() {
+        for (protocol, max_tokens, want) in [
+            (gw_consts::Protocol::AnthropicMessages, None, 16384),
+            (gw_consts::Protocol::AwsAnthropic, Some(300), 300),
+            (gw_consts::Protocol::AwsConverse, Some(300), 300),
+        ] {
+            let mut param = ModelParamV2::with_name(protocol, "claude-opus-5-5");
+            param.typed = Some(TypedParams::Chat(ChatParams {
+                max_tokens,
+                ..Default::default()
+            }));
+            let mut r = base_req();
+            r.model_param_v2 = Some(param);
+            let mut engine = ClaudeEngine::new(r, Arc::new(MockTransport));
+            engine.build_body().unwrap();
+            assert_eq!(engine.base.output_cap, want, "{protocol:?}");
         }
     }
 
