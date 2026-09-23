@@ -1336,10 +1336,12 @@ impl ResponsesEngine {
                 }
                 body.insert("tool_choice".to_owned(), responses_tool_choice(v));
             }
-            if let Some(effort) = p
-                .reasoning
-                .and_then(|r| crate::openai_engine::reasoning_effort(*r))
-            {
+            if let Some(effort) = p.reasoning.and_then(|r| {
+                crate::openai_engine::reasoning_effort(
+                    *r,
+                    self.base.model_name().unwrap_or_default(),
+                )
+            }) {
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }

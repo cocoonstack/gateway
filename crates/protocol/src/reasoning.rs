@@ -69,15 +69,27 @@ pub enum EffortWire {
     Bedrock,
 }
 
+/// OpenAI's own reasoning families — o-series and GPT-5 onward.
+pub fn openai_reasoning_family(model: &str) -> bool {
+    match base_id(model).as_bytes() {
+        [b'o', minor, ..] => minor.is_ascii_digit(),
+        [b'g', b'p', b't', b'-', major, ..] => (b'5'..=b'9').contains(major),
+        _ => false,
+    }
+}
+
+fn o_series(model: &str) -> bool {
+    matches!(base_id(model).as_bytes(), [b'o', minor, ..] if minor.is_ascii_digit())
+}
+
+fn base_id(model: &str) -> &str {
+    model.strip_prefix("ft:").unwrap_or(model)
+}
+
 /// The GPT generation of an id OpenAI serves itself (`gpt-5.6-luna` → `(5, 6)`); a
 /// vendor-prefixed id is `None`, since OpenRouter and Bedrock normalize the request themselves.
 fn openai_generation(model: &str) -> Option<(u32, u32)> {
-    let version = model
-        .strip_prefix("ft:")
-        .unwrap_or(model)
-        .strip_prefix("gpt-")?
-        .split('-')
-        .next()?;
+    let version = base_id(model).strip_prefix("gpt-")?.split('-').next()?;
     let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
     let (major, minor) = (major.parse().ok()?, minor.parse().ok()?);
     (major >= 5).then_some((major, minor))
@@ -95,7 +107,8 @@ fn reasoning_engaged(generation: (u32, u32), effort: Option<&str>) -> bool {
 /// clamps up, since either is a vendor 400.
 pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) -> Cow<'a, str> {
     let generation = openai_generation(model);
-    let always_reasons = model.contains("gpt-6-astra");
+    let o_series = o_series(model);
+    let always_reasons = o_series || model.contains("gpt-6-astra");
     let takes_minimal =
         !always_reasons && matches!(generation, None | Some((5, 0))) && wire != EffortWire::Bedrock;
     let takes_none = !always_reasons && generation != Some((5, 0));
@@ -111,8 +124,10 @@ pub fn openai_effort<'a>(model: &str, effort: Cow<'a, str>, wire: EffortWire) ->
         _ => {}
     }
     let top = match (wire, generation) {
+        (EffortWire::Responses, _) if o_series => "high",
         (EffortWire::Chat, Some(generation)) if generation <= (5, 1) => "high",
         (EffortWire::Chat, Some(_)) => "xhigh",
+        (EffortWire::Chat, None) if o_series => "xhigh",
         (EffortWire::Responses, Some(generation)) if generation < (5, 6) => "xhigh",
         _ => "max",
     };
@@ -141,7 +156,9 @@ pub fn normalize_openai_body(model: &str, body: &mut Map<String, Value>, wire: E
     } else {
         None
     };
-    if openai_generation(model).is_some_and(|generation| reasoning_engaged(generation, effort)) {
+    if o_series(model)
+        || openai_generation(model).is_some_and(|generation| reasoning_engaged(generation, effort))
+    {
         for knob in SAMPLING_KNOBS {
             body.remove(knob);
         }
@@ -278,6 +295,11 @@ mod tests {
             ("gpt-6-luna", Chat, "minimal", "low"),
             ("gpt-6-luna", Responses, "none", "none"),
             ("ft:gpt-5.4-mini:org::abc", Chat, "max", "xhigh"),
+            ("o3", Chat, "none", "low"),
+            ("o3", Chat, "minimal", "low"),
+            ("o3", Chat, "max", "xhigh"),
+            ("o4-mini", Responses, "xhigh", "high"),
+            ("o3-mini", Responses, "none", "low"),
             ("openai/gpt-5.6-luna", Chat, "max", "max"),
             ("openai/gpt-5.6-luna", Chat, "minimal", "minimal"),
             ("openai/gpt-6-astra", Chat, "none", "low"),
@@ -326,6 +348,8 @@ mod tests {
             ("gpt-6-astra", None),
             ("gpt-6-astra", Some("none")),
             ("gpt-6-sol", None),
+            ("o3", None),
+            ("o1", Some("high")),
         ] {
             assert!(!kept(model, effort), "{model} reasons at {effort:?}");
         }
