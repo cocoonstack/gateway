@@ -1,9 +1,4 @@
-//! Service entrypoint: load config (GW_CONFIG path, else the embedded default;
-//! with `storage.postgres_url` the config store is the source of truth and the
-//! file only seeds it), build state, select the transport (`GW_TRANSPORT`),
-//! spawn background tasks and the config change feed, serve with graceful
-//! shutdown. Accounts with an `endpoint` egress to real vendors; the rest are
-//! served by the in-process mock; `GW_TRANSPORT=mock` forces zero egress.
+//! Service entrypoint for configuration, background tasks, transport and HTTP serving.
 
 use std::borrow::Cow;
 use std::env;
@@ -159,20 +154,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 match gw_state::configstore::subscribe(&postgres_url).await {
-                    Ok(mut versions) => {
+                    Ok(versions) => {
                         tracing::info!("config change feed connected");
-                        // a publish during a reconnect gap notified no one — catch up
-                        if let Err(e) = app.reload().await {
-                            tracing::error!(error = %e, "config feed: catch-up reload failed");
-                        }
-                        while let Some(version) = versions.recv().await {
-                            match app.reload().await {
-                                Ok(()) => tracing::info!(version, "config feed: reloaded"),
-                                Err(e) => {
-                                    tracing::error!(error = %e, "config feed: reload failed");
-                                }
-                            }
-                        }
+                        follow_config_feed(&app, versions).await;
                         tracing::warn!("config change feed dropped; reconnecting");
                     }
                     Err(e) => tracing::warn!(error = %e, "config change feed connect failed"),
@@ -245,7 +229,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stdout logs under RUST_LOG, plus OTLP span export once OTEL_EXPORTER_OTLP_* names a collector.
+async fn follow_config_feed(app: &AppState, mut versions: tokio::sync::mpsc::Receiver<i64>) {
+    loop {
+        while let Err(e) = app.reload().await {
+            tracing::error!(error = %e, "config feed: reload failed; retrying");
+            tokio::time::sleep(CONFIG_FEED_RETRY).await;
+        }
+        tracing::info!("config feed: reloaded");
+        if versions.recv().await.is_none() {
+            return;
+        }
+    }
+}
+
 fn init_tracing() -> anyhow::Result<Option<SdkTracerProvider>> {
     let log_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -342,5 +338,76 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("SIGINT received, draining"),
         _ = terminate => tracing::info!("SIGTERM received, draining"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+
+    use futures::poll;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn config_feed_retries_catch_up_and_notifications_without_another_publish() {
+        let cfg = GatewayConfig::from_yaml(gw_config::DEFAULT_YAML).unwrap();
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let shared = gw_state::SharedConfig::new(Arc::new(cfg), state);
+        let fail = Arc::new(AtomicBool::new(true));
+        let head = Arc::new(AtomicU16::new(1));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let loader: gw_views::ConfigLoader = {
+            let fail = fail.clone();
+            let head = head.clone();
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let result = if fail.swap(false, Ordering::SeqCst) {
+                    Err("config store unavailable".to_owned())
+                } else {
+                    let mut cfg = GatewayConfig::from_yaml(gw_config::DEFAULT_YAML).unwrap();
+                    cfg.listen.port = head.load(Ordering::SeqCst);
+                    Ok(cfg)
+                };
+                Box::pin(async move { result })
+            })
+        };
+        let app = AppState::with_config(
+            shared.clone(),
+            Arc::new(gw_engines::MockTransport),
+            Some(loader),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut feed = std::pin::pin!(follow_config_feed(&app, rx));
+
+        assert!(poll!(&mut feed).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        head.store(2, Ordering::SeqCst);
+        tokio::time::advance(CONFIG_FEED_RETRY - Duration::from_millis(1)).await;
+        assert!(poll!(&mut feed).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(poll!(&mut feed).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(shared.load().cfg.listen.port, 2);
+
+        fail.store(true, Ordering::SeqCst);
+        head.store(3, Ordering::SeqCst);
+        tx.send(3).await.unwrap();
+        assert!(poll!(&mut feed).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(shared.load().cfg.listen.port, 2);
+        head.store(4, Ordering::SeqCst);
+        tokio::time::advance(CONFIG_FEED_RETRY).await;
+        assert!(poll!(&mut feed).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(shared.load().cfg.listen.port, 4);
+
+        tokio::time::advance(CONFIG_FEED_RETRY).await;
+        assert!(poll!(&mut feed).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        drop(tx);
+        assert!(poll!(&mut feed).is_ready());
     }
 }
