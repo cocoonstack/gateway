@@ -5935,3 +5935,52 @@ async fn a_buffered_native_reply_keeps_the_vendor_stop_sequence_and_usage() {
         "{v}"
     );
 }
+
+async fn wait_batch(app: &Router, ak: &str, id: &str) -> Value {
+    for _ in 0..500 {
+        let req = Request::builder()
+            .uri(format!("/v1/batches/{id}"))
+            .header("authorization", format!("Bearer {ak}"))
+            .body(Body::empty())
+            .unwrap();
+        let j = body_json(app.clone().oneshot(req).await.unwrap()).await;
+        if j["status"] == "completed" || j["status"] == "failed" {
+            return j;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("batch {id} did not finish");
+}
+
+#[tokio::test]
+async fn batch_items_parse_as_chat_requests_and_report_tool_calls() {
+    let (app, fixture) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x"}}],
+        "stop_reason":"tool_use","stop_sequence":null,
+        "usage":{"input_tokens":10,"output_tokens":4}
+    }));
+    let submit = json!({"model":"claude-test","items":[{
+        "messages":[
+            {"role":"developer","content":"Be brief."},
+            {"role":"user","content":[{"type":"text","text":"look up x"}]}],
+        "max_completion_tokens":77,
+        "stop":["END"],
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+    }]});
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-fixed"), &submit.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let job = wait_batch(&app, "ak-fixed", &id).await;
+    let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
+    assert_eq!(sent["max_tokens"], 77, "{sent}");
+    assert_eq!(sent["stop_sequences"][0], "END", "{sent}");
+    assert_eq!(sent["tools"][0]["name"], "lookup", "{sent}");
+    assert!(sent["system"].to_string().contains("Be brief."), "{sent}");
+    assert!(sent["messages"].to_string().contains("look up x"), "{sent}");
+    assert_eq!(job["status"], "completed", "{job}");
+}

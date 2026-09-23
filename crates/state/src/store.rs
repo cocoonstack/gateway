@@ -52,8 +52,8 @@ const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60
 
 /// A put prunes async video jobs older than this (vendor results expire far sooner).
 const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
-/// Rows per batch_items INSERT: four binds each under the 65535-parameter limit.
-const BATCH_ITEM_CHUNK: usize = 16_000;
+/// Rows per batch_items INSERT: five binds each under the 65535-parameter limit.
+const BATCH_ITEM_CHUNK: usize = 13_000;
 
 // store pool size when storage.postgres_max_connections is unset
 const PG_MAX_CONNECTIONS: u32 = 10;
@@ -2316,6 +2316,16 @@ async fn prune_terminal_items(
     Ok(())
 }
 
+fn pg_batch_item(r: &sqlx::postgres::PgRow) -> gw_models::BatchItem {
+    let (typed, raw) = serde_json::from_str(r.get::<&str, _>(2)).unwrap_or_default();
+    gw_models::BatchItem {
+        messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
+        typed,
+        raw,
+        user: r.get(1),
+    }
+}
+
 /// Postgres-backed store shared across a fleet; no orphan sweep on open, since
 /// another live instance may still be executing those batches.
 #[derive(Debug)]
@@ -2415,6 +2425,7 @@ impl PostgresStore {
                 PRIMARY KEY (batch_id, idx))",
             // per-item end-user attribution so a fleet drainer still bills/budgets it
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS params TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             // pre-upgrade results predate user_id; backfill it from the items rows so erasure
             // reaches history (idempotent)
@@ -2512,7 +2523,7 @@ sql_store_impl!(PostgresStore, postgres, {
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
         // pending/running batches included: an emptied item fails at execution instead of running
         let i = sqlx::query(
-            "UPDATE batch_items i SET messages = '[]' FROM batches b
+            "UPDATE batch_items i SET messages = '[]', params = '' FROM batches b
              WHERE i.batch_id = b.id AND i.user_id = $1 AND i.messages <> '[]'
                AND ($2::text IS NULL OR b.tenant = $2)",
         )
@@ -2737,14 +2748,16 @@ sql_store_impl!(PostgresStore, postgres, {
             .map_err(|e| crate::sqlx_err("insert batch", e))?;
         for (chunk, items) in items.chunks(BATCH_ITEM_CHUNK).enumerate() {
             let mut qb = sqlx::QueryBuilder::new(
-                "INSERT INTO batch_items (batch_id, idx, messages, user_id) ",
+                "INSERT INTO batch_items (batch_id, idx, messages, user_id, params) ",
             );
             qb.push_values(items.iter().enumerate(), |mut v, (i, item)| {
                 let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
+                let params = serde_json::to_string(&(&item.typed, &item.raw)).unwrap_or_default();
                 v.push_bind(&id)
                     .push_bind((chunk * BATCH_ITEM_CHUNK + i) as i64)
                     .push_bind(json)
-                    .push_bind(&item.user);
+                    .push_bind(&item.user)
+                    .push_bind(params);
             });
             qb.build()
                 .execute(&mut *tx)
@@ -2771,34 +2784,25 @@ sql_store_impl!(PostgresStore, postgres, {
         idx: usize,
     ) -> GResult<Option<gw_models::BatchItem>> {
         let row = sqlx::query(
-            "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 AND idx = $2",
+            "SELECT messages, user_id, params FROM batch_items WHERE batch_id = $1 AND idx = $2",
         )
         .bind(id)
         .bind(idx as i64)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("read batch item", e))?;
-        Ok(row.map(|r| gw_models::BatchItem {
-            messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
-            user: r.get(1),
-        }))
+        Ok(row.as_ref().map(pg_batch_item))
     }
 
     async fn batch_load_items(&self, id: &str) -> GResult<Vec<gw_models::BatchItem>> {
         let rows = sqlx::query(
-            "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 ORDER BY idx",
+            "SELECT messages, user_id, params FROM batch_items WHERE batch_id = $1 ORDER BY idx",
         )
         .bind(id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("load batch items", e))?;
-        Ok(rows
-            .iter()
-            .map(|r| gw_models::BatchItem {
-                messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
-                user: r.get::<String, _>(1),
-            })
-            .collect())
+        Ok(rows.iter().map(pg_batch_item).collect())
     }
 
     async fn batch_claim_pending(&self, stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
@@ -3832,13 +3836,21 @@ mod tests {
         exercise_video_jobs(&store).await;
 
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
+        let typed = Some(gw_models::TypedParams::Chat(gw_models::ChatParams {
+            max_tokens: Some(7),
+            ..Default::default()
+        }));
         let items = vec![
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "erase me")],
+                typed: typed.clone(),
+                raw: serde_json::json!({"metadata": {"note": "erase me"}}),
                 user: erika.clone(),
             },
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "keep me")],
+                typed,
+                raw: serde_json::json!({"seed": 3}),
                 user: format!("other{ns}"),
             },
         ];
@@ -3872,6 +3884,12 @@ mod tests {
             loaded[1].messages[0].content, "keep me",
             "other users' queued items untouched"
         );
+        assert!(loaded[0].typed.is_none() && loaded[0].raw.is_null());
+        assert!(matches!(
+            &loaded[1].typed,
+            Some(gw_models::TypedParams::Chat(p)) if p.max_tokens == Some(7)
+        ));
+        assert_eq!(loaded[1].raw["seed"], 3);
         let fresh = store
             .batch_item_snapshot(&pending.id, 0)
             .await
@@ -4305,10 +4323,12 @@ mod tests {
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "one")],
                 user: "u-one".into(),
+                ..Default::default()
             },
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "two")],
                 user: "u-two".into(),
+                ..Default::default()
             },
         ];
         let qjob = store

@@ -155,10 +155,11 @@ impl OfflineHandler {
                 is_online: false,
                 message: item.messages,
                 user_id: (!item.user.is_empty()).then_some(item.user),
-                model_param_v2: Some(ModelParamV2::with_name(
-                    gw_consts::Protocol::OpenaiChat,
-                    model.to_owned(),
-                )),
+                model_param_v2: Some(ModelParamV2 {
+                    typed: item.typed,
+                    raw: item.raw,
+                    ..ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, model)
+                }),
                 ..Default::default()
             };
             // each item on its own task so a pipeline panic fails the item, not the batch

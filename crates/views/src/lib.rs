@@ -2849,63 +2849,14 @@ async fn chat_completions(
         return error_response(400, "messages must not be empty");
     }
 
-    let mut leading = true;
-    let messages: Vec<ChatMsg> = body
-        .messages
-        .into_iter()
-        .map(|m| {
-            let (content, parts) = m
-                .content
-                .map(|c| c.into_text_and_parts())
-                .unwrap_or_default();
-            let role = if leading && m.role == "developer" {
-                gw_consts::role::SYSTEM.to_owned()
-            } else {
-                m.role.into_owned()
-            };
-            leading = leading && role == gw_consts::role::SYSTEM;
-            ChatMsg {
-                role,
-                content,
-                parts: parts.map(Value::Array),
-                tool_calls: m.tool_calls.map(Value::Array),
-                tool_call_id: m.tool_call_id,
-                reasoning_content: m.reasoning_content,
-                reasoning_details: m.reasoning_details.map(Value::Array),
-            }
-        })
-        .collect();
-    let typed = TypedParams::Chat(ChatParams {
-        temperature: body.temperature,
-        top_p: body.top_p,
-        max_tokens: body.max_tokens.or(body.max_completion_tokens),
-        client_sent_max_completion_tokens: body.max_tokens.is_none()
-            && body.max_completion_tokens.is_some(),
-        stop: body.stop,
-        presence_penalty: body.presence_penalty,
-        frequency_penalty: body.frequency_penalty,
-        tools: body.tools.map(Value::Array),
-        tool_choice: body.tool_choice,
-        response_format: body.response_format,
-        logprobs: body.logprobs,
-        top_logprobs: body.top_logprobs,
-        system: None,
-        system_blocks: None,
-        reasoning: chat_reasoning(body.reasoning_effort, body.reasoning),
-    });
-    let stream_model = body.stream.then(|| body.model.clone());
-    let mut param = ModelParamV2::with_name(
-        // placeholder type; the resolve_model DAG node maps model_name properly
-        gw_consts::Protocol::OpenaiChat,
-        body.model,
-    );
-    param.typed = Some(typed);
-    param.raw = Value::Object(body.extra);
+    let stream = body.stream;
+    let (messages, param) = chat_request(body);
+    let stream_model = stream.then(|| param.model_name.clone());
     let user_id = user_hint(hint, &param.raw["user"]);
 
     let request = GatewayRequest {
         is_online: true,
-        stream: body.stream,
+        stream,
         message: messages,
         model_param_v2: Some(param),
         user_id,
@@ -2968,6 +2919,61 @@ async fn chat_completions(
     }
     let response = (StatusCode::OK, Json(resp)).into_response();
     terminal_response(&ctx, response).await
+}
+
+fn chat_request(body: ChatCompletionRequest) -> (Vec<ChatMsg>, ModelParamV2) {
+    let mut leading = true;
+    let messages: Vec<ChatMsg> = body
+        .messages
+        .into_iter()
+        .map(|m| {
+            let (content, parts) = m
+                .content
+                .map(|c| c.into_text_and_parts())
+                .unwrap_or_default();
+            let role = if leading && m.role == "developer" {
+                gw_consts::role::SYSTEM.to_owned()
+            } else {
+                m.role.into_owned()
+            };
+            leading = leading && role == gw_consts::role::SYSTEM;
+            ChatMsg {
+                role,
+                content,
+                parts: parts.map(Value::Array),
+                tool_calls: m.tool_calls.map(Value::Array),
+                tool_call_id: m.tool_call_id,
+                reasoning_content: m.reasoning_content,
+                reasoning_details: m.reasoning_details.map(Value::Array),
+            }
+        })
+        .collect();
+    let typed = TypedParams::Chat(ChatParams {
+        temperature: body.temperature,
+        top_p: body.top_p,
+        max_tokens: body.max_tokens.or(body.max_completion_tokens),
+        client_sent_max_completion_tokens: body.max_tokens.is_none()
+            && body.max_completion_tokens.is_some(),
+        stop: body.stop,
+        presence_penalty: body.presence_penalty,
+        frequency_penalty: body.frequency_penalty,
+        tools: body.tools.map(Value::Array),
+        tool_choice: body.tool_choice,
+        response_format: body.response_format,
+        logprobs: body.logprobs,
+        top_logprobs: body.top_logprobs,
+        system: None,
+        system_blocks: None,
+        reasoning: chat_reasoning(body.reasoning_effort, body.reasoning),
+    });
+    let mut param = ModelParamV2::with_name(
+        // placeholder type; the resolve_model DAG node maps model_name properly
+        gw_consts::Protocol::OpenaiChat,
+        body.model,
+    );
+    param.typed = Some(typed);
+    param.raw = Value::Object(body.extra);
+    (messages, param)
 }
 
 /// Run the pipeline on its own task, forwarding chunks through a bounded channel;
@@ -4664,20 +4670,26 @@ async fn rerank(
     .await
 }
 
-fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
-    v["messages"]
-        .as_array()
-        .map(|ms| {
-            ms.iter()
-                .map(|m| {
-                    ChatMsg::text(
-                        m["role"].as_str().unwrap_or("user"),
-                        m["content"].as_str().unwrap_or_default(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn batch_item(mut line: Value, hint: Option<&str>) -> Result<(BatchItem, String), String> {
+    let user = cap_user_hint(line["user"].as_str().or(hint).unwrap_or_default());
+    if let Some(fields) = line.as_object_mut() {
+        fields
+            .entry("model")
+            .or_insert_with(|| Value::String(String::new()));
+    }
+    let body = serde_json::from_value::<ChatCompletionRequest>(line)
+        .map_err(|e| format!("batch item is not a chat request: {e}"))?;
+    let (messages, param) = chat_request(body);
+    if messages.is_empty() {
+        return Err("each item needs a non-empty messages array".into());
+    }
+    let item = BatchItem {
+        messages,
+        typed: param.typed,
+        raw: param.raw,
+        user,
+    };
+    Ok((item, param.model_name))
 }
 
 /// POST /v1/batches (inline `items` or an uploaded JSONL `input_file_id`).
@@ -4689,10 +4701,6 @@ async fn batches_submit(
 ) -> Response {
     let mut model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let mut batch_items = Vec::new();
-    // batch-level attribution hint; a per-item body `user` overrides it
-    let item_user =
-        |v: &Value| cap_user_hint(v["user"].as_str().or(hint.as_deref()).unwrap_or_default());
-
     if let Some(file_id) = body["input_file_id"].as_str() {
         let found = s.handler.state().store.file_get(file_id).await;
         let file = match tenant_owned(found, |f| &f.tenant, &ak.tenant, "input file", file_id) {
@@ -4700,34 +4708,25 @@ async fn batches_submit(
             Err(resp) => return resp,
         };
         for line in file.content.lines().filter(|l| !l.trim().is_empty()) {
-            let Ok(req) = serde_json::from_str::<Value>(line) else {
+            let Ok(mut req) = serde_json::from_str::<Value>(line) else {
                 return error_response(400, "input file line is not valid json");
             };
-            let reqbody = &req["body"];
-            if model.is_empty()
-                && let Some(m) = reqbody["model"].as_str()
-            {
-                model = m.to_owned();
+            match batch_item(req["body"].take(), hint.as_deref()) {
+                Ok((item, line_model)) => {
+                    if model.is_empty() {
+                        model = line_model;
+                    }
+                    batch_items.push(item);
+                }
+                Err(e) => return error_response(400, e),
             }
-            let msgs = parse_batch_messages(reqbody);
-            if msgs.is_empty() {
-                return error_response(400, "input file line missing a messages array");
-            }
-            batch_items.push(BatchItem {
-                messages: msgs,
-                user: item_user(reqbody),
-            });
         }
-    } else if let Some(items) = body["items"].as_array() {
+    } else if let Some(items) = body["items"].as_array_mut() {
         for it in items {
-            let msgs = parse_batch_messages(it);
-            if msgs.is_empty() {
-                return error_response(400, "each item needs a non-empty messages array");
+            match batch_item(it.take(), hint.as_deref()) {
+                Ok((item, _)) => batch_items.push(item),
+                Err(e) => return error_response(400, e),
             }
-            batch_items.push(BatchItem {
-                messages: msgs,
-                user: item_user(it),
-            });
         }
     } else {
         return error_response(400, "either items or input_file_id is required");

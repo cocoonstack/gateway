@@ -131,11 +131,13 @@ fn replays_responses_reasoning(param: &ModelParamV2) -> bool {
         .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning"))
 }
 
-/// One queued batch item: messages plus the end-user attribution, persisted so
-/// a distributed drainer still attributes and budgets it (owner overrides at billing).
-#[derive(Debug, Clone)]
+/// One queued batch item: a parsed chat request plus the end-user attribution, persisted
+/// so a distributed drainer still attributes and budgets it (owner overrides at billing).
+#[derive(Debug, Clone, Default)]
 pub struct BatchItem {
     pub messages: Vec<ChatMsg>,
+    pub typed: Option<crate::params::TypedParams>,
+    pub raw: serde_json::Value,
     pub user: String,
 }
 

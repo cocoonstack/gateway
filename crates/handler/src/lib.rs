@@ -2818,10 +2818,12 @@ mod tests {
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
                 user: String::new(),
+                ..Default::default()
             },
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
                 user: String::new(),
+                ..Default::default()
             },
         ];
         let job = off
@@ -2845,10 +2847,12 @@ mod tests {
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "one")],
                         user: String::new(),
+                        ..Default::default()
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "two")],
                         user: String::new(),
+                        ..Default::default()
                     },
                 ],
             )
@@ -2882,6 +2886,7 @@ mod tests {
                 vec![BatchItem {
                     messages: vec![ChatMsg::text("user", "one")],
                     user: String::new(),
+                    ..Default::default()
                 }],
             )
             .await
@@ -2923,6 +2928,7 @@ mod tests {
                 vec![BatchItem {
                     messages: vec![ChatMsg::text("user", "new content after erasure")],
                     user: "user-42".into(),
+                    ..Default::default()
                 }],
             )
             .await
@@ -2948,6 +2954,7 @@ mod tests {
                 vec![BatchItem {
                     messages: Vec::new(),
                     user: "u1".into(),
+                    ..Default::default()
                 }],
             )
             .await
@@ -2978,10 +2985,12 @@ mod tests {
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "for alice")],
                         user: "alice".into(),
+                        ..Default::default()
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "for bob")],
                         user: "bob".into(),
+                        ..Default::default()
                     },
                 ],
             )
@@ -3036,10 +3045,12 @@ mod tests {
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "alpha")],
                         user: "alice".into(),
+                        ..Default::default()
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "beta")],
                         user: "bob".into(),
+                        ..Default::default()
                     },
                 ],
             )
