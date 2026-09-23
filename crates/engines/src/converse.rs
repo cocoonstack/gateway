@@ -13,13 +13,12 @@ use serde_json::{Map, Value, json};
 /// Markers of the Bedrock ids whose family takes `reasoning_config`.
 const REASONING_CONFIG_MARKERS: [&str; 2] = ["openai.gpt-", "xai.grok-"];
 
-/// Converse stream events as the Anthropic sequence: implicit text/reasoning
-/// blocks get a synthesized `content_block_start`, the trailing `metadata`
-/// becomes the `message_delta` usage overlay plus `message_stop`.
+/// Converse stream events as the Anthropic event sequence.
 #[derive(Debug)]
 pub(crate) struct Events {
     model: String,
     open: Vec<u64>,
+    stop_reason: &'static str,
 }
 
 impl Events {
@@ -27,6 +26,7 @@ impl Events {
         Self {
             model,
             open: Vec::new(),
+            stop_reason: stop_reason(None),
         }
     }
 
@@ -119,14 +119,17 @@ impl Events {
                 self.open.retain(|i| *i != index);
                 vec![json!({"type": "content_block_stop", "index": index})]
             }
-            "messageStop" => vec![json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason(ev["stopReason"].as_str()), "stop_sequence": null}
-            })],
+            "messageStop" => {
+                self.stop_reason = stop_reason(ev["stopReason"].as_str());
+                Vec::new()
+            }
             "metadata" => vec![
                 object([
                     ("type", "message_delta".into()),
-                    ("delta", json!({})),
+                    (
+                        "delta",
+                        json!({"stop_reason": self.stop_reason, "stop_sequence": null}),
+                    ),
                     ("usage", usage(&mut ev["usage"])),
                 ]),
                 json!({"type": "message_stop"}),
@@ -833,7 +836,6 @@ mod tests {
                 "content_block_delta",
                 "content_block_stop",
                 "message_delta",
-                "message_delta",
                 "message_stop"
             ]
         );
@@ -842,7 +844,7 @@ mod tests {
         assert_eq!(out[5]["content_block"]["type"], "text");
         assert_eq!(out[10]["delta"]["partial_json"], "{\"a\":1}");
         assert_eq!(out[12]["delta"]["stop_reason"], "tool_use");
-        assert_eq!(out[13]["usage"]["output_tokens"], 9);
+        assert_eq!(out[12]["usage"]["output_tokens"], 9);
     }
 
     #[test]
