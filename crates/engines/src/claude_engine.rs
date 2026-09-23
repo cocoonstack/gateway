@@ -490,8 +490,7 @@ impl<'a> SseState<'a> {
                 }
             }
             "content_block_delta" => {
-                // the native event is forwarded whole, so its text is read; the chat
-                // surface renders from the chunk instead, so its text is moved
+                // the native event keeps its delta; the chat surface moves it out
                 if self.preserve_native {
                     if let Some(t) = v["delta"]["text"].as_str() {
                         self.full.push_str(t);
@@ -510,7 +509,6 @@ impl<'a> SseState<'a> {
                     }
                     native_chunk.delta = t;
                 }
-                // the native event keeps its delta; the chat surface moves it out
                 if self.preserve_native {
                     if let Some(t) = v["delta"]["thinking"].as_str() {
                         self.append_thinking(t);

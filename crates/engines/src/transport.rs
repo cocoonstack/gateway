@@ -14,8 +14,8 @@ pub use crate::mock_transport::MockTransport;
 
 /// Fixed "created" timestamp for deterministic mock payloads.
 pub const MOCK_CREATED: i64 = 1_720_000_000;
-/// 1x1 PNG-ish placeholder bytes, base64. Deterministic image/audio payload.
-pub const MOCK_B64: &str = "TU9DS0JZVEVT"; // "MOCKBYTES"
+/// Deterministic image/audio payload: base64 of "MOCKBYTES".
+pub const MOCK_B64: &str = "TU9DS0JZVEVT";
 pub(crate) const DEFAULT_CONNECT_RETRIES: u32 = 1;
 
 /// Wire headers an engine attaches; names are always literals.
