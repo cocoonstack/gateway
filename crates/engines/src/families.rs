@@ -1247,6 +1247,7 @@ impl ResponsesEngine {
         if !system.is_empty() {
             body.entry("instructions").or_insert(system.into());
         }
+        body.entry("store").or_insert(false.into());
         let messages = std::mem::take(&mut self.base.request.message);
         let mut input = Vec::with_capacity(messages.len());
         for m in messages {
@@ -2039,6 +2040,10 @@ mod tests {
         }));
         let body = ResponsesEngine::new(r, t()).build_body().unwrap();
         assert_eq!(body["instructions"], "be terse");
+        assert_eq!(
+            body["store"], false,
+            "chat completions do not store by default"
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 64);
         assert_eq!(body["reasoning"]["effort"], "low");
