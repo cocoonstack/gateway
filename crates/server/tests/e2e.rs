@@ -4796,7 +4796,6 @@ accounts:
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
     }
-    // a bare wire name resolves to its own protocol, so it must be refused the same way
     for path in ["/v1/embeddings", "/v1/rerank", "/v1/responses"] {
         let resp = app
             .clone()
@@ -4819,7 +4818,6 @@ accounts:
         "a model the surface cannot serve must be refused before any upstream call"
     );
 
-    // the one cross-protocol pairing that is legitimate still reaches the vendor
     let resp = app
         .oneshot(post(
             "/v1/embeddings",

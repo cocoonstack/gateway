@@ -78,8 +78,7 @@ fn openai_generation(model: &str) -> Option<(u32, u32)> {
     (major >= 5).then_some((major, minor))
 }
 
-/// Whether the request reasons: an effort other than `none`, or no effort on a generation
-/// that reasons by default (GPT-5.0 knows `minimal` but not `none`; GPT-6 onward).
+/// Whether the request reasons: any effort but `none`, or no effort on GPT-5.0 or GPT-6 onward.
 fn reasoning_engaged(generation: (u32, u32), effort: Option<&str>) -> bool {
     match effort {
         Some(effort) => effort != "none",
