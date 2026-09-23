@@ -509,15 +509,17 @@ fn usage(u: &mut Value) -> Value {
             out.insert(to.into(), n);
         }
     }
-    if let Some(tokens) = u["cacheDetails"].as_array().and_then(|details| {
-        details
-            .iter()
-            .find(|detail| detail["ttl"] == "1h")
-            .and_then(|detail| detail["inputTokens"].as_i64())
-    }) {
+    if let Some(details) = u["cacheDetails"].as_array() {
+        let ttl = |ttl: &str| -> i64 {
+            details
+                .iter()
+                .filter(|detail| detail["ttl"] == ttl)
+                .filter_map(|detail| detail["inputTokens"].as_i64())
+                .sum()
+        };
         out.insert(
             "cache_creation".into(),
-            json!({"ephemeral_1h_input_tokens": tokens}),
+            json!({"ephemeral_5m_input_tokens": ttl("5m"), "ephemeral_1h_input_tokens": ttl("1h")}),
         );
     }
     Value::Object(out)
@@ -816,6 +818,7 @@ mod tests {
         assert_eq!(m["usage"]["cache_read_input_tokens"], 3);
         assert_eq!(m["usage"]["cache_creation_input_tokens"], 5);
         assert_eq!(m["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 3);
+        assert_eq!(m["usage"]["cache_creation"]["ephemeral_5m_input_tokens"], 2);
         let usage = crate::usage_extract::extract_common_usage(&m["usage"], true).unwrap();
         assert_eq!((usage.write_cache, usage.write_cache_1h), (5, 3));
         assert_eq!(m["model"], "eu.amazon.nova-micro-v1:0");
