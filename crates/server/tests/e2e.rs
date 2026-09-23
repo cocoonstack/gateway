@@ -20,6 +20,8 @@ use tower::ServiceExt;
 mod common;
 use common::app;
 
+const CHAT_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello e2e"}]}"#;
+
 #[tokio::test]
 async fn admin_audit_freezes_source_ip_before_a_trust_flip() {
     const V1: &str = r#"
@@ -684,8 +686,6 @@ fn internal_get(uri: &str) -> Request<Body> {
         .body(Body::empty())
         .expect("request")
 }
-
-const CHAT_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello e2e"}]}"#;
 
 #[tokio::test]
 async fn health_and_models() {
