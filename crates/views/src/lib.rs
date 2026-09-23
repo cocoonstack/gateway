@@ -3317,7 +3317,14 @@ fn redacted_stream_tail(outcome: &mut gw_engines::EngineOutcome) -> Vec<gw_engin
         return gw_engines::anthropic_native_chunks(resp, content, None);
     }
     outcome.chunks.clear();
-    synth_chunks(outcome)
+    let mut chunks = synth_chunks(outcome);
+    if let Some(error) = outcome.terminal_error.clone() {
+        chunks.push(gw_engines::StreamChunk {
+            error: Some(Box::new(error)),
+            ..Default::default()
+        });
+    }
+    chunks
 }
 
 fn stream_chunk_output_tokens(chunk: &gw_engines::StreamChunk) -> i64 {
