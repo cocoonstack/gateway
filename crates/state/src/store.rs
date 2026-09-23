@@ -3162,6 +3162,24 @@ mod tests {
         }
     }
 
+    fn item(text: &str, user: &str) -> gw_models::BatchItem {
+        gw_models::BatchItem {
+            messages: vec![gw_models::ChatMsg::text("user", text)],
+            user: user.into(),
+            ..Default::default()
+        }
+    }
+
+    fn result(index: usize, ok: bool, message: &str, total_tokens: i64) -> BatchItemResult {
+        BatchItemResult {
+            index,
+            ok,
+            message: message.into(),
+            total_tokens,
+            ..Default::default()
+        }
+    }
+
     async fn exercise(store: &dyn Store) {
         store.ledger_add(&record("m1")).await.unwrap();
         store.ledger_add(&record("m2")).await.unwrap();
@@ -3196,17 +3214,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .batch_push_result(
-                &job.id,
-                BatchItemResult {
-                    index: 0,
-                    ok: true,
-                    message: "ok".into(),
-                    total_tokens: 8,
-                    user: String::new(),
-                    ..Default::default()
-                },
-            )
+            .batch_push_result(&job.id, result(0, true, "ok", 8))
             .await
             .unwrap();
         store
@@ -4056,14 +4064,7 @@ mod tests {
     #[tokio::test]
     async fn batch_result_rejected_after_terminal_and_finalize_derives() {
         let store = MemoryStore::default();
-        let res = |index, ok| BatchItemResult {
-            index,
-            ok,
-            message: String::new(),
-            total_tokens: 0,
-            user: String::new(),
-            ..Default::default()
-        };
+        let res = |index, ok| result(index, ok, "", 0);
         let job = store.batch_create("ak", "default", "m", 2).await.unwrap();
         store
             .batch_push_result(&job.id, res(0, true))
@@ -4315,34 +4316,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .batch_push_result(
-                &b.id,
-                BatchItemResult {
-                    index: 0,
-                    ok: true,
-                    message: "ok".into(),
-                    total_tokens: 5,
-                    user: String::new(),
-                    ..Default::default()
-                },
-            )
+            .batch_push_result(&b.id, result(0, true, "ok", 5))
             .await
             .unwrap();
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
         assert_eq!(got.status, BatchStatus::Running);
         assert_eq!(got.results.len(), 1);
         store
-            .batch_push_result(
-                &b.id,
-                BatchItemResult {
-                    index: 0,
-                    ok: false,
-                    message: "stale".into(),
-                    total_tokens: 0,
-                    user: String::new(),
-                    ..Default::default()
-                },
-            )
+            .batch_push_result(&b.id, result(0, false, "stale", 0))
             .await
             .unwrap();
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
@@ -4356,17 +4337,7 @@ mod tests {
             Some(BatchStatus::Failed)
         );
         store
-            .batch_push_result(
-                &b.id,
-                BatchItemResult {
-                    index: 1,
-                    ok: true,
-                    message: "late".into(),
-                    total_tokens: 0,
-                    user: String::new(),
-                    ..Default::default()
-                },
-            )
+            .batch_push_result(&b.id, result(1, true, "late", 0))
             .await
             .unwrap();
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
@@ -4378,18 +4349,7 @@ mod tests {
         assert_eq!(got.status, BatchStatus::Failed);
 
         assert!(store.distributes_batches());
-        let qmsgs = vec![
-            gw_models::BatchItem {
-                messages: vec![gw_models::ChatMsg::text("user", "one")],
-                user: "u-one".into(),
-                ..Default::default()
-            },
-            gw_models::BatchItem {
-                messages: vec![gw_models::ChatMsg::text("user", "two")],
-                user: "u-two".into(),
-                ..Default::default()
-            },
-        ];
+        let qmsgs = vec![item("one", "u-one"), item("two", "u-two")];
         let qjob = store
             .batch_enqueue("ak-b", "default", "gpt-4o", &qmsgs)
             .await

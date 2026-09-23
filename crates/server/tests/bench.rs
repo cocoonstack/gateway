@@ -5,8 +5,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
@@ -58,6 +59,24 @@ fn tool_chat_req() -> Request<Body> {
         .expect("request")
 }
 
+async fn serial(app: &Router, n: usize, req: impl Fn() -> Request<Body>) -> (Vec<u64>, Duration) {
+    let mut lat_us = Vec::with_capacity(n);
+    let t0 = Instant::now();
+    for _ in 0..n {
+        let t = Instant::now();
+        let resp = app.clone().oneshot(req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        lat_us.push(t.elapsed().as_micros() as u64);
+    }
+    let total = t0.elapsed();
+    lat_us.sort_unstable();
+    (lat_us, total)
+}
+
+fn pct(lat_us: &[u64], p: f64) -> u64 {
+    lat_us[((lat_us.len() as f64 * p) as usize).min(lat_us.len() - 1)]
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark; run with --ignored --nocapture"]
 async fn bench_request_clone() {
@@ -99,20 +118,12 @@ async fn bench_big_payload() {
         app.clone().oneshot(big_chat_req()).await.unwrap();
     }
     const N: usize = 2000;
-    let mut lat_us = Vec::with_capacity(N);
-    for _ in 0..N {
-        let t = Instant::now();
-        let resp = app.clone().oneshot(big_chat_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        lat_us.push(t.elapsed().as_micros() as u64);
-    }
-    lat_us.sort_unstable();
-    let pct = |p: f64| lat_us[((lat_us.len() as f64 * p) as usize).min(lat_us.len() - 1)];
+    let (lat_us, _) = serial(&app, N, big_chat_req).await;
     println!(
         "big-payload serial: n={N} p50={}us p95={}us p99={}us",
-        pct(0.50),
-        pct(0.95),
-        pct(0.99),
+        pct(&lat_us, 0.50),
+        pct(&lat_us, 0.95),
+        pct(&lat_us, 0.99),
     );
 }
 
@@ -127,23 +138,13 @@ async fn bench_chat_completions() {
     }
 
     const N: usize = 2000;
-    let mut lat_us = Vec::with_capacity(N);
-    let t0 = Instant::now();
-    for _ in 0..N {
-        let t = Instant::now();
-        let resp = app.clone().oneshot(chat_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        lat_us.push(t.elapsed().as_micros() as u64);
-    }
-    let serial_total = t0.elapsed();
-    lat_us.sort_unstable();
-    let pct = |p: f64| lat_us[((lat_us.len() as f64 * p) as usize).min(lat_us.len() - 1)];
+    let (lat_us, serial_total) = serial(&app, N, chat_req).await;
     println!(
         "serial: n={N} total={serial_total:?} rps={:.0} p50={}us p95={}us p99={}us max={}us",
         N as f64 / serial_total.as_secs_f64(),
-        pct(0.50),
-        pct(0.95),
-        pct(0.99),
+        pct(&lat_us, 0.50),
+        pct(&lat_us, 0.95),
+        pct(&lat_us, 0.99),
         lat_us[lat_us.len() - 1],
     );
 
@@ -182,23 +183,13 @@ async fn bench_tool_calls() {
     }
 
     const N: usize = 2000;
-    let mut lat_us = Vec::with_capacity(N);
-    let t0 = Instant::now();
-    for _ in 0..N {
-        let t = Instant::now();
-        let resp = app.clone().oneshot(tool_chat_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        lat_us.push(t.elapsed().as_micros() as u64);
-    }
-    let serial_total = t0.elapsed();
-    lat_us.sort_unstable();
-    let pct = |p: f64| lat_us[((lat_us.len() as f64 * p) as usize).min(lat_us.len() - 1)];
+    let (lat_us, serial_total) = serial(&app, N, tool_chat_req).await;
     println!(
         "tool-calls serial: n={N} total={serial_total:?} rps={:.0} p50={}us p95={}us p99={}us max={}us",
         N as f64 / serial_total.as_secs_f64(),
-        pct(0.50),
-        pct(0.95),
-        pct(0.99),
+        pct(&lat_us, 0.50),
+        pct(&lat_us, 0.95),
+        pct(&lat_us, 0.99),
         lat_us[lat_us.len() - 1],
     );
 }

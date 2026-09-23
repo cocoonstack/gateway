@@ -19,6 +19,9 @@ use gw_views::AppState;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+mod common;
+use common::body_json;
+
 async fn spawn_vendor() -> String {
     let app = Router::new()
         .route(
@@ -108,13 +111,6 @@ accounts:
     let state = Arc::new(GatewayState::from_config(&cfg));
     let transport = Arc::new(HttpTransport::new(Duration::from_secs(5)).expect("http transport"));
     gw_views::app(AppState::new(cfg, state, transport))
-}
-
-async fn body_json(resp: axum::response::Response) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&bytes).unwrap()
 }
 
 #[tokio::test]

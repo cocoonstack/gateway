@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 mod common;
-use common::app;
+use common::{app, body_json};
 
 const CHAT_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello e2e"}]}"#;
 
@@ -319,8 +319,20 @@ async fn serve_app(application: Router) -> std::net::SocketAddr {
     addr
 }
 
-async fn body_json(resp: Response) -> Value {
-    serde_json::from_slice(&body_bytes(resp).await).expect("json body")
+async fn wait_batch(app: &Router, ak: &str, id: &str) -> Value {
+    for _ in 0..500 {
+        let req = Request::builder()
+            .uri(format!("/v1/batches/{id}"))
+            .header("authorization", format!("Bearer {ak}"))
+            .body(Body::empty())
+            .unwrap();
+        let j = body_json(app.clone().oneshot(req).await.unwrap()).await;
+        if j["status"] == "completed" || j["status"] == "failed" {
+            return j;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("batch {id} did not finish");
 }
 
 #[tokio::test]
@@ -1437,22 +1449,10 @@ async fn pricing_dimensions_batch_discount_long_context_tier_and_per_image() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
-    let mut done = None;
-    for _ in 0..100 {
-        let j = body_json(
-            app.clone()
-                .oneshot(get_authed(&format!("/v1/batches/{id}")))
-                .await
-                .unwrap(),
-        )
-        .await;
-        if j["status"] == "completed" {
-            done = Some(j);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    done.expect("batch finished");
+    assert_eq!(
+        wait_batch(&app, "ak-demo-123", &id).await["status"],
+        "completed"
+    );
     let resp = app
         .clone()
         .oneshot(post(
@@ -2073,22 +2073,7 @@ async fn batch_submit_and_poll() {
     let id = j["id"].as_str().unwrap().to_owned();
     assert_eq!(j["total"], 2);
 
-    let mut done = None;
-    for _ in 0..100 {
-        let resp = app
-            .clone()
-            .oneshot(get_authed(&format!("/v1/batches/{id}")))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
-        if j["status"] == "completed" || j["status"] == "failed" {
-            done = Some(j);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let j = done.expect("batch finished");
+    let j = wait_batch(&app, "ak-demo-123", &id).await;
     assert_eq!(j["status"], "completed");
     assert_eq!(j["results"].as_array().unwrap().len(), 2);
     assert!(
@@ -2785,21 +2770,7 @@ async fn files_upload_then_batch_from_file() {
     assert_eq!(j["total"], 2);
     let id = j["id"].as_str().unwrap().to_owned();
 
-    let mut done = None;
-    for _ in 0..100 {
-        let resp = app
-            .clone()
-            .oneshot(get_authed(&format!("/v1/batches/{id}")))
-            .await
-            .unwrap();
-        let j = body_json(resp).await;
-        if j["status"] == "completed" || j["status"] == "failed" {
-            done = Some(j);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let j = done.expect("batch finished");
+    let j = wait_batch(&app, "ak-demo-123", &id).await;
     assert_eq!(j["status"], "completed");
     assert_eq!(j["results"].as_array().unwrap().len(), 2);
 }
@@ -5934,22 +5905,6 @@ async fn a_buffered_native_reply_keeps_the_vendor_stop_sequence_and_usage() {
         v["usage"]["output_tokens_details"]["thinking_tokens"], 3,
         "{v}"
     );
-}
-
-async fn wait_batch(app: &Router, ak: &str, id: &str) -> Value {
-    for _ in 0..500 {
-        let req = Request::builder()
-            .uri(format!("/v1/batches/{id}"))
-            .header("authorization", format!("Bearer {ak}"))
-            .body(Body::empty())
-            .unwrap();
-        let j = body_json(app.clone().oneshot(req).await.unwrap()).await;
-        if j["status"] == "completed" || j["status"] == "failed" {
-            return j;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("batch {id} did not finish");
 }
 
 #[tokio::test]
