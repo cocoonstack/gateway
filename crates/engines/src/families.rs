@@ -1509,10 +1509,10 @@ fn function_call_output(call_id: Value, output: String) -> Value {
 fn responses_finish(response: &Value, tool_calls: bool) -> String {
     let status = response["status"].as_str().unwrap_or("completed");
     match (status, response["incomplete_details"]["reason"].as_str()) {
-        _ if tool_calls => "tool_calls",
-        ("completed", _) => "stop",
         ("incomplete", Some("content_filter")) => "content_filter",
         ("incomplete", _) => "length",
+        _ if tool_calls => "tool_calls",
+        ("completed", _) => "stop",
         (other, _) => other,
     }
     .to_owned()
@@ -2501,7 +2501,10 @@ mod tests {
             ("max_output_tokens", "length"),
             ("content_filter", "content_filter"),
         ] {
-            let mut resp = GatewayResponse::default();
+            let mut resp = GatewayResponse {
+                tool_calls: Some(json!([{"id": "call_1"}])),
+                ..Default::default()
+            };
             let chunks = responses_apply_frame(
                 json!({"type": "response.incomplete", "response": {
                     "status": "incomplete", "incomplete_details": {"reason": reason},

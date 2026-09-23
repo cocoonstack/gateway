@@ -2725,7 +2725,7 @@ fn openai_tool_calls(calls: Value, index: &mut usize) -> Vec<Value> {
 fn finish_openai(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => Cow::Borrowed("stop"),
-        "max_tokens" => Cow::Borrowed("length"),
+        "max_tokens" | "model_context_window_exceeded" => Cow::Borrowed("length"),
         "tool_use" => Cow::Borrowed("tool_calls"),
         _ => Cow::Owned(fr),
     }
@@ -6349,6 +6349,10 @@ mod tests {
         assert_eq!(finish_openai("stop_sequence".into()), "stop");
         assert_eq!(finish_openai(String::new()), "stop");
         assert_eq!(finish_openai("max_tokens".into()), "length");
+        assert_eq!(
+            finish_openai("model_context_window_exceeded".into()),
+            "length"
+        );
         assert_eq!(finish_openai("tool_use".into()), "tool_calls");
         assert_eq!(finish_openai("refusal".into()), "refusal");
 
