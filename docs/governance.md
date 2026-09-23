@@ -89,6 +89,9 @@ window below); the token/window counters are fixed windows. When Redis is
 configured and unreachable, limits fail open (requests pass) and a warning is
 logged — a persistent outage never silently wedges the gateway.
 
+A batch item refused by one of these limits waits 1s, 2s and 4s between three
+retries before it fails.
+
 Key QPS is checked before tenant QPS in the model pipeline, realtime turns,
 MCP requests and video polls. A request denied by tenant QPS has already spent
 a key-QPS permit; a request denied by key QPS spends no tenant permit.

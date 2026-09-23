@@ -24,6 +24,8 @@ pub use gw_models::BatchItem;
 pub use offline::OfflineHandler;
 
 const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
+const OFFLINE_THROTTLE_RETRIES: u32 = 3;
+const OFFLINE_THROTTLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
 static REQ_INSTANCE: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +257,7 @@ impl OnlineHandler {
         }
 
         let mut tried = 0;
+        let mut throttled = 0;
         loop {
             ctx.fallback_ahead = !ctx.request.replays_reasoning_output()
                 && next_fallback(&snap.cfg, &ctx, tried).is_some();
@@ -284,6 +287,17 @@ impl OnlineHandler {
             {
                 tried = i + 1;
                 switch_model(&mut ctx, next, &e.message);
+                continue;
+            }
+            if !ctx.request.is_online
+                && throttled < OFFLINE_THROTTLE_RETRIES
+                && matches!(
+                    e.code,
+                    gw_consts::ErrCode::STOP_LIMIT_MSG | gw_consts::ErrCode::POOLED_LIMIT_MSG
+                )
+            {
+                tokio::time::sleep(OFFLINE_THROTTLE_BACKOFF * 2u32.pow(throttled)).await;
+                throttled += 1;
                 continue;
             }
             if e.code == gw_consts::ErrCode::STOP_LIMIT_MSG {
@@ -484,10 +498,14 @@ pub async fn complete_buffered_stream(
     ctx: &mut DagContext,
     delivery: gw_dag::StreamDelivery,
 ) -> GResult<()> {
-    let terminal = match &delivery {
-        gw_dag::StreamDelivery::Complete => terminal_plain_body("success", 200, false),
-        gw_dag::StreamDelivery::Partial(_) => terminal_plain_body("client_closed", 499, true),
-        gw_dag::StreamDelivery::None => terminal_plain_body("client_closed", 499, false),
+    let failure = ctx.outcome.as_ref().and_then(|o| o.terminal_error.as_ref());
+    let terminal = match (&delivery, failure) {
+        (gw_dag::StreamDelivery::Complete, Some(error)) => {
+            terminal_error_body(error.class, error.original_status, true)
+        }
+        (gw_dag::StreamDelivery::Complete, None) => terminal_plain_body("success", 200, false),
+        (gw_dag::StreamDelivery::Partial(_), _) => terminal_plain_body("client_closed", 499, true),
+        (gw_dag::StreamDelivery::None, _) => terminal_plain_body("client_closed", 499, false),
     };
     gw_dag::settle_deferred_stream(ctx, delivery).await?;
     persist_ctx_terminal(ctx, || terminal).await;
@@ -561,7 +579,10 @@ async fn note_abuse(ctx: &DagContext) {
 fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
         Some(status) => status >= 500 || status == 429,
-        None => e.http_status >= 502,
+        None => {
+            e.http_status >= 502
+                || (e.http_status == 429 && e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO)
+        }
     }
 }
 
@@ -1505,7 +1526,7 @@ mod tests {
         assert!(ledger[0].cost_micros >= 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn batch_item_rejections_do_not_trip_the_abuse_tier() {
         let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -1524,6 +1545,47 @@ mod tests {
             fresh.status_at(gw_state::epoch_secs()),
             gw_state::KeyStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn an_offline_request_waits_out_its_key_rate_limit() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        for _ in 0..2 {
+            let mut item = chat_req("gpt-4o", "hi");
+            item.is_online = false;
+            assert!(h.run(item, key.clone()).await.is_ok());
+        }
+        let err = h
+            .run(chat_req("gpt-4o", "hi"), key)
+            .await
+            .err()
+            .expect("an online request is refused at once");
+        assert_eq!(err.http_status, 429);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_item_on_a_variant_keeps_its_tenant_entitlement() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, variants: [{model: m1-b, weight: 1}]}, {name: m1-b, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m1]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        for _ in 0..2 {
+            let mut item = chat_req("m1", "hi");
+            item.is_online = false;
+            let ctx = h.run(item, key.clone()).await.unwrap();
+            assert_eq!(ctx.outcome.unwrap().response.model, "m1");
+        }
     }
 
     #[tokio::test]
@@ -2086,6 +2148,83 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct FailedResponsesStream(&'static str);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for FailedResponsesStream {
+        async fn send(
+            &self,
+            _request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let failed = format!(
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"code\":\"{}\",\"message\":\"failed\"}},\"usage\":{{\"input_tokens\":9,\"output_tokens\":7}}}}}}\n\n",
+                self.0
+            );
+            let frames = [
+                Ok(bytes::Bytes::from(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                )),
+                Ok(bytes::Bytes::from(failed)),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_band_responses_failure_bills_vendor_usage_and_faults_only_on_vendor_codes() {
+        for (code, native, faults) in [
+            ("failed_to_download_image", false, false),
+            ("server_error", false, true),
+            ("failed_to_download_image", true, false),
+            ("server_error", true, true),
+        ] {
+            let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: false}\nmodels: [{name: m, protocol: responses}]\naccounts: [{name: a1, provider: p, protocols: [responses]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+            let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(FailedResponsesStream(code)),
+            );
+            let mut request = drained_stream_req("m", "hi");
+            if native {
+                request.preserve_responses_wire = true;
+                if let Some(param) = request.model_param_v2.as_mut() {
+                    param.raw = serde_json::json!({"input": "hi"});
+                }
+            }
+            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let ctx = h.run(request, key).await.unwrap();
+            let outcome = ctx.outcome.expect("outcome");
+            assert!(outcome.terminal_error.is_some(), "{code} native={native}");
+            assert_eq!(
+                h.state().health.available("a1").await,
+                !faults,
+                "{code} native={native}"
+            );
+            let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+            assert_eq!(
+                ledger[0].completion_tokens, 7,
+                "vendor usage, {code} native={native}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vendor_rate_limit_is_an_upstream_fault_in_band_too() {
+        let in_band = GatewayError::new(gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO, 429, "slow");
+        assert!(is_upstream_fault(&in_band));
+        let local = GatewayError::new(gw_consts::ErrCode::STOP_LIMIT_MSG, 429, "qps");
+        assert!(!is_upstream_fault(&local));
+    }
+
     #[tokio::test]
     async fn committed_retry_error_records_both_account_failures() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: [openai-chat]}, {name: a-up, provider: p, priority: 2, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
@@ -2204,6 +2343,32 @@ mod tests {
         assert_eq!(terminal["state"], "error");
         assert_eq!(terminal["code"], "internal_server_exception");
         assert_eq!(terminal["http_status"], 500);
+        assert_eq!(terminal["stream_committed"], true);
+    }
+
+    #[tokio::test]
+    async fn a_buffered_responses_failure_persists_an_error_terminal_row() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: true}\nmodels: [{name: m, protocol: responses}]\naccounts: [{name: a1, provider: p, protocols: [responses]}]\ntenants: [{name: t1, retention: {content: redacted, days: 1}}]\naccess_keys: [{ak: retained-ak, tenant: t1, owner: attempt-1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(FailedResponsesStream("server_error")),
+        );
+        let mut request = chat_req("m", "hi");
+        request.stream = true;
+        request.preserve_responses_wire = true;
+        request.request_id = "req-buffered-failed".into();
+        if let Some(param) = request.model_param_v2.as_mut() {
+            param.raw = serde_json::json!({"input": "hi"});
+        }
+        let mut ctx = h.run(request, retained_ak(&h).await).await.unwrap();
+        assert!(ctx.billing_deferred);
+        complete_buffered_stream(&mut ctx, gw_dag::StreamDelivery::Complete)
+            .await
+            .unwrap();
+        let terminal = terminal_body(&h, "req-buffered-failed").await;
+        assert_eq!(terminal["state"], "error", "{terminal}");
         assert_eq!(terminal["stream_committed"], true);
     }
 
@@ -2708,10 +2873,12 @@ mod tests {
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
                 user: String::new(),
+                ..Default::default()
             },
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
                 user: String::new(),
+                ..Default::default()
             },
         ];
         let job = off
@@ -2735,10 +2902,12 @@ mod tests {
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "one")],
                         user: String::new(),
+                        ..Default::default()
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "two")],
                         user: String::new(),
+                        ..Default::default()
                     },
                 ],
             )
@@ -2753,6 +2922,36 @@ mod tests {
             h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_batch_item_fails_with_its_finish_reason() {
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.blocklist = vec!["forbidden".into()];
+        cfg.security = std::mem::take(&mut cfg.security).compiled();
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let job = OfflineHandler::new(h.clone())
+            .submit(
+                ak(&h).await,
+                "gpt-4o-mini".into(),
+                vec![BatchItem {
+                    messages: vec![ChatMsg::text("user", "a forbidden word")],
+                    user: String::new(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert!(!j.results[0].ok, "{:?}", j.results);
+        assert_eq!(j.results[0].finish_reason, "content_filter");
+        assert_eq!(j.status, gw_state::BatchStatus::Failed);
     }
 
     #[tokio::test]
@@ -2772,6 +2971,7 @@ mod tests {
                 vec![BatchItem {
                     messages: vec![ChatMsg::text("user", "one")],
                     user: String::new(),
+                    ..Default::default()
                 }],
             )
             .await
@@ -2813,6 +3013,7 @@ mod tests {
                 vec![BatchItem {
                     messages: vec![ChatMsg::text("user", "new content after erasure")],
                     user: "user-42".into(),
+                    ..Default::default()
                 }],
             )
             .await
@@ -2838,6 +3039,7 @@ mod tests {
                 vec![BatchItem {
                     messages: Vec::new(),
                     user: "u1".into(),
+                    ..Default::default()
                 }],
             )
             .await
@@ -2868,10 +3070,12 @@ mod tests {
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "for alice")],
                         user: "alice".into(),
+                        ..Default::default()
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "for bob")],
                         user: "bob".into(),
+                        ..Default::default()
                     },
                 ],
             )
@@ -2926,10 +3130,12 @@ mod tests {
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "alpha")],
                         user: "alice".into(),
+                        ..Default::default()
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "beta")],
                         user: "bob".into(),
+                        ..Default::default()
                     },
                 ],
             )

@@ -50,10 +50,11 @@ const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 /// starts. Valid in both SQL dialects.
 const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup";
 
-/// A put prunes async video jobs older than this (vendor results expire far sooner).
-const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
-/// Rows per batch_items INSERT: four binds each under the 65535-parameter limit.
-const BATCH_ITEM_CHUNK: usize = 16_000;
+/// A put prunes async video jobs older than this (vendor results expire far sooner),
+/// as a create does in-memory batches.
+const JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+/// Rows per batch_items INSERT: five binds each under the 65535-parameter limit.
+const BATCH_ITEM_CHUNK: usize = 13_000;
 
 // store pool size when storage.postgres_max_connections is unset
 const PG_MAX_CONNECTIONS: u32 = 10;
@@ -134,12 +135,16 @@ impl BatchStatus {
 }
 
 /// One item's result inside a batch.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BatchItemResult {
     pub index: usize,
     pub ok: bool,
     pub message: String,
     pub total_tokens: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
     /// Effective end user the item billed to; ties the generated `message`
     /// to an owner so user erasure can reach it.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -764,7 +769,7 @@ pub struct MemoryStore {
     /// [`Store::user_erased_since`] — one entry per pair, not a log.
     erasures: Mutex<HashMap<String, HashMap<String, i64>>>,
     files: DashMap<String, StoredFile>,
-    jobs: DashMap<String, BatchJob>,
+    jobs: DashMap<String, (BatchJob, i64)>,
     videos: DashMap<String, (VideoJob, bool)>,
     seq: AtomicUsize,
     /// oldest records beyond this are pruned on write; 0 = unlimited.
@@ -1048,13 +1053,15 @@ impl Store for MemoryStore {
             let mut content = lock(&self.content);
             content.retain(|r| r.user_id != user || tenant.is_some_and(|t| t != r.tenant))
         };
-        for mut job in self.jobs.iter_mut() {
+        for mut entry in self.jobs.iter_mut() {
+            let job = &mut entry.0;
             if tenant.is_some_and(|t| t != job.tenant) {
                 continue;
             }
             for r in job.results.iter_mut() {
-                if r.user == user && !r.message.is_empty() {
+                if r.user == user && (!r.message.is_empty() || r.tool_calls.is_some()) {
                     r.message = String::new();
+                    r.tool_calls = None;
                     erased += 1;
                 }
             }
@@ -1151,7 +1158,7 @@ impl Store for MemoryStore {
     }
 
     async fn video_job_put(&self, job: VideoJob) -> GResult<()> {
-        let cutoff = job.created_at_epoch_secs - VIDEO_JOB_RETENTION_SECS;
+        let cutoff = job.created_at_epoch_secs - JOB_RETENTION_SECS;
         self.videos
             .retain(|_, (j, _)| j.created_at_epoch_secs >= cutoff);
         self.videos.insert(job.id.clone(), (job, false));
@@ -1190,27 +1197,30 @@ impl Store for MemoryStore {
             total,
             results: Vec::new(),
         };
-        self.jobs.insert(id, job.clone());
+        let now = crate::epoch_secs();
+        self.jobs
+            .retain(|_, (_, created)| *created >= now - JOB_RETENTION_SECS);
+        self.jobs.insert(id, (job.clone(), now));
         Ok(job)
     }
 
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
-        Ok(self.jobs.get(id).map(|j| j.value().clone()))
+        Ok(self.jobs.get(id).map(|j| j.value().0.clone()))
     }
 
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
         if let Some(mut j) = self.jobs.get_mut(id) {
-            j.status = status;
+            j.0.status = status;
         }
         Ok(())
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         if let Some(mut j) = self.jobs.get_mut(id)
-            && !matches!(j.status, BatchStatus::Completed | BatchStatus::Failed)
-            && !j.results.iter().any(|r| r.index == result.index)
+            && !matches!(j.0.status, BatchStatus::Completed | BatchStatus::Failed)
+            && !j.0.results.iter().any(|r| r.index == result.index)
         {
-            j.results.push(result);
+            j.0.results.push(result);
         }
         Ok(())
     }
@@ -1401,6 +1411,8 @@ impl SqliteStore {
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN finish_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN tool_calls TEXT NOT NULL DEFAULT ''",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
                 && !e.to_string().contains("duplicate column name")
@@ -2023,7 +2035,7 @@ macro_rules! sql_store_impl {
                     $dialect,
                     "DELETE FROM video_jobs WHERE created_at_epoch_secs < ?"
                 ))
-                .bind(job.created_at_epoch_secs - VIDEO_JOB_RETENTION_SECS)
+                .bind(job.created_at_epoch_secs - JOB_RETENTION_SECS)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::sqlx_err("prune video jobs", e))?;
@@ -2087,8 +2099,8 @@ macro_rules! sql_store_impl {
                 let Some(row) = row else { return Ok(None) };
                 let results = sqlx::query(dialect_sql!(
                     $dialect,
-                    "SELECT idx, ok, message, total_tokens, user_id FROM batch_results
-                     WHERE batch_id = ? ORDER BY idx"
+                    "SELECT idx, ok, message, total_tokens, user_id, finish_reason, tool_calls
+                     FROM batch_results WHERE batch_id = ? ORDER BY idx"
                 ))
                 .bind(id)
                 .fetch_all(&self.pool)
@@ -2110,6 +2122,8 @@ macro_rules! sql_store_impl {
                             message: r.get(2),
                             total_tokens: r.get(3),
                             user: r.get(4),
+                            finish_reason: r.get(5),
+                            tool_calls: serde_json::from_str(r.get::<&str, _>(6)).ok(),
                         })
                         .collect(),
                 }))
@@ -2154,7 +2168,8 @@ sql_store_impl!(SqliteStore, sqlite, {
         .await
         .map_err(|e| crate::sqlx_err("erase user content", e))?;
         let m = sqlx::query(
-            "UPDATE batch_results SET message = '' WHERE user_id = ?1 AND message <> ''
+            "UPDATE batch_results SET message = '', tool_calls = ''
+             WHERE user_id = ?1 AND (message <> '' OR tool_calls <> '')
               AND batch_id IN (SELECT id FROM batches WHERE ?2 IS NULL OR tenant = ?2)",
         )
         .bind(user)
@@ -2279,8 +2294,9 @@ sql_store_impl!(SqliteStore, sqlite, {
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         // reject inserts into a terminal batch (single-node, so no writer race)
         sqlx::query(
-            "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens, user_id)
-             SELECT ?, ?, ?, ?, ?, ?
+            "INSERT INTO batch_results
+             (batch_id, idx, ok, message, total_tokens, user_id, finish_reason, tool_calls)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (SELECT 1 FROM batches
                            WHERE id = ? AND status NOT IN ('completed', 'failed'))",
         )
@@ -2290,6 +2306,8 @@ sql_store_impl!(SqliteStore, sqlite, {
         .bind(&result.message)
         .bind(result.total_tokens)
         .bind(&result.user)
+        .bind(&result.finish_reason)
+        .bind(tool_calls_text(&result))
         .bind(id)
         .execute(&self.pool)
         .await
@@ -2314,6 +2332,24 @@ async fn prune_terminal_items(
         .await
         .map_err(|e| crate::sqlx_err("prune batch items", e))?;
     Ok(())
+}
+
+fn pg_batch_item(r: &sqlx::postgres::PgRow) -> gw_models::BatchItem {
+    let (typed, raw) = serde_json::from_str(r.get::<&str, _>(2)).unwrap_or_default();
+    gw_models::BatchItem {
+        messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
+        typed,
+        raw,
+        user: r.get(1),
+    }
+}
+
+fn tool_calls_text(result: &BatchItemResult) -> String {
+    result
+        .tool_calls
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default()
 }
 
 /// Postgres-backed store shared across a fleet; no orphan sweep on open, since
@@ -2415,7 +2451,10 @@ impl PostgresStore {
                 PRIMARY KEY (batch_id, idx))",
             // per-item end-user attribution so a fleet drainer still bills/budgets it
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS params TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS finish_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS tool_calls TEXT NOT NULL DEFAULT ''",
             // pre-upgrade results predate user_id; backfill it from the items rows so erasure
             // reaches history (idempotent)
             "UPDATE batch_results r SET user_id = i.user_id FROM batch_items i
@@ -2501,8 +2540,8 @@ sql_store_impl!(PostgresStore, postgres, {
         .await
         .map_err(|e| crate::sqlx_err("erase user content", e))?;
         let m = sqlx::query(
-            "UPDATE batch_results r SET message = '' FROM batches b
-             WHERE r.batch_id = b.id AND r.user_id = $1 AND r.message <> ''
+            "UPDATE batch_results r SET message = '', tool_calls = '' FROM batches b
+             WHERE r.batch_id = b.id AND r.user_id = $1 AND (r.message <> '' OR r.tool_calls <> '')
                AND ($2::text IS NULL OR b.tenant = $2)",
         )
         .bind(user)
@@ -2512,7 +2551,7 @@ sql_store_impl!(PostgresStore, postgres, {
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
         // pending/running batches included: an emptied item fails at execution instead of running
         let i = sqlx::query(
-            "UPDATE batch_items i SET messages = '[]' FROM batches b
+            "UPDATE batch_items i SET messages = '[]', params = '' FROM batches b
              WHERE i.batch_id = b.id AND i.user_id = $1 AND i.messages <> '[]'
                AND ($2::text IS NULL OR b.tenant = $2)",
         )
@@ -2643,8 +2682,9 @@ sql_store_impl!(PostgresStore, postgres, {
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         // first-writer-wins + non-terminal guard; FOR UPDATE serializes with batch_finalize
         sqlx::query(
-            "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens, user_id)
-             SELECT $1, $2, $3, $4, $5, $6
+            "INSERT INTO batch_results
+             (batch_id, idx, ok, message, total_tokens, user_id, finish_reason, tool_calls)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8
              WHERE EXISTS (SELECT 1 FROM batches
                            WHERE id = $1 AND status NOT IN ('completed', 'failed') FOR UPDATE)
              ON CONFLICT (batch_id, idx) DO NOTHING",
@@ -2655,6 +2695,8 @@ sql_store_impl!(PostgresStore, postgres, {
         .bind(&result.message)
         .bind(result.total_tokens)
         .bind(&result.user)
+        .bind(&result.finish_reason)
+        .bind(tool_calls_text(&result))
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert batch result", e))?;
@@ -2737,14 +2779,16 @@ sql_store_impl!(PostgresStore, postgres, {
             .map_err(|e| crate::sqlx_err("insert batch", e))?;
         for (chunk, items) in items.chunks(BATCH_ITEM_CHUNK).enumerate() {
             let mut qb = sqlx::QueryBuilder::new(
-                "INSERT INTO batch_items (batch_id, idx, messages, user_id) ",
+                "INSERT INTO batch_items (batch_id, idx, messages, user_id, params) ",
             );
             qb.push_values(items.iter().enumerate(), |mut v, (i, item)| {
                 let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
+                let params = serde_json::to_string(&(&item.typed, &item.raw)).unwrap_or_default();
                 v.push_bind(&id)
                     .push_bind((chunk * BATCH_ITEM_CHUNK + i) as i64)
                     .push_bind(json)
-                    .push_bind(&item.user);
+                    .push_bind(&item.user)
+                    .push_bind(params);
             });
             qb.build()
                 .execute(&mut *tx)
@@ -2771,34 +2815,25 @@ sql_store_impl!(PostgresStore, postgres, {
         idx: usize,
     ) -> GResult<Option<gw_models::BatchItem>> {
         let row = sqlx::query(
-            "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 AND idx = $2",
+            "SELECT messages, user_id, params FROM batch_items WHERE batch_id = $1 AND idx = $2",
         )
         .bind(id)
         .bind(idx as i64)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("read batch item", e))?;
-        Ok(row.map(|r| gw_models::BatchItem {
-            messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
-            user: r.get(1),
-        }))
+        Ok(row.as_ref().map(pg_batch_item))
     }
 
     async fn batch_load_items(&self, id: &str) -> GResult<Vec<gw_models::BatchItem>> {
         let rows = sqlx::query(
-            "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 ORDER BY idx",
+            "SELECT messages, user_id, params FROM batch_items WHERE batch_id = $1 ORDER BY idx",
         )
         .bind(id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("load batch items", e))?;
-        Ok(rows
-            .iter()
-            .map(|r| gw_models::BatchItem {
-                messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
-                user: r.get::<String, _>(1),
-            })
-            .collect())
+        Ok(rows.iter().map(pg_batch_item).collect())
     }
 
     async fn batch_claim_pending(&self, stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
@@ -3169,6 +3204,7 @@ mod tests {
                     message: "ok".into(),
                     total_tokens: 8,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -3233,7 +3269,7 @@ mod tests {
         assert!(!store.video_job_settle("vid-2").await.unwrap());
         let later = VideoJob {
             id: "vid-2".into(),
-            created_at_epoch_secs: 1_001 + VIDEO_JOB_RETENTION_SECS,
+            created_at_epoch_secs: 1_001 + JOB_RETENTION_SECS,
             ..job
         };
         store.video_job_put(later).await.unwrap();
@@ -3242,6 +3278,16 @@ mod tests {
             None,
             "a put prunes jobs past retention"
         );
+    }
+
+    #[tokio::test]
+    async fn a_memory_batch_create_prunes_batches_past_retention() {
+        let store = MemoryStore::default();
+        let old = store.batch_create("k", "t", "m", 1).await.unwrap();
+        store.jobs.get_mut(&old.id).unwrap().1 -= JOB_RETENTION_SECS + 1;
+        let kept = store.batch_create("k", "t", "m", 1).await.unwrap();
+        assert!(store.batch_get(&old.id).await.unwrap().is_none());
+        assert!(store.batch_get(&kept.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -3557,11 +3603,18 @@ mod tests {
                     ok: true,
                     message: "generated for u1".into(),
                     total_tokens: 3,
+                    finish_reason: "tool_use".into(),
+                    tool_calls: Some(serde_json::json!([{"name": "lookup", "input": {"q": "u1"}}])),
                     user: u1.into(),
                 },
             )
             .await
             .unwrap();
+        let stored = store.batch_get(&job.id).await.unwrap().unwrap().results;
+        assert_eq!(
+            stored[0].tool_calls.as_ref().unwrap()[0]["input"]["q"],
+            "u1"
+        );
 
         let audit = || AdminAudit {
             created_at_epoch_secs: 20,
@@ -3583,6 +3636,11 @@ mod tests {
         assert_eq!(store.content_for(&r2).await.unwrap().len(), 1);
         let results = store.batch_get(&job.id).await.unwrap().unwrap().results;
         assert_eq!(results[0].message, "", "generated output erased");
+        assert!(
+            results[0].tool_calls.is_none(),
+            "generated tool calls erased"
+        );
+        assert_eq!(results[0].finish_reason, "tool_use");
         assert_eq!(results[0].user, u1, "attribution survives for billing");
         assert_eq!(
             store.content_erase_user(None, u1, audit()).await.unwrap(),
@@ -3832,13 +3890,21 @@ mod tests {
         exercise_video_jobs(&store).await;
 
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
+        let typed = Some(gw_models::TypedParams::Chat(gw_models::ChatParams {
+            max_tokens: Some(7),
+            ..Default::default()
+        }));
         let items = vec![
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "erase me")],
+                typed: typed.clone(),
+                raw: serde_json::json!({"metadata": {"note": "erase me"}}),
                 user: erika.clone(),
             },
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "keep me")],
+                typed,
+                raw: serde_json::json!({"seed": 3}),
                 user: format!("other{ns}"),
             },
         ];
@@ -3872,6 +3938,12 @@ mod tests {
             loaded[1].messages[0].content, "keep me",
             "other users' queued items untouched"
         );
+        assert!(loaded[0].typed.is_none() && loaded[0].raw.is_null());
+        assert!(matches!(
+            &loaded[1].typed,
+            Some(gw_models::TypedParams::Chat(p)) if p.max_tokens == Some(7)
+        ));
+        assert_eq!(loaded[1].raw["seed"], 3);
         let fresh = store
             .batch_item_snapshot(&pending.id, 0)
             .await
@@ -3969,6 +4041,7 @@ mod tests {
                     message: msg.into(),
                     total_tokens: 1,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
         };
@@ -3989,6 +4062,7 @@ mod tests {
             message: String::new(),
             total_tokens: 0,
             user: String::new(),
+            ..Default::default()
         };
         let job = store.batch_create("ak", "default", "m", 2).await.unwrap();
         store
@@ -4249,6 +4323,7 @@ mod tests {
                     message: "ok".into(),
                     total_tokens: 5,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -4265,6 +4340,7 @@ mod tests {
                     message: "stale".into(),
                     total_tokens: 0,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -4288,6 +4364,7 @@ mod tests {
                     message: "late".into(),
                     total_tokens: 0,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -4305,10 +4382,12 @@ mod tests {
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "one")],
                 user: "u-one".into(),
+                ..Default::default()
             },
             gw_models::BatchItem {
                 messages: vec![gw_models::ChatMsg::text("user", "two")],
                 user: "u-two".into(),
+                ..Default::default()
             },
         ];
         let qjob = store

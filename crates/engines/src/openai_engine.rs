@@ -57,7 +57,7 @@ impl OpenAiEngine {
         let (typed, raw) = (self.base.take_typed(), self.base.take_raw());
         let param = self.base.param()?;
         let protocol = param.protocol;
-        let reasoning_model = is_openai_reasoning_model(&param.model_name);
+        let reasoning_model = gw_protocol::reasoning::openai_reasoning_family(&param.model_name);
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), messages);
@@ -86,7 +86,7 @@ impl OpenAiEngine {
             put!(
                 "reasoning_effort",
                 p.reasoning
-                    .and_then(|reasoning| reasoning_effort(*reasoning))
+                    .and_then(|reasoning| reasoning_effort(*reasoning, &param.model_name))
             );
             put!("presence_penalty", p.presence_penalty);
             put!("frequency_penalty", p.frequency_penalty);
@@ -422,8 +422,11 @@ pub(crate) fn parallel_tool_calls(choice: &Value) -> Option<Value> {
 }
 
 /// The client's `reasoning_effort`, else one derived from `output_config.effort` or a budget;
-/// `adaptive` without an effort and `disabled` leave the vendor default.
-pub(crate) fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<Cow<'static, str>> {
+/// `disabled` is `none` on OpenAI's reasoning families, and `adaptive` alone leaves the default.
+pub(crate) fn reasoning_effort(
+    reasoning: gw_models::ReasoningParam,
+    model: &str,
+) -> Option<Cow<'static, str>> {
     if let Some(effort) = reasoning.effort {
         return Some(effort);
     }
@@ -433,21 +436,17 @@ pub(crate) fn reasoning_effort(reasoning: gw_models::ReasoningParam) -> Option<C
     {
         return Some(Cow::Owned(effort));
     }
+    let thinking = reasoning.thinking.as_ref();
     let budget = reasoning.budget_tokens.or_else(|| {
-        reasoning
-            .thinking
+        thinking
             .filter(|thinking| thinking["type"] == "enabled")
             .and_then(|thinking| thinking["budget_tokens"].as_i64())
-    })?;
-    Some(Cow::Borrowed(gw_protocol::reasoning::budget_effort(budget)))
-}
-
-/// OpenAI's own reasoning families — o-series and GPT-5 onward.
-fn is_openai_reasoning_model(model: &str) -> bool {
-    match model.strip_prefix("ft:").unwrap_or(model).as_bytes() {
-        [b'o', minor, ..] => minor.is_ascii_digit(),
-        [b'g', b'p', b't', b'-', major, ..] => (b'5'..=b'9').contains(major),
-        _ => false,
+    });
+    match budget {
+        Some(budget) => Some(Cow::Borrowed(gw_protocol::reasoning::budget_effort(budget))),
+        None => (thinking.is_some_and(|thinking| thinking["type"] == "disabled")
+            && gw_protocol::reasoning::openai_reasoning_family(model))
+        .then_some(Cow::Borrowed("none")),
     }
 }
 

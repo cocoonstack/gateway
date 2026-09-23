@@ -1103,6 +1103,31 @@ def case_tool_loop(gw: Gateway, model: str, label: str = "", **extra: Any) -> No
     )
 
 
+def case_batch(gw: Gateway, model: str) -> None:
+    """A batch item is a chat request: array content, the cap and the tools reach the model, and the result keeps the tool call."""
+    name = f"{model} batch tool item"
+    question = [{"role": "user", "content": [{"type": "text", "text": WEATHER_QUESTION[0]["content"]}]}]
+    item = {"messages": question, "tools": WEATHER_TOOL_OPENAI, "max_completion_tokens": 200}
+    st, txt = gw.call("/v1/batches", {"model": model, "items": [item]})
+    if st != 202:
+        record(name, False, f"submit HTTP {st}: {txt[:200]}")
+        return
+    batch_id = json.loads(txt)["id"]
+    job: dict[str, Any] = {}
+    for _ in range(60):
+        job = json.loads(gw.call(f"/v1/batches/{batch_id}")[1])
+        if job.get("status") in ("completed", "failed"):
+            break
+        time.sleep(1)
+    result = (job.get("results") or [{}])[0]
+    calls = result.get("tool_calls") or []
+    record(
+        name,
+        job.get("status") == "completed" and result.get("finish_reason") == "tool_calls" and bool(calls),
+        f"status={job.get('status')} finish={result.get('finish_reason')} tool={calls[0]['function']['name'] if calls else None}",
+    )
+
+
 def run_group(gw: Gateway, group: str) -> None:
     prime = "Is 17 prime? One word."
     arith = "What is 123456 * 789? Work it out carefully before answering, then give only the number."
@@ -1136,6 +1161,7 @@ def run_group(gw: Gateway, group: str) -> None:
         )
         case_chat(gw, haiku, "reasoning_effort low", prompt=prime, expect_reasoning=True, reasoning_effort="low")
         case_chat(gw, haiku, "max_completion_tokens", max_completion_tokens=300)
+        case_batch(gw, haiku)
         case_chat(
             gw, haiku, "reasoning_effort", stream=True, prompt=prime, expect_reasoning=True, reasoning_effort="low"
         )
@@ -1173,6 +1199,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, "gpt-4o-mini")
         case_chat(gw, "gpt-4o-mini", stream=True)
         case_response_cache(gw, "gpt-4o-mini")
+        case_batch(gw, "gpt-4o-mini")
         case_chat(gw, "gpt-5-mini", "reasoning_effort low", prompt=prime, reasoning_effort="low")
         case_chat(gw, "gpt-5-mini", "reasoning", stream=True, prompt=prime, reasoning_effort="low")
         case_prompt_cache(gw, "gpt-4.1-mini")

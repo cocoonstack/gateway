@@ -1427,7 +1427,10 @@ async fn anthropic_budget_and_client_thinking_precedence() {
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["output_config"], serde_json::json!({"effort":"high"}));
-    assert_eq!(b["max_tokens"], 12000 + 1024);
+    assert_eq!(
+        b["max_tokens"], 16384,
+        "a model that thinks by default already has room past the budget"
+    );
 
     let t = RecordingTransport::new(CLAUDE_OK);
     let mut req = reasoning_req(
@@ -1736,11 +1739,37 @@ async fn openai_reasoning_effort_and_thinking_dialects() {
     }
     let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    assert!(b.get("reasoning_effort").is_none());
+    assert_eq!(
+        b["reasoning_effort"], "minimal",
+        "5.0 cannot go below minimal"
+    );
     assert_eq!(
         b["max_completion_tokens"], 700,
         "the cap follows the model family, not the reasoning request"
     );
+
+    for (model, want) in [
+        ("gpt-6-sol", Some("none")),
+        ("gpt-6-astra", Some("low")),
+        ("o3", Some("low")),
+        ("deepseek-v4", None),
+    ] {
+        let t = RecordingTransport::new(OPENAI_OK);
+        let req = reasoning_req(
+            Protocol::OpenaiChat,
+            model,
+            gw_models::ReasoningParam {
+                thinking: Some(serde_json::json!({"type":"disabled"})),
+                ..Default::default()
+            },
+        );
+        let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+        assert_eq!(
+            t.body_json()["reasoning_effort"].as_str(),
+            want,
+            "{model}: disabled thinking"
+        );
+    }
 
     let t = RecordingTransport::new(OPENAI_OK);
     let mut req = reasoning_req(

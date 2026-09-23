@@ -242,7 +242,10 @@ fn reasoning_config(
         .map(Value::take)
     {
         Some(Value::String(effort)) => Cow::Owned(effort),
-        _ => Cow::Borrowed(budget_effort(thinking?["budget_tokens"].as_i64()?)),
+        _ => match thinking? {
+            thinking if thinking["type"] == "disabled" => Cow::Borrowed("none"),
+            thinking => Cow::Borrowed(budget_effort(thinking["budget_tokens"].as_i64()?)),
+        },
     };
     Some(openai_effort(model, effort, EffortWire::Bedrock).into())
 }
@@ -637,6 +640,17 @@ mod tests {
             out["additionalModelRequestFields"]["reasoning_config"], "max",
             "Bedrock takes the top tier the chat surface rejects"
         );
+
+        for (model, want) in [
+            ("us.openai.gpt-6-sol", "none"),
+            ("us.openai.gpt-6-astra", "low"),
+        ] {
+            let out = request(body(json!({"type": "disabled"})), model);
+            assert_eq!(
+                out["additionalModelRequestFields"]["reasoning_config"], want,
+                "{model}: disabled thinking"
+            );
+        }
 
         let mut with_effort = body(json!({"type": "adaptive"}));
         with_effort.insert("output_config".to_owned(), json!({"effort": "none"}));

@@ -1247,6 +1247,7 @@ impl ResponsesEngine {
         if !system.is_empty() {
             body.entry("instructions").or_insert(system.into());
         }
+        body.entry("store").or_insert(false.into());
         let messages = std::mem::take(&mut self.base.request.message);
         let mut input = Vec::with_capacity(messages.len());
         for m in messages {
@@ -1336,10 +1337,12 @@ impl ResponsesEngine {
                 }
                 body.insert("tool_choice".to_owned(), responses_tool_choice(v));
             }
-            if let Some(effort) = p
-                .reasoning
-                .and_then(|r| crate::openai_engine::reasoning_effort(*r))
-            {
+            if let Some(effort) = p.reasoning.and_then(|r| {
+                crate::openai_engine::reasoning_effort(
+                    *r,
+                    self.base.model_name().unwrap_or_default(),
+                )
+            }) {
                 body.insert("reasoning".to_owned(), object([("effort", effort.into())]));
             }
         }
@@ -1358,15 +1361,29 @@ impl ResponsesEngine {
         };
         crate::pump::reject_json_error("responses", status, &body)?;
         let mut full = String::new();
+        let mut failure = None;
         let model_override = self.base.model_override();
         let native = self.base.request.preserve_responses_wire;
-        let r = crate::pump::pump_sse(
+        let mut r = crate::pump::pump_sse(
             "responses",
             body,
             self.base.request.stream_tx.clone(),
-            |v| responses_apply_frame(v, status, model_override, native, &mut resp, &mut full),
+            |v| {
+                responses_apply_frame(
+                    v,
+                    status,
+                    model_override,
+                    native,
+                    &mut resp,
+                    &mut full,
+                    &mut failure,
+                )
+            },
         )
         .await?;
+        if r.terminal_error.is_none() {
+            r.terminal_error = failure.and_then(gw_models::StreamError::from_error);
+        }
         resp.message = full;
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
@@ -1558,6 +1575,7 @@ fn responses_apply_frame(
     native: bool,
     resp: &mut GatewayResponse,
     full: &mut String,
+    failure: &mut Option<GatewayError>,
 ) -> GResult<Vec<StreamChunk>> {
     if v["type"] == "error" {
         let error = match v.get_mut("error").filter(|e| e.is_object()) {
@@ -1578,6 +1596,7 @@ fn responses_apply_frame(
     let mut chunk = StreamChunk::default();
     match v["type"].as_str().unwrap_or_default() {
         "response.failed" if !native => {
+            record_responses_usage(resp, &v["response"]["usage"]);
             let error = v.pointer_mut("/response/error").map(Value::take);
             return Err(stream_failure(error.unwrap_or_default()));
         }
@@ -1616,12 +1635,10 @@ fn responses_apply_frame(
                     responses_finish(r, resp.tool_calls.is_some())
                 };
             }
-            let (input, output, common) = responses_usage(&r["usage"]);
-            resp.prompt_tokens = input;
-            resp.completion_tokens = output;
-            crate::engine::fill_total_if_zero(resp);
-            resp.common_usage = common;
-            resp.raw_usage = (!r["usage"].is_null()).then(|| r["usage"].clone());
+            record_responses_usage(resp, &r["usage"]);
+            if v["type"] == "response.failed" {
+                *failure = Some(stream_failure(r["error"].clone()));
+            }
             chunk.finish_reason = Some(resp.finish_reason.clone());
         }
         _ => {}
@@ -1636,17 +1653,37 @@ fn responses_apply_frame(
 }
 
 fn stream_failure(mut error: Value) -> GatewayError {
-    let status = match error["code"].as_str() {
-        Some("rate_limit_exceeded" | "rate_limit_reached") => 429,
-        Some("server_error" | "vector_store_timeout") | None => 502,
-        Some(_) => 400,
+    let (code, status) = match error["code"].as_str() {
+        Some("rate_limit_exceeded" | "rate_limit_reached") => {
+            (gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO, 429)
+        }
+        Some("server_error" | "vector_store_timeout") => {
+            (gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO, 502)
+        }
+        Some(_) => (gw_consts::ErrCode::REQ_PARAM, 400),
+        None => {
+            let numeric = error["code"].as_u64().and_then(|c| u16::try_from(c).ok());
+            (
+                gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+                numeric.filter(|c| *c >= 400).unwrap_or(502),
+            )
+        }
     };
     let message = crate::engine::take_string(&mut error, "/message");
     GatewayError::new(
-        gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+        code,
         status,
         message.unwrap_or_else(|| "upstream error".to_owned()),
     )
+}
+
+fn record_responses_usage(resp: &mut GatewayResponse, usage: &Value) {
+    let (input, output, common) = responses_usage(usage);
+    resp.prompt_tokens = input;
+    resp.completion_tokens = output;
+    crate::engine::fill_total_if_zero(resp);
+    resp.common_usage = common;
+    resp.raw_usage = (!usage.is_null()).then(|| usage.clone());
 }
 
 #[cfg(test)]
@@ -2037,6 +2074,10 @@ mod tests {
         }));
         let body = ResponsesEngine::new(r, t()).build_body().unwrap();
         assert_eq!(body["instructions"], "be terse");
+        assert_eq!(
+            body["store"], false,
+            "chat completions do not store by default"
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 64);
         assert_eq!(body["reasoning"]["effort"], "low");
@@ -2436,6 +2477,10 @@ mod tests {
                     "error": {"code": "failed_to_download_image", "message": "bad url"}}}),
                 400,
             ),
+            (
+                json!({"type": "error", "error": {"code": 429, "message": "numeric code"}}),
+                429,
+            ),
         ] {
             let err = responses_apply_frame(
                 frame.clone(),
@@ -2444,6 +2489,7 @@ mod tests {
                 false,
                 &mut GatewayResponse::default(),
                 &mut String::new(),
+                &mut None,
             )
             .unwrap_err();
             assert_eq!(err.http_status, status, "{frame}: {err}");
@@ -2458,6 +2504,7 @@ mod tests {
             true,
             &mut resp,
             &mut String::new(),
+            &mut None,
         )
         .unwrap();
         assert_eq!(
@@ -2480,6 +2527,7 @@ mod tests {
             false,
             &mut resp,
             &mut full,
+            &mut None,
         )
         .unwrap();
         assert_eq!(chunks[0].tool_calls.as_ref().unwrap()[0]["index"], 0);
@@ -2492,6 +2540,7 @@ mod tests {
             false,
             &mut resp,
             &mut full,
+            &mut None,
         )
         .unwrap();
         assert_eq!(chunks[0].finish_reason.as_deref(), Some("tool_calls"));
@@ -2514,6 +2563,7 @@ mod tests {
                 false,
                 &mut resp,
                 &mut String::new(),
+                &mut None,
             )
             .unwrap();
             assert_eq!(chunks[0].finish_reason.as_deref(), Some(want), "{reason}");

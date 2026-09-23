@@ -155,10 +155,11 @@ impl OfflineHandler {
                 is_online: false,
                 message: item.messages,
                 user_id: (!item.user.is_empty()).then_some(item.user),
-                model_param_v2: Some(ModelParamV2::with_name(
-                    gw_consts::Protocol::OpenaiChat,
-                    model.to_owned(),
-                )),
+                model_param_v2: Some(ModelParamV2 {
+                    typed: item.typed,
+                    raw: item.raw,
+                    ..ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, model)
+                }),
                 ..Default::default()
             };
             // each item on its own task so a pipeline panic fails the item, not the batch
@@ -169,9 +170,11 @@ impl OfflineHandler {
                 Ok(Ok(ctx)) => match ctx.outcome {
                     Some(out) => BatchItemResult {
                         index,
-                        ok: true,
+                        ok: !out.block.block,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
+                        finish_reason: out.response.finish_reason,
+                        tool_calls: out.response.tool_calls,
                         user,
                     },
                     None => failed_item(index, "pipeline produced no outcome".into(), user),
@@ -293,9 +296,8 @@ async fn pause_or_stop(
 fn failed_item(index: usize, message: String, user: String) -> BatchItemResult {
     BatchItemResult {
         index,
-        ok: false,
         message,
-        total_tokens: 0,
         user,
+        ..Default::default()
     }
 }

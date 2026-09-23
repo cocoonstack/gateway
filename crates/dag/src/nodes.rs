@@ -119,7 +119,7 @@ impl DagNode for TenantEntitlement {
         "tenant_entitlement"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let name = &ctx.model_param()?.model_name;
+        let name = requested_model(Some(ctx.model_param()?));
         if !ctx.cfg.tenant_allows_model(&ctx.ak.tenant, name) {
             return Err(GatewayError::new(
                 ErrCode::PERMISSION_CHECK,
@@ -152,10 +152,11 @@ impl DagNode for VariantSelect {
         let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
             return Ok(());
         };
-        if conf.variants.is_empty() || ctx.request.pins_reasoning_route() {
+        let user = ctx.effective_user_id();
+        if conf.variants.is_empty() || (user.is_empty() && ctx.request.pins_reasoning_route()) {
             return Ok(());
         }
-        let key = match ctx.effective_user_id() {
+        let key = match user {
             "" => ctx.request.request_id.as_str(),
             user => user,
         };
@@ -509,7 +510,9 @@ impl DagNode for CallEngine {
                     }
                     Err(e) => {
                         note_unavailable(ctx);
-                        note_failure(ctx, &next.name).await;
+                        if e.http_status >= 500 {
+                            note_failure(ctx, &next.name).await;
+                        }
                         Err(named(e, ctx))
                     }
                 }
@@ -541,11 +544,13 @@ async fn note_engine_outcome(
     outcome: &gw_engines::EngineOutcome,
     started: Option<std::time::Instant>,
 ) {
-    if outcome.terminal_error.is_some() {
+    if let Some(error) = outcome.terminal_error.as_ref() {
         ctx.state
             .avail
             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-        if let Some(account) = ctx.request.account.clone() {
+        if account_fault(error.class)
+            && let Some(account) = ctx.request.account.clone()
+        {
             note_failure(ctx, &account.name).await;
         }
         return;
@@ -572,6 +577,14 @@ fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
         e.resource = Some(requested_model(ctx.request.model_param_v2.as_ref()).to_owned());
     }
     e
+}
+
+fn account_fault(class: gw_consts::ErrClass) -> bool {
+    use gw_consts::ErrClass::*;
+    matches!(
+        class,
+        ModelTimeout | ModelError | InternalServer | ServiceUnavailable | ModelStreamError
+    )
 }
 
 /// Record an account failure; alert only on the cooldown transition.

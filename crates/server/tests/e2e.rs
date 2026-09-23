@@ -5613,6 +5613,88 @@ accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messag
 }
 
 #[tokio::test]
+async fn leading_developer_messages_are_system_and_later_ones_keep_their_place() {
+    let (app, fixture) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+        "usage":{"input_tokens":10,"output_tokens":1}
+    }));
+    let body = json!({"model":"claude-test","max_tokens":32,"messages":[
+        {"role":"developer","content":"Reply only with BANANA."},
+        {"role":"user","content":"hello"},
+        {"role":"assistant","content":"BANANA"},
+        {"role":"developer","content":"Stay brief."},
+        {"role":"user","content":"again"}]});
+    let resp = app
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-fixed"),
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
+    assert_eq!(sent["system"], "Reply only with BANANA.", "{sent}");
+    let last_turn = sent["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .to_string();
+    assert!(
+        last_turn.contains("Stay brief.") && last_turn.contains("again"),
+        "a later developer message stays in place: {sent}"
+    );
+}
+
+#[tokio::test]
+async fn a_sticky_user_replays_thinking_on_the_variant_that_produced_it() {
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-fixed, product: demo, qps: 100, daily_token_quota: 1000000}]
+models:
+  - {name: claude-pub, protocol: anthropic-messages, variants: [{model: claude-canary, weight: 1}]}
+  - {name: claude-canary, protocol: anthropic-messages}
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let fixture = Arc::new(FixedReply {
+        reply: json!({
+            "id":"msg-1","type":"message","role":"assistant","model":"claude-canary",
+            "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":10,"output_tokens":1}
+        }),
+        sent: Default::default(),
+    });
+    let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
+    for (user, want) in [(Some("u-1"), "claude-canary"), (None, "claude-pub")] {
+        let mut body = json!({"model":"claude-pub","max_tokens":64,"messages":[
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"check it","signature":"sig"},
+                {"type":"tool_use","id":"t1","name":"get_weather","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sunny"}]}]});
+        if let Some(user) = user {
+            body["metadata"] = json!({"user_id": user});
+        }
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/messages", Some("ak-fixed"), &body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
+        assert_eq!(sent["model"], want, "user {user:?}");
+    }
+}
+
+#[tokio::test]
 async fn chat_max_completion_tokens_is_the_cap_on_the_anthropic_wire() {
     let (app, fixture) = fixed_reply_app(json!({
         "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
@@ -5852,4 +5934,100 @@ async fn a_buffered_native_reply_keeps_the_vendor_stop_sequence_and_usage() {
         v["usage"]["output_tokens_details"]["thinking_tokens"], 3,
         "{v}"
     );
+}
+
+async fn wait_batch(app: &Router, ak: &str, id: &str) -> Value {
+    for _ in 0..500 {
+        let req = Request::builder()
+            .uri(format!("/v1/batches/{id}"))
+            .header("authorization", format!("Bearer {ak}"))
+            .body(Body::empty())
+            .unwrap();
+        let j = body_json(app.clone().oneshot(req).await.unwrap()).await;
+        if j["status"] == "completed" || j["status"] == "failed" {
+            return j;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("batch {id} did not finish");
+}
+
+#[tokio::test]
+async fn batch_items_parse_as_chat_requests_and_report_tool_calls() {
+    let (app, fixture) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x"}}],
+        "stop_reason":"tool_use","stop_sequence":null,
+        "usage":{"input_tokens":10,"output_tokens":4}
+    }));
+    let submit = json!({"model":"claude-test","items":[{
+        "messages":[
+            {"role":"developer","content":"Be brief."},
+            {"role":"user","content":[{"type":"text","text":"look up x"}]}],
+        "max_completion_tokens":77,
+        "stop":["END"],
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+    }]});
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-fixed"), &submit.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let job = wait_batch(&app, "ak-fixed", &id).await;
+    let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
+    assert_eq!(sent["max_tokens"], 77, "{sent}");
+    assert_eq!(sent["stop_sequences"][0], "END", "{sent}");
+    assert_eq!(sent["tools"][0]["name"], "lookup", "{sent}");
+    assert!(sent["system"].to_string().contains("Be brief."), "{sent}");
+    assert!(sent["messages"].to_string().contains("look up x"), "{sent}");
+    let result = &job["results"][0];
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(result["finish_reason"], "tool_calls", "{job}");
+    assert_eq!(
+        result["tool_calls"][0]["function"]["name"], "lookup",
+        "{job}"
+    );
+}
+
+#[tokio::test]
+async fn batch_submission_is_rate_gated_and_throttled_items_wait() {
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-slow, product: demo, qps: 1, daily_token_quota: 1000000}]
+models: [{name: gpt-4o-mini, protocol: openai-chat}]
+accounts: [{name: openai, provider: openai, protocols: ["openai-chat"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let submit = json!({"model":"gpt-4o-mini","items":[
+        {"messages":[{"role":"user","content":"one"}]},
+        {"messages":[{"role":"user","content":"two"}]}]})
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-slow"), &submit))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let again = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-slow"), &submit))
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+    let job = wait_batch(&app, "ak-slow", &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["results"].as_array().unwrap().len(), 2, "{job}");
 }
