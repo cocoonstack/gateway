@@ -5990,3 +5990,44 @@ async fn batch_items_parse_as_chat_requests_and_report_tool_calls() {
         "{job}"
     );
 }
+
+#[tokio::test]
+async fn batch_submission_is_rate_gated_and_throttled_items_wait() {
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-slow, product: demo, qps: 1, daily_token_quota: 1000000}]
+models: [{name: gpt-4o-mini, protocol: openai-chat}]
+accounts: [{name: openai, provider: openai, protocols: ["openai-chat"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let submit = json!({"model":"gpt-4o-mini","items":[
+        {"messages":[{"role":"user","content":"one"}]},
+        {"messages":[{"role":"user","content":"two"}]}]})
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-slow"), &submit))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let again = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-slow"), &submit))
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+    let job = wait_batch(&app, "ak-slow", &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["results"].as_array().unwrap().len(), 2, "{job}");
+}

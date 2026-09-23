@@ -427,6 +427,17 @@ pub async fn check_product_qpm(
     )
 }
 
+/// Key QPS, tenant QPS, then product QPM: the limits a request spends once.
+pub async fn check_request_rates(
+    gov: &dyn Governance,
+    cfg: &GatewayConfig,
+    ak: &AkInfo,
+) -> Result<(), String> {
+    check_ak_rate(gov, ak).await?;
+    check_tenant_rate(gov, cfg, &ak.tenant).await?;
+    check_product_qpm(gov, cfg, &ak.product).await
+}
+
 /// Model-level QPM, when the model configures one.
 pub async fn check_model_qpm(
     gov: &dyn Governance,

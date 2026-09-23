@@ -50,8 +50,9 @@ const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 /// starts. Valid in both SQL dialects.
 const ROLLUP_WATERMARK_SQL: &str = "SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup";
 
-/// A put prunes async video jobs older than this (vendor results expire far sooner).
-const VIDEO_JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+/// A put prunes async video jobs older than this (vendor results expire far sooner),
+/// as a create does in-memory batches.
+const JOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// Rows per batch_items INSERT: five binds each under the 65535-parameter limit.
 const BATCH_ITEM_CHUNK: usize = 13_000;
 
@@ -768,7 +769,7 @@ pub struct MemoryStore {
     /// [`Store::user_erased_since`] — one entry per pair, not a log.
     erasures: Mutex<HashMap<String, HashMap<String, i64>>>,
     files: DashMap<String, StoredFile>,
-    jobs: DashMap<String, BatchJob>,
+    jobs: DashMap<String, (BatchJob, i64)>,
     videos: DashMap<String, (VideoJob, bool)>,
     seq: AtomicUsize,
     /// oldest records beyond this are pruned on write; 0 = unlimited.
@@ -1052,7 +1053,8 @@ impl Store for MemoryStore {
             let mut content = lock(&self.content);
             content.retain(|r| r.user_id != user || tenant.is_some_and(|t| t != r.tenant))
         };
-        for mut job in self.jobs.iter_mut() {
+        for mut entry in self.jobs.iter_mut() {
+            let job = &mut entry.0;
             if tenant.is_some_and(|t| t != job.tenant) {
                 continue;
             }
@@ -1156,7 +1158,7 @@ impl Store for MemoryStore {
     }
 
     async fn video_job_put(&self, job: VideoJob) -> GResult<()> {
-        let cutoff = job.created_at_epoch_secs - VIDEO_JOB_RETENTION_SECS;
+        let cutoff = job.created_at_epoch_secs - JOB_RETENTION_SECS;
         self.videos
             .retain(|_, (j, _)| j.created_at_epoch_secs >= cutoff);
         self.videos.insert(job.id.clone(), (job, false));
@@ -1195,27 +1197,30 @@ impl Store for MemoryStore {
             total,
             results: Vec::new(),
         };
-        self.jobs.insert(id, job.clone());
+        let now = crate::epoch_secs();
+        self.jobs
+            .retain(|_, (_, created)| *created >= now - JOB_RETENTION_SECS);
+        self.jobs.insert(id, (job.clone(), now));
         Ok(job)
     }
 
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
-        Ok(self.jobs.get(id).map(|j| j.value().clone()))
+        Ok(self.jobs.get(id).map(|j| j.value().0.clone()))
     }
 
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
         if let Some(mut j) = self.jobs.get_mut(id) {
-            j.status = status;
+            j.0.status = status;
         }
         Ok(())
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         if let Some(mut j) = self.jobs.get_mut(id)
-            && !matches!(j.status, BatchStatus::Completed | BatchStatus::Failed)
-            && !j.results.iter().any(|r| r.index == result.index)
+            && !matches!(j.0.status, BatchStatus::Completed | BatchStatus::Failed)
+            && !j.0.results.iter().any(|r| r.index == result.index)
         {
-            j.results.push(result);
+            j.0.results.push(result);
         }
         Ok(())
     }
@@ -2030,7 +2035,7 @@ macro_rules! sql_store_impl {
                     $dialect,
                     "DELETE FROM video_jobs WHERE created_at_epoch_secs < ?"
                 ))
-                .bind(job.created_at_epoch_secs - VIDEO_JOB_RETENTION_SECS)
+                .bind(job.created_at_epoch_secs - JOB_RETENTION_SECS)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::sqlx_err("prune video jobs", e))?;
@@ -3264,7 +3269,7 @@ mod tests {
         assert!(!store.video_job_settle("vid-2").await.unwrap());
         let later = VideoJob {
             id: "vid-2".into(),
-            created_at_epoch_secs: 1_001 + VIDEO_JOB_RETENTION_SECS,
+            created_at_epoch_secs: 1_001 + JOB_RETENTION_SECS,
             ..job
         };
         store.video_job_put(later).await.unwrap();
@@ -3273,6 +3278,16 @@ mod tests {
             None,
             "a put prunes jobs past retention"
         );
+    }
+
+    #[tokio::test]
+    async fn a_memory_batch_create_prunes_batches_past_retention() {
+        let store = MemoryStore::default();
+        let old = store.batch_create("k", "t", "m", 1).await.unwrap();
+        store.jobs.get_mut(&old.id).unwrap().1 -= JOB_RETENTION_SECS + 1;
+        let kept = store.batch_create("k", "t", "m", 1).await.unwrap();
+        assert!(store.batch_get(&old.id).await.unwrap().is_none());
+        assert!(store.batch_get(&kept.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

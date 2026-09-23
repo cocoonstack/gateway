@@ -34,7 +34,8 @@ storage:
 ```
 
 The billing ledger, uploaded files, and batch jobs live here. In-memory by
-default (lost on restart); a SQLite path makes them durable on one node.
+default (lost on restart; batch jobs are kept 30 days); a SQLite path makes them
+durable on one node.
 `postgres_url` turns Postgres into the fleet backend: the source of truth for
 config (versioned documents + a change feed every instance follows), the
 shared access-key table, the shared ledger/files/batches store, and a

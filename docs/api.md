@@ -287,10 +287,11 @@ Each JSONL line is `{"body": {...}}` and each inline item is a
 `/v1/chat/completions` request body. Every item runs on the batch's `model`, or
 on the first JSONL line's when the batch names none. A batch runs every item
 through the same pipeline as a live request (auth, quota, limits, billing all
-apply per item); an item a content rule blocks reports `ok: false` with
-`finish_reason: "content_filter"`. Attribution inverts the REST precedence: a
-per-item `user` field wins over the connection's `x-gw-user` header, so a
-shared-key batch keeps per-item attribution.
+apply per item, and the submission itself spends one request against the key
+QPS, tenant QPS and product QPM); an item a content rule blocks reports
+`ok: false` with `finish_reason: "content_filter"`. Attribution inverts the
+REST precedence: a per-item `user` field wins over the connection's `x-gw-user`
+header, so a shared-key batch keeps per-item attribution.
 
 Files and batches are owned by the uploading key's tenant. A file or batch
 belonging to another tenant answers `404` (not `403`, so sequential ids can't be

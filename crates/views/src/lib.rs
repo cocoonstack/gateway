@@ -568,13 +568,7 @@ async fn realtime_gate(
     let gov = state.governance.as_ref();
     let throttled = |m: String| (ErrClass::Throttling, m);
     let quota_exceeded = |m: String| (ErrClass::ServiceQuotaExceeded, m);
-    admission::check_ak_rate(gov, &ak)
-        .await
-        .map_err(throttled)?;
-    admission::check_tenant_rate(gov, cfg, &ak.tenant)
-        .await
-        .map_err(throttled)?;
-    admission::check_product_qpm(gov, cfg, &ak.product)
+    admission::check_request_rates(gov, cfg, &ak)
         .await
         .map_err(throttled)?;
     admission::check_model_qpm(gov, cfg, &m.served)
@@ -4309,12 +4303,7 @@ async fn admit_video_job(
     let state = s.handler.state();
     let cfg = s.handler.cfg();
     let gov = state.governance.as_ref();
-    let admitted = async {
-        admission::check_ak_rate(gov, ak).await?;
-        admission::check_tenant_rate(gov, &cfg, &ak.tenant).await?;
-        admission::check_product_qpm(gov, &cfg, &ak.product).await
-    };
-    if let Err(denied) = admitted.await {
+    if let Err(denied) = admission::check_request_rates(gov, &cfg, ak).await {
         return Err(error_response(429, denied));
     }
     let found = state.store.video_job_get(id).await;
@@ -4702,10 +4691,15 @@ async fn batches_submit(
     Authed(ak): Authed,
     ApiJson(mut body): ApiJson<Value>,
 ) -> Response {
+    let (state, cfg) = (s.handler.state(), s.handler.cfg());
+    if let Err(denied) = admission::check_request_rates(state.governance.as_ref(), &cfg, &ak).await
+    {
+        return error_response(429, denied);
+    }
     let mut model = gw_engines::engine::take_string(&mut body, "/model").unwrap_or_default();
     let mut batch_items = Vec::new();
     if let Some(file_id) = body["input_file_id"].as_str() {
-        let found = s.handler.state().store.file_get(file_id).await;
+        let found = state.store.file_get(file_id).await;
         let file = match tenant_owned(found, |f| &f.tenant, &ak.tenant, "input file", file_id) {
             Ok(f) => f,
             Err(resp) => return resp,
