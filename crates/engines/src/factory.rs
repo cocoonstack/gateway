@@ -53,7 +53,7 @@ pub fn get_engine(
                 400,
                 format!(
                     "realtime model `{}` is served on the /v1/realtime websocket surface, not the chat surface",
-                    p.as_str()
+                    request.model_param_v2.unwrap_or_default().model_name
                 ),
             ));
         }
@@ -90,6 +90,17 @@ mod tests {
             }
         }
         assert_eq!(dispatched, Protocol::ALL.len() - 1);
+    }
+
+    #[test]
+    fn a_realtime_refusal_names_the_model() {
+        let t: SharedTransport = Arc::new(MockTransport);
+        let request = GatewayRequest {
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::Realtime, "gpt-rt")),
+            ..Default::default()
+        };
+        let err = get_engine(request, t).err().unwrap();
+        assert!(err.message.contains("`gpt-rt`"), "{}", err.message);
     }
 
     #[test]
