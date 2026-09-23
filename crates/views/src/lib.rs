@@ -3448,11 +3448,14 @@ async fn messages(
         let response = anthropic_error(500, NO_OUTCOME);
         return terminal_response(&ctx, response).await;
     };
-    let usage = anthropic_usage(
-        outcome.response.prompt_tokens,
-        outcome.response.completion_tokens,
-        outcome.response.common_usage,
-    );
+    let usage = match outcome.response.raw_usage.take() {
+        Some(raw) if outcome.response.anthropic_content.is_some() => raw,
+        _ => json!(anthropic_usage(
+            outcome.response.prompt_tokens,
+            outcome.response.completion_tokens,
+            outcome.response.common_usage,
+        )),
+    };
     let content = match outcome.response.anthropic_content.take() {
         Some(Value::Array(blocks)) => blocks,
         _ => {
@@ -3482,14 +3485,18 @@ async fn messages(
         content.iter().any(|b| b["type"] == "tool_use"),
     );
     // built by hand: json! would deep-copy the content blocks
-    let mut body = serde_json::Map::with_capacity(7);
+    let mut body = serde_json::Map::with_capacity(8);
     body.insert("id".into(), next_id("msg").into());
     body.insert("type".into(), "message".into());
     body.insert("role".into(), "assistant".into());
     body.insert("model".into(), Value::String(outcome.response.model));
     body.insert("content".into(), Value::Array(content));
     body.insert("stop_reason".into(), stop.into());
-    body.insert("usage".into(), json!(usage));
+    body.insert(
+        "stop_sequence".into(),
+        outcome.response.stop_sequence.into(),
+    );
+    body.insert("usage".into(), usage);
     let response = (StatusCode::OK, Json(Value::Object(body))).into_response();
     terminal_response(&ctx, response).await
 }

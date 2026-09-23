@@ -272,6 +272,7 @@ impl ClaudeEngine {
             },
             model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
             finish_reason: crate::engine::take_string(&mut v, "/stop_reason").unwrap_or_default(),
+            stop_sequence: crate::engine::take_string(&mut v, "/stop_sequence"),
             is_messages_protocol: true,
             prompt_tokens: input,
             completion_tokens: output,

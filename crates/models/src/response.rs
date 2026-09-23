@@ -38,6 +38,7 @@ pub struct GatewayResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_content: Option<Value>,
     pub finish_reason: String,
+    pub stop_sequence: Option<String>,
 
     /// PTU spilled over to pay-go account.
     pub ptu_spillover: bool,

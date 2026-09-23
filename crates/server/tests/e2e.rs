@@ -5847,3 +5847,65 @@ accounts: [{{name: g, provider: openai, protocols: ["openai-chat"]}}]
         );
     }
 }
+
+#[tokio::test]
+async fn a_buffered_native_reply_keeps_the_vendor_stop_sequence_and_usage() {
+    #[derive(Debug)]
+    struct StopSequence;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for StopSequence {
+        async fn send(
+            &self,
+            _request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let response = json!({
+                "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+                "content":[{"type":"text","text":"1 2 3 4 5 6 "}],
+                "stop_reason":"stop_sequence","stop_sequence":"7",
+                "usage":{"input_tokens":10,"output_tokens":14,"cache_read_input_tokens":0,
+                    "cache_creation_input_tokens":2048,
+                    "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2048},
+                    "output_tokens_details":{"thinking_tokens":3}}
+            });
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&response).unwrap().into(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-stop, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: claude-test, protocol: anthropic-messages}]
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(StopSequence)));
+    let body = json!({"model":"claude-test","max_tokens":64,"stop_sequences":["7"],
+        "messages":[{"role":"user","content":"count"}]});
+    let resp = app
+        .oneshot(post("/v1/messages", Some("ak-stop"), &body.to_string()))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["stop_reason"], "stop_sequence");
+    assert_eq!(v["stop_sequence"], "7", "{v}");
+    assert_eq!(
+        v["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 2048,
+        "{v}"
+    );
+    assert_eq!(
+        v["usage"]["output_tokens_details"]["thinking_tokens"], 3,
+        "{v}"
+    );
+}
