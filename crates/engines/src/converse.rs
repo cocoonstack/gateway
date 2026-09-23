@@ -605,7 +605,7 @@ mod tests {
         let out = request(with_effort, "openai.gpt-6-astra");
         assert_eq!(
             out["additionalModelRequestFields"]["reasoning_config"], "low",
-            "GPT-6 always reasons"
+            "GPT-6 Astra always reasons"
         );
 
         let out = request(
