@@ -2871,7 +2871,9 @@ async fn chat_completions(
     let typed = TypedParams::Chat(ChatParams {
         temperature: body.temperature,
         top_p: body.top_p,
-        max_tokens: body.max_tokens,
+        max_tokens: body.max_tokens.or(body.max_completion_tokens),
+        client_sent_max_completion_tokens: body.max_tokens.is_none()
+            && body.max_completion_tokens.is_some(),
         stop: body.stop,
         presence_penalty: body.presence_penalty,
         frequency_penalty: body.frequency_penalty,

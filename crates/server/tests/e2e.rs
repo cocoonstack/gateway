@@ -5599,6 +5599,67 @@ accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messag
 }
 
 #[tokio::test]
+async fn chat_max_completion_tokens_is_the_cap_on_the_anthropic_wire() {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CaptureFixture {
+        body: Mutex<Option<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for CaptureFixture {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            *self.body.lock().unwrap() = Some(serde_json::from_slice(&request.body).unwrap());
+            let response = json!({
+                "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+                "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+                "usage":{"input_tokens":10,"output_tokens":1}
+            });
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&response).unwrap().into(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-dialect, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: claude-test, protocol: anthropic-messages}]
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let fixture = Arc::new(CaptureFixture::default());
+    let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
+    let body = json!({"model":"claude-test","max_completion_tokens":300,
+        "messages":[{"role":"user","content":"hello"}]});
+    let resp = app
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-dialect"),
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = fixture.body.lock().unwrap().take().expect("upstream body");
+    assert_eq!(sent["max_tokens"], 300, "{sent}");
+    assert!(sent.get("max_completion_tokens").is_none(), "{sent}");
+}
+
+#[tokio::test]
 async fn model_prompt_cache_knob_reaches_the_anthropic_wire() {
     use std::sync::Mutex;
 

@@ -39,6 +39,8 @@ pub struct ChatParams {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_sent_max_completion_tokens: bool,
     /// string or [string] (OpenAI accepts both forms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Value>,

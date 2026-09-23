@@ -78,6 +78,7 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<i64>,
+    pub max_completion_tokens: Option<i64>,
     #[serde(default)]
     pub stop: Option<Value>, // string | [string]
     pub presence_penalty: Option<f64>,
