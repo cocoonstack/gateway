@@ -71,7 +71,8 @@ default, so the whole pipeline is testable offline:
   behind a 2s auth cache, admin key CRUD survives restarts.
 - **`HealthStore`** — account cooldown/recovery. In-process breaker by
   default; `RedisHealth` with `storage.redis_url` — a tripped account is
-  skipped by every instance.
+  skipped by every instance. Only upstream faults count (5xx, timeouts,
+  broken streams), never a client-caused or rate-limit error.
 - **`Governance`** — rate/quota/TPM counters. In-process by default;
   `RedisGovernance` shares them (including pooled tenant QPS) fleet-wide.
 - **`Moderator`** — the external content review behind `security.moderate`;

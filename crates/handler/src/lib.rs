@@ -484,10 +484,14 @@ pub async fn complete_buffered_stream(
     ctx: &mut DagContext,
     delivery: gw_dag::StreamDelivery,
 ) -> GResult<()> {
-    let terminal = match &delivery {
-        gw_dag::StreamDelivery::Complete => terminal_plain_body("success", 200, false),
-        gw_dag::StreamDelivery::Partial(_) => terminal_plain_body("client_closed", 499, true),
-        gw_dag::StreamDelivery::None => terminal_plain_body("client_closed", 499, false),
+    let failure = ctx.outcome.as_ref().and_then(|o| o.terminal_error.as_ref());
+    let terminal = match (&delivery, failure) {
+        (gw_dag::StreamDelivery::Complete, Some(error)) => {
+            terminal_error_body(error.class, error.original_status, true)
+        }
+        (gw_dag::StreamDelivery::Complete, None) => terminal_plain_body("success", 200, false),
+        (gw_dag::StreamDelivery::Partial(_), _) => terminal_plain_body("client_closed", 499, true),
+        (gw_dag::StreamDelivery::None, _) => terminal_plain_body("client_closed", 499, false),
     };
     gw_dag::settle_deferred_stream(ctx, delivery).await?;
     persist_ctx_terminal(ctx, || terminal).await;
@@ -561,7 +565,10 @@ async fn note_abuse(ctx: &DagContext) {
 fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
         Some(status) => status >= 500 || status == 429,
-        None => e.http_status >= 502,
+        None => {
+            e.http_status >= 502
+                || (e.http_status == 429 && e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO)
+        }
     }
 }
 
@@ -2086,6 +2093,83 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct FailedResponsesStream(&'static str);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for FailedResponsesStream {
+        async fn send(
+            &self,
+            _request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let failed = format!(
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"code\":\"{}\",\"message\":\"failed\"}},\"usage\":{{\"input_tokens\":9,\"output_tokens\":7}}}}}}\n\n",
+                self.0
+            );
+            let frames = [
+                Ok(bytes::Bytes::from(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                )),
+                Ok(bytes::Bytes::from(failed)),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_band_responses_failure_bills_vendor_usage_and_faults_only_on_vendor_codes() {
+        for (code, native, faults) in [
+            ("failed_to_download_image", false, false),
+            ("server_error", false, true),
+            ("failed_to_download_image", true, false),
+            ("server_error", true, true),
+        ] {
+            let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: false}\nmodels: [{name: m, protocol: responses}]\naccounts: [{name: a1, provider: p, protocols: [responses]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+            let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(FailedResponsesStream(code)),
+            );
+            let mut request = drained_stream_req("m", "hi");
+            if native {
+                request.preserve_responses_wire = true;
+                if let Some(param) = request.model_param_v2.as_mut() {
+                    param.raw = serde_json::json!({"input": "hi"});
+                }
+            }
+            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let ctx = h.run(request, key).await.unwrap();
+            let outcome = ctx.outcome.expect("outcome");
+            assert!(outcome.terminal_error.is_some(), "{code} native={native}");
+            assert_eq!(
+                h.state().health.available("a1").await,
+                !faults,
+                "{code} native={native}"
+            );
+            let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+            assert_eq!(
+                ledger[0].completion_tokens, 7,
+                "vendor usage, {code} native={native}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vendor_rate_limit_is_an_upstream_fault_in_band_too() {
+        let in_band = GatewayError::new(gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO, 429, "slow");
+        assert!(is_upstream_fault(&in_band));
+        let local = GatewayError::new(gw_consts::ErrCode::STOP_LIMIT_MSG, 429, "qps");
+        assert!(!is_upstream_fault(&local));
+    }
+
     #[tokio::test]
     async fn committed_retry_error_records_both_account_failures() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-down, provider: p, priority: 1, protocols: [openai-chat]}, {name: a-up, provider: p, priority: 2, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
@@ -2204,6 +2288,32 @@ mod tests {
         assert_eq!(terminal["state"], "error");
         assert_eq!(terminal["code"], "internal_server_exception");
         assert_eq!(terminal["http_status"], 500);
+        assert_eq!(terminal["stream_committed"], true);
+    }
+
+    #[tokio::test]
+    async fn a_buffered_responses_failure_persists_an_error_terminal_row() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {dlp_redact: true}\nmodels: [{name: m, protocol: responses}]\naccounts: [{name: a1, provider: p, protocols: [responses]}]\ntenants: [{name: t1, retention: {content: redacted, days: 1}}]\naccess_keys: [{ak: retained-ak, tenant: t1, owner: attempt-1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(FailedResponsesStream("server_error")),
+        );
+        let mut request = chat_req("m", "hi");
+        request.stream = true;
+        request.preserve_responses_wire = true;
+        request.request_id = "req-buffered-failed".into();
+        if let Some(param) = request.model_param_v2.as_mut() {
+            param.raw = serde_json::json!({"input": "hi"});
+        }
+        let mut ctx = h.run(request, retained_ak(&h).await).await.unwrap();
+        assert!(ctx.billing_deferred);
+        complete_buffered_stream(&mut ctx, gw_dag::StreamDelivery::Complete)
+            .await
+            .unwrap();
+        let terminal = terminal_body(&h, "req-buffered-failed").await;
+        assert_eq!(terminal["state"], "error", "{terminal}");
         assert_eq!(terminal["stream_committed"], true);
     }
 
