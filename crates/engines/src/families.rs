@@ -1470,10 +1470,14 @@ fn responses_output(v: &Value) -> (String, Vec<Value>) {
                 Some("message") => {
                     if let Some(content) = item["content"].as_array() {
                         for c in content {
-                            if c["type"] == "output_text"
-                                && let Some(t) = c["text"].as_str()
-                            {
-                                text.push_str(t);
+                            match c["type"].as_str() {
+                                Some("output_text") => {
+                                    text.push_str(c["text"].as_str().unwrap_or_default())
+                                }
+                                Some("refusal") => {
+                                    text.push_str(c["refusal"].as_str().unwrap_or_default())
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1606,10 +1610,10 @@ fn responses_apply_frame(
             let error = v.pointer_mut("/response/error").map(Value::take);
             return Err(stream_failure(error.unwrap_or_default()));
         }
-        "response.output_text.delta" if native => {
+        "response.output_text.delta" | "response.refusal.delta" if native => {
             full.push_str(v["delta"].as_str().unwrap_or_default());
         }
-        "response.output_text.delta" => {
+        "response.output_text.delta" | "response.refusal.delta" => {
             if let Some(Value::String(d)) = v.get_mut("delta").map(Value::take) {
                 full.push_str(&d);
                 chunk.delta = d;
@@ -2461,6 +2465,27 @@ mod tests {
         assert_eq!(out.response.message, "done");
         assert_eq!(out.response.finish_reason, "completed");
         assert_eq!(out.response.common_usage.unwrap().reason, 4);
+    }
+
+    #[test]
+    fn a_refusal_part_and_delta_reach_the_reply_text() {
+        let (text, calls) = responses_output(&json!({"output": [{"type": "message",
+            "content": [{"type": "refusal", "refusal": "I can't help with that."}]}]}));
+        assert_eq!(text, "I can't help with that.");
+        assert!(calls.is_empty());
+        let mut full = String::new();
+        let chunks = responses_apply_frame(
+            json!({"type": "response.refusal.delta", "delta": "no"}),
+            200,
+            None,
+            false,
+            &mut GatewayResponse::default(),
+            &mut full,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(full, "no");
+        assert_eq!(chunks[0].delta, "no");
     }
 
     #[test]
