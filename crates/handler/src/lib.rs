@@ -352,7 +352,11 @@ impl OnlineHandler {
 
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
             let native_event_hits = plugins::native_event_dlp_hits(sec, &mut outcome.chunks);
-            let n = plugins::dlp_redact_response(sec, &mut outcome.response);
+            let n = plugins::dlp_redact_response(sec, &mut outcome.response)
+                + outcome
+                    .terminal_error
+                    .as_mut()
+                    .map_or(0, |e| plugins::dlp_redact_text(sec, &mut e.message));
             // raw deltas are pre-redaction: on any DLP hit keep only the signed reasoning units
             if dlp && (n > 0 || native_event_hits > 0) {
                 for chunk in outcome.chunks.drain(..) {

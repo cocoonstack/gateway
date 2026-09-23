@@ -3310,6 +3310,55 @@ accounts: [{name: a, provider: openai, protocols: ["responses"]}]
 }
 
 #[tokio::test]
+async fn a_redacted_stream_failure_message_is_redacted_too() {
+    #[derive(Debug)]
+    struct PiiInTheError;
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PiiInTheError {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let frames = [
+                Ok::<_, gw_engines::transport::StreamFault>(bytes::Bytes::from(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"clean text\"}\n\n",
+                )),
+                Ok(bytes::Bytes::from(
+                    "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"rejected input from leak@evil.com\"}}}\n\n",
+                )),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {dlp_redact: true}
+access_keys: [{ak: ak-d, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-5-responses, protocol: responses}]
+accounts: [{name: a, provider: openai, protocols: ["responses"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(PiiInTheError)));
+    let body = r#"{"model":"gpt-5-responses","input":"hi","stream":true}"#;
+    let resp = app
+        .oneshot(post("/v1/responses", Some("ak-d"), body))
+        .await
+        .unwrap();
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(text.contains("event: error"), "{text}");
+    assert!(text.contains("[REDACTED_EMAIL]"), "{text}");
+    assert!(!text.contains("leak@evil.com"), "{text}");
+}
+
+#[tokio::test]
 async fn batch_requires_items_or_file() {
     let app = app();
     let resp = app

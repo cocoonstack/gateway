@@ -805,6 +805,14 @@ fn collect_delta_fragments(
 }
 
 /// Outbound DLP over `message` and the payloads the surfaces serialize verbatim.
+/// Outbound DLP over one string: the error message a stream failure carries back.
+pub fn dlp_redact_text(sec: &SecurityConf, text: &mut String) -> usize {
+    if !sec.redacts_output() {
+        return 0;
+    }
+    redact_in_place(text, sec.dlp_redact, sec.detect_secrets)
+}
+
 pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
     if !sec.redacts_output() {
         return 0;
