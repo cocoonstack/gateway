@@ -687,6 +687,52 @@ fn internal_get(uri: &str) -> Request<Body> {
         .expect("request")
 }
 
+#[derive(Debug)]
+struct FixedReply {
+    reply: Value,
+    sent: std::sync::Mutex<Option<Value>>,
+}
+
+#[async_trait::async_trait]
+impl gw_engines::transport::Transport for FixedReply {
+    async fn send(
+        &self,
+        request: gw_engines::transport::UpstreamRequest,
+    ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+        *self.sent.lock().unwrap() = Some(serde_json::from_slice(&request.body).unwrap());
+        Ok(gw_engines::transport::UpstreamResponse {
+            status: 200,
+            body: gw_engines::transport::UpstreamBody::Json(
+                serde_json::to_vec(&self.reply).unwrap().into(),
+            ),
+            headers: Default::default(),
+        })
+    }
+}
+
+fn fixed_reply_app(reply: Value) -> (Router, Arc<FixedReply>) {
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-fixed, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: claude-test, protocol: anthropic-messages}]
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let fixture = Arc::new(FixedReply {
+        reply,
+        sent: Default::default(),
+    });
+    (
+        gw_views::app(AppState::new(cfg, state, fixture.clone())),
+        fixture,
+    )
+}
+
 #[tokio::test]
 async fn health_and_models() {
     let app = app();
@@ -5396,51 +5442,19 @@ async fn ledger_pagination_limits_records_not_count() {
 
 #[tokio::test]
 async fn a_tool_call_cut_by_max_tokens_finishes_with_length() {
-    #[derive(Debug)]
-    struct CutToolUse;
-
-    #[async_trait::async_trait]
-    impl gw_engines::transport::Transport for CutToolUse {
-        async fn send(
-            &self,
-            _request: gw_engines::transport::UpstreamRequest,
-        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
-            let response = json!({
-                "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
-                "content":[{"type":"tool_use","id":"tool-1","name":"write_file","input":{"path":"essay.txt"}}],
-                "stop_reason":"max_tokens","stop_sequence":null,
-                "usage":{"input_tokens":10,"output_tokens":40}
-            });
-            Ok(gw_engines::transport::UpstreamResponse {
-                status: 200,
-                body: gw_engines::transport::UpstreamBody::Json(
-                    serde_json::to_vec(&response).unwrap().into(),
-                ),
-                headers: Default::default(),
-            })
-        }
-    }
-
-    let cfg = Arc::new(
-        GatewayConfig::from_yaml(
-            r#"
-listen: {host: 127.0.0.1, port: 0}
-access_keys: [{ak: ak-cut, product: demo, qps: 100, daily_token_quota: 1000000}]
-models: [{name: claude-test, protocol: anthropic-messages}]
-accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
-"#,
-        )
-        .unwrap(),
-    );
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    let app = gw_views::app(AppState::new(cfg, state, Arc::new(CutToolUse)));
+    let (app, _) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"tool_use","id":"tool-1","name":"write_file","input":{"path":"essay.txt"}}],
+        "stop_reason":"max_tokens","stop_sequence":null,
+        "usage":{"input_tokens":10,"output_tokens":40}
+    }));
     let body = json!({"model":"claude-test","max_tokens":40,
         "tools":[{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}],
         "messages":[{"role":"user","content":"write an essay"}]});
     let resp = app
         .oneshot(post(
             "/v1/chat/completions",
-            Some("ak-cut"),
+            Some("ak-fixed"),
             &body.to_string(),
         ))
         .await
@@ -5600,61 +5614,23 @@ accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messag
 
 #[tokio::test]
 async fn chat_max_completion_tokens_is_the_cap_on_the_anthropic_wire() {
-    use std::sync::Mutex;
-
-    #[derive(Debug, Default)]
-    struct CaptureFixture {
-        body: Mutex<Option<Value>>,
-    }
-
-    #[async_trait::async_trait]
-    impl gw_engines::transport::Transport for CaptureFixture {
-        async fn send(
-            &self,
-            request: gw_engines::transport::UpstreamRequest,
-        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
-            *self.body.lock().unwrap() = Some(serde_json::from_slice(&request.body).unwrap());
-            let response = json!({
-                "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
-                "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
-                "usage":{"input_tokens":10,"output_tokens":1}
-            });
-            Ok(gw_engines::transport::UpstreamResponse {
-                status: 200,
-                body: gw_engines::transport::UpstreamBody::Json(
-                    serde_json::to_vec(&response).unwrap().into(),
-                ),
-                headers: Default::default(),
-            })
-        }
-    }
-
-    let cfg = Arc::new(
-        GatewayConfig::from_yaml(
-            r#"
-listen: {host: 127.0.0.1, port: 0}
-access_keys: [{ak: ak-dialect, product: demo, qps: 100, daily_token_quota: 1000000}]
-models: [{name: claude-test, protocol: anthropic-messages}]
-accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
-"#,
-        )
-        .unwrap(),
-    );
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    let fixture = Arc::new(CaptureFixture::default());
-    let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
+    let (app, fixture) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+        "usage":{"input_tokens":10,"output_tokens":1}
+    }));
     let body = json!({"model":"claude-test","max_completion_tokens":300,
         "messages":[{"role":"user","content":"hello"}]});
     let resp = app
         .oneshot(post(
             "/v1/chat/completions",
-            Some("ak-dialect"),
+            Some("ak-fixed"),
             &body.to_string(),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let sent = fixture.body.lock().unwrap().take().expect("upstream body");
+    let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
     assert_eq!(sent["max_tokens"], 300, "{sent}");
     assert!(sent.get("max_completion_tokens").is_none(), "{sent}");
 }
@@ -5850,51 +5826,19 @@ accounts: [{{name: g, provider: openai, protocols: ["openai-chat"]}}]
 
 #[tokio::test]
 async fn a_buffered_native_reply_keeps_the_vendor_stop_sequence_and_usage() {
-    #[derive(Debug)]
-    struct StopSequence;
-
-    #[async_trait::async_trait]
-    impl gw_engines::transport::Transport for StopSequence {
-        async fn send(
-            &self,
-            _request: gw_engines::transport::UpstreamRequest,
-        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
-            let response = json!({
-                "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
-                "content":[{"type":"text","text":"1 2 3 4 5 6 "}],
-                "stop_reason":"stop_sequence","stop_sequence":"7",
-                "usage":{"input_tokens":10,"output_tokens":14,"cache_read_input_tokens":0,
-                    "cache_creation_input_tokens":2048,
-                    "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2048},
-                    "output_tokens_details":{"thinking_tokens":3}}
-            });
-            Ok(gw_engines::transport::UpstreamResponse {
-                status: 200,
-                body: gw_engines::transport::UpstreamBody::Json(
-                    serde_json::to_vec(&response).unwrap().into(),
-                ),
-                headers: Default::default(),
-            })
-        }
-    }
-
-    let cfg = Arc::new(
-        GatewayConfig::from_yaml(
-            r#"
-listen: {host: 127.0.0.1, port: 0}
-access_keys: [{ak: ak-stop, product: demo, qps: 100, daily_token_quota: 1000000}]
-models: [{name: claude-test, protocol: anthropic-messages}]
-accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
-"#,
-        )
-        .unwrap(),
-    );
-    let state = Arc::new(GatewayState::from_config(&cfg));
-    let app = gw_views::app(AppState::new(cfg, state, Arc::new(StopSequence)));
+    let (app, _) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"text","text":"1 2 3 4 5 6 "}],
+        "stop_reason":"stop_sequence","stop_sequence":"7",
+        "usage":{"input_tokens":10,"output_tokens":14,"cache_read_input_tokens":0,
+            "cache_creation_input_tokens":2048,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2048},
+            "output_tokens_details":{"thinking_tokens":3}}
+    }));
     let body = json!({"model":"claude-test","max_tokens":64,"stop_sequences":["7"],
         "messages":[{"role":"user","content":"count"}]});
     let resp = app
-        .oneshot(post("/v1/messages", Some("ak-stop"), &body.to_string()))
+        .oneshot(post("/v1/messages", Some("ak-fixed"), &body.to_string()))
         .await
         .unwrap();
     let v = body_json(resp).await;
