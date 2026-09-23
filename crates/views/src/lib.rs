@@ -2731,6 +2731,13 @@ fn finish_openai(fr: String) -> Cow<'static, str> {
     }
 }
 
+fn chat_finish(fr: String, tool_calls: bool) -> Cow<'static, str> {
+    match finish_openai(fr) {
+        finish if !tool_calls || finish == "length" => finish,
+        _ => Cow::Borrowed("tool_calls"),
+    }
+}
+
 fn finish_anthropic(fr: String) -> Cow<'static, str> {
     match fr.as_str() {
         "" | "stop" => Cow::Borrowed("end_turn"),
@@ -2888,17 +2895,13 @@ async fn chat_completions(
     let model_out = outcome.response.model;
 
     let mut resp = if let Some(tc) = outcome.response.tool_calls.take() {
-        let finish = match finish_openai(outcome.response.finish_reason) {
-            length if length == "length" => length,
-            _ => Cow::Borrowed("tool_calls"),
-        };
         ChatCompletionResponse::tool_calls(
             id,
             created,
             model_out,
             outcome.response.message,
             openai_tool_calls(tc, &mut 0),
-            finish,
+            chat_finish(outcome.response.finish_reason, true),
             usage,
         )
     } else {
@@ -4831,10 +4834,23 @@ async fn batches_get(
     Path(id): Path<String>,
 ) -> Response {
     let found = s.handler.state().store.batch_get(&id).await;
-    match tenant_owned(found, |j| &j.tenant, &ak.tenant, "batch", &id) {
-        Ok(job) => (StatusCode::OK, Json(job)).into_response(),
-        Err(resp) => resp,
+    let mut job = match tenant_owned(found, |j| &j.tenant, &ak.tenant, "batch", &id) {
+        Ok(job) => job,
+        Err(resp) => return resp,
+    };
+    for r in job
+        .results
+        .iter_mut()
+        .filter(|r| r.ok || !r.finish_reason.is_empty())
+    {
+        let finish = std::mem::take(&mut r.finish_reason);
+        r.finish_reason = chat_finish(finish, r.tool_calls.is_some()).into_owned();
+        r.tool_calls = r
+            .tool_calls
+            .take()
+            .map(|tc| Value::Array(openai_tool_calls(tc, &mut 0)));
     }
+    (StatusCode::OK, Json(job)).into_response()
 }
 
 #[cfg(test)]

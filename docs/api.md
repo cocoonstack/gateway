@@ -281,12 +281,14 @@ identity provider's error text stay in the gateway log.
 | GET | `/v1/files/{id}/content` | raw content |
 | DELETE | `/v1/files/{id}` | delete an uploaded file (tenant-owned) |
 | POST | `/v1/batches` | `{"input_file_id":"..."}` or inline `{"items":[...]}`; answers `202` with `{id, status, total}` |
-| GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results |
+| GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results `{index, ok, message, total_tokens, finish_reason?, tool_calls?}` (`finish_reason` is absent for an item that failed before it produced an outcome) |
 
 Each JSONL line is `{"body": {...}}` and each inline item is a
 `/v1/chat/completions` request body. Every item runs on the batch's `model`, or
-on the first JSONL line's when the batch names none. A batch runs every item through the same pipeline as a live
-request (auth, quota, limits, billing all apply per item). Attribution inverts the REST precedence: a
+on the first JSONL line's when the batch names none. A batch runs every item
+through the same pipeline as a live request (auth, quota, limits, billing all
+apply per item); an item a content rule blocks reports `ok: false` with
+`finish_reason: "content_filter"`. Attribution inverts the REST precedence: a
 per-item `user` field wins over the connection's `x-gw-user` header, so a
 shared-key batch keeps per-item attribution.
 

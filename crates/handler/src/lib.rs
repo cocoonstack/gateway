@@ -2870,6 +2870,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blocked_batch_item_fails_with_its_finish_reason() {
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.blocklist = vec!["forbidden".into()];
+        cfg.security = std::mem::take(&mut cfg.security).compiled();
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let job = OfflineHandler::new(h.clone())
+            .submit(
+                ak(&h).await,
+                "gpt-4o-mini".into(),
+                vec![BatchItem {
+                    messages: vec![ChatMsg::text("user", "a forbidden word")],
+                    user: String::new(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert!(!j.results[0].ok, "{:?}", j.results);
+        assert_eq!(j.results[0].finish_reason, "content_filter");
+        assert_eq!(j.status, gw_state::BatchStatus::Failed);
+    }
+
+    #[tokio::test]
     async fn a_banned_key_stops_its_running_batch() {
         let h = handler();
         let off = OfflineHandler::new(h.clone());

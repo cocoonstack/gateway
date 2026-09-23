@@ -5982,5 +5982,11 @@ async fn batch_items_parse_as_chat_requests_and_report_tool_calls() {
     assert_eq!(sent["tools"][0]["name"], "lookup", "{sent}");
     assert!(sent["system"].to_string().contains("Be brief."), "{sent}");
     assert!(sent["messages"].to_string().contains("look up x"), "{sent}");
+    let result = &job["results"][0];
     assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(result["finish_reason"], "tool_calls", "{job}");
+    assert_eq!(
+        result["tool_calls"][0]["function"]["name"], "lookup",
+        "{job}"
+    );
 }

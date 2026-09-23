@@ -170,9 +170,11 @@ impl OfflineHandler {
                 Ok(Ok(ctx)) => match ctx.outcome {
                     Some(out) => BatchItemResult {
                         index,
-                        ok: true,
+                        ok: !out.block.block,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
+                        finish_reason: out.response.finish_reason,
+                        tool_calls: out.response.tool_calls,
                         user,
                     },
                     None => failed_item(index, "pipeline produced no outcome".into(), user),
@@ -294,9 +296,8 @@ async fn pause_or_stop(
 fn failed_item(index: usize, message: String, user: String) -> BatchItemResult {
     BatchItemResult {
         index,
-        ok: false,
         message,
-        total_tokens: 0,
         user,
+        ..Default::default()
     }
 }

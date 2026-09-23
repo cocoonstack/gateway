@@ -134,12 +134,16 @@ impl BatchStatus {
 }
 
 /// One item's result inside a batch.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BatchItemResult {
     pub index: usize,
     pub ok: bool,
     pub message: String,
     pub total_tokens: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
     /// Effective end user the item billed to; ties the generated `message`
     /// to an owner so user erasure can reach it.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1053,8 +1057,9 @@ impl Store for MemoryStore {
                 continue;
             }
             for r in job.results.iter_mut() {
-                if r.user == user && !r.message.is_empty() {
+                if r.user == user && (!r.message.is_empty() || r.tool_calls.is_some()) {
                     r.message = String::new();
+                    r.tool_calls = None;
                     erased += 1;
                 }
             }
@@ -1401,6 +1406,8 @@ impl SqliteStore {
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN finish_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN tool_calls TEXT NOT NULL DEFAULT ''",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
                 && !e.to_string().contains("duplicate column name")
@@ -2087,8 +2094,8 @@ macro_rules! sql_store_impl {
                 let Some(row) = row else { return Ok(None) };
                 let results = sqlx::query(dialect_sql!(
                     $dialect,
-                    "SELECT idx, ok, message, total_tokens, user_id FROM batch_results
-                     WHERE batch_id = ? ORDER BY idx"
+                    "SELECT idx, ok, message, total_tokens, user_id, finish_reason, tool_calls
+                     FROM batch_results WHERE batch_id = ? ORDER BY idx"
                 ))
                 .bind(id)
                 .fetch_all(&self.pool)
@@ -2110,6 +2117,8 @@ macro_rules! sql_store_impl {
                             message: r.get(2),
                             total_tokens: r.get(3),
                             user: r.get(4),
+                            finish_reason: r.get(5),
+                            tool_calls: serde_json::from_str(r.get::<&str, _>(6)).ok(),
                         })
                         .collect(),
                 }))
@@ -2154,7 +2163,8 @@ sql_store_impl!(SqliteStore, sqlite, {
         .await
         .map_err(|e| crate::sqlx_err("erase user content", e))?;
         let m = sqlx::query(
-            "UPDATE batch_results SET message = '' WHERE user_id = ?1 AND message <> ''
+            "UPDATE batch_results SET message = '', tool_calls = ''
+             WHERE user_id = ?1 AND (message <> '' OR tool_calls <> '')
               AND batch_id IN (SELECT id FROM batches WHERE ?2 IS NULL OR tenant = ?2)",
         )
         .bind(user)
@@ -2279,8 +2289,9 @@ sql_store_impl!(SqliteStore, sqlite, {
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         // reject inserts into a terminal batch (single-node, so no writer race)
         sqlx::query(
-            "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens, user_id)
-             SELECT ?, ?, ?, ?, ?, ?
+            "INSERT INTO batch_results
+             (batch_id, idx, ok, message, total_tokens, user_id, finish_reason, tool_calls)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (SELECT 1 FROM batches
                            WHERE id = ? AND status NOT IN ('completed', 'failed'))",
         )
@@ -2290,6 +2301,8 @@ sql_store_impl!(SqliteStore, sqlite, {
         .bind(&result.message)
         .bind(result.total_tokens)
         .bind(&result.user)
+        .bind(&result.finish_reason)
+        .bind(tool_calls_text(&result))
         .bind(id)
         .execute(&self.pool)
         .await
@@ -2324,6 +2337,14 @@ fn pg_batch_item(r: &sqlx::postgres::PgRow) -> gw_models::BatchItem {
         raw,
         user: r.get(1),
     }
+}
+
+fn tool_calls_text(result: &BatchItemResult) -> String {
+    result
+        .tool_calls
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default()
 }
 
 /// Postgres-backed store shared across a fleet; no orphan sweep on open, since
@@ -2427,6 +2448,8 @@ impl PostgresStore {
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS params TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS finish_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS tool_calls TEXT NOT NULL DEFAULT ''",
             // pre-upgrade results predate user_id; backfill it from the items rows so erasure
             // reaches history (idempotent)
             "UPDATE batch_results r SET user_id = i.user_id FROM batch_items i
@@ -2512,8 +2535,8 @@ sql_store_impl!(PostgresStore, postgres, {
         .await
         .map_err(|e| crate::sqlx_err("erase user content", e))?;
         let m = sqlx::query(
-            "UPDATE batch_results r SET message = '' FROM batches b
-             WHERE r.batch_id = b.id AND r.user_id = $1 AND r.message <> ''
+            "UPDATE batch_results r SET message = '', tool_calls = '' FROM batches b
+             WHERE r.batch_id = b.id AND r.user_id = $1 AND (r.message <> '' OR r.tool_calls <> '')
                AND ($2::text IS NULL OR b.tenant = $2)",
         )
         .bind(user)
@@ -2654,8 +2677,9 @@ sql_store_impl!(PostgresStore, postgres, {
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         // first-writer-wins + non-terminal guard; FOR UPDATE serializes with batch_finalize
         sqlx::query(
-            "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens, user_id)
-             SELECT $1, $2, $3, $4, $5, $6
+            "INSERT INTO batch_results
+             (batch_id, idx, ok, message, total_tokens, user_id, finish_reason, tool_calls)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8
              WHERE EXISTS (SELECT 1 FROM batches
                            WHERE id = $1 AND status NOT IN ('completed', 'failed') FOR UPDATE)
              ON CONFLICT (batch_id, idx) DO NOTHING",
@@ -2666,6 +2690,8 @@ sql_store_impl!(PostgresStore, postgres, {
         .bind(&result.message)
         .bind(result.total_tokens)
         .bind(&result.user)
+        .bind(&result.finish_reason)
+        .bind(tool_calls_text(&result))
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert batch result", e))?;
@@ -3173,6 +3199,7 @@ mod tests {
                     message: "ok".into(),
                     total_tokens: 8,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -3561,11 +3588,18 @@ mod tests {
                     ok: true,
                     message: "generated for u1".into(),
                     total_tokens: 3,
+                    finish_reason: "tool_use".into(),
+                    tool_calls: Some(serde_json::json!([{"name": "lookup", "input": {"q": "u1"}}])),
                     user: u1.into(),
                 },
             )
             .await
             .unwrap();
+        let stored = store.batch_get(&job.id).await.unwrap().unwrap().results;
+        assert_eq!(
+            stored[0].tool_calls.as_ref().unwrap()[0]["input"]["q"],
+            "u1"
+        );
 
         let audit = || AdminAudit {
             created_at_epoch_secs: 20,
@@ -3587,6 +3621,11 @@ mod tests {
         assert_eq!(store.content_for(&r2).await.unwrap().len(), 1);
         let results = store.batch_get(&job.id).await.unwrap().unwrap().results;
         assert_eq!(results[0].message, "", "generated output erased");
+        assert!(
+            results[0].tool_calls.is_none(),
+            "generated tool calls erased"
+        );
+        assert_eq!(results[0].finish_reason, "tool_use");
         assert_eq!(results[0].user, u1, "attribution survives for billing");
         assert_eq!(
             store.content_erase_user(None, u1, audit()).await.unwrap(),
@@ -3987,6 +4026,7 @@ mod tests {
                     message: msg.into(),
                     total_tokens: 1,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
         };
@@ -4007,6 +4047,7 @@ mod tests {
             message: String::new(),
             total_tokens: 0,
             user: String::new(),
+            ..Default::default()
         };
         let job = store.batch_create("ak", "default", "m", 2).await.unwrap();
         store
@@ -4267,6 +4308,7 @@ mod tests {
                     message: "ok".into(),
                     total_tokens: 5,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -4283,6 +4325,7 @@ mod tests {
                     message: "stale".into(),
                     total_tokens: 0,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -4306,6 +4349,7 @@ mod tests {
                     message: "late".into(),
                     total_tokens: 0,
                     user: String::new(),
+                    ..Default::default()
                 },
             )
             .await
