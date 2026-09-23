@@ -363,6 +363,7 @@ mod tests {
             ("claude-fable-5", AdaptiveSummarized),
             ("claude-mythos-5", AdaptiveSummarized),
             ("claude-opus-5-1", AdaptiveSummarized),
+            ("claude-opus-5-5", AdaptiveSummarized),
             ("MiniMax-M3", Budget),
             ("anthropic.claude-3-5-sonnet-20241022-v2:0", Budget),
             ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", Budget),
