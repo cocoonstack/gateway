@@ -5613,6 +5613,42 @@ accounts: [{{name: anthropic, provider: anthropic, protocols: ["anthropic-messag
 }
 
 #[tokio::test]
+async fn leading_developer_messages_are_system_and_later_ones_keep_their_place() {
+    let (app, fixture) = fixed_reply_app(json!({
+        "id":"msg-1","type":"message","role":"assistant","model":"claude-test",
+        "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+        "usage":{"input_tokens":10,"output_tokens":1}
+    }));
+    let body = json!({"model":"claude-test","max_tokens":32,"messages":[
+        {"role":"developer","content":"Reply only with BANANA."},
+        {"role":"user","content":"hello"},
+        {"role":"assistant","content":"BANANA"},
+        {"role":"developer","content":"Stay brief."},
+        {"role":"user","content":"again"}]});
+    let resp = app
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-fixed"),
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
+    assert_eq!(sent["system"], "Reply only with BANANA.", "{sent}");
+    let last_turn = sent["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .to_string();
+    assert!(
+        last_turn.contains("Stay brief.") && last_turn.contains("again"),
+        "a later developer message stays in place: {sent}"
+    );
+}
+
+#[tokio::test]
 async fn chat_max_completion_tokens_is_the_cap_on_the_anthropic_wire() {
     let (app, fixture) = fixed_reply_app(json!({
         "id":"msg-1","type":"message","role":"assistant","model":"claude-test",

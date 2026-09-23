@@ -2849,6 +2849,7 @@ async fn chat_completions(
         return error_response(400, "messages must not be empty");
     }
 
+    let mut leading = true;
     let messages: Vec<ChatMsg> = body
         .messages
         .into_iter()
@@ -2857,8 +2858,14 @@ async fn chat_completions(
                 .content
                 .map(|c| c.into_text_and_parts())
                 .unwrap_or_default();
+            let role = if leading && m.role == "developer" {
+                gw_consts::role::SYSTEM.to_owned()
+            } else {
+                m.role.into_owned()
+            };
+            leading = leading && role == gw_consts::role::SYSTEM;
             ChatMsg {
-                role: m.role.into_owned(),
+                role,
                 content,
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.map(Value::Array),
