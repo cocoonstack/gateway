@@ -135,8 +135,8 @@ impl DagNode for TenantEntitlement {
 }
 
 /// preprocess/variant_select: weighted split of a public model across its
-/// variants, sticky by effective user; after entitlement (on the public name),
-/// before the cache (each variant caches separately); a degraded request is left alone.
+/// variants, sticky per user id, else per conversation (its first user turn);
+/// after entitlement (on the public name), before the cache; a degraded request is left alone.
 pub struct VariantSelect;
 
 #[async_trait::async_trait]
@@ -152,13 +152,18 @@ impl DagNode for VariantSelect {
         let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
             return Ok(());
         };
-        let user = ctx.effective_user_id();
-        if conf.variants.is_empty() || (user.is_empty() && ctx.request.pins_reasoning_route()) {
+        if conf.variants.is_empty() {
             return Ok(());
         }
-        let key = match user {
-            "" => ctx.request.request_id.as_str(),
-            user => user,
+        let user = ctx.effective_user_id();
+        let key = if !user.is_empty() {
+            user
+        } else if let Some(turn) = first_user_turn(&ctx.request.message) {
+            turn
+        } else if ctx.request.pins_reasoning_route() {
+            return Ok(());
+        } else {
+            ctx.request.request_id.as_str()
         };
         let Some(target) = gw_config::pick_variant(&conf.variants, key) else {
             return Ok(());
@@ -992,6 +997,13 @@ pub fn default_layers() -> Vec<Layer> {
 
 fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {
     cfg.find_model(model_name).and_then(|m| m.cache_ttl_seconds)
+}
+
+fn first_user_turn(messages: &[gw_models::ChatMsg]) -> Option<&str> {
+    messages
+        .iter()
+        .find(|m| m.role == gw_consts::role::USER && !m.content.is_empty())
+        .map(|m| m.content.as_str())
 }
 
 fn model_provider(ctx: &DagContext) -> Option<&str> {

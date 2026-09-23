@@ -5649,7 +5649,7 @@ async fn leading_developer_messages_are_system_and_later_ones_keep_their_place()
 }
 
 #[tokio::test]
-async fn a_sticky_user_replays_thinking_on_the_variant_that_produced_it() {
+async fn a_thinking_replay_stays_on_the_variant_that_produced_it() {
     let cfg = Arc::new(
         GatewayConfig::from_yaml(
             r#"
@@ -5673,7 +5673,7 @@ accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-message
         sent: Default::default(),
     });
     let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
-    for (user, want) in [(Some("u-1"), "claude-canary"), (None, "claude-pub")] {
+    for (user, want) in [(Some("u-1"), "claude-canary"), (None, "claude-canary")] {
         let mut body = json!({"model":"claude-pub","max_tokens":64,"messages":[
             {"role":"user","content":"weather?"},
             {"role":"assistant","content":[

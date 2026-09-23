@@ -1702,7 +1702,7 @@ mod tests {
         assert_eq!(rec.served_model, "fb-m");
     }
 
-    async fn assert_thinking_route_pinned(thinking_type: &str) {
+    async fn assert_thinking_conversation_sticky(thinking_type: &str) {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
@@ -1720,11 +1720,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !seed
-                .decisions
+            seed.decisions
                 .iter()
-                .any(|(node, _)| *node == "variant_select"),
-            "{thinking_type} thinking must stay on the requested model"
+                .any(|(node, w)| *node == "variant_select" && w.contains("-> canary-m")),
+            "{thinking_type} thinking joins the split like any conversation: {:?}",
+            seed.decisions
         );
 
         let mut assistant = ChatMsg::text("assistant", String::new());
@@ -1736,9 +1736,9 @@ mod tests {
         tool_result.parts = Some(serde_json::json!([
             {"type":"tool_result","tool_use_id":"tool-1","content":"done"}
         ]));
-        let mut continuation = chat_req("pub-m", "");
+        let mut continuation = chat_req("pub-m", "start thinking");
         continuation.preserve_anthropic_wire = true;
-        continuation.message = vec![assistant, tool_result];
+        continuation.message.extend([assistant, tool_result]);
         let continued = h.run(continuation, key).await.unwrap();
         assert!(
             continued.decisions.iter().any(|(node, decision)| {
@@ -1747,23 +1747,43 @@ mod tests {
             "over-quota continuation must not fall back: {:?}",
             continued.decisions
         );
-        assert!(
-            !continued
-                .decisions
-                .iter()
-                .any(|(node, _)| *node == "variant_select")
-        );
-
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 2);
-        assert!(ledger.iter().all(|record| record.served_model == "pub-m"));
+        assert!(
+            ledger
+                .iter()
+                .all(|record| record.served_model == "canary-m"),
+            "both turns land on the variant that produced the thinking: {ledger:?}"
+        );
     }
 
     #[tokio::test]
-    async fn thinking_modes_stay_off_variants_and_quota_fallbacks() {
+    async fn thinking_conversations_stay_on_one_variant_and_off_quota_fallbacks() {
         for thinking_type in ["enabled", "adaptive"] {
-            assert_thinking_route_pinned(thinking_type).await;
+            assert_thinking_conversation_sticky(thinking_type).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_conversation_without_a_user_id_sticks_to_one_variant() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: v-a, weight: 1}, {model: v-b, weight: 1}]}, {name: v-a, protocol: openai-chat}, {name: v-b, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        for _ in 0..8 {
+            h.run(chat_req("pub-m", "the same opening turn"), key.clone())
+                .await
+                .unwrap();
+        }
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let served: std::collections::HashSet<&str> =
+            ledger.iter().map(|r| r.served_model.as_str()).collect();
+        assert_eq!(served.len(), 1, "one conversation, one variant: {served:?}");
+        assert!(served.contains("v-a") || served.contains("v-b"));
     }
 
     #[tokio::test]
