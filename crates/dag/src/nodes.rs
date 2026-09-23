@@ -119,7 +119,7 @@ impl DagNode for TenantEntitlement {
         "tenant_entitlement"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let name = &ctx.model_param()?.model_name;
+        let name = requested_model(Some(ctx.model_param()?));
         if !ctx.cfg.tenant_allows_model(&ctx.ak.tenant, name) {
             return Err(GatewayError::new(
                 ErrCode::PERMISSION_CHECK,

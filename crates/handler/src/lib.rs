@@ -24,6 +24,8 @@ pub use gw_models::BatchItem;
 pub use offline::OfflineHandler;
 
 const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
+const OFFLINE_THROTTLE_RETRIES: u32 = 3;
+const OFFLINE_THROTTLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
 static REQ_INSTANCE: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +257,7 @@ impl OnlineHandler {
         }
 
         let mut tried = 0;
+        let mut throttled = 0;
         loop {
             ctx.fallback_ahead = !ctx.request.replays_reasoning_output()
                 && next_fallback(&snap.cfg, &ctx, tried).is_some();
@@ -284,6 +287,17 @@ impl OnlineHandler {
             {
                 tried = i + 1;
                 switch_model(&mut ctx, next, &e.message);
+                continue;
+            }
+            if !ctx.request.is_online
+                && throttled < OFFLINE_THROTTLE_RETRIES
+                && matches!(
+                    e.code,
+                    gw_consts::ErrCode::STOP_LIMIT_MSG | gw_consts::ErrCode::POOLED_LIMIT_MSG
+                )
+            {
+                tokio::time::sleep(OFFLINE_THROTTLE_BACKOFF * 2u32.pow(throttled)).await;
+                throttled += 1;
                 continue;
             }
             if e.code == gw_consts::ErrCode::STOP_LIMIT_MSG {
@@ -1512,7 +1526,7 @@ mod tests {
         assert!(ledger[0].cost_micros >= 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn batch_item_rejections_do_not_trip_the_abuse_tier() {
         let yaml = "listen: {host: h, port: 1}\nabuse: {tiers: [{rejects: 1, suspend_hours: 2}]}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 0, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -1531,6 +1545,47 @@ mod tests {
             fresh.status_at(gw_state::epoch_secs()),
             gw_state::KeyStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn an_offline_request_waits_out_its_key_rate_limit() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        for _ in 0..2 {
+            let mut item = chat_req("gpt-4o", "hi");
+            item.is_online = false;
+            assert!(h.run(item, key.clone()).await.is_ok());
+        }
+        let err = h
+            .run(chat_req("gpt-4o", "hi"), key)
+            .await
+            .err()
+            .expect("an online request is refused at once");
+        assert_eq!(err.http_status, 429);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_item_on_a_variant_keeps_its_tenant_entitlement() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, variants: [{model: m1-b, weight: 1}]}, {name: m1-b, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m1]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        for _ in 0..2 {
+            let mut item = chat_req("m1", "hi");
+            item.is_online = false;
+            let ctx = h.run(item, key.clone()).await.unwrap();
+            assert_eq!(ctx.outcome.unwrap().response.model, "m1");
+        }
     }
 
     #[tokio::test]
