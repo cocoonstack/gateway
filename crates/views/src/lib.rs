@@ -2928,12 +2928,17 @@ async fn chat_completions(
     let model_out = outcome.response.model;
 
     let mut resp = if let Some(tc) = outcome.response.tool_calls.take() {
+        let finish = match finish_openai(outcome.response.finish_reason) {
+            length if length == "length" => length,
+            _ => Cow::Borrowed("tool_calls"),
+        };
         ChatCompletionResponse::tool_calls(
             id,
             created,
             model_out,
             outcome.response.message,
             openai_tool_calls(tc, &mut 0),
+            finish,
             usage,
         )
     } else {
