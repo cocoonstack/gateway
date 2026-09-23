@@ -1559,6 +1559,13 @@ fn responses_apply_frame(
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
+    if v["type"] == "error" {
+        let error = match v.get_mut("error").filter(|e| e.is_object()) {
+            Some(nested) => nested.take(),
+            None => v.take(),
+        };
+        return Err(stream_failure(error));
+    }
     if let Some(err) = crate::engine::vendor_error(status, &v) {
         return Err(err);
     }
@@ -1570,6 +1577,10 @@ fn responses_apply_frame(
     }
     let mut chunk = StreamChunk::default();
     match v["type"].as_str().unwrap_or_default() {
+        "response.failed" if !native => {
+            let error = v.pointer_mut("/response/error").map(Value::take);
+            return Err(stream_failure(error.unwrap_or_default()));
+        }
         "response.output_text.delta" if native => {
             full.push_str(v["delta"].as_str().unwrap_or_default());
         }
@@ -1593,7 +1604,7 @@ fn responses_apply_frame(
                 chunk.tool_calls = Some(Value::Array(vec![call]));
             }
         }
-        "response.completed" | "response.incomplete" => {
+        "response.completed" | "response.incomplete" | "response.failed" => {
             let r = &v["response"];
             if let Some(m) = r["model"].as_str() {
                 resp.model = m.to_owned();
@@ -1622,6 +1633,20 @@ fn responses_apply_frame(
         return Ok(Vec::new());
     }
     Ok(vec![chunk])
+}
+
+fn stream_failure(mut error: Value) -> GatewayError {
+    let status = match error["code"].as_str() {
+        Some("rate_limit_exceeded" | "rate_limit_reached") => 429,
+        Some("server_error" | "vector_store_timeout") | None => 502,
+        Some(_) => 400,
+    };
+    let message = crate::engine::take_string(&mut error, "/message");
+    GatewayError::new(
+        gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+        status,
+        message.unwrap_or_else(|| "upstream error".to_owned()),
+    )
 }
 
 #[cfg(test)]
@@ -2387,6 +2412,60 @@ mod tests {
         assert_eq!(out.response.message, "done");
         assert_eq!(out.response.finish_reason, "completed");
         assert_eq!(out.response.common_usage.unwrap().reason, 4);
+    }
+
+    #[test]
+    fn responses_stream_failure_frames_fail_cross_protocol_and_pass_through_natively() {
+        for (frame, status) in [
+            (
+                json!({"type": "error", "code": "server_error", "message": "boom"}),
+                502,
+            ),
+            (
+                json!({"type": "error", "sequence_number": 2, "error": {"type": "too_many_requests",
+                    "code": "rate_limit_reached", "message": "throughput limit"}}),
+                429,
+            ),
+            (
+                json!({"type": "response.failed", "response": {"status": "failed",
+                    "error": {"code": "rate_limit_exceeded", "message": "slow down"}}}),
+                429,
+            ),
+            (
+                json!({"type": "response.failed", "response": {"status": "failed",
+                    "error": {"code": "failed_to_download_image", "message": "bad url"}}}),
+                400,
+            ),
+        ] {
+            let err = responses_apply_frame(
+                frame.clone(),
+                200,
+                None,
+                false,
+                &mut GatewayResponse::default(),
+                &mut String::new(),
+            )
+            .unwrap_err();
+            assert_eq!(err.http_status, status, "{frame}: {err}");
+        }
+        let mut resp = GatewayResponse::default();
+        let chunks = responses_apply_frame(
+            json!({"type": "response.failed", "response": {"status": "failed",
+                "error": {"code": "server_error", "message": "boom"},
+                "usage": {"input_tokens": 9, "output_tokens": 1}}}),
+            200,
+            None,
+            true,
+            &mut resp,
+            &mut String::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            chunks[0].native_event.as_ref().unwrap()["type"],
+            "response.failed"
+        );
+        assert_eq!(resp.finish_reason, "failed");
+        assert_eq!((resp.prompt_tokens, resp.completion_tokens), (9, 1));
     }
 
     #[test]
