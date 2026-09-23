@@ -1240,6 +1240,10 @@ impl ResponsesEngine {
             gw_protocol::reasoning::EffortWire::Responses,
         );
         body.insert("model".to_owned(), model.into());
+        self.base.output_cap = body
+            .get("max_output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         Ok(Value::Object(body))
     }
 
@@ -2074,7 +2078,9 @@ mod tests {
             })),
             ..Default::default()
         }));
-        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        let mut engine = ResponsesEngine::new(r, t());
+        let body = engine.build_body().unwrap();
+        assert_eq!(engine.base.output_cap, 64);
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(
             body["store"], false,
