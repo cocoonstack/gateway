@@ -12,7 +12,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 mod common;
-use common::app;
+use common::{app, body_json};
 
 fn keys(v: &Value) -> BTreeSet<String> {
     v.as_object()
@@ -86,13 +86,6 @@ fn canonical_anthropic_parses_into_protocol_structs() {
         ContentBlock::Text { text } if text == "Hello!"
     ));
     assert_eq!(resp.usage.input_tokens, 12);
-}
-
-async fn body_json(resp: axum::response::Response) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    serde_json::from_slice(&bytes).expect("json")
 }
 
 fn post(uri: &str, body: &str) -> Request<Body> {

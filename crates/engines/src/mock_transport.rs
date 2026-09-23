@@ -325,8 +325,8 @@ impl MockTransport {
                 let v: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| GatewayError::internal("mock bedrock reply").with_source(e))?;
                 if v.get("generation").is_some() {
-                    let text = v["generation"].as_str().unwrap_or_default().to_owned();
-                    let (a, b) = Self::split_half(&text);
+                    let text = v["generation"].as_str().unwrap_or_default();
+                    let (a, b) = Self::split_half(text);
                     vec![
                         json!({"generation": a, "prompt_token_count": v["prompt_token_count"],
                                "generation_token_count": null, "stop_reason": null}),
@@ -379,11 +379,10 @@ impl MockTransport {
             .as_array()
             .and_then(|ms| ms.iter().rev().find(|m| m["role"] == "user"))
             .and_then(|m| m["content"][0]["text"].as_str())
-            .unwrap_or_default()
-            .to_owned();
+            .unwrap_or_default();
         let sys_note = Self::sys_note(body["system"][0]["text"].as_str().unwrap_or_default());
         let reply = format!("[mock-converse:{model}] {sys_note}you said: {user}");
-        let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
+        let (it, ot) = (Self::tokens(user) + 3, Self::tokens(&reply));
         if let Some(tool) = body["toolConfig"]["tools"][0]["toolSpec"]["name"].as_str() {
             return Self::ok_json(json!({
                 "output": {"message": {"role": "assistant", "content": [

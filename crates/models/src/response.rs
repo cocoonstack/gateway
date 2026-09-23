@@ -32,6 +32,7 @@ pub struct GatewayResponse {
     pub total_tokens: i64,
 
     /// v2 typed response payload (dynamic for now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_v2: Option<Value>,
     /// Native Anthropic content blocks. Anthropic views use this to preserve
     /// signed thinking and redacted-thinking blocks in their original order.
@@ -51,6 +52,7 @@ pub struct GatewayResponse {
     pub step: String,
 
     /// normalized usage view, filled by the CommonUsage post-processor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_usage: Option<CommonUsage>,
 
     /// the stream was committed to the client and then broke off; `message`

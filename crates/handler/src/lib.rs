@@ -1034,6 +1034,14 @@ mod tests {
         }
     }
 
+    fn item(text: &str, user: &str) -> BatchItem {
+        BatchItem {
+            messages: vec![ChatMsg::text("user", text)],
+            user: user.into(),
+            ..Default::default()
+        }
+    }
+
     fn chat_req(name: &str, content: &str) -> GatewayRequest {
         GatewayRequest {
             is_online: true,
@@ -2946,18 +2954,7 @@ mod tests {
     async fn batch_items_bypass_the_cache_and_bill_each() {
         let h = handler();
         let off = OfflineHandler::new(h.clone());
-        let items = vec![
-            BatchItem {
-                messages: vec![ChatMsg::text("user", "same prompt")],
-                user: String::new(),
-                ..Default::default()
-            },
-            BatchItem {
-                messages: vec![ChatMsg::text("user", "same prompt")],
-                user: String::new(),
-                ..Default::default()
-            },
-        ];
+        let items = vec![item("same prompt", ""), item("same prompt", "")];
         let job = off
             .submit(ak(&h).await, "cached-mini".into(), items)
             .await
@@ -2975,18 +2972,7 @@ mod tests {
             .submit(
                 ak(&h).await,
                 "gpt-4o-mini".into(),
-                vec![
-                    BatchItem {
-                        messages: vec![ChatMsg::text("user", "one")],
-                        user: String::new(),
-                        ..Default::default()
-                    },
-                    BatchItem {
-                        messages: vec![ChatMsg::text("user", "two")],
-                        user: String::new(),
-                        ..Default::default()
-                    },
-                ],
+                vec![item("one", ""), item("two", "")],
             )
             .await
             .unwrap();
@@ -3016,11 +3002,7 @@ mod tests {
             .submit(
                 ak(&h).await,
                 "gpt-4o-mini".into(),
-                vec![BatchItem {
-                    messages: vec![ChatMsg::text("user", "a forbidden word")],
-                    user: String::new(),
-                    ..Default::default()
-                }],
+                vec![item("a forbidden word", "")],
             )
             .await
             .unwrap();
@@ -3042,15 +3024,7 @@ mod tests {
         };
         h.state().auth.patch(&key.ak, &ban).await.unwrap();
         let job = off
-            .submit(
-                key,
-                "gpt-4o-mini".into(),
-                vec![BatchItem {
-                    messages: vec![ChatMsg::text("user", "one")],
-                    user: String::new(),
-                    ..Default::default()
-                }],
-            )
+            .submit(key, "gpt-4o-mini".into(), vec![item("one", "")])
             .await
             .unwrap();
         wait_terminal(&h, &job.id).await;
@@ -3087,11 +3061,7 @@ mod tests {
             .submit(
                 key,
                 "gpt-4o".into(),
-                vec![BatchItem {
-                    messages: vec![ChatMsg::text("user", "new content after erasure")],
-                    user: "user-42".into(),
-                    ..Default::default()
-                }],
+                vec![item("new content after erasure", "user-42")],
             )
             .await
             .unwrap();
@@ -3143,18 +3113,7 @@ mod tests {
             .submit(
                 key,
                 "gpt-4o".into(),
-                vec![
-                    BatchItem {
-                        messages: vec![ChatMsg::text("user", "for alice")],
-                        user: "alice".into(),
-                        ..Default::default()
-                    },
-                    BatchItem {
-                        messages: vec![ChatMsg::text("user", "for bob")],
-                        user: "bob".into(),
-                        ..Default::default()
-                    },
-                ],
+                vec![item("for alice", "alice"), item("for bob", "bob")],
             )
             .await
             .unwrap();
@@ -3203,18 +3162,7 @@ mod tests {
             .submit(
                 ak,
                 "gpt-4o-mini".into(),
-                vec![
-                    BatchItem {
-                        messages: vec![ChatMsg::text("user", "alpha")],
-                        user: "alice".into(),
-                        ..Default::default()
-                    },
-                    BatchItem {
-                        messages: vec![ChatMsg::text("user", "beta")],
-                        user: "bob".into(),
-                        ..Default::default()
-                    },
-                ],
+                vec![item("alpha", "alice"), item("beta", "bob")],
             )
             .await
             .unwrap();
