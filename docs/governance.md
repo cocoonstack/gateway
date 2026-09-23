@@ -36,7 +36,8 @@ unconfigured (key, model) pairs never touch a counter.
 ## Model fallback
 
 A model may name `fallback_models`, tried in order when the request fails
-upstream — a vendor 5xx or `429`, a connection failure, or no healthy account
+upstream — a vendor 5xx, `429`, or a `401`/`402`/`403` credential or billing
+refusal, a connection failure, or no healthy account
 left for the model (`503`) — after the account-level failover within the model
 is exhausted, and only while no byte has reached the client (a failure after a
 stream has begun stays a failure). Gateway-side denials (quotas, rate limits,

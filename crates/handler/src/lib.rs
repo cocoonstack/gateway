@@ -574,11 +574,11 @@ async fn note_abuse(ctx: &DagContext) {
         .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
 }
 
-/// Whether a pipeline error came from upstream: a vendor 5xx or 429, or a
-/// 502/503 the gateway raised for a connection failure or an exhausted pool.
+/// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403
+/// refusal, or a 502/503 the gateway raised for a connection failure or an exhausted pool.
 fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
-        Some(status) => status >= 500 || status == 429,
+        Some(status) => status >= 500 || matches!(status, 401..=403 | 429),
         None => {
             e.http_status >= 502
                 || (e.http_status == 429 && e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO)
@@ -1170,6 +1170,63 @@ mod tests {
         avail.flush().await;
         let minute = gw_state::epoch_secs() / 60;
         assert_eq!(avail.window("m", minute - 5, minute).await, (1, 0));
+    }
+
+    #[derive(Debug)]
+    struct RefusingAccount(u16);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for RefusingAccount {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            if request.account != "a-bad" {
+                return gw_engines::transport::Transport::send(&gw_engines::MockTransport, request)
+                    .await;
+            }
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: self.0,
+                body: gw_engines::transport::UpstreamBody::Json(
+                    br#"{"error":{"type":"authentication_error","message":"invalid api key"}}"#
+                        .to_vec()
+                        .into(),
+                ),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_refusal_fails_over_and_cools_the_account() {
+        for status in [401u16, 402, 403] {
+            let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, provider: p}]\naccounts: [{name: a-bad, provider: p, priority: 1, protocols: ['openai-chat']}, {name: a-good, provider: p, priority: 2, protocols: ['openai-chat']}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+            let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(RefusingAccount(status)),
+            );
+            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let first = h.run(chat_req("m", "hi"), key.clone()).await.unwrap();
+            assert!(
+                first
+                    .decisions
+                    .iter()
+                    .any(|(_, w)| w.contains("failover a-bad -> a-good")),
+                "{status}: {:?}",
+                first.decisions
+            );
+            let second = h.run(chat_req("m", "hi again"), key).await.unwrap();
+            assert!(
+                second
+                    .decisions
+                    .iter()
+                    .any(|(n, w)| *n == "select_account" && w == "a-good"),
+                "{status}: the refused account is cooled: {:?}",
+                second.decisions
+            );
+        }
     }
 
     #[tokio::test]

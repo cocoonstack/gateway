@@ -462,7 +462,7 @@ impl DagNode for CallEngine {
                 ctx.outcome = Some(outcome);
                 Ok(())
             }
-            Err(first_err) if first_err.http_status >= 500 => {
+            Err(first_err) if account_fault_status(&first_err) => {
                 let mt = ctx
                     .request
                     .protocol()
@@ -515,7 +515,7 @@ impl DagNode for CallEngine {
                     }
                     Err(e) => {
                         note_unavailable(ctx);
-                        if e.http_status >= 500 {
+                        if account_fault_status(&e) {
                             note_failure(ctx, &next.name).await;
                         }
                         Err(named(e, ctx))
@@ -582,6 +582,10 @@ fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
         e.resource = Some(requested_model(ctx.request.model_param_v2.as_ref()).to_owned());
     }
     e
+}
+
+fn account_fault_status(e: &GatewayError) -> bool {
+    e.http_status >= 500 || matches!(e.original_status(), Some(401..=403))
 }
 
 fn account_fault(class: gw_consts::ErrClass) -> bool {

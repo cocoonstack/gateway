@@ -258,7 +258,7 @@ moderation:                    # the external moderator behind security.moderate
   timeout_seconds: 10
 
 stability:
-  failure_threshold: 3         # consecutive failures before an account cools down
+  failure_threshold: 3         # consecutive failures (5xx, timeouts, a 401/402/403 refusal) before an account cools down
   cooldown_seconds: 30
   availability_window_minutes: 5   # /admin/models/status judgment window (max 60)
   unstable_error_rate: 0.1         # window error rate that reports `unstable`
