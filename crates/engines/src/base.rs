@@ -332,7 +332,7 @@ pub(crate) fn parse_json_reply(reply: UpstreamResponse) -> GResult<(u16, Value)>
         ));
     };
     let v: Value = serde_json::from_slice(bytes)
-        .map_err(|e| GatewayError::internal("parse upstream response").with_source(e))?;
+        .map_err(|e| crate::engine::unparsed_reply(reply.status, "parse upstream response", e))?;
     if let Some(err) = crate::engine::vendor_error(reply.status, &v) {
         return Err(err);
     }

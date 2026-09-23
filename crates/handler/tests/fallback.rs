@@ -28,6 +28,8 @@ impl Transport for Vendor {
         let (status, body): (u16, &'static [u8]) = match body["model"].as_str() {
             Some("broken") => (503, br#"{"error":{"message":"vendor down"}}"#),
             Some("throttled") => (429, br#"{"error":{"message":"rate limited"}}"#),
+            Some("proxied") => (502, b"<html><body>502 Bad Gateway</body></html>"),
+            Some("oversized") => (413, b"Request Entity Too Large"),
             Some("healthy") => (
                 200,
                 br#"{"model":"healthy","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
@@ -55,6 +57,8 @@ models:
   - {{name: unavailable, protocol: openai-chat, provider: absent, fallback_models: [broken, throttled, healthy]}}
   - {{name: broken, protocol: openai-chat, fallback_models: [throttled, healthy]}}
   - {{name: throttled, protocol: openai-chat}}
+  - {{name: proxied, protocol: openai-chat, fallback_models: [healthy]}}
+  - {{name: oversized, protocol: openai-chat, fallback_models: [healthy]}}
   - {{name: healthy, protocol: openai-chat, qpm: {model_qpm}}}
 accounts: [{{name: a, provider: p, protocols: [openai-chat]}}]"
     );
@@ -177,6 +181,29 @@ async fn an_exhausted_chain_reports_the_last_upstream_error() {
     assert_eq!(vendor.calls(), 2);
     assert_eq!(err.original_status(), Some(429));
     assert!(err.message.contains("rate limited"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn a_non_json_error_body_keeps_the_vendor_status() {
+    let (h, vendor) = handler(100.0, "tenants: [{name: t}]", 100).expect("fallback config");
+    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ctx = h
+        .run(request("proxied", true), ak.clone())
+        .await
+        .expect("a proxy's 502 page falls back");
+    let trail = ctx.decisions_line();
+    assert!(trail.contains("fallback: proxied -> healthy"), "{trail}");
+    let err = h
+        .run(request("oversized", true), ak)
+        .await
+        .err()
+        .expect("a 413 page is the vendor's refusal");
+    assert_eq!((err.http_status, err.original_status()), (413, Some(413)));
+    assert_eq!(
+        vendor.calls(),
+        3,
+        "a 4xx page neither fails over nor falls back"
+    );
 }
 
 #[tokio::test]

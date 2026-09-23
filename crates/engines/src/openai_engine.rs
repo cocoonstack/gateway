@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use gw_models::{GResult, GatewayError, GatewayResponse};
+use gw_models::{GResult, GatewayResponse};
 use gw_protocol::object;
 use gw_protocol::reasoning::is_thinking_block;
 use serde_json::{Map, Value, json};
@@ -143,7 +143,7 @@ impl OpenAiEngine {
 
     fn parse_json(&self, status: u16, body: &[u8]) -> GResult<EngineOutcome> {
         let mut v: Value = serde_json::from_slice(body)
-            .map_err(|e| GatewayError::internal("parse openai response").with_source(e))?;
+            .map_err(|e| crate::engine::unparsed_reply(status, "parse openai response", e))?;
         // surface vendor error envelopes instead of silently returning empty
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);

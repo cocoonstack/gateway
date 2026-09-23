@@ -131,6 +131,15 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     })
 }
 
+pub(crate) fn unparsed_reply(
+    status: u16,
+    what: impl Into<String>,
+    e: serde_json::Error,
+) -> GatewayError {
+    vendor_error(status, &Value::Null)
+        .unwrap_or_else(|| GatewayError::internal(what).with_source(e))
+}
+
 /// MiniMax reports business errors as `base_resp.status_code != 0` on an HTTP 200.
 pub(crate) fn reject_minimax_error(v: &Value) -> GResult<()> {
     let code = v["base_resp"]["status_code"].as_i64().unwrap_or(0);
