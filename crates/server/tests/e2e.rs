@@ -5649,6 +5649,52 @@ async fn leading_developer_messages_are_system_and_later_ones_keep_their_place()
 }
 
 #[tokio::test]
+async fn a_sticky_user_replays_thinking_on_the_variant_that_produced_it() {
+    let cfg = Arc::new(
+        GatewayConfig::from_yaml(
+            r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-fixed, product: demo, qps: 100, daily_token_quota: 1000000}]
+models:
+  - {name: claude-pub, protocol: anthropic-messages, variants: [{model: claude-canary, weight: 1}]}
+  - {name: claude-canary, protocol: anthropic-messages}
+accounts: [{name: anthropic, provider: anthropic, protocols: ["anthropic-messages"]}]
+"#,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let fixture = Arc::new(FixedReply {
+        reply: json!({
+            "id":"msg-1","type":"message","role":"assistant","model":"claude-canary",
+            "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":10,"output_tokens":1}
+        }),
+        sent: Default::default(),
+    });
+    let app = gw_views::app(AppState::new(cfg, state, fixture.clone()));
+    for (user, want) in [(Some("u-1"), "claude-canary"), (None, "claude-pub")] {
+        let mut body = json!({"model":"claude-pub","max_tokens":64,"messages":[
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"check it","signature":"sig"},
+                {"type":"tool_use","id":"t1","name":"get_weather","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sunny"}]}]});
+        if let Some(user) = user {
+            body["metadata"] = json!({"user_id": user});
+        }
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/messages", Some("ak-fixed"), &body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent = fixture.sent.lock().unwrap().take().expect("upstream body");
+        assert_eq!(sent["model"], want, "user {user:?}");
+    }
+}
+
+#[tokio::test]
 async fn chat_max_completion_tokens_is_the_cap_on_the_anthropic_wire() {
     let (app, fixture) = fixed_reply_app(json!({
         "id":"msg-1","type":"message","role":"assistant","model":"claude-test",

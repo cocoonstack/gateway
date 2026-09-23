@@ -152,10 +152,11 @@ impl DagNode for VariantSelect {
         let Some(conf) = ctx.cfg.find_model(&param.model_name) else {
             return Ok(());
         };
-        if conf.variants.is_empty() || ctx.request.pins_reasoning_route() {
+        let user = ctx.effective_user_id();
+        if conf.variants.is_empty() || (user.is_empty() && ctx.request.pins_reasoning_route()) {
             return Ok(());
         }
-        let key = match ctx.effective_user_id() {
+        let key = match user {
             "" => ctx.request.request_id.as_str(),
             user => user,
         };
