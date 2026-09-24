@@ -1,3 +1,4 @@
+// Package main is the gateway control-plane entry point.
 package main
 
 import (
