@@ -1,8 +1,11 @@
-.PHONY: test test-integration web web-test build fmt fmt-check gofumpt goimports
+.PHONY: test test-integration web web-test build fmt fmt-check gofumpt goimports lint golangci-lint
 
 RUST_CARGO ?= cargo
 
 LOCALBIN ?= $(shell pwd)/bin
+GOLANGCILINT_VERSION ?= v2.13.2
+GOLANGCILINT_ROOT := $(LOCALBIN)/golangci-lint-$(GOLANGCILINT_VERSION)
+GOLANGCILINT := $(GOLANGCILINT_ROOT)/golangci-lint
 GOFUMPT_VERSION ?= v0.11.0
 GOFUMPT_ROOT := $(LOCALBIN)/gofumpt-$(GOFUMPT_VERSION)
 GOFMT := $(GOFUMPT_ROOT)/gofumpt
@@ -10,6 +13,13 @@ GOIMPORTS_VERSION ?= v0.49.0
 GOIMPORTS_ROOT := $(LOCALBIN)/goimports-$(GOIMPORTS_VERSION)
 GOIMPORTS := $(GOIMPORTS_ROOT)/goimports
 GOIMPORTS_LOCAL_PREFIXES := github.com/cocoonstack/
+
+## Target OSes for lint
+GOOSES ?= linux darwin
+
+golangci-lint: $(GOLANGCILINT)
+$(GOLANGCILINT):
+	GOBIN=$(GOLANGCILINT_ROOT) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCILINT_VERSION)
 
 gofumpt: $(GOFMT)
 $(GOFMT):
@@ -26,6 +36,14 @@ fmt: gofumpt goimports
 fmt-check: gofumpt goimports
 	@test -z "$$($(GOFMT) -l .)" || { echo "Files need formatting (gofumpt):"; $(GOFMT) -l .; exit 1; }
 	@test -z "$$($(GOIMPORTS) -l .)" || { echo "Files need formatting (goimports):"; $(GOIMPORTS) -l .; exit 1; }
+
+lint: golangci-lint ## Run golangci-lint on every target OS, integration harness included
+	@for goos in $(GOOSES); do \
+		echo "==> golangci-lint GOOS=$$goos"; \
+		GOOS=$$goos $(GOLANGCILINT) run ./... || exit 1; \
+		echo "==> golangci-lint GOOS=$$goos -tags integration ./internal/integration"; \
+		GOOS=$$goos $(GOLANGCILINT) run --build-tags integration ./internal/integration || exit 1; \
+	done
 
 test:
 	GOWORK=off go test ./...

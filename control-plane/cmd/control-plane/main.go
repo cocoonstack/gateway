@@ -40,13 +40,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := log.SetupLog(ctx, &types.ServerLogConfig{Level: cfg.LogLevel, UseJSON: !stderrIsTerminal()}, ""); err != nil {
+	if err = log.SetupLog(ctx, &types.ServerLogConfig{Level: cfg.LogLevel, UseJSON: !stderrIsTerminal()}, ""); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if err := run(ctx, cfg); err != nil {
+	err = run(ctx, cfg)
+	stop()
+	if err != nil {
 		log.WithFunc("main").Error(ctx, err, "control plane stopped")
 		os.Exit(1)
 	}
@@ -67,7 +68,7 @@ func run(ctx context.Context, cfg config.Config) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := seedUsers(ctx, users, cfg); err != nil {
+	if err = seedUsers(ctx, users, cfg); err != nil {
 		return err
 	}
 
@@ -92,8 +93,8 @@ func run(ctx context.Context, cfg config.Config) (err error) {
 		defer close(done)
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.WithFunc("main.run").Error(shutdownCtx, err, "drain HTTP server")
+		if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
+			log.WithFunc("main.run").Error(shutdownCtx, shutdownErr, "drain HTTP server")
 		}
 	})
 	log.WithFunc("main.run").Infof(ctx, "control plane listening on http://%s", cfg.ListenAddr)

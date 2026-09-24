@@ -21,7 +21,7 @@ var dummyHash = sync.OnceValue(func() string {
 })
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "gateway-control-plane"})
+	writeJSON(w, http.StatusOK, map[string]string{statusField: "ok", "service": "gateway-control-plane"})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +71,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		loginError(r.Context(), w, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure follows CP_COOKIE_SECURE
 		Name: sessionCookie, Value: session.ID, Path: "/", HttpOnly: true,
 		Secure: s.cookieSecure, SameSite: http.SameSiteLaxMode,
 		MaxAge: int(s.sessionTTL.Seconds()), Expires: time.Unix(session.ExpiresAt, 0),
@@ -85,7 +85,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure follows CP_COOKIE_SECURE
 		Name: sessionCookie, Path: "/", HttpOnly: true, Secure: s.cookieSecure,
 		SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0),
 	})
