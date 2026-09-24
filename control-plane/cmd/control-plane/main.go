@@ -39,7 +39,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := log.SetupLog(ctx, &types.ServerLogConfig{Level: cfg.LogLevel}, ""); err != nil {
+	if err := log.SetupLog(ctx, &types.ServerLogConfig{Level: cfg.LogLevel, UseJSON: !stderrIsTerminal()}, ""); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -170,4 +170,9 @@ func ensureUser(ctx context.Context, store user.Store, seed userSeed) error {
 		return fmt.Errorf("seed user %s: %w", seed.email, err)
 	}
 	return nil
+}
+
+func stderrIsTerminal() bool {
+	fi, err := os.Stderr.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
