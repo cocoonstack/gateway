@@ -1,0 +1,90 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bodyclose
+    - dogsled
+    - errcheck
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - gocyclo
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - modernize
+    - nakedret
+    - nestif
+    - nolintlint
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    gocritic:
+      disabled-checks:
+        - captLocal
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    revive:
+      enable-default-rules: true
+      rules:
+        - name: exported
+          disabled: true
+    nolintlint:
+      allow-unused: false
+    misspell:
+      locale: US
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    gocyclo:
+      min-complexity: 30
+    nakedret:
+      max-func-lines: 30
+    nestif:
+      min-complexity: 5
+  exclusions:
+    generated: strict
+    paths:
+      - vendor
+      - mocks
+      - dist
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - unparam
+          - goconst
+          - gocyclo
+          - nestif
+      # Table-driven subtests re-declare err per case; the outer one is fixture setup.
+      - path: _test\.go
+        linters:
+          - govet
+        text: "shadow"
+      # Fixture strings in the dev-mode mock client; naming them is churn.
+      - path: internal/gateway/mock/
+        linters:
+          - goconst
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/cocoonstack/

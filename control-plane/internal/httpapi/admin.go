@@ -153,7 +153,7 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditLog(r, "key_create", key.AK)
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "created", "ak": key.AK})
+	writeJSON(w, http.StatusCreated, map[string]string{statusField: "created", "ak": key.AK})
 }
 
 func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
@@ -220,7 +220,7 @@ func (s *Server) publishConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditLog(r, "config_publish", strconv.FormatInt(version, 10))
-	writeJSON(w, http.StatusOK, map[string]any{"status": "published", "version": version})
+	writeJSON(w, http.StatusOK, map[string]any{statusField: "published", "version": version})
 }
 
 func (s *Server) configVersions(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +244,7 @@ func (s *Server) rollbackConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditLog(r, "config_rollback", strconv.FormatInt(version, 10))
-	writeJSON(w, http.StatusOK, map[string]any{"status": "rolled_back", "version": version})
+	writeJSON(w, http.StatusOK, map[string]any{statusField: "rolled_back", "version": version})
 }
 
 func (s *Server) audit(w http.ResponseWriter, r *http.Request) {

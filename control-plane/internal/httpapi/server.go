@@ -27,6 +27,7 @@ const (
 	sessionCookie = "cp_session"
 	maxJSONBody   = 1 << 20
 	maxConfigBody = 4 << 20
+	statusField   = "status"
 )
 
 type principal struct {
