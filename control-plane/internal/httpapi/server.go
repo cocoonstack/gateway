@@ -115,6 +115,11 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		u, err := s.users.ByID(r.Context(), session.UserID)
+		if err != nil && !errors.Is(err, user.ErrNotFound) {
+			log.WithFunc("httpapi.requireAuth").Errorf(r.Context(), err, "load session user rid=%s", gateway.RequestIDFrom(r.Context()))
+			writeError(w, http.StatusServiceUnavailable, "authentication is temporarily unavailable")
+			return
+		}
 		if err != nil || u.Disabled || (u.PasswordChangedAt > 0 && session.IssuedAt <= u.PasswordChangedAt) {
 			_ = s.sessions.Delete(r.Context(), session.ID)
 			writeError(w, http.StatusUnauthorized, "authentication required")
