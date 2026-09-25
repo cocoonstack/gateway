@@ -102,7 +102,7 @@ func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// evict sessions issued before the reset so a stolen cookie dies too
+		// Evict sessions issued before the reset so a stolen cookie dies too
 		u.PasswordChangedAt = time.Now().Unix()
 	}
 	if body.Tenant != nil {

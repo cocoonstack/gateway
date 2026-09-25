@@ -292,7 +292,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, value any) 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	// the status line is already committed; an encode error is a gone client
+	// The status line is already committed; an encode error is a gone client
 	_ = json.NewEncoder(w).Encode(value)
 }
 
