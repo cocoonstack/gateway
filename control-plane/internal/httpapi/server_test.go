@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -226,6 +227,21 @@ func TestLoginThrottleSweepStaysAmortisedAndReclaimsExpired(t *testing.T) {
 	}
 	if _, ok := throttle.windows["0"]; ok {
 		t.Error("expired window survived every sweep")
+	}
+}
+
+func TestLoginRejectsAnOverlongEmailBeforeTheThrottle(t *testing.T) {
+	s := newTestServer(t, usermemory.New(), false)
+	body, _ := json.Marshal(map[string]string{"email": strings.Repeat("a", 1<<16) + "@example.com", "password": "x"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if n := len(s.throttle.windows); n != 0 {
+		t.Fatalf("throttle windows = %d, want none kept for an overlong email", n)
 	}
 }
 
