@@ -32,6 +32,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, maxJSONBody, &body) {
 		return
 	}
+	if len(body.Email) > maxEmailLen {
+		writeError(w, http.StatusUnauthorized, "invalid email or password")
+		return
+	}
 	throttleKey := s.clientIP(r) + "|" + user.NormalizeEmail(body.Email)
 	if !s.throttle.allow(throttleKey, time.Now()) {
 		writeError(w, http.StatusTooManyRequests, "too many login attempts; retry later")

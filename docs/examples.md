@@ -204,7 +204,7 @@ Price the chat models by their reasoning too: xAI's chat wire reports
 `total_tokens`, and the gateway reads that arithmetic and bills them at the
 output rate. Every reply carries `usage.cost_in_usd_ticks`, so with list prices
 configured the ledger's `cost_micros` matches the vendor's own charge — the
-check `scripts/live-matrix/live_matrix.py --group xai` runs.
+check `scripts/live-matrix/live_matrix.py xai` runs.
 
 The same models are served by Bedrock and OpenRouter, both of which normalize
 that usage shape to the OpenAI one:
