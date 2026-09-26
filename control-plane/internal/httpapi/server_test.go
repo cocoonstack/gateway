@@ -2,10 +2,14 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -229,6 +233,47 @@ func TestLoginThrottleSweepStaysAmortisedAndReclaimsExpired(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsAnOverlongEmailBeforeTheThrottle(t *testing.T) {
+	s := newTestServer(t, usermemory.New(), false)
+	body, _ := json.Marshal(map[string]string{"email": strings.Repeat("a", 1<<16) + "@example.com", "password": "x"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if n := len(s.throttle.windows); n != 0 {
+		t.Fatalf("throttle windows = %d, want none kept for an overlong email", n)
+	}
+}
+
+func TestSessionSurvivesATransientUserStoreError(t *testing.T) {
+	store := &flakyStore{Store: usermemory.New()}
+	hash, err := auth.HashPassword("password123!")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	now := time.Now().Unix()
+	if err := store.Create(t.Context(), user.User{
+		ID: "admin", Email: "admin@example.com", DisplayName: "admin", PasswordHash: hash,
+		Role: user.RoleSystemAdmin, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	handler := newTestServer(t, store, false).Handler()
+	admin := loginAs(t, handler, "admin@example.com")
+
+	store.fail.Store(true)
+	if rec := request(t, handler, admin, http.MethodGet, "/api/v1/session", nil, false); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("session status during a store outage = %d, want 503", rec.Code)
+	}
+	store.fail.Store(false)
+	if rec := request(t, handler, admin, http.MethodGet, "/api/v1/session", nil, false); rec.Code != http.StatusOK {
+		t.Fatalf("session status after the store recovered = %d, want 200", rec.Code)
+	}
+}
+
 type loginState struct {
 	cookie *http.Cookie
 	csrf   string
@@ -311,4 +356,16 @@ func request(t *testing.T, handler http.Handler, state loginState, method, path 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec
+}
+
+type flakyStore struct {
+	user.Store
+	fail atomic.Bool
+}
+
+func (f *flakyStore) ByID(ctx context.Context, id string) (user.User, error) {
+	if f.fail.Load() {
+		return user.User{}, errors.New("connection refused")
+	}
+	return f.Store.ByID(ctx, id)
 }

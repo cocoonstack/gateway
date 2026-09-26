@@ -95,8 +95,10 @@ Stated so an operator can choose them deliberately:
   (default) denies the request or tool result, `true` admits it.
 - Upstream failure: account failover within the model, then the model's
   `fallback_models` chain, only while nothing has been sent to the client.
-  Upstream and identity-provider errors reach the customer as a generic
-  `502`; endpoints and error text stay in the gateway log.
+  A terminal model failure then answers `424` with
+  `model_error_exception` (see [API](api.md)); an MCP server or
+  identity-provider failure answers a generic `500`, and its endpoint and
+  error text stay in the gateway log.
 - Abuse of long-lived connections: realtime sessions and MCP listen streams
   are capped per key (`max_live_streams_per_key`); realtime turns and every
   MCP request spend the key's QPS permits; request bodies are capped at

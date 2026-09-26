@@ -271,8 +271,9 @@ against `max_live_streams_per_key`. JSON-RPC batches are refused (400); the
 key's QPS and the tenant's pooled QPS apply. A server declared with `oauth` is
 called with an access token the gateway fetches from the server's token
 endpoint; a `401` from the server fetches a fresh token and retries the call
-once. Upstream failures answer a generic `502`; the server's endpoint and the
-identity provider's error text stay in the gateway log.
+once. Upstream failures answer a generic `500` (`internal_server_exception`);
+the server's endpoint and the identity provider's error text stay in the
+gateway log.
 
 ## Batch & files
 

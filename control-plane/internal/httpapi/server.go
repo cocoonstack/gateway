@@ -26,6 +26,7 @@ import (
 const (
 	sessionCookie = "cp_session"
 	maxJSONBody   = 1 << 20
+	maxEmailLen   = 254
 	maxConfigBody = 4 << 20
 	statusField   = "status"
 )
@@ -114,6 +115,11 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		u, err := s.users.ByID(r.Context(), session.UserID)
+		if err != nil && !errors.Is(err, user.ErrNotFound) {
+			log.WithFunc("httpapi.requireAuth").Errorf(r.Context(), err, "load session user rid=%s", gateway.RequestIDFrom(r.Context()))
+			writeError(w, http.StatusServiceUnavailable, "authentication is temporarily unavailable")
+			return
+		}
 		if err != nil || u.Disabled || (u.PasswordChangedAt > 0 && session.IssuedAt <= u.PasswordChangedAt) {
 			_ = s.sessions.Delete(r.Context(), session.ID)
 			writeError(w, http.StatusUnauthorized, "authentication required")
@@ -286,7 +292,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, value any) 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	// the status line is already committed; an encode error is a gone client
+	// The status line is already committed; an encode error is a gone client
 	_ = json.NewEncoder(w).Encode(value)
 }
 

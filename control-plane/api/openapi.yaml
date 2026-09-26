@@ -31,6 +31,8 @@ paths:
       responses:
         "200": {$ref: "#/components/responses/Session"}
         "401": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
   /auth/logout:
     post:
       summary: End the current session
@@ -42,6 +44,7 @@ paths:
       responses:
         "200": {$ref: "#/components/responses/Session"}
         "401": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/Error"}
   /overview:
     get:
       summary: Scoped usage, trend and model availability
