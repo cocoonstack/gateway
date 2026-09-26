@@ -165,9 +165,9 @@ secret and refresh-token seed are read from the environment at fetch time.
 A tenant whose `security.moderate` is on has every served `tools/call`,
 `resources/read` and `prompts/get` result reviewed by the moderator behind
 `moderation:` — the same review the chat and realtime surfaces apply to
-inbound text, here over every prose field of the result (string values under
-`result`, joined by newlines; `blob`, `mimeType`, `name`, `type` and `uri`
-fields are identifiers or binary and pass untouched). The reply is buffered
+inbound text, here over every string value under `result`, joined by
+newlines, except the base64 `blob` and `data` of an image or audio block or a
+blob resource, which pass untouched. The reply is buffered
 for the review, up to the server's `max_reply_bytes`. A mask rewrites the text
 in place (`[MASKED]`); a denial, a degrade verdict, a mask that matches
 nothing, or a reply the gateway cannot parse replaces the whole reply with one
