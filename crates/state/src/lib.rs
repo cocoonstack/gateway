@@ -826,47 +826,42 @@ impl GatewayState {
     /// durable store) aborts on failure — it is the source of truth; Redis
     /// (governance/health/cache) fails soft and stays in-process.
     pub async fn build(cfg: &GatewayConfig) -> gw_models::GResult<Self> {
+        let st = &cfg.storage;
         let mut state = GatewayState {
             pool: AccountPool::from_config(cfg),
             ..Default::default()
         };
-        if cfg.storage.postgres_url.is_empty() {
+        if st.postgres_url.is_empty() {
             for k in &cfg.access_keys {
                 state.auth.put(AkInfo::from(k), KeySource::Config).await?;
             }
+            if !st.sqlite_path.is_empty() {
+                state.store = Arc::new(
+                    SqliteStore::open_with_cap(&st.sqlite_path, st.ledger_max_rows).await?,
+                );
+                tracing::info!(path = %st.sqlite_path, "store = sqlite");
+            } else if st.ledger_max_rows > 0 {
+                state.store = Arc::new(MemoryStore::with_ledger_cap(st.ledger_max_rows as usize));
+            }
         } else {
-            let ks = PostgresKeyStore::connect(
-                &cfg.storage.postgres_url,
-                cfg.storage.postgres_max_connections,
-            )
-            .await?;
+            let ks =
+                PostgresKeyStore::connect(&st.postgres_url, st.postgres_max_connections).await?;
             ks.reload_config_keys(&cfg.access_keys).await?;
             state.auth = Arc::new(ks);
             tracing::info!("key store = postgres (config keys seeded)");
             state.store = Arc::new(
                 PostgresStore::connect_with_cap(
-                    &cfg.storage.postgres_url,
-                    cfg.storage.ledger_max_rows,
-                    cfg.storage.postgres_max_connections,
+                    &st.postgres_url,
+                    st.ledger_max_rows,
+                    st.postgres_max_connections,
                 )
                 .await?,
             );
             tracing::info!("store = postgres");
         }
-        if cfg.storage.postgres_url.is_empty() && !cfg.storage.sqlite_path.is_empty() {
-            state.store = Arc::new(
-                SqliteStore::open_with_cap(&cfg.storage.sqlite_path, cfg.storage.ledger_max_rows)
-                    .await?,
-            );
-            tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
-        } else if cfg.storage.postgres_url.is_empty() && cfg.storage.ledger_max_rows > 0 {
-            state.store = Arc::new(MemoryStore::with_ledger_cap(
-                cfg.storage.ledger_max_rows as usize,
-            ));
-        }
-        if !cfg.storage.redis_url.is_empty() {
-            if cfg.storage.shared_cache {
-                match RedisResponseCache::connect(&cfg.storage.redis_url).await {
+        if !st.redis_url.is_empty() {
+            if st.shared_cache {
+                match RedisResponseCache::connect(&st.redis_url).await {
                     Ok(c) => {
                         state.cache = Arc::new(c);
                         tracing::info!("response cache = redis (fleet-shared)");
@@ -876,14 +871,14 @@ impl GatewayState {
                     }
                 }
             }
-            match RedisGovernance::connect(&cfg.storage.redis_url).await {
+            match RedisGovernance::connect(&st.redis_url).await {
                 Ok(g) => {
                     state.governance = Arc::new(g);
                     tracing::info!("governance = redis");
                 }
                 Err(e) => tracing::error!(error = %e, "redis connect failed; staying in-process"),
             }
-            match RedisHealth::connect(&cfg.storage.redis_url).await {
+            match RedisHealth::connect(&st.redis_url).await {
                 Ok(h) => {
                     state.health = Arc::new(h);
                     tracing::info!("account health = redis (fleet-wide cooldown)");
@@ -892,7 +887,7 @@ impl GatewayState {
                     tracing::error!(error = %e, "redis health connect failed; staying in-process")
                 }
             }
-            match avail::RedisAvail::connect(&cfg.storage.redis_url).await {
+            match avail::RedisAvail::connect(&st.redis_url).await {
                 Ok(a) => {
                     state.avail = Arc::new(a);
                     tracing::info!("model availability = redis (fleet-wide counts)");

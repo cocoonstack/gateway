@@ -112,7 +112,8 @@ pub fn spawn_alert_dispatch(shared: SharedConfig) -> tokio::task::JoinHandle<()>
         let client = reqwest::Client::new();
         let mut sent: HashMap<String, Instant> = HashMap::new();
         while let Some(ev) = rx.recv().await {
-            let conf = shared.load().cfg.alerts.clone();
+            let snap = shared.load();
+            let conf = &snap.cfg.alerts;
             let Some(url) = conf.webhook_url() else {
                 continue;
             };
@@ -120,16 +121,10 @@ pub fn spawn_alert_dispatch(shared: SharedConfig) -> tokio::task::JoinHandle<()>
             if !should_send(&mut sent, format!("{}:{}", ev.kind, ev.subject), dedup) {
                 continue;
             }
-            let body = serde_json::json!({
-                "kind": ev.kind,
-                "subject": ev.subject,
-                "detail": ev.detail,
-                "at_epoch_secs": ev.at_epoch_secs,
-            });
             let post = client
                 .post(&url)
                 .header("content-type", "application/json")
-                .body(body.to_string())
+                .body(serde_json::to_vec(&ev).unwrap_or_default())
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await;

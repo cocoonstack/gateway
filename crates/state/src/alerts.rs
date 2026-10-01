@@ -2,13 +2,14 @@
 //! (spawned by the server) drains them to the configured webhook. Bounded and
 //! lossy by design — an alert must never block or slow the serving path.
 
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 // bounded: a stuck dispatcher drops alerts instead of growing memory
 const ALERT_QUEUE: usize = 256;
 
 /// One outbound alert.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct AlertEvent {
     pub kind: &'static str,
     pub subject: String,

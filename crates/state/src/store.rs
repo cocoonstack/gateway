@@ -160,6 +160,20 @@ pub struct BatchJob {
     pub results: Vec<BatchItemResult>,
 }
 
+impl BatchJob {
+    fn pending(id: String, ak: &str, tenant: &str, model: &str, total: usize) -> Self {
+        Self {
+            id,
+            ak: ak.to_owned(),
+            tenant: tenant.to_owned(),
+            model: model.to_owned(),
+            status: BatchStatus::Pending,
+            total,
+            results: Vec::new(),
+        }
+    }
+}
+
 /// A stored file (batch input JSONL, etc.).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StoredFile {
@@ -1181,15 +1195,7 @@ impl Store for MemoryStore {
             "batch-local-{}",
             self.seq.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let job = BatchJob {
-            id: id.clone(),
-            ak: ak.to_owned(),
-            tenant: tenant.to_owned(),
-            model: model.to_owned(),
-            status: BatchStatus::Pending,
-            total,
-            results: Vec::new(),
-        };
+        let job = BatchJob::pending(id.clone(), ak, tenant, model, total);
         let now = crate::epoch_secs();
         self.jobs
             .retain(|_, (_, created)| *created >= now - JOB_RETENTION_SECS);
@@ -2263,15 +2269,7 @@ sql_store_impl!(SqliteStore, sqlite, {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert batch", e))?;
-        Ok(BatchJob {
-            id,
-            ak: ak.to_owned(),
-            tenant: tenant.to_owned(),
-            model: model.to_owned(),
-            status: BatchStatus::Pending,
-            total,
-            results: Vec::new(),
-        })
+        Ok(BatchJob::pending(id, ak, tenant, model, total))
     }
 
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
@@ -2615,15 +2613,7 @@ sql_store_impl!(PostgresStore, postgres, {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("insert batch", e))?;
-        Ok(BatchJob {
-            id,
-            ak: ak.to_owned(),
-            tenant: tenant.to_owned(),
-            model: model.to_owned(),
-            status: BatchStatus::Pending,
-            total,
-            results: Vec::new(),
-        })
+        Ok(BatchJob::pending(id, ak, tenant, model, total))
     }
 
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
@@ -2791,15 +2781,7 @@ sql_store_impl!(PostgresStore, postgres, {
         tx.commit()
             .await
             .map_err(|e| crate::sqlx_err("commit batch enqueue", e))?;
-        Ok(BatchJob {
-            id,
-            ak: ak.to_owned(),
-            tenant: tenant.to_owned(),
-            model: model.to_owned(),
-            status: BatchStatus::Pending,
-            total: items.len(),
-            results: Vec::new(),
-        })
+        Ok(BatchJob::pending(id, ak, tenant, model, items.len()))
     }
 
     async fn batch_item_snapshot(
