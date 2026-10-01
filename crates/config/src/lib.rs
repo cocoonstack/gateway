@@ -1424,10 +1424,12 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
 /// bytes in hex. Request auth uses only this, so an id never authenticates.
 pub fn access_key_id(raw: &str) -> String {
     let digest = Sha256::digest(raw.as_bytes());
-    format!(
-        "{AK_ID_PREFIX}{}",
-        hex::encode(&digest[..AK_ID_HEX_LEN / 2])
-    )
+    let mut hex = [0u8; AK_ID_HEX_LEN];
+    let _ = hex::encode_to_slice(&digest[..AK_ID_HEX_LEN / 2], &mut hex);
+    let mut id = String::with_capacity(AK_ID_PREFIX.len() + AK_ID_HEX_LEN);
+    id.push_str(AK_ID_PREFIX);
+    id.push_str(std::str::from_utf8(&hex).unwrap_or_default());
+    id
 }
 
 /// The id a trusted caller (config, admin API, a stored row) names: the value

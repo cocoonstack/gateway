@@ -87,7 +87,7 @@ base64 = "0.22"
 tikv-jemallocator = "0.7"
 tiktoken-rs = "0.12"
 # pure-compute crypto (SigV4 signing, cache keys, content-at-rest AEAD) — no network capability
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] } # asm: hardware SHA-256 on aarch64; x86_64 detects SHA-NI without it
 hmac = "0.12"
 hex = "0.4"
 chacha20poly1305 = "0.10"
