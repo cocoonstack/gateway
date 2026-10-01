@@ -1,7 +1,4 @@
-//! End-to-end round against the fully composed app (embedded config + in-process
-//! state + MockTransport). Exercises the same wiring `main.rs` serves, one HTTP
-//! call at a time: auth → resolve → quota → account → rate-limit → engine →
-//! usage → billing. No network leaves the process (zero-egress default build).
+//! The composed app on the embedded config and `MockTransport`, one HTTP call at a time.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

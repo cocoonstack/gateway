@@ -1,7 +1,4 @@
-//! Capstone: the ENTIRE gateway pipeline over real HTTP, with the REAL
-//! `HttpTransport` against a loopback "vendor" server. Boundary: the vendor is
-//! local — swap the account endpoint/api_key_env for a real one and it is
-//! live, no code change.
+//! The full pipeline over real HTTP with `HttpTransport` against a loopback vendor.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

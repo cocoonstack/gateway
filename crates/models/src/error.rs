@@ -45,10 +45,7 @@ impl GatewayError {
         Self::new(ErrCode::REQ_PARAM, 400, message)
     }
 
-    /// Client went away before the response was committed. Status 499 stays
-    /// below the 5xx failover threshold so the disconnect neither re-bills nor
-    /// faults the account. (Once delivery has begun, a break returns an
-    /// aborted outcome instead — billed from the delivered content.)
+    /// Client left before the response was committed; 499 stays below the 5xx failover threshold.
     pub fn client_closed(message: impl Into<String>) -> Self {
         Self::new(ErrCode::SYSTEM_ERROR, 499, message)
     }

@@ -1,6 +1,4 @@
-//! Request-construction alignment: verify engines build vendor-correct request
-//! bodies (the other half of the round-trip; response parsing is covered by
-//! golden_fixtures.rs). Fully offline.
+//! The request bodies each engine builds for its vendor.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

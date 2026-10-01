@@ -1,7 +1,4 @@
-//! Real-socket wire verification for `HttpTransport`: a REAL axum server on a
-//! loopback port, driven over real TCP with real HTTP framing (JSON + SSE).
-//! Boundary: a local server, not a real vendor — byte-level vendor alignment
-//! still needs real endpoints + credentials.
+//! `HttpTransport` over real TCP against a loopback axum server (JSON and SSE).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

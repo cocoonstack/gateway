@@ -376,187 +376,6 @@ impl ThinkingSignatureAudit {
     }
 }
 
-struct AuditInner {
-    key: Digest,
-    ttl: Duration,
-    max_entries: usize,
-    cache: Mutex<AuditCache>,
-}
-
-struct AuditCache {
-    entries: HashMap<Digest, CacheEntry>,
-    next_sweep: Instant,
-}
-
-struct CacheEntry {
-    fingerprints: Vec<SequenceFingerprint>,
-    expires_at: Instant,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SequenceFingerprint {
-    opaque: Digest,
-    strict: Option<Digest>,
-}
-
-fn new_mac(key: &Digest) -> HmacSha256 {
-    #[allow(clippy::expect_used)]
-    HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length")
-}
-
-fn random_key() -> Digest {
-    use chacha20poly1305::XChaCha20Poly1305;
-    use chacha20poly1305::aead::{KeyInit, OsRng};
-
-    let generated = XChaCha20Poly1305::generate_key(&mut OsRng);
-    let mut key = [0; 32];
-    key.copy_from_slice(&generated);
-    key
-}
-
-fn nonempty_bounded(value: &str, max: usize) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty() && value.len() <= max).then_some(value)
-}
-
-fn update_field(mac: &mut HmacSha256, value: &[u8]) {
-    mac.update(&(value.len() as u64).to_be_bytes());
-    mac.update(value);
-}
-
-fn finalize_digest(mac: HmacSha256) -> Digest {
-    let bytes = mac.finalize().into_bytes();
-    let mut digest = [0; 32];
-    digest.copy_from_slice(&bytes);
-    digest
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProtectedBlock<'a> {
-    Thinking {
-        thinking: &'a str,
-        signature: &'a str,
-    },
-    RedactedThinking {
-        data: &'a str,
-    },
-}
-
-#[derive(Debug, Default)]
-struct ProtectedSequence<'a> {
-    blocks: Vec<ProtectedBlock<'a>>,
-    tool_ids: Vec<&'a str>,
-    has_opaque_proof: bool,
-    invalid: bool,
-}
-
-impl<'a> ProtectedSequence<'a> {
-    fn append_content(&mut self, content: &'a [Value]) {
-        for block in content {
-            match block.get("type").and_then(Value::as_str) {
-                Some("thinking") => {
-                    self.invalid |= invalid_bounded_string(block.get("thinking"))
-                        || invalid_bounded_string(block.get("signature"));
-                    let thinking = bounded_string(block.get("thinking"));
-                    let signature = bounded_string(block.get("signature"));
-                    self.has_opaque_proof |= !signature.is_empty();
-                    self.blocks.push(ProtectedBlock::Thinking {
-                        thinking,
-                        signature,
-                    });
-                }
-                Some("redacted_thinking") => {
-                    self.invalid |= invalid_bounded_string(block.get("data"));
-                    let data = bounded_string(block.get("data"));
-                    self.has_opaque_proof |= !data.is_empty();
-                    self.blocks.push(ProtectedBlock::RedactedThinking { data });
-                }
-                Some("tool_use") => {
-                    self.invalid |= invalid_bounded_string(block.get("id"));
-                    let id = bounded_string(block.get("id"));
-                    if !id.is_empty() {
-                        self.tool_ids.push(id);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn bounded_string(value: Option<&Value>) -> &str {
-    value
-        .and_then(Value::as_str)
-        .filter(|value| value.len() <= MAX_OPAQUE_FIELD)
-        .unwrap_or_default()
-}
-
-fn invalid_bounded_string(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::String(value)) => value.len() > MAX_OPAQUE_FIELD,
-        Some(_) => true,
-        None => false,
-    }
-}
-
-fn tool_result_ids(message: &ChatMsg) -> impl Iterator<Item = &str> {
-    message
-        .parts
-        .as_ref()
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
-}
-
-#[derive(Debug)]
-enum CapturedBlock {
-    Thinking {
-        thinking: String,
-        signature: String,
-        complete: bool,
-    },
-    RedactedThinking {
-        data: String,
-        complete: bool,
-    },
-    ToolUse {
-        id: String,
-        complete: bool,
-    },
-}
-
-impl CapturedBlock {
-    fn mark_complete(&mut self) {
-        match self {
-            Self::Thinking { complete, .. }
-            | Self::RedactedThinking { complete, .. }
-            | Self::ToolUse { complete, .. } => *complete = true,
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            Self::Thinking { complete, .. }
-            | Self::RedactedThinking { complete, .. }
-            | Self::ToolUse { complete, .. } => *complete,
-        }
-    }
-
-    fn captured_len(&self) -> usize {
-        match self {
-            Self::Thinking {
-                thinking,
-                signature,
-                ..
-            } => thinking.len().saturating_add(signature.len()),
-            Self::RedactedThinking { data, .. } => data.len(),
-            Self::ToolUse { id, .. } => id.len(),
-        }
-    }
-}
-
 /// Accumulates a live stream's signed thinking blocks so the finished turn
 /// registers just like a buffered one.
 pub struct ThinkingStreamCapture {
@@ -734,6 +553,187 @@ impl ThinkingStreamCapture {
         self.blocks.clear();
         self.captured_bytes = 0;
     }
+}
+
+struct AuditInner {
+    key: Digest,
+    ttl: Duration,
+    max_entries: usize,
+    cache: Mutex<AuditCache>,
+}
+
+struct AuditCache {
+    entries: HashMap<Digest, CacheEntry>,
+    next_sweep: Instant,
+}
+
+struct CacheEntry {
+    fingerprints: Vec<SequenceFingerprint>,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SequenceFingerprint {
+    opaque: Digest,
+    strict: Option<Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProtectedBlock<'a> {
+    Thinking {
+        thinking: &'a str,
+        signature: &'a str,
+    },
+    RedactedThinking {
+        data: &'a str,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ProtectedSequence<'a> {
+    blocks: Vec<ProtectedBlock<'a>>,
+    tool_ids: Vec<&'a str>,
+    has_opaque_proof: bool,
+    invalid: bool,
+}
+
+impl<'a> ProtectedSequence<'a> {
+    fn append_content(&mut self, content: &'a [Value]) {
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    self.invalid |= invalid_bounded_string(block.get("thinking"))
+                        || invalid_bounded_string(block.get("signature"));
+                    let thinking = bounded_string(block.get("thinking"));
+                    let signature = bounded_string(block.get("signature"));
+                    self.has_opaque_proof |= !signature.is_empty();
+                    self.blocks.push(ProtectedBlock::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+                Some("redacted_thinking") => {
+                    self.invalid |= invalid_bounded_string(block.get("data"));
+                    let data = bounded_string(block.get("data"));
+                    self.has_opaque_proof |= !data.is_empty();
+                    self.blocks.push(ProtectedBlock::RedactedThinking { data });
+                }
+                Some("tool_use") => {
+                    self.invalid |= invalid_bounded_string(block.get("id"));
+                    let id = bounded_string(block.get("id"));
+                    if !id.is_empty() {
+                        self.tool_ids.push(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CapturedBlock {
+    Thinking {
+        thinking: String,
+        signature: String,
+        complete: bool,
+    },
+    RedactedThinking {
+        data: String,
+        complete: bool,
+    },
+    ToolUse {
+        id: String,
+        complete: bool,
+    },
+}
+
+impl CapturedBlock {
+    fn mark_complete(&mut self) {
+        match self {
+            Self::Thinking { complete, .. }
+            | Self::RedactedThinking { complete, .. }
+            | Self::ToolUse { complete, .. } => *complete = true,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Thinking { complete, .. }
+            | Self::RedactedThinking { complete, .. }
+            | Self::ToolUse { complete, .. } => *complete,
+        }
+    }
+
+    fn captured_len(&self) -> usize {
+        match self {
+            Self::Thinking {
+                thinking,
+                signature,
+                ..
+            } => thinking.len().saturating_add(signature.len()),
+            Self::RedactedThinking { data, .. } => data.len(),
+            Self::ToolUse { id, .. } => id.len(),
+        }
+    }
+}
+
+fn new_mac(key: &Digest) -> HmacSha256 {
+    #[allow(clippy::expect_used)]
+    HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length")
+}
+
+fn random_key() -> Digest {
+    use chacha20poly1305::XChaCha20Poly1305;
+    use chacha20poly1305::aead::{KeyInit, OsRng};
+
+    let generated = XChaCha20Poly1305::generate_key(&mut OsRng);
+    let mut key = [0; 32];
+    key.copy_from_slice(&generated);
+    key
+}
+
+fn nonempty_bounded(value: &str, max: usize) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= max).then_some(value)
+}
+
+fn update_field(mac: &mut HmacSha256, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value);
+}
+
+fn finalize_digest(mac: HmacSha256) -> Digest {
+    let bytes = mac.finalize().into_bytes();
+    let mut digest = [0; 32];
+    digest.copy_from_slice(&bytes);
+    digest
+}
+
+fn bounded_string(value: Option<&Value>) -> &str {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= MAX_OPAQUE_FIELD)
+        .unwrap_or_default()
+}
+
+fn invalid_bounded_string(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(value)) => value.len() > MAX_OPAQUE_FIELD,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn tool_result_ids(message: &ChatMsg) -> impl Iterator<Item = &str> {
+    message
+        .parts
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
 }
 
 fn append_bounded(target: &mut String, value: Option<&Value>) -> Option<()> {

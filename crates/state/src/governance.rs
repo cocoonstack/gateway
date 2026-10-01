@@ -21,8 +21,8 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     /// Rate limit: take one permit at `qps` for `key`.
     async fn rate_allow(&self, key: &str, qps: f64) -> bool;
 
-    /// Daily quota: is `ak` under `limit`?
-    async fn quota_check(&self, ak: &str, limit: i64) -> bool;
+    /// Daily quota: is `key` under `limit`?
+    async fn quota_check(&self, key: &str, limit: i64) -> bool;
     /// Admission with reservation: admit while spent-before < `limit`, atomically
     /// adding `amount` so in-flight requests count; false = nothing reserved.
     /// `at_epoch_secs` pins the day bucket so the paired settle lands on the
@@ -31,10 +31,10 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
     /// bucket the paired reserve used (`at_epoch_secs`).
     async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
-    /// Tokens spent today by `ak`.
-    async fn quota_used(&self, ak: &str) -> i64;
-    /// Add to `ak`'s spent tokens; returns the day's new total.
-    async fn quota_consume(&self, ak: &str, tokens: i64) -> i64;
+    /// Tokens spent today under `key`.
+    async fn quota_used(&self, key: &str) -> i64;
+    /// Add to `key`'s spent tokens; returns the day's new total.
+    async fn quota_consume(&self, key: &str, tokens: i64) -> i64;
     /// Reset every daily counter.
     async fn quota_reset_all(&self);
     /// A calendar-window counter; `key` names its window, so nothing buckets or resets it.
@@ -62,16 +62,16 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     /// window) — for a request/turn that never reached billing.
     async fn refund_reserves(
         &self,
-        ak: &str,
+        key: &str,
         reserved: i64,
         tpm_reserved: Option<TpmReserve>,
         at_epoch_secs: i64,
     ) {
         if reserved != 0 {
-            self.quota_settle(ak, -reserved, at_epoch_secs).await;
+            self.quota_settle(key, -reserved, at_epoch_secs).await;
         }
         if let Some(tpm) = tpm_reserved {
-            self.token_window_settle(ak, -tpm.est, gw_consts::MINUTE, tpm.window)
+            self.token_window_settle(key, -tpm.est, gw_consts::MINUTE, tpm.window)
                 .await;
         }
     }
@@ -92,8 +92,8 @@ impl Governance for MemoryGovernance {
     async fn rate_allow(&self, key: &str, qps: f64) -> bool {
         self.rate.allow(key, qps)
     }
-    async fn quota_check(&self, ak: &str, limit: i64) -> bool {
-        self.quota.check(ak, limit)
+    async fn quota_check(&self, key: &str, limit: i64) -> bool {
+        self.quota.check(key, limit)
     }
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> bool {
         self.quota.reserve(key, amount, limit)
@@ -101,11 +101,11 @@ impl Governance for MemoryGovernance {
     async fn quota_settle(&self, key: &str, delta: i64, _at: i64) {
         self.quota.settle(key, delta);
     }
-    async fn quota_used(&self, ak: &str) -> i64 {
-        self.quota.used(ak)
+    async fn quota_used(&self, key: &str) -> i64 {
+        self.quota.used(key)
     }
-    async fn quota_consume(&self, ak: &str, tokens: i64) -> i64 {
-        self.quota.consume(ak, tokens)
+    async fn quota_consume(&self, key: &str, tokens: i64) -> i64 {
+        self.quota.consume(key, tokens)
     }
     async fn quota_reset_all(&self) {
         self.quota.reset_all();
@@ -236,19 +236,19 @@ impl Governance for RedisGovernance {
         };
         self.incr_window(&format!("gw:rate:{key}"), 1, window).await <= limit
     }
-    async fn quota_check(&self, ak: &str, limit: i64) -> bool {
-        self.quota_used(ak).await < limit
+    async fn quota_check(&self, key: &str, limit: i64) -> bool {
+        self.quota_used(key).await < limit
     }
-    async fn quota_used(&self, ak: &str) -> i64 {
+    async fn quota_used(&self, key: &str) -> i64 {
         let mut conn = self.conn.clone();
         match redis::cmd("GET")
-            .arg(quota_key(ak))
+            .arg(quota_key(key))
             .query_async::<Option<i64>>(&mut conn)
             .await
         {
             Ok(v) => v.unwrap_or(0),
             Err(e) => {
-                tracing::warn!(error = %e, key = ak, "redis quota read failed; treating as 0");
+                tracing::warn!(error = %e, key, "redis quota read failed; treating as 0");
                 0
             }
         }
@@ -271,9 +271,9 @@ impl Governance for RedisGovernance {
         )
         .await;
     }
-    async fn quota_consume(&self, ak: &str, tokens: i64) -> i64 {
+    async fn quota_consume(&self, key: &str, tokens: i64) -> i64 {
         self.incr_window(
-            &quota_key(ak),
+            &quota_key(key),
             tokens,
             Duration::from_millis(QUOTA_TTL_MS as u64),
         )

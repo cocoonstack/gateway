@@ -161,21 +161,9 @@ fn mp3_seconds(bytes: &[u8]) -> Option<f64> {
 pub fn image_kind(bytes: &[u8]) -> (&'static str, &'static str) {
     match bytes {
         [0xFF, 0xD8, 0xFF, ..] => ("jpg", "image/jpeg"),
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => ("webp", "image/webp"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, rest @ ..] if rest.starts_with(b"WEBP") => {
+            ("webp", "image/webp")
+        }
         _ => ("png", "image/png"),
     }
 }

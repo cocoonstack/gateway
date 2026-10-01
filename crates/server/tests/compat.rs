@@ -1,6 +1,4 @@
-//! Protocol-compatibility diff against the upstream OpenAI/Anthropic wire:
-//! canonical samples deserialize into our structs (inbound) and our live
-//! responses diff against the canonical key sets (outbound). Fully offline.
+//! Canonical OpenAI/Anthropic samples against our inbound structs and outbound key sets.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
