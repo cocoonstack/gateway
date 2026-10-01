@@ -2233,7 +2233,7 @@ async fn admin_config_rollback(
     }
 }
 
-/// GET /admin/keys?offset=&limit= — a page of the key table, scoped: a tenant
+/// GET /admin/keys?owner=&offset=&limit= — a page of the key table, scoped: a tenant
 /// admin sees only its own keys. Paginated so a fleet key table never loads whole.
 async fn admin_key_list(
     State(s): State<AppState>,
@@ -2256,11 +2256,16 @@ async fn admin_key_list(
         resp["keys"] = Value::Array(keys);
         return Json(resp).into_response();
     }
+    let owner = q.get("owner").map(String::as_str);
+    if owner == Some("") {
+        return error_response(400, "owner must be non-empty");
+    }
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT).min(ADMIN_PAGE_MAX);
     // the scope filters in the store before paging, or a tenant admin's page could come back empty
     let tenant = scope.tenant_filter(&q);
-    let listed = match s.handler.state().auth.list(tenant, offset, limit).await {
+    let auth = &s.handler.state().auth;
+    let listed = match auth.list(tenant, owner, offset, limit).await {
         Ok(v) => v,
         Err(e) => return gateway_error(e),
     };

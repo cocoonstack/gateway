@@ -33,11 +33,16 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>>;
     /// Remove a key regardless of source; whether it existed.
     async fn revoke(&self, ak: &str) -> GResult<bool>;
-    /// A page of keys, sorted by ak, optionally confined to one tenant. The
-    /// tenant filter applies before paging, so a scoped page is never emptied
+    /// A page of keys, sorted by ak, optionally confined to one tenant and one
+    /// owner. The filters apply before paging, so a scoped page is never emptied
     /// by a later filter; `offset`/`limit` bound the scan.
-    async fn list(&self, tenant: Option<&str>, offset: usize, limit: usize)
-    -> GResult<Vec<AkInfo>>;
+    async fn list(
+        &self,
+        tenant: Option<&str>,
+        owner: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GResult<Vec<AkInfo>>;
     /// Re-apply the config file's key set, leaving admin-created keys untouched.
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()>;
 }
@@ -87,6 +92,7 @@ impl PostgresKeyStore {
                 "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS suspended_until_epoch_secs BIGINT",
                 "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS mcp_servers TEXT NOT NULL DEFAULT '[]'",
                 "ALTER TABLE access_keys ADD COLUMN IF NOT EXISTS mcp_tools TEXT NOT NULL DEFAULT '{}'",
+                "CREATE INDEX IF NOT EXISTS access_keys_owner_idx ON access_keys (owner, tenant)",
             ],
         )
         .await?;
@@ -208,15 +214,18 @@ impl KeyStore for PostgresKeyStore {
     async fn list(
         &self,
         tenant: Option<&str>,
+        owner: Option<&str>,
         offset: usize,
         limit: usize,
     ) -> GResult<Vec<AkInfo>> {
         let rows = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
              expires_at_epoch_secs, banned, model_quotas, owner, suspended_until_epoch_secs, mcp_servers, mcp_tools FROM access_keys
-             WHERE ($1::text IS NULL OR tenant = $1) ORDER BY ak LIMIT $2 OFFSET $3",
+             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR owner = $2)
+             ORDER BY ak LIMIT $3 OFFSET $4",
         )
         .bind(tenant)
+        .bind(owner)
         .bind(limit.min(i64::MAX as usize) as i64)
         .bind(offset.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)
@@ -440,5 +449,18 @@ mod tests {
             .expect("admin key persisted");
         assert_eq!(k.mcp.servers, vec!["srv".to_owned()]);
         assert!(k.mcp.tools.is_empty());
+
+        let mut owned = info("pk-owned", 1.0);
+        owned.owner = Some("m-1".into());
+        ks.put(owned, KeySource::Admin).await.unwrap();
+        let listed = ks.list(None, Some("m-1"), 0, 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].ak, "pk-owned");
+        assert!(
+            ks.list(Some("other"), Some("m-1"), 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
