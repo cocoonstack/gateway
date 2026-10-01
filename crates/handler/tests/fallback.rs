@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use gw_config::{ConfigError, GatewayConfig};
+use gw_config::{ConfigError, GatewayConfig, access_key_id};
 use gw_consts::{ErrCode, Protocol};
 use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 use gw_handler::OnlineHandler;
@@ -81,10 +81,19 @@ fn request(model: &str, online: bool) -> GatewayRequest {
     }
 }
 
+#[allow(clippy::expect_used)]
+async fn access_key(h: &OnlineHandler) -> Arc<gw_state::AkInfo> {
+    h.state()
+        .auth
+        .get(&access_key_id("k"))
+        .await
+        .expect("access key")
+}
+
 #[tokio::test]
 async fn upstream_failures_fall_back_along_the_chain() {
     let (h, vendor) = handler(100.0, "tenants: [{name: t}]", 100).expect("fallback config");
-    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     let ctx = h
         .run(request("broken", true), ak)
         .await
@@ -120,7 +129,7 @@ async fn fallback_skips_unentitled_models_and_gateway_denials_never_fall_back() 
         100,
     )
     .expect("fallback config");
-    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     let ctx = h
         .run(request("broken", true), ak)
         .await
@@ -132,7 +141,7 @@ async fn fallback_skips_unentitled_models_and_gateway_denials_never_fall_back() 
         "{trail}"
     );
 
-    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     let err = h
         .run(request("throttled", true), ak)
         .await
@@ -150,7 +159,7 @@ async fn a_served_fallback_samples_one_success_for_the_requested_model() {
         100,
     )
     .expect("fallback config");
-    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     h.run(request("broken", true), ak)
         .await
         .expect("the chain recovers");
@@ -172,7 +181,7 @@ async fn an_exhausted_chain_reports_the_last_upstream_error() {
         100,
     )
     .expect("fallback config");
-    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     let err = h
         .run(request("broken", true), ak)
         .await
@@ -186,7 +195,7 @@ async fn an_exhausted_chain_reports_the_last_upstream_error() {
 #[tokio::test]
 async fn a_non_json_error_body_keeps_the_vendor_status() {
     let (h, vendor) = handler(100.0, "tenants: [{name: t}]", 100).expect("fallback config");
-    let ak = h.state().auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     let ctx = h
         .run(request("proxied", true), ak.clone())
         .await
@@ -224,14 +233,14 @@ async fn fallback_consumes_each_request_limit_once() {
         for (start, online) in [("broken", true), ("unavailable", true), ("broken", false)] {
             let (h, vendor) = handler(qps, limits, 100).expect("fallback config");
             let state = h.state();
-            let ak = state.auth.authenticate("k").await.expect("access key");
+            let ak = access_key(&h).await;
             let ctx = h
                 .run(request(start, online), ak)
                 .await
                 .unwrap_or_else(|e| panic!("{start}, {denial}: {e}"));
             assert_eq!(ctx.outcome.as_ref().expect("outcome").response.model, start);
             assert_eq!(vendor.calls(), 3);
-            let ak = state.auth.authenticate("k").await.expect("access key");
+            let ak = access_key(&h).await;
             let err = h
                 .run(request("healthy", online), ak)
                 .await
@@ -239,18 +248,18 @@ async fn fallback_consumes_each_request_limit_once() {
                 .expect("a new request must consume its own permit");
             assert!(err.message.contains(denial), "{err}");
             assert_eq!(vendor.calls(), 3);
-            assert_eq!(state.governance.quota_used("k").await, 2);
+            assert_eq!(state.governance.quota_used(&access_key_id("k")).await, 2);
             assert!(
                 state
                     .governance
-                    .token_window_reserve("k", 1, 3, gw_consts::MINUTE)
+                    .token_window_reserve(&access_key_id("k"), 1, 3, gw_consts::MINUTE)
                     .await
                     .is_some()
             );
             assert!(
                 state
                     .governance
-                    .token_window_reserve("k", 1, 3, gw_consts::MINUTE)
+                    .token_window_reserve(&access_key_id("k"), 1, 3, gw_consts::MINUTE)
                     .await
                     .is_none()
             );
@@ -288,7 +297,7 @@ async fn no_account_fallback_does_not_bypass_initial_request_limits() {
     ] {
         let (h, vendor) = handler(qps, limits, 100).expect("fallback config");
         let state = h.state();
-        let ak = state.auth.authenticate("k").await.expect("access key");
+        let ak = access_key(&h).await;
         let err = h
             .run(request("unavailable", true), ak)
             .await
@@ -297,7 +306,7 @@ async fn no_account_fallback_does_not_bypass_initial_request_limits() {
         assert_eq!(err.code, code);
         assert!(err.message.contains(denial), "{err}");
         assert_eq!(vendor.calls(), 0);
-        assert_eq!(state.governance.quota_used("k").await, 0);
+        assert_eq!(state.governance.quota_used(&access_key_id("k")).await, 0);
     }
 }
 
@@ -305,7 +314,7 @@ async fn no_account_fallback_does_not_bypass_initial_request_limits() {
 async fn fallback_keeps_model_qpm_and_refunds_token_reservations() {
     let (h, vendor) = handler(100.0, "tenants: [{name: t}]", 0).expect("fallback config");
     let state = h.state();
-    let ak = state.auth.authenticate("k").await.expect("access key");
+    let ak = access_key(&h).await;
     let err = h
         .run(request("broken", true), ak)
         .await
@@ -313,11 +322,11 @@ async fn fallback_keeps_model_qpm_and_refunds_token_reservations() {
         .expect("the fallback model's QPM is exhausted");
     assert!(err.message.contains("model qpm limit"), "{err}");
     assert_eq!(vendor.calls(), 2);
-    assert_eq!(state.governance.quota_used("k").await, 0);
+    assert_eq!(state.governance.quota_used(&access_key_id("k")).await, 0);
     assert!(
         state
             .governance
-            .token_window_reserve("k", 1, 1, gw_consts::MINUTE)
+            .token_window_reserve(&access_key_id("k"), 1, 1, gw_consts::MINUTE)
             .await
             .is_some()
     );
@@ -332,9 +341,9 @@ async fn quota_degradation_preserves_the_requested_model_and_fallback_chain() {
         );
         let (h, vendor) = handler(100.0, &tenants, 100).expect("fallback config");
         let state = h.state();
-        let quota_key = admission::model_quota_key("k", "throttled");
+        let quota_key = admission::model_quota_key(&access_key_id("k"), "throttled");
         state.governance.quota_consume(&quota_key, 1).await;
-        let ak = state.auth.authenticate("k").await.expect("access key");
+        let ak = access_key(&h).await;
         let ctx = h
             .run(request("broken", true), ak)
             .await
@@ -364,7 +373,10 @@ async fn quota_degradation_preserves_the_requested_model_and_fallback_chain() {
             (row.model.as_str(), row.served_model.as_str()),
             ("broken", "healthy")
         );
-        assert_eq!(state.governance.quota_used("k").await, row.total_tokens);
+        assert_eq!(
+            state.governance.quota_used(&access_key_id("k")).await,
+            row.total_tokens
+        );
         let accrued = if degraded_serves { row.total_tokens } else { 0 };
         assert_eq!(state.governance.quota_used(&quota_key).await, 1 + accrued);
     }

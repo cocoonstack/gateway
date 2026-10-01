@@ -67,4 +67,7 @@ document includes `listen`, give each instance its own port with `GW_PORT`
 Access keys are higher-churn and have their own seam: `/admin/keys` CRUD
 writes the shared Postgres key table directly (no config publish needed); a
 key created, re-quota'd, banned, or revoked on one instance is live on all
-within the ~2s auth-cache TTL. See [API — Admin](api.md#admin-dynamic-config).
+within the ~2s auth-cache TTL. The table holds key ids, not keys; the first
+start of a release with ids rewrites an older table in place, so upgrade every
+instance together — an instance still on the older release fails every key
+until it is replaced. See [API — Admin](api.md#admin-dynamic-config).

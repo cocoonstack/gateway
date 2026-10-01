@@ -126,7 +126,7 @@ pub(crate) async fn proxy(
         let Some(guard) = snap
             .state
             .streams
-            .open(&ak.ak, snap.cfg.max_live_streams_per_key)
+            .open(&ak.ak_id, snap.cfg.max_live_streams_per_key)
         else {
             return error_response(429, "too many open mcp streams for this key");
         };
@@ -501,7 +501,7 @@ async fn audit(
     SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: gw_handler::new_request_id(),
-        ak: ak.ak.clone(),
+        ak: ak.ak_id.to_string(),
         user_id: ak.owner.clone().unwrap_or_default(),
         tenant: ak.tenant.clone(),
         surface: "mcp".to_owned(),

@@ -276,7 +276,7 @@ settlement; without it the monthly check is the same single read as the daily
 one.
 Keys without a tenant take a declared `default` tenant's budgets. Reaching any
 budget raises a `budget_exhausted` alert on the webhook — subject
-`tenant:<name>`, `key:<fingerprint>` or `user:<tenant>/<id>`, detail the
+`tenant:<name>`, `key:<ak_id>` or `user:<tenant>/<id>`, detail the
 window's total against the cap — muted per `alerts.dedup_seconds` while it holds.
 
 A background task folds completed ledger minutes into durable per-(minute,

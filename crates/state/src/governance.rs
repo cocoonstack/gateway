@@ -188,8 +188,7 @@ impl RedisGovernance {
         {
             Ok(id) => (id != 0).then_some(id),
             Err(e) => {
-                let key_id = crate::access_key_fingerprint(&key);
-                tracing::warn!(error = %e, key_id, "redis reserve failed; admitting");
+                tracing::warn!(error = %e, key, "redis reserve failed; admitting");
                 Some(UNRECORDED_WINDOW)
             }
         }
@@ -216,8 +215,7 @@ impl RedisGovernance {
         {
             Ok(v) => v,
             Err(e) => {
-                let key_id = crate::access_key_fingerprint(key);
-                tracing::warn!(error = %e, key_id, "redis governance unavailable; limit skipped");
+                tracing::warn!(error = %e, key, "redis governance unavailable; limit skipped");
                 0
             }
         }
@@ -250,8 +248,7 @@ impl Governance for RedisGovernance {
         {
             Ok(v) => v.unwrap_or(0),
             Err(e) => {
-                let ak_id = crate::access_key_fingerprint(ak);
-                tracing::warn!(error = %e, ak_id, "redis quota read failed; treating as 0");
+                tracing::warn!(error = %e, key = ak, "redis quota read failed; treating as 0");
                 0
             }
         }
@@ -373,8 +370,7 @@ async fn settle_floored(
         .invoke_async::<i64>(&mut conn)
         .await
     {
-        let key_id = crate::access_key_fingerprint(key);
-        tracing::warn!(error = %e, key_id, "redis settle failed");
+        tracing::warn!(error = %e, key, "redis settle failed");
     }
 }
 

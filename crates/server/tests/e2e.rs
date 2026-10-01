@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
-use gw_config::GatewayConfig;
+use gw_config::{GatewayConfig, access_key_id};
 use gw_state::GatewayState;
 use gw_views::AppState;
 use serde_json::{Value, json};
@@ -301,6 +301,135 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         j["tokens_per_minute"], 50,
         "malformed tpm must leave the cap unchanged, not clear it"
     );
+}
+
+#[tokio::test]
+async fn admin_keys_are_named_by_id_and_the_raw_key_never_comes_back() {
+    let declared = access_key_id("ak-declared");
+    let yaml = format!(
+        "listen: {{host: 127.0.0.1, port: 0}}\nadmin: {{token_env: GW_TEST_ADMIN_TOKEN_IDS}}\nmodels: [{{name: gpt-4o, protocol: openai-chat}}]\naccounts: [{{name: mock-openai-1, provider: openai, protocols: [\"openai-chat\"]}}]\naccess_keys: [{{ak: '{declared}', product: demo, qps: 100, daily_token_quota: 1000000}}]"
+    );
+    // SAFETY: unique var name for this test; no concurrent reader of it.
+    unsafe { std::env::set_var("GW_TEST_ADMIN_TOKEN_IDS", "ids-secret") };
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let store = state.store.clone();
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let call = |req| app.clone().oneshot(req);
+    let chat = |ak: &str| post("/v1/chat/completions", Some(ak), CHAT_BODY);
+    let token = Some("ids-secret");
+
+    assert_eq!(
+        call(chat("ak-declared")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(chat(&declared)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "an id never authenticates"
+    );
+
+    let r = call(admin(
+        "POST",
+        "/admin/keys",
+        token,
+        Some(r#"{"product":"demo","qps":100,"daily_token_quota":1000000}"#),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let created = body_json(r).await;
+    let generated = created["ak"]
+        .as_str()
+        .expect("generated key returned once")
+        .to_owned();
+    assert_eq!(created["ak_id"], access_key_id(&generated));
+    assert_eq!(
+        call(chat(&generated)).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let r = call(admin(
+        "POST",
+        "/admin/keys",
+        token,
+        Some(r#"{"ak":"ak-chosen","product":"demo","qps":100,"daily_token_quota":1000000}"#),
+    ))
+    .await
+    .unwrap();
+    let created = body_json(r).await;
+    assert_eq!(created["ak_id"], access_key_id("ak-chosen"));
+    assert!(
+        created.get("ak").is_none(),
+        "a caller-chosen key is not echoed"
+    );
+    let r = call(admin(
+        "POST",
+        "/admin/keys",
+        token,
+        Some(r#"{"ak":"a:b","product":"demo"}"#),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    let listed = body_json(
+        call(admin("GET", "/admin/keys", token, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let keys = listed["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 3);
+    assert!(
+        keys.iter()
+            .all(|k| k.get("ak").is_none() && k["ak_id"].is_string())
+    );
+    let by_raw = body_json(
+        call(admin("GET", "/admin/keys?ak=ak-chosen", token, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(by_raw["keys"][0]["ak_id"], access_key_id("ak-chosen"));
+
+    let chosen_id = access_key_id("ak-chosen");
+    let r = call(admin(
+        "PATCH",
+        &format!("/admin/keys/{chosen_id}"),
+        token,
+        Some(r#"{"banned":true}"#),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        call(chat("ak-chosen")).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let r = call(admin("DELETE", "/admin/keys/ak-chosen", token, None))
+        .await
+        .unwrap();
+    assert_eq!(body_json(r).await["ak_id"], chosen_id);
+    assert_eq!(
+        call(chat("ak-chosen")).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let audit = store.admin_audit_list(10).await.unwrap();
+    assert!(!audit.is_empty());
+    for row in &audit {
+        assert!(gw_config::is_access_key_id(&row.target), "{row:?}");
+    }
+    let (_, ledger) = store.ledger_snapshot(usize::MAX).await.unwrap();
+    assert!(!ledger.is_empty());
+    for rec in &ledger {
+        assert!(gw_config::is_access_key_id(&rec.ak), "{rec:?}");
+    }
 }
 
 async fn body_bytes(resp: Response) -> Vec<u8> {
@@ -851,7 +980,11 @@ async fn tenant_price_override_and_vendor_cost_reach_the_ledger() {
     let j = body_json(r).await;
     let rec = j["records"]
         .as_array()
-        .and_then(|a| a.iter().rev().find(|x| x["ak"] == "ak-beta-1"))
+        .and_then(|a| {
+            a.iter()
+                .rev()
+                .find(|x| x["ak"] == access_key_id("ak-beta-1"))
+        })
         .expect("beta record");
     let (p, c) = (
         rec["prompt_tokens"].as_i64().unwrap(),
@@ -1056,7 +1189,7 @@ access_keys:
         .unwrap();
     let j = body_json(r).await;
     assert_eq!(j["count"], 1);
-    assert_eq!(j["keys"][0]["ak"], "ak-acme-new");
+    assert_eq!(j["keys"][0]["ak_id"], access_key_id("ak-acme-new"));
     let r = app
         .clone()
         .oneshot(admin("GET", "/admin/keys", Some("g-secret"), None))
@@ -1253,9 +1386,9 @@ async fn model_quota_degrades_to_fallback() {
     let last = j["records"]
         .as_array()
         .and_then(|r| {
-            r.iter()
-                .rev()
-                .find(|rec| rec["ak"] == "ak-beta-1" && rec["served_model"] == "gpt-4o-mini")
+            r.iter().rev().find(|rec| {
+                rec["ak"] == access_key_id("ak-beta-1") && rec["served_model"] == "gpt-4o-mini"
+            })
         })
         .expect("degraded call recorded in the ledger");
     assert_eq!(last["model"], "gpt-4o");
@@ -1323,8 +1456,14 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::FORBIDDEN,
         "two rejections for its own limit suspend the flooder"
     );
-    assert_eq!(state.governance.quota_used("abuse:bystander").await, 0);
-    let bystander = state.auth.authenticate("bystander").await.unwrap();
+    assert_eq!(
+        state
+            .governance
+            .quota_used(&format!("abuse:{}", access_key_id("bystander")))
+            .await,
+        0
+    );
+    let bystander = state.auth.get(&access_key_id("bystander")).await.unwrap();
     assert_eq!(
         bystander.status_at(gw_state::epoch_secs()),
         gw_state::KeyStatus::Active,
@@ -1814,7 +1953,7 @@ async fn async_video_bills_once_on_the_first_done_poll() {
     assert_eq!(settled.len(), 3, "each done job billed once: {rows:?}");
     for s in settled {
         assert_eq!(s["model"], "grok-imagine-video");
-        assert_eq!(s["ak"], "ak-demo-123");
+        assert_eq!(s["ak"], access_key_id("ak-demo-123"));
         assert_eq!(s["billed_units"], 2);
         assert_eq!(
             s["cost_micros"], 200_000,
@@ -2230,7 +2369,7 @@ async fn chat_non_stream_full_pipeline_bills_the_ledger() {
     let j = body_json(resp).await;
     assert_eq!(j["count"], 1);
     let rec = &j["records"][0];
-    assert_eq!(rec["ak"], "ak-demo-123");
+    assert_eq!(rec["ak"], access_key_id("ak-demo-123"));
     assert_eq!(rec["model"], "gpt-4o");
     assert_eq!(rec["account"], "mock-openai-1");
     assert_eq!(rec["total_tokens"].as_i64().unwrap(), total);
@@ -4342,7 +4481,7 @@ models:
     assert!(aborted.completion_tokens > 0);
     assert_ne!(aborted.request_id, records[0].request_id);
     assert_eq!(
-        state.governance.quota_used("ak-rt").await,
+        state.governance.quota_used(&access_key_id("ak-rt")).await,
         records
             .iter()
             .map(|record| record.total_tokens)
@@ -4419,7 +4558,11 @@ models:
         banned: Some(true),
         ..Default::default()
     };
-    state.auth.patch("ak-rt", &ban).await.unwrap();
+    state
+        .auth
+        .patch(&access_key_id("ak-rt"), &ban)
+        .await
+        .unwrap();
     tx.send(Message::text(r#"{"type":"response.create"}"#))
         .await
         .unwrap();
@@ -4541,7 +4684,7 @@ models:
     }
 
     assert_eq!(
-        state.governance.quota_used("ak-dup").await,
+        state.governance.quota_used(&access_key_id("ak-dup")).await,
         26,
         "both turns settled to actuals with no reserve left dangling"
     );
@@ -4686,7 +4829,11 @@ models:
         banned: Some(true),
         ..Default::default()
     };
-    state.auth.patch("ak-vad", &ban).await.unwrap();
+    state
+        .auth
+        .patch(&access_key_id("ak-vad"), &ban)
+        .await
+        .unwrap();
     ws.send(append()).await.unwrap();
     let mut denied = Value::Null;
     let ended = loop {
@@ -4741,7 +4888,11 @@ models:
         banned: Some(true),
         ..Default::default()
     };
-    state.auth.patch("ak-rt", &ban).await.unwrap();
+    state
+        .auth
+        .patch(&access_key_id("ak-rt"), &ban)
+        .await
+        .unwrap();
     ws.send(Message::text(r#"{"type":"input_text","text":"hi"}"#))
         .await
         .unwrap();
