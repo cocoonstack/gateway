@@ -37,6 +37,22 @@ test("member and system admin receive different control surfaces", async ({ page
   await expect(page.getByText(/restored as version \d+/)).toBeVisible();
 });
 
+test("a generated key is shown once and listed only by its id", async ({ page }) => {
+  await page.goto("/");
+  await signIn(page, "admin@example.com", "admin12345!");
+  await page.getByRole("link", { name: "Access keys" }).click();
+  await page.getByRole("button", { name: "New key" }).click();
+  await page.getByLabel("Tenant", { exact: true }).fill("acme");
+  await page.getByRole("button", { name: "Create key" }).click();
+
+  const issued = page.getByText(/^gw-[A-Z2-7]{26}$/);
+  await expect(issued).toBeVisible();
+  const key = (await issued.textContent()) ?? "";
+  await expect(page.getByRole("cell", { name: /^sha256:[0-9a-f]{32}/ }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Dismiss" }).click();
+  await expect(page.getByText(key)).toHaveCount(0);
+});
+
 test("failed login shows an error and grants nothing", async ({ page }) => {
   await page.goto("/");
   await page.getByLabel("Email").fill("admin@example.com");

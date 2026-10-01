@@ -50,8 +50,10 @@ type ModelStatus struct {
 	WindowMinutes int64  `json:"window_minutes"`
 }
 
+// Key is a gateway access key; AK is only ever a create input, AKID the stored identity.
 type Key struct {
-	AK      string  `json:"ak"`
+	AKID    string  `json:"ak_id,omitempty"`
+	AK      string  `json:"ak,omitempty"`
 	Product string  `json:"product"`
 	Tenant  string  `json:"tenant"`
 	Owner   *string `json:"owner"`
@@ -66,6 +68,12 @@ type Key struct {
 	SuspendedUntilEpochSecs *int64 `json:"suspended_until_epoch_secs"`
 	Status                  string `json:"status"`
 	Available               bool   `json:"available"`
+}
+
+// CreatedKey answers a key create; AK is set only when the gateway generated the key.
+type CreatedKey struct {
+	AKID string `json:"ak_id"`
+	AK   string `json:"ak,omitempty"`
 }
 
 type Account struct {
@@ -128,9 +136,9 @@ type Client interface {
 	UsageSeries(ctx context.Context, scope Scope, bucket string, since, until int64) (Series, error)
 	Models(ctx context.Context, scope Scope) ([]ModelStatus, error)
 	Keys(ctx context.Context, tenant string, offset, limit int64) ([]Key, error)
-	CreateKey(ctx context.Context, actingTenant string, key Key) error
+	CreateKey(ctx context.Context, actingTenant string, key Key) (CreatedKey, error)
 	PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (Key, error)
-	DeleteKey(ctx context.Context, actingTenant, ak string) error
+	DeleteKey(ctx context.Context, actingTenant, ak string) (string, error)
 	Instances(ctx context.Context) ([]Instance, error)
 	Config(ctx context.Context) (ConfigDocument, error)
 	ValidateConfig(ctx context.Context, yaml string) (map[string]any, error)
