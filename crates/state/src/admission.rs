@@ -588,14 +588,8 @@ async fn budgets(
 
 /// The proleptic-Gregorian (year, month) of a UTC epoch second.
 fn civil_month(epoch_secs: i64) -> (i64, u32) {
-    let z = epoch_secs.div_euclid(86_400) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i64::from(m <= 2), m as u32)
+    let (y, m, _) = gw_models::civil_from_days(epoch_secs.div_euclid(86_400));
+    (y, m)
 }
 
 fn previous_month((y, m): (i64, u32)) -> (i64, u32) {
