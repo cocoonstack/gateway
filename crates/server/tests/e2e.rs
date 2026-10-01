@@ -945,7 +945,7 @@ tenants:
   - {name: acme, admin_token_env: GW_TEST_ACME_ADMIN_TSA}
   - {name: beta}
 access_keys:
-  - {ak: ak-beta-key, tenant: beta, product: demo, qps: 100, daily_token_quota: 1000000}
+  - {ak: ak-beta-key, tenant: beta, owner: m-1, product: demo, qps: 100, daily_token_quota: 1000000}
 "#;
     // SAFETY: unique var names for this test; no concurrent reader of them.
     unsafe {
@@ -966,7 +966,9 @@ access_keys:
             "POST",
             "/admin/keys",
             Some("t-secret"),
-            Some(r#"{"ak":"ak-acme-new","product":"demo","qps":100,"daily_token_quota":1000}"#),
+            Some(
+                r#"{"ak":"ak-acme-new","product":"demo","owner":"m-1","qps":100,"daily_token_quota":1000}"#,
+            ),
         ))
         .await
         .unwrap();
@@ -1062,6 +1064,26 @@ access_keys:
         .unwrap();
     let j = body_json(r).await;
     assert_eq!(j["count"], 2);
+    for (uri, token, want) in [
+        ("/admin/keys?owner=m-1", "t-secret", 1),
+        ("/admin/keys?owner=m-1", "g-secret", 2),
+        ("/admin/keys?owner=m-1&tenant=beta", "g-secret", 1),
+        ("/admin/keys?owner=m-2", "g-secret", 0),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(admin("GET", uri, Some(token), None))
+            .await
+            .unwrap();
+        let j = body_json(r).await;
+        assert_eq!(j["count"], want, "{uri} as {token}");
+    }
+    let r = app
+        .clone()
+        .oneshot(admin("GET", "/admin/keys?owner=", Some("g-secret"), None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
     let r = app
         .clone()

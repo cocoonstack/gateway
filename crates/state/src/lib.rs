@@ -247,13 +247,23 @@ impl AkAuth {
         Some(e.0.as_ref().clone())
     }
 
-    /// A page of keys, sorted by ak (stable), optionally confined to `tenant`,
-    /// `offset..offset+limit` — the filter applies before paging.
-    pub fn list(&self, tenant: Option<&str>, offset: usize, limit: usize) -> Vec<AkInfo> {
+    /// A page of keys, sorted by ak (stable), optionally confined to `tenant`
+    /// and `owner`, `offset..offset+limit` — the filters apply before paging.
+    pub fn list(
+        &self,
+        tenant: Option<&str>,
+        owner: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<AkInfo> {
         let mut keys: Vec<Arc<AkInfo>> = self
             .keys
             .iter()
-            .filter(|e| tenant.is_none_or(|t| t == e.value().0.tenant))
+            .filter(|e| {
+                let k = &e.value().0;
+                tenant.is_none_or(|t| t == k.tenant)
+                    && owner.is_none_or(|o| k.owner.as_deref() == Some(o))
+            })
             .map(|e| Arc::clone(&e.value().0))
             .collect();
         keys.sort_by(|a, b| a.ak.cmp(&b.ak));
@@ -300,10 +310,11 @@ impl KeyStore for AkAuth {
     async fn list(
         &self,
         tenant: Option<&str>,
+        owner: Option<&str>,
         offset: usize,
         limit: usize,
     ) -> gw_models::GResult<Vec<AkInfo>> {
-        Ok(AkAuth::list(self, tenant, offset, limit))
+        Ok(AkAuth::list(self, tenant, owner, offset, limit))
     }
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> gw_models::GResult<()> {
         AkAuth::reload_config_keys(self, keys);
@@ -1142,6 +1153,23 @@ mod tests {
         assert_eq!(fingerprint, "sha256:41d7cef0ff97ad3b306ff0a0fff45d54");
         assert!(!fingerprint.contains("ak-secret"));
         assert_ne!(fingerprint, access_key_fingerprint("ak-other"));
+    }
+
+    #[test]
+    fn key_list_filters_by_owner_before_paging() {
+        let auth = AkAuth::default();
+        for (ak, owner) in [("k1", Some("m-1")), ("k2", None), ("k3", Some("m-1"))] {
+            let mut info = ak_info(ak);
+            info.owner = owner.map(str::to_owned);
+            auth.put(info, KeySource::Admin);
+        }
+        let page: Vec<String> = auth
+            .list(None, Some("m-1"), 1, 10)
+            .into_iter()
+            .map(|k| k.ak)
+            .collect();
+        assert_eq!(page, ["k3"]);
+        assert!(auth.list(Some("other"), Some("m-1"), 0, 10).is_empty());
     }
 
     #[test]
