@@ -106,7 +106,7 @@ impl BudgetScope {
         }
     }
 
-    /// The alert subject; the key is named by its fingerprint, never the credential.
+    /// The alert subject; the key is named by its `ak_id`, never the credential.
     fn subject(self, ak: &AkInfo, user: &str) -> String {
         match self {
             Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),

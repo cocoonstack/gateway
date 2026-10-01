@@ -20,8 +20,8 @@ const AUTH_CACHE_MAX: u64 = 100_000;
 const KEYSTORE_MAX_CONNECTIONS: u32 = 5;
 
 /// The live key table with [`crate::AkAuth`]'s semantics: config keys re-apply
-/// on reload, admin keys survive it, config ownership is sticky. Every method
-/// takes the key's id ([`gw_config::access_key_id`]), never the raw key.
+/// on reload, admin keys survive it, config ownership is sticky. Every key
+/// argument is the key's id ([`gw_config::access_key_id`]), never the raw key.
 #[async_trait]
 pub trait KeyStore: Send + Sync + std::fmt::Debug {
     /// Resolve a key by id; `None` = unknown, revoked, or (for a networked
@@ -366,20 +366,7 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db = format!("gwtest_keys_{nonce}");
-        let admin = sqlx::PgPool::connect(&url).await.expect("pg admin");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
-            .execute(&admin)
-            .await
-            .expect("create test db");
-        let own_url = match url.rfind('/') {
-            Some(i) => format!("{}/{db}", &url[..i]),
-            None => url.clone(),
-        };
+        let (own_url, _) = crate::scratch_pg(&url).await;
         let legacy = sqlx::PgPool::connect(&own_url).await.expect("pg legacy");
         sqlx::query(
             "CREATE TABLE access_keys (ak TEXT PRIMARY KEY, product TEXT NOT NULL,

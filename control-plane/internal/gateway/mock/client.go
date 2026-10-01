@@ -130,7 +130,9 @@ func (c *Client) CreateKey(_ context.Context, actingTenant string, key gateway.K
 	}
 	var created gateway.CreatedKey
 	if key.AK == "" {
-		created.AK = "gw-" + rand.Text()
+		secret := make([]byte, 32)
+		_, _ = rand.Read(secret)
+		created.AK = "gw-" + hex.EncodeToString(secret)
 	}
 	created.AKID = resolveKeyID(cmp.Or(key.AK, created.AK))
 	// the real gateway answers an uncovered existing ak with 404 (scoped_key anti-probing), never 409

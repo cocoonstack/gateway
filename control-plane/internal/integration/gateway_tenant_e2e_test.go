@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
+	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 	gatewayhttp "github.com/cocoonstack/gateway/control-plane/internal/gateway/http"
 	"github.com/cocoonstack/gateway/control-plane/internal/httpapi"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
@@ -352,9 +353,7 @@ func send(t *testing.T, cp *httptest.Server, session browserSession, method, pat
 
 func createdKeyID(t *testing.T, rec wireResponse) string {
 	t.Helper()
-	var created struct {
-		AKID string `json:"ak_id"`
-	}
+	var created gateway.CreatedKey
 	if err := json.Unmarshal([]byte(rec.Body), &created); err != nil || created.AKID == "" {
 		t.Fatalf("create reply %s carries no ak_id: %v", rec.Body, err)
 	}

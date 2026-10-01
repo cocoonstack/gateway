@@ -94,7 +94,7 @@ pub struct AppInner {
     pub mcp: reqwest::Client,
     /// Upstream MCP credentials, OAuth tokens cached per server.
     pub mcp_auth: Arc<mcp_auth::McpAuth>,
-    /// MCP session id → the fingerprint of the key that opened it.
+    /// MCP session id → the `ak_id` of the key that opened it.
     pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
@@ -1622,7 +1622,7 @@ async fn write_rt_event(
     gw_state::SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: String::new(),
-        ak: ak.ak_id.to_string(),
+        ak: String::from(&*ak.ak_id),
         user_id: user.to_owned(),
         tenant: ak.tenant.clone(),
         surface: "realtime".to_owned(),
@@ -1928,8 +1928,7 @@ async fn admin_key_create(
     let Some(ak) = generated.as_deref().or(body["ak"].as_str()) else {
         return error_response(400, "ak must be a string");
     };
-    // same rule as config load: a colon marks the id form
-    if ak.is_empty() || (ak.contains(':') && !gw_config::is_access_key_id(ak)) {
+    if !gw_config::is_valid_access_key(ak) {
         return error_response(
             400,
             "ak must be non-empty and contain ':' only in the sha256 id form",
@@ -4293,7 +4292,7 @@ async fn videos_generations(
         let job = VideoJob {
             id: id.to_owned(),
             tenant: ctx.ak.tenant.clone(),
-            ak: ctx.ak.ak_id.to_string(),
+            ak: String::from(&*ctx.ak.ak_id),
             product: ctx.ak.product.clone(),
             user_id: ctx.effective_user_id().to_owned(),
             model: param

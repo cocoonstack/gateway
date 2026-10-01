@@ -501,7 +501,7 @@ async fn audit(
     SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: gw_handler::new_request_id(),
-        ak: ak.ak_id.to_string(),
+        ak: String::from(&*ak.ak_id),
         user_id: ak.owner.clone().unwrap_or_default(),
         tenant: ak.tenant.clone(),
         surface: "mcp".to_owned(),

@@ -40,7 +40,7 @@ export default function KeysPage(): ReactElement {
       <PageHeader eyebrow="Credentials" title="Access keys" description="Lifecycle and governance state from the gateway's live key store." actions={<button className="button primary" onClick={() => setCreating(true)}>New key</button>} />
       {session.user.role === "system_admin" && <div className="filter-bar"><label>Tenant filter<input placeholder="All tenants" value={tenant} onChange={(event) => setTenant(event.target.value)} /></label></div>}
       {(error || action.error) && <ErrorNotice message={error || action.error} />}
-      {issued && <div className="notice notice-success">New key <code className="key-code">{issued}</code> — copy it now; the gateway keeps only its id. <button onClick={() => setIssued(null)}>Dismiss</button></div>}
+      {issued && <div className="notice notice-success" role="status">New key <code className="key-code">{issued}</code> — copy it now; the gateway keeps only its id. <button onClick={() => setIssued(null)}>Dismiss</button></div>}
       {creating && <CreateKey tenant={tenant || session.user.tenant} tenantLocked={session.user.role === "tenant_admin"} onClose={() => setCreating(false)} onCreated={(ak) => { setCreating(false); setIssued(ak ?? null); reload(); }} />}
       {!data ? <Loading /> : data.keys.length === 0 ? <Empty>No keys match this tenant.</Empty> : (
         <Card><div className="table-wrap"><table><thead><tr><th>Key</th><th>Tenant / owner</th><th>Status</th><th>QPS</th><th>Daily quota</th><th>Expires</th><th /></tr></thead><tbody>

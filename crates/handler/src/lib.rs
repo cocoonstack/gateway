@@ -567,7 +567,7 @@ async fn note_abuse(ctx: &DagContext) {
             actor: "system".to_owned(),
             scope: "global".to_owned(),
             action: "abuse_suspend".to_owned(),
-            target: ctx.ak.ak_id.to_string(),
+            target: String::from(&*ctx.ak.ak_id),
             summary: summary.clone(),
             source_ip: String::new(),
         })
@@ -575,7 +575,7 @@ async fn note_abuse(ctx: &DagContext) {
         .unwrap_or_else(|e| tracing::warn!(error = %e, "abuse audit write failed"));
     ctx.state
         .alerts
-        .emit("abuse_suspend", ctx.ak.ak_id.to_string(), summary);
+        .emit("abuse_suspend", String::from(&*ctx.ak.ak_id), summary);
 }
 
 /// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403
@@ -674,7 +674,7 @@ fn security_event(
     gw_state::SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: ctx.request.request_id.clone(),
-        ak: ctx.ak.ak_id.to_string(),
+        ak: String::from(&*ctx.ak.ak_id),
         user_id: ctx.effective_user_id().to_owned(),
         tenant: ctx.ak.tenant.clone(),
         surface,
@@ -695,7 +695,7 @@ async fn persist_terminal(
     let record = gw_state::ContentRecord {
         created_at_epoch_secs: now,
         request_id: subject.request_id.clone(),
-        ak: subject.ak.ak_id.to_string(),
+        ak: String::from(&*subject.ak.ak_id),
         user_id: subject.user_id,
         tenant: subject.ak.tenant.clone(),
         kind: "terminal".to_owned(),
@@ -820,7 +820,7 @@ async fn persist_content(
             let record = gw_state::ContentRecord {
                 created_at_epoch_secs: now,
                 request_id: ctx.request.request_id.clone(),
-                ak: ctx.ak.ak_id.to_string(),
+                ak: String::from(&*ctx.ak.ak_id),
                 user_id: ctx.effective_user_id().to_owned(),
                 tenant: ctx.ak.tenant.clone(),
                 kind: kind.to_owned(),

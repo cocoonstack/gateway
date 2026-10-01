@@ -70,4 +70,6 @@ key created, re-quota'd, banned, or revoked on one instance is live on all
 within the ~2s auth-cache TTL. The table holds key ids, not keys; the first
 start of a release with ids rewrites an older table in place, so upgrade every
 instance together — an instance still on the older release fails every key
-until it is replaced. See [API — Admin](api.md#admin-dynamic-config).
+until it is replaced. The rewrite is one-way: back up the table first, since
+an older release cannot start on it. Per-key governance counters (daily quota,
+TPM, QPS, model quotas, abuse) restart from zero at the upgrade. See [API — Admin](api.md#admin-dynamic-config).

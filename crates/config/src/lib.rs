@@ -1187,9 +1187,8 @@ impl GatewayConfig {
                 });
             }
         }
-        // a colon marks the id form, so a raw ak never parses as an id
         for k in &self.access_keys {
-            if k.ak.contains(':') && !is_access_key_id(&k.ak) {
+            if !is_valid_access_key(&k.ak) {
                 return Err(ConfigError::DuplicateName {
                     kind: "access_key (':' only in the sha256 id form)",
                     name: k.ak.clone(),
@@ -1440,6 +1439,12 @@ pub fn resolve_access_key_id(ak_or_id: &str) -> String {
     } else {
         access_key_id(ak_or_id)
     }
+}
+
+/// Whether `ak` may name a key: non-empty, with a colon only in the id form,
+/// so a raw key never parses as an id.
+pub fn is_valid_access_key(ak: &str) -> bool {
+    !ak.is_empty() && (!ak.contains(':') || is_access_key_id(ak))
 }
 
 /// Whether `s` is an access-key id rather than a raw key.

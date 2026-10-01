@@ -278,7 +278,7 @@ impl AkAuth {
 
     /// Re-apply the config file's key set, leaving admin-created keys untouched.
     /// Surviving keys are upserted in place (never briefly absent) so a
-    /// concurrent `authenticate` can't spuriously 401 mid-reload.
+    /// concurrent `get` can't spuriously 401 mid-reload.
     pub fn reload_config_keys(&self, keys: &[gw_config::AkConf]) {
         let infos: Vec<AkInfo> = keys.iter().map(AkInfo::from).collect();
         let wanted: std::collections::HashSet<&str> = infos.iter().map(|k| &*k.ak_id).collect();
@@ -1066,6 +1066,25 @@ fn reserve_on(counter: &mut i64, amount: i64, limit: i64) -> bool {
 /// Apply a settle delta, flooring at zero (Redis mirrors it in `settle_floored`).
 fn settle_on(counter: &mut i64, delta: i64) {
     *counter = counter.saturating_add(delta).max(0);
+}
+
+#[cfg(test)]
+pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db = format!("gwtest_{nonce}");
+    let admin = sqlx::PgPool::connect(url).await.expect("pg admin");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
+        .execute(&admin)
+        .await
+        .expect("create test db");
+    let own_url = match url.rfind('/') {
+        Some(i) => format!("{}/{db}", &url[..i]),
+        None => url.to_owned(),
+    };
+    (own_url, nonce)
 }
 
 #[cfg(test)]

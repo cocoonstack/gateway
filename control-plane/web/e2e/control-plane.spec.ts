@@ -45,7 +45,7 @@ test("a generated key is shown once and listed only by its id", async ({ page })
   await page.getByLabel("Tenant", { exact: true }).fill("acme");
   await page.getByRole("button", { name: "Create key" }).click();
 
-  const issued = page.getByText(/^gw-[A-Z2-7]{26}$/);
+  const issued = page.getByText(/^gw-[0-9a-f]{64}$/);
   await expect(issued).toBeVisible();
   const key = (await issued.textContent()) ?? "";
   await expect(page.getByRole("cell", { name: /^sha256:[0-9a-f]{32}/ }).first()).toBeVisible();
