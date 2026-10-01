@@ -532,11 +532,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
     /// Usage rolled up by (tenant, requested model), sorted.
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>>;
-    /// Per-user cost over `[since, until]` (unix secs), grouped by (user,
-    /// requested model); optional tenant/user filter. The billing-period query
-    /// behind per-user invoicing. Served from the minute rollup for rolled
-    /// minutes (where the bounds are minute-aligned) plus the raw ledger tail,
-    /// so the result survives `ledger_max_rows` pruning.
+    /// Per-(user, model) usage over `[since, until]` unix secs: minute rollup plus ledger tail.
     async fn usage_by_user(
         &self,
         tenant: Option<&str>,
@@ -554,11 +550,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         until: i64,
         bucket_secs: i64,
     ) -> GResult<Vec<(i64, UserUsageRow)>>;
-    /// Roll completed minutes of the ledger into durable `usage_rollup`
-    /// buckets: every bucket in the trailing backfill window is recomputed
-    /// from the raw rows and upserted — never deleted — so the periodic task
-    /// is idempotent, self-heals missed ticks, and a bucket outlives the raw
-    /// rows it summarizes. Returns the buckets written.
+    /// Recompute and upsert every rollup bucket in the trailing backfill window; buckets are never
+    /// deleted, so a missed tick self-heals. Returns the buckets written.
     async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64>;
     /// Delete rolled billing rows past `ledger_max_rows`; returns rows deleted.
     async fn ledger_prune(&self) -> GResult<u64> {
@@ -586,21 +579,15 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Delete content whose `expires_at_epoch_secs` is in `(0, now]`; returns the
     /// number deleted. Rows with `expires_at = 0` are kept until manual purge.
     async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
-    /// Erase every retained trace of `user`'s content, optionally confined to one tenant:
-    /// prompt/response rows, batch-result messages, and still-queued batch inputs.
-    /// `audit` (its `summary` set to the erased-row count) is written in the same
-    /// transaction on the SQL backends. Returns rows erased; ledger rows and security
-    /// events carry no content and are kept.
+    /// Erase `user`'s retained content, batch-result messages and queued batch inputs; returns rows
+    /// erased. SQL backends write `audit` (summary = erased count) in the same transaction.
     async fn content_erase_user(
         &self,
         tenant: Option<&str>,
         user: &str,
         audit: AdminAudit,
     ) -> GResult<u64>;
-    /// The most recent `limit` retained-content rows for `user`, newest first,
-    /// optionally confined to one tenant (a tenant admin's scope). Metadata
-    /// only unless `with_bodies`, which carries each row's stored (possibly
-    /// sealed) content for whole-user archiving.
+    /// The newest `limit` retained-content rows for `user`; stored bodies only when `with_bodies`.
     async fn content_list_user(
         &self,
         tenant: Option<&str>,
@@ -684,10 +671,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn batch_load_items(&self, _id: &str) -> GResult<Vec<gw_models::BatchItem>> {
         Ok(Vec::new())
     }
-    /// The current stored copy of one queued item, on backends that persist
-    /// items (`None` otherwise). Executors re-read this immediately before
-    /// dispatch, so an erasure landing while the batch sat queued stops the
-    /// item instead of letting the pre-load snapshot run.
+    /// The stored copy of a queued item (`None` if not persisted); re-read so an erasure stops it.
     async fn batch_item_snapshot(
         &self,
         _id: &str,
@@ -695,20 +679,13 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<Option<gw_models::BatchItem>> {
         Ok(None)
     }
-    /// Whether `user`'s content was erased at or after `since` (unix MILLIS —
-    /// second granularity would misjudge an erase-then-resubmit in the same
-    /// second). Local executors check this before dispatching an item captured
-    /// before the erasure, so a long sequential batch can't keep running an
-    /// erased user's prompts; a batch submitted after the erasure passes.
-    /// Item-persisting backends re-read rows at dispatch instead and keep the
-    /// default `false`.
+    /// Whether `user`'s content was erased at or after `since`, in unix millis so a same-second
+    /// resubmit passes; item-persisting backends re-read rows instead and keep the default `false`.
     async fn user_erased_since(&self, _tenant: &str, _user: &str, _since: i64) -> GResult<bool> {
         Ok(false)
     }
-    /// Claim one pending batch (requeuing stale running ones first); `None` =
-    /// nothing to run. The returned fence token (>= 1, bumped per claim) rides
-    /// [`Store::batch_touch`] / [`Store::batch_set_status_owned`] so a reclaimed
-    /// executor detects it lost ownership; the in-process path passes 0.
+    /// Claim one pending batch, requeuing stale running ones first; the fence token (>= 1, bumped
+    /// per claim) rides `batch_touch`/`batch_set_status_owned`; the in-process path passes 0.
     async fn batch_claim_pending(&self, _stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
         Ok(None)
     }

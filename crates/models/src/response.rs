@@ -31,7 +31,7 @@ pub struct GatewayResponse {
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
 
-    /// v2 typed response payload (dynamic for now).
+    /// v2 typed response payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_v2: Option<Value>,
     /// Native Anthropic content blocks. Anthropic views use this to preserve

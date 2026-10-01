@@ -1,6 +1,4 @@
-//! The request span reaches an OTLP exporter with the route, the pipeline
-//! fields, and the caller's trace context; its own binary, since the global
-//! subscriber is process-wide.
+//! The request span reaches an OTLP exporter; own binary since the subscriber is process-wide.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,7 +1,4 @@
-//! Golden byte-level alignment against REAL recorded vendor responses: each
-//! fixture is a recorded upstream body fed through the Rust engines and diffed
-//! against expected values — the offline half of byte-level vendor alignment
-//! (the online half needs credentials + egress).
+//! Recorded vendor response bodies parsed by the engines and checked against expected values.
 
 use std::sync::Arc;
 

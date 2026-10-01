@@ -179,7 +179,6 @@ pub mod domain {
         }
     }
 
-    // `Protocol` has no Default, so the struct's Default is manual.
     impl Default for ModelParamV2 {
         fn default() -> Self {
             Self {

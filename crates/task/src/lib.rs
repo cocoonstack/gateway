@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gw_state::{GatewayState, SharedConfig};
 
-/// The production period: once a day.
+/// Quota reset period.
 pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Retained content is swept for expiry this often.
 pub const PURGE_PERIOD: Duration = Duration::from_secs(60 * 60);
@@ -19,8 +19,7 @@ pub const AVAIL_FLUSH_PERIOD: Duration = Duration::from_secs(2);
 /// Model availability is re-classified for alerting this often.
 pub const AVAIL_ALERT_PERIOD: Duration = Duration::from_secs(60);
 
-/// Spawn the daily quota reset loop. Returns the join handle (abort to stop).
-/// `period` is configurable so tests don't wait 24h.
+/// Spawn the daily quota reset loop.
 pub fn spawn_quota_reset(
     state: Arc<GatewayState>,
     period: Duration,
@@ -39,8 +38,7 @@ pub fn spawn_quota_reset(
     })
 }
 
-/// Spawn the retained-content purge loop: deletes content rows whose retention
-/// window has elapsed. Returns the join handle (abort to stop).
+/// Spawn the loop that deletes content rows past their retention window.
 pub fn spawn_content_purge(
     state: Arc<GatewayState>,
     period: Duration,
@@ -60,9 +58,7 @@ pub fn spawn_content_purge(
     })
 }
 
-/// Spawn the usage-rollup loop: folds completed ledger minutes into the durable
-/// per-user buckets, then prunes the raw rows they now cover. Returns the join
-/// handle (abort to stop).
+/// Spawn the loop that folds settled ledger minutes into usage buckets and prunes the covered rows.
 pub fn spawn_usage_rollup(
     state: Arc<GatewayState>,
     period: Duration,
@@ -152,7 +148,6 @@ pub fn spawn_avail_alerts(shared: SharedConfig, period: Duration) -> tokio::task
     })
 }
 
-/// One sweep round, factored out so tests drive it directly.
 async fn avail_alert_sweep(
     shared: &SharedConfig,
     last: &mut HashMap<String, gw_state::AvailState>,
