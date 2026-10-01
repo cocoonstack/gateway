@@ -372,18 +372,18 @@ pub struct QuotaStore {
 }
 
 impl QuotaStore {
-    pub fn used(&self, ak: &str) -> i64 {
-        self.used.get(ak).map(|v| *v.value()).unwrap_or(0)
+    pub fn used(&self, key: &str) -> i64 {
+        self.used.get(key).map(|v| *v.value()).unwrap_or(0)
     }
 
     /// Pre-check: is there budget left before serving the request?
-    pub fn check(&self, ak: &str, limit: i64) -> bool {
-        self.used(ak) < limit
+    pub fn check(&self, key: &str, limit: i64) -> bool {
+        self.used(key) < limit
     }
 
     /// Post-consume actual usage; saturating against a hostile i64::MAX count.
-    pub fn consume(&self, ak: &str, tokens: i64) -> i64 {
-        let mut e = slot_mut(&self.used, ak, || 0);
+    pub fn consume(&self, key: &str, tokens: i64) -> i64 {
+        let mut e = slot_mut(&self.used, key, || 0);
         *e = e.saturating_add(tokens);
         *e
     }

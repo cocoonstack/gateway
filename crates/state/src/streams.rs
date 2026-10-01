@@ -12,9 +12,9 @@ pub struct LiveStreams {
 }
 
 impl LiveStreams {
-    /// Take a slot for `ak`; `None` at `cap` (0 = unlimited).
-    pub fn open(self: &Arc<Self>, ak: &str, cap: usize) -> Option<StreamGuard> {
-        let mut n = crate::slot_mut(&self.open, ak, || 0);
+    /// Take a slot for `ak_id`; `None` at `cap` (0 = unlimited).
+    pub fn open(self: &Arc<Self>, ak_id: &str, cap: usize) -> Option<StreamGuard> {
+        let mut n = crate::slot_mut(&self.open, ak_id, || 0);
         if cap > 0 && *n >= cap {
             return None;
         }
@@ -22,7 +22,7 @@ impl LiveStreams {
         drop(n);
         Some(StreamGuard {
             streams: Arc::clone(self),
-            ak: ak.to_owned(),
+            ak_id: ak_id.to_owned(),
         })
     }
 }
@@ -31,18 +31,18 @@ impl LiveStreams {
 #[derive(Debug)]
 pub struct StreamGuard {
     streams: Arc<LiveStreams>,
-    ak: String,
+    ak_id: String,
 }
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         // the entry lock is released before the removal, which would deadlock on it
-        let left = self.streams.open.get_mut(&self.ak).map(|mut n| {
+        let left = self.streams.open.get_mut(&self.ak_id).map(|mut n| {
             *n = n.saturating_sub(1);
             *n
         });
         if left == Some(0) {
-            self.streams.open.remove_if(&self.ak, |_, n| *n == 0);
+            self.streams.open.remove_if(&self.ak_id, |_, n| *n == 0);
         }
     }
 }

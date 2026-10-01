@@ -354,8 +354,8 @@ pub async fn consume_budgets(
     }
 }
 
-pub fn model_quota_key(ak: &str, model: &str) -> String {
-    format!("{ak}|{model}")
+pub fn model_quota_key(ak_id: &str, model: &str) -> String {
+    format!("{ak_id}|{model}")
 }
 
 /// The per-(AK, model) daily cap: AK override, else tenant default, else none.
