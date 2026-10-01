@@ -21,24 +21,6 @@ pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize)
     walk(v, text_delta, f)
 }
 
-fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usize) -> usize {
-    match v {
-        // bare strings inside arrays (schema enum values, prompt variables)
-        Value::String(s) => f(s),
-        Value::Array(a) => a.iter_mut().map(|x| walk(x, text_delta, f)).sum(),
-        Value::Object(o) => o
-            .iter_mut()
-            .map(|(k, x)| match x {
-                Value::String(_) if is_skipped_scalar(k, text_delta) => 0,
-                // identifier lists, never prose
-                _ if k == "modalities" || k == "output_modalities" => 0,
-                _ => walk(x, text_delta, f),
-            })
-            .sum(),
-        _ => 0,
-    }
-}
-
 /// A non-OpenAI realtime dialect (Gemini Live family): no turn-start signal to
 /// gate before generation; metered off the vendor's own turn-complete frame.
 pub fn is_gemini_realtime(provider: &str) -> bool {
@@ -160,6 +142,24 @@ pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
             .unwrap_or(0)
             .max(0),
     )
+}
+
+fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usize) -> usize {
+    match v {
+        // bare strings inside arrays (schema enum values, prompt variables)
+        Value::String(s) => f(s),
+        Value::Array(a) => a.iter_mut().map(|x| walk(x, text_delta, f)).sum(),
+        Value::Object(o) => o
+            .iter_mut()
+            .map(|(k, x)| match x {
+                Value::String(_) if is_skipped_scalar(k, text_delta) => 0,
+                // identifier lists, never prose
+                _ if k == "modalities" || k == "output_modalities" => 0,
+                _ => walk(x, text_delta, f),
+            })
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// String values that never carry human text (base64 media, protocol ids);

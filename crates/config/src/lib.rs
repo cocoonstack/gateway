@@ -1353,6 +1353,56 @@ struct ProviderPreset {
     default_model_wire: &'static str,
 }
 
+/// A raw access key's stored identity: `sha256:` plus the first 16 digest
+/// bytes in hex. Request auth uses only this, so an id never authenticates.
+pub fn access_key_id(raw: &str) -> String {
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut hex = [0u8; AK_ID_HEX_LEN];
+    let _ = hex::encode_to_slice(&digest[..AK_ID_HEX_LEN / 2], &mut hex);
+    let mut id = String::with_capacity(AK_ID_PREFIX.len() + AK_ID_HEX_LEN);
+    id.push_str(AK_ID_PREFIX);
+    id.push_str(std::str::from_utf8(&hex).unwrap_or_default());
+    id
+}
+
+/// The id a trusted caller (config, admin API, a stored row) names: the value
+/// itself when it is an id, else the raw key's id.
+pub fn resolve_access_key_id(ak_or_id: &str) -> String {
+    if is_access_key_id(ak_or_id) {
+        ak_or_id.to_owned()
+    } else {
+        access_key_id(ak_or_id)
+    }
+}
+
+/// Whether `ak` may name a key: non-empty, with a colon only in the id form,
+/// so a raw key never parses as an id.
+pub fn is_valid_access_key(ak: &str) -> bool {
+    !ak.is_empty() && (!ak.contains(':') || is_access_key_id(ak))
+}
+
+/// Whether `s` is an access-key id rather than a raw key.
+pub fn is_access_key_id(s: &str) -> bool {
+    s.strip_prefix(AK_ID_PREFIX).is_some_and(|h| {
+        h.len() == AK_ID_HEX_LEN && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Cumulative-weight pick over a model's variants by a stable hash, so every
+/// instance maps the same key to the same bucket with no shared state.
+pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
+    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
+    let mut roll = fnv1a(key) % total.max(1);
+    for v in variants {
+        if roll < u64::from(v.weight) {
+            return Some(v);
+        }
+        roll -= u64::from(v.weight);
+    }
+    // weights are validated >= 1, so only an empty list falls through
+    variants.first()
+}
+
 fn provider_preset(kind: &str) -> Option<ProviderPreset> {
     Some(match kind {
         "openai" => ProviderPreset {
@@ -1417,56 +1467,6 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         _ => return None,
     })
-}
-
-/// A raw access key's stored identity: `sha256:` plus the first 16 digest
-/// bytes in hex. Request auth uses only this, so an id never authenticates.
-pub fn access_key_id(raw: &str) -> String {
-    let digest = Sha256::digest(raw.as_bytes());
-    let mut hex = [0u8; AK_ID_HEX_LEN];
-    let _ = hex::encode_to_slice(&digest[..AK_ID_HEX_LEN / 2], &mut hex);
-    let mut id = String::with_capacity(AK_ID_PREFIX.len() + AK_ID_HEX_LEN);
-    id.push_str(AK_ID_PREFIX);
-    id.push_str(std::str::from_utf8(&hex).unwrap_or_default());
-    id
-}
-
-/// The id a trusted caller (config, admin API, a stored row) names: the value
-/// itself when it is an id, else the raw key's id.
-pub fn resolve_access_key_id(ak_or_id: &str) -> String {
-    if is_access_key_id(ak_or_id) {
-        ak_or_id.to_owned()
-    } else {
-        access_key_id(ak_or_id)
-    }
-}
-
-/// Whether `ak` may name a key: non-empty, with a colon only in the id form,
-/// so a raw key never parses as an id.
-pub fn is_valid_access_key(ak: &str) -> bool {
-    !ak.is_empty() && (!ak.contains(':') || is_access_key_id(ak))
-}
-
-/// Whether `s` is an access-key id rather than a raw key.
-pub fn is_access_key_id(s: &str) -> bool {
-    s.strip_prefix(AK_ID_PREFIX).is_some_and(|h| {
-        h.len() == AK_ID_HEX_LEN && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
-}
-
-/// Cumulative-weight pick over a model's variants by a stable hash, so every
-/// instance maps the same key to the same bucket with no shared state.
-pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
-    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
-    let mut roll = fnv1a(key) % total.max(1);
-    for v in variants {
-        if roll < u64::from(v.weight) {
-            return Some(v);
-        }
-        roll -= u64::from(v.weight);
-    }
-    // weights are validated >= 1, so only an empty list falls through
-    variants.first()
 }
 
 /// FNV-1a 64: deterministic across processes and releases (std's hasher is

@@ -530,6 +530,12 @@ pub async fn settle_and_bill(
     settled
 }
 
+/// The counter prefixes of the current and previous month: everything the rollover still reads.
+pub fn month_prefixes() -> [String; 2] {
+    let month = civil_month(crate::epoch_secs());
+    [month_prefix(month), month_prefix(previous_month(month))]
+}
+
 fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(deny()) }
 }
@@ -598,12 +604,6 @@ fn previous_month((y, m): (i64, u32)) -> (i64, u32) {
 
 fn month_prefix((y, m): (i64, u32)) -> String {
     format!("m:{y}{m:02}:")
-}
-
-/// The counter prefixes of the current and previous month: everything the rollover still reads.
-pub fn month_prefixes() -> [String; 2] {
-    let month = civil_month(crate::epoch_secs());
-    [month_prefix(month), month_prefix(previous_month(month))]
 }
 
 #[cfg(test)]

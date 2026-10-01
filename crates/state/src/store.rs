@@ -239,99 +239,6 @@ pub struct BillingInput<'a> {
     pub unit_price: Option<i64>,
 }
 
-/// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
-pub fn clamp_tokens(n: i64) -> i64 {
-    n.clamp(0, MAX_METERED_TOKENS)
-}
-
-/// The served model's billing weights; identity when unconfigured. The
-/// `prompt_includes_cache` normalization already happened at usage extraction.
-pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_models::TokenRate {
-    match cfg.find_model(model).and_then(|m| m.token_rate) {
-        Some(r) => gw_models::TokenRate {
-            prompt_includes_cache: false,
-            prompt_weight: r.prompt,
-            audio_prompt_weight: r.audio_prompt.unwrap_or(r.prompt),
-            read_cache_weight: r.read_cache,
-            write_cache_weight: r.write_cache,
-            write_cache_1h_weight: r.write_cache_1h.unwrap_or(r.write_cache),
-            completion_weight: r.completion,
-            audio_completion_weight: r.audio_completion.unwrap_or(r.completion),
-            reasoning_weight: r.reasoning,
-        },
-        None => gw_models::TokenRate::default(),
-    }
-}
-
-/// Price one call into a [`BillingRecord`] (tenant price for the served model,
-/// vendor cost from the account), shared by the pipeline and the realtime
-/// surface; prompt/completion keep the vendor counts, `total_tokens` is the
-/// weighted platform total quota metering consumed.
-pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
-    let (prompt, completion, total) = (
-        clamp_tokens(b.prompt),
-        clamp_tokens(b.completion),
-        clamp_tokens(b.total),
-    );
-    let (billable_prompt, billable_completion) = (
-        clamp_tokens(b.billable_prompt),
-        clamp_tokens(b.billable_completion),
-    );
-    let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
-    let units = clamp_tokens(b.units);
-    let unit_price = b
-        .unit_price
-        .unwrap_or_else(|| cfg.unit_price_for_tenant(b.tenant, b.served_model));
-    let unit_cost = units.saturating_mul(unit_price);
-    let discounted = |cost: i64| {
-        if b.discount == 1.0 {
-            cost
-        } else {
-            (cost as f64 * b.discount).round() as i64
-        }
-    };
-    let (vendor, vendor_unit) = cfg
-        .find_account(b.account)
-        .map(|a| {
-            (
-                (
-                    a.cost_input_price_per_1k_micros,
-                    a.cost_output_price_per_1k_micros,
-                ),
-                a.cost_unit_price_micros,
-            )
-        })
-        .unwrap_or(((0, 0), 0));
-    BillingRecord {
-        ak: b.ak.to_owned(),
-        product: b.product.to_owned(),
-        tenant: b.tenant.to_owned(),
-        user_id: b.user_id.to_owned(),
-        request_id: b.request_id.to_owned(),
-        created_at_epoch_secs: crate::epoch_secs(),
-        model: b.requested_model.to_owned(),
-        served_model: b.served_model.to_owned(),
-        protocol: b.protocol.to_owned(),
-        account: b.account.to_owned(),
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: total,
-        cost_micros: discounted(
-            gw_models::cost_micros(billable_prompt, billable_completion, charged)
-                .saturating_add(unit_cost),
-        ),
-        vendor_cost_micros: b.vendor_cost.unwrap_or_else(|| {
-            discounted(
-                gw_models::cost_micros(billable_prompt, billable_completion, vendor)
-                    .saturating_add(units.saturating_mul(vendor_unit)),
-            )
-        }),
-        billed_units: units,
-        ptu_spillover: b.ptu_spillover,
-        estimated: b.estimated,
-    }
-}
-
 /// One row of the per-(tenant, model) usage rollup.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct UsageRow {
@@ -396,77 +303,6 @@ impl UserUsageRow {
         self.vendor_cost_micros = self.vendor_cost_micros.max(o.vendor_cost_micros);
         self.billed_units = self.billed_units.max(o.billed_units);
     }
-}
-
-/// One raw ledger row as a single-request usage line.
-fn usage_of(r: &BillingRecord) -> UserUsageRow {
-    UserUsageRow {
-        user_id: r.user_id.clone(),
-        model: r.model.clone(),
-        requests: 1,
-        prompt_tokens: r.prompt_tokens,
-        completion_tokens: r.completion_tokens,
-        total_tokens: r.total_tokens,
-        cost_micros: r.cost_micros,
-        vendor_cost_micros: r.vendor_cost_micros,
-        billed_units: r.billed_units,
-    }
-}
-
-/// Fold grouped usage rows into `map` by (user, model).
-fn fold_user_usage(
-    map: &mut BTreeMap<(String, String), UserUsageRow>,
-    rows: impl IntoIterator<Item = UserUsageRow>,
-) {
-    for r in rows {
-        map.entry((r.user_id.clone(), r.model.clone()))
-            .and_modify(|e| e.absorb(&r))
-            .or_insert(r);
-    }
-}
-
-fn fold_series(
-    map: &mut BTreeMap<i64, UserUsageRow>,
-    rows: impl IntoIterator<Item = (i64, UserUsageRow)>,
-) {
-    for (start, r) in rows {
-        map.entry(start).and_modify(|e| e.absorb(&r)).or_insert(r);
-    }
-}
-
-fn series_row<'r, R>(row: &'r R) -> (i64, UserUsageRow)
-where
-    R: sqlx::Row,
-    usize: sqlx::ColumnIndex<R>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    (
-        row.get(0),
-        UserUsageRow {
-            user_id: String::new(),
-            model: String::new(),
-            requests: row.get(1),
-            prompt_tokens: row.get(2),
-            completion_tokens: row.get(3),
-            total_tokens: row.get(4),
-            cost_micros: row.get(5),
-            vendor_cost_micros: row.get(6),
-            billed_units: row.get(7),
-        },
-    )
-}
-
-fn bucket_floor(ts: i64) -> i64 {
-    ts - ts.rem_euclid(ROLLUP_BUCKET_SECS)
-}
-
-/// Minute-align a query window so a repeated query cannot drift as the
-/// watermark advances past its bounds.
-fn align_bounds(since: i64, until: i64) -> (i64, i64) {
-    (
-        bucket_floor(since),
-        bucket_floor(until).saturating_add(ROLLUP_BUCKET_SECS - 1),
-    )
 }
 
 /// A content-safety outcome recorded WITHOUT the offending text: which
@@ -1202,15 +1038,6 @@ impl Store for MemoryStore {
     }
 }
 
-/// First epoch second NOT yet folded into the rollup: rows at or above it are
-/// still the ledger's to report.
-fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
-    rollup
-        .keys()
-        .next_back()
-        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
-}
-
 /// Positional row → record mappers shared by the SQL backends (fields decode in
 /// the SELECT's column order).
 macro_rules! row_mapper {
@@ -1228,12 +1055,6 @@ macro_rules! row_mapper {
             $ty { $($field),+ }
         }
     };
-}
-
-fn next_col(col: &mut usize) -> usize {
-    let i = *col;
-    *col += 1;
-    i
 }
 
 row_mapper!(row_to_billing -> BillingRecord {
@@ -1406,30 +1227,6 @@ impl SqliteStore {
             ledger_max_rows,
         })
     }
-}
-
-/// Rewrite `?` placeholders to Postgres `$1..$N`; a numbered `?N` keeps its N.
-/// Only used on the shared queries below, none of which carries a literal `?`.
-fn pg_numbered(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len() + 8);
-    let mut n = 0;
-    let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '?' {
-            out.push(ch);
-            continue;
-        }
-        out.push('$');
-        if chars.peek().is_some_and(char::is_ascii_digit) {
-            while let Some(d) = chars.next_if(char::is_ascii_digit) {
-                out.push(d);
-            }
-        } else {
-            n += 1;
-            out.push_str(&n.to_string());
-        }
-    }
-    out
 }
 
 /// The shared query text for one backend: SQLite takes the `?`-placeholder
@@ -2284,42 +2081,6 @@ sql_store_impl!(SqliteStore, sqlite, {
     }
 });
 
-/// Delete a terminal batch's input rows in the status write's transaction, so
-/// submitted prompt text cannot outlive the run.
-async fn prune_terminal_items(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: &str,
-    status: BatchStatus,
-) -> GResult<()> {
-    if !matches!(status, BatchStatus::Completed | BatchStatus::Failed) {
-        return Ok(());
-    }
-    sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
-        .bind(id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| crate::sqlx_err("prune batch items", e))?;
-    Ok(())
-}
-
-fn pg_batch_item(r: &sqlx::postgres::PgRow) -> gw_models::BatchItem {
-    let (typed, raw) = serde_json::from_str(r.get::<&str, _>(2)).unwrap_or_default();
-    gw_models::BatchItem {
-        messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
-        typed,
-        raw,
-        user: r.get(1),
-    }
-}
-
-fn tool_calls_text(result: &BatchItemResult) -> String {
-    result
-        .tool_calls
-        .as_ref()
-        .map(serde_json::Value::to_string)
-        .unwrap_or_default()
-}
-
 /// Postgres-backed store shared across a fleet; no orphan sweep on open, since
 /// another live instance may still be executing those batches.
 #[derive(Debug)]
@@ -2837,6 +2598,245 @@ sql_store_impl!(PostgresStore, postgres, {
         Ok(r.rows_affected() > 0)
     }
 });
+
+/// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
+pub fn clamp_tokens(n: i64) -> i64 {
+    n.clamp(0, MAX_METERED_TOKENS)
+}
+
+/// The served model's billing weights; identity when unconfigured. The
+/// `prompt_includes_cache` normalization already happened at usage extraction.
+pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_models::TokenRate {
+    match cfg.find_model(model).and_then(|m| m.token_rate) {
+        Some(r) => gw_models::TokenRate {
+            prompt_includes_cache: false,
+            prompt_weight: r.prompt,
+            audio_prompt_weight: r.audio_prompt.unwrap_or(r.prompt),
+            read_cache_weight: r.read_cache,
+            write_cache_weight: r.write_cache,
+            write_cache_1h_weight: r.write_cache_1h.unwrap_or(r.write_cache),
+            completion_weight: r.completion,
+            audio_completion_weight: r.audio_completion.unwrap_or(r.completion),
+            reasoning_weight: r.reasoning,
+        },
+        None => gw_models::TokenRate::default(),
+    }
+}
+
+/// Price one call into a [`BillingRecord`] (tenant price for the served model,
+/// vendor cost from the account), shared by the pipeline and the realtime
+/// surface; prompt/completion keep the vendor counts, `total_tokens` is the
+/// weighted platform total quota metering consumed.
+pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
+    let (prompt, completion, total) = (
+        clamp_tokens(b.prompt),
+        clamp_tokens(b.completion),
+        clamp_tokens(b.total),
+    );
+    let (billable_prompt, billable_completion) = (
+        clamp_tokens(b.billable_prompt),
+        clamp_tokens(b.billable_completion),
+    );
+    let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
+    let units = clamp_tokens(b.units);
+    let unit_price = b
+        .unit_price
+        .unwrap_or_else(|| cfg.unit_price_for_tenant(b.tenant, b.served_model));
+    let unit_cost = units.saturating_mul(unit_price);
+    let discounted = |cost: i64| {
+        if b.discount == 1.0 {
+            cost
+        } else {
+            (cost as f64 * b.discount).round() as i64
+        }
+    };
+    let (vendor, vendor_unit) = cfg
+        .find_account(b.account)
+        .map(|a| {
+            (
+                (
+                    a.cost_input_price_per_1k_micros,
+                    a.cost_output_price_per_1k_micros,
+                ),
+                a.cost_unit_price_micros,
+            )
+        })
+        .unwrap_or(((0, 0), 0));
+    BillingRecord {
+        ak: b.ak.to_owned(),
+        product: b.product.to_owned(),
+        tenant: b.tenant.to_owned(),
+        user_id: b.user_id.to_owned(),
+        request_id: b.request_id.to_owned(),
+        created_at_epoch_secs: crate::epoch_secs(),
+        model: b.requested_model.to_owned(),
+        served_model: b.served_model.to_owned(),
+        protocol: b.protocol.to_owned(),
+        account: b.account.to_owned(),
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+        cost_micros: discounted(
+            gw_models::cost_micros(billable_prompt, billable_completion, charged)
+                .saturating_add(unit_cost),
+        ),
+        vendor_cost_micros: b.vendor_cost.unwrap_or_else(|| {
+            discounted(
+                gw_models::cost_micros(billable_prompt, billable_completion, vendor)
+                    .saturating_add(units.saturating_mul(vendor_unit)),
+            )
+        }),
+        billed_units: units,
+        ptu_spillover: b.ptu_spillover,
+        estimated: b.estimated,
+    }
+}
+
+/// One raw ledger row as a single-request usage line.
+fn usage_of(r: &BillingRecord) -> UserUsageRow {
+    UserUsageRow {
+        user_id: r.user_id.clone(),
+        model: r.model.clone(),
+        requests: 1,
+        prompt_tokens: r.prompt_tokens,
+        completion_tokens: r.completion_tokens,
+        total_tokens: r.total_tokens,
+        cost_micros: r.cost_micros,
+        vendor_cost_micros: r.vendor_cost_micros,
+        billed_units: r.billed_units,
+    }
+}
+
+/// Fold grouped usage rows into `map` by (user, model).
+fn fold_user_usage(
+    map: &mut BTreeMap<(String, String), UserUsageRow>,
+    rows: impl IntoIterator<Item = UserUsageRow>,
+) {
+    for r in rows {
+        map.entry((r.user_id.clone(), r.model.clone()))
+            .and_modify(|e| e.absorb(&r))
+            .or_insert(r);
+    }
+}
+
+fn fold_series(
+    map: &mut BTreeMap<i64, UserUsageRow>,
+    rows: impl IntoIterator<Item = (i64, UserUsageRow)>,
+) {
+    for (start, r) in rows {
+        map.entry(start).and_modify(|e| e.absorb(&r)).or_insert(r);
+    }
+}
+
+fn series_row<'r, R>(row: &'r R) -> (i64, UserUsageRow)
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    (
+        row.get(0),
+        UserUsageRow {
+            user_id: String::new(),
+            model: String::new(),
+            requests: row.get(1),
+            prompt_tokens: row.get(2),
+            completion_tokens: row.get(3),
+            total_tokens: row.get(4),
+            cost_micros: row.get(5),
+            vendor_cost_micros: row.get(6),
+            billed_units: row.get(7),
+        },
+    )
+}
+
+fn bucket_floor(ts: i64) -> i64 {
+    ts - ts.rem_euclid(ROLLUP_BUCKET_SECS)
+}
+
+/// Minute-align a query window so a repeated query cannot drift as the
+/// watermark advances past its bounds.
+fn align_bounds(since: i64, until: i64) -> (i64, i64) {
+    (
+        bucket_floor(since),
+        bucket_floor(until).saturating_add(ROLLUP_BUCKET_SECS - 1),
+    )
+}
+
+/// First epoch second NOT yet folded into the rollup: rows at or above it are
+/// still the ledger's to report.
+fn rollup_watermark(rollup: &BTreeMap<(i64, String, String, String), UserUsageRow>) -> i64 {
+    rollup
+        .keys()
+        .next_back()
+        .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+}
+
+fn next_col(col: &mut usize) -> usize {
+    let i = *col;
+    *col += 1;
+    i
+}
+
+/// Rewrite `?` placeholders to Postgres `$1..$N`; a numbered `?N` keeps its N.
+/// Only used on the shared queries below, none of which carries a literal `?`.
+fn pg_numbered(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '?' {
+            out.push(ch);
+            continue;
+        }
+        out.push('$');
+        if chars.peek().is_some_and(char::is_ascii_digit) {
+            while let Some(d) = chars.next_if(char::is_ascii_digit) {
+                out.push(d);
+            }
+        } else {
+            n += 1;
+            out.push_str(&n.to_string());
+        }
+    }
+    out
+}
+
+/// Delete a terminal batch's input rows in the status write's transaction, so
+/// submitted prompt text cannot outlive the run.
+async fn prune_terminal_items(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    status: BatchStatus,
+) -> GResult<()> {
+    if !matches!(status, BatchStatus::Completed | BatchStatus::Failed) {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| crate::sqlx_err("prune batch items", e))?;
+    Ok(())
+}
+
+fn pg_batch_item(r: &sqlx::postgres::PgRow) -> gw_models::BatchItem {
+    let (typed, raw) = serde_json::from_str(r.get::<&str, _>(2)).unwrap_or_default();
+    gw_models::BatchItem {
+        messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
+        typed,
+        raw,
+        user: r.get(1),
+    }
+}
+
+fn tool_calls_text(result: &BatchItemResult) -> String {
+    result
+        .tool_calls
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {
