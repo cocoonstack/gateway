@@ -94,7 +94,7 @@ pub struct AppInner {
     pub mcp: reqwest::Client,
     /// Upstream MCP credentials, OAuth tokens cached per server.
     pub mcp_auth: Arc<mcp_auth::McpAuth>,
-    /// MCP session id → the fingerprint of the key that opened it.
+    /// MCP session id → the `ak_id` of the key that opened it.
     pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
@@ -374,7 +374,7 @@ async fn realtime_ws(
         Ok(ak) => ak,
         Err((st, msg)) => {
             let sub = match ws_subprotocol_ak(&headers) {
-                Some(k) => snap.state.auth.authenticate(k).await,
+                Some(k) => snap.state.auth.get(&gw_config::access_key_id(k)).await,
                 None => None,
             };
             match sub {
@@ -389,7 +389,7 @@ async fn realtime_ws(
     let Some(stream_guard) = snap
         .state
         .streams
-        .open(&ak.ak, snap.cfg.max_live_streams_per_key)
+        .open(&ak.ak_id, snap.cfg.max_live_streams_per_key)
     else {
         return error_response(429, "too many open realtime sessions for this key");
     };
@@ -497,7 +497,7 @@ impl RealtimeAdmit {
         self.snap
             .state
             .governance
-            .refund_reserves(&self.ak.ak, self.reserved, self.tpm_reserved, self.at)
+            .refund_reserves(&self.ak.ak_id, self.reserved, self.tpm_reserved, self.at)
             .await;
     }
 }
@@ -538,7 +538,7 @@ async fn realtime_gate(
 ) -> Result<RealtimeAdmit, (ErrClass, String)> {
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
-    let ak = match state.auth.authenticate(&ak.ak).await {
+    let ak = match state.auth.get(&ak.ak_id).await {
         Some(fresh) if fresh.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active => {
             fresh
         }
@@ -579,7 +579,7 @@ async fn realtime_gate(
         .map_err(quota_exceeded)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
-            .quota_check(&admission::model_quota_key(&ak.ak, &m.requested), limit)
+            .quota_check(&admission::model_quota_key(&ak.ak_id, &m.requested), limit)
             .await
     {
         return Err((
@@ -594,7 +594,8 @@ async fn realtime_gate(
     let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
         Ok(reserved) => reserved,
         Err(denied) => {
-            gov.quota_settle(&ak.ak, -REALTIME_TURN_RESERVE, at).await;
+            gov.quota_settle(&ak.ak_id, -REALTIME_TURN_RESERVE, at)
+                .await;
             return Err((ErrClass::Throttling, denied));
         }
     };
@@ -643,13 +644,13 @@ async fn bill_realtime_turn(
     );
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
-        .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
+        .map(|_| admission::model_quota_key(&ak.ak_id, &m.requested));
     let settled = admission::settle_and_bill(
         state,
         cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {
-                ak: &ak.ak,
+                ak: &ak.ak_id,
                 product: &ak.product,
                 tenant: &ak.tenant,
                 user_id: admit.user.as_str(),
@@ -1071,7 +1072,7 @@ async fn realtime_bridge(
                                     let billed = snap
                                         .state
                                         .auth
-                                        .authenticate(&ak.ak)
+                                        .get(&ak.ak_id)
                                         .await
                                         .unwrap_or_else(|| ak.clone());
                                     let user = billed.attributed_user(&hint).to_owned();
@@ -1380,7 +1381,7 @@ async fn authenticate(
         .handler
         .state()
         .auth
-        .authenticate(ak)
+        .get(&gw_config::access_key_id(ak))
         .await
         .ok_or((401, "invalid api key"))?;
     check_key_status(&info)?;
@@ -1621,7 +1622,7 @@ async fn write_rt_event(
     gw_state::SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: String::new(),
-        ak: ak.ak.clone(),
+        ak: String::from(&*ak.ak_id),
         user_id: user.to_owned(),
         tenant: ak.tenant.clone(),
         surface: "realtime".to_owned(),
@@ -1824,11 +1825,11 @@ fn require_global_admin(s: &AppState, headers: &HeaderMap) -> Result<(), Respons
 async fn scoped_key(
     s: &AppState,
     scope: &AdminScope,
-    ak: &str,
+    ak_id: &str,
 ) -> Result<Option<Arc<AkInfo>>, Response> {
-    match s.handler.state().auth.authenticate(ak).await {
+    match s.handler.state().auth.get(ak_id).await {
         Some(existing) if !scope.covers(&existing.tenant) => {
-            Err(error_response(404, format!("key {ak} not found")))
+            Err(error_response(404, format!("key {ak_id} not found")))
         }
         found => Ok(found),
     }
@@ -1838,7 +1839,7 @@ async fn scoped_key(
 fn ak_public_json(k: &AkInfo) -> Value {
     let status = k.status_at(gw_state::epoch_secs());
     json!({
-        "ak": k.ak, "product": k.product, "tenant": k.tenant, "owner": k.owner,
+        "ak_id": &*k.ak_id, "product": k.product, "tenant": k.tenant, "owner": k.owner,
         "qps": k.qps, "daily_token_quota": k.daily_token_quota,
         "tokens_per_minute": k.tokens_per_minute,
         "expires_at_epoch_secs": k.expires_at_epoch_secs,
@@ -1864,6 +1865,11 @@ fn tenant_owned<T>(
         Ok(_) => Err(error_response(404, format!("{kind} {id} not found"))),
         Err(e) => Err(gateway_error(e)),
     }
+}
+
+fn new_access_key() -> String {
+    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    format!("gw-{}{}", a.simple(), b.simple())
 }
 
 /// Constant-time string equality for bearer-token checks.
@@ -1907,21 +1913,28 @@ async fn admin_reload(
     }
 }
 
-/// POST /admin/keys — create (or replace) a runtime access key. Admin keys
-/// survive a config reload; the config file remains the boot baseline.
+/// POST /admin/keys — create (or replace) a runtime access key; an absent `ak`
+/// is generated and returned once. Admin keys survive a config reload.
 async fn admin_key_create(
     State(s): State<AppState>,
     scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
-    let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
-        return error_response(400, "ak and product are required");
+    let Some(product) = body["product"].as_str() else {
+        return error_response(400, "product is required");
     };
-    // same ban as config load: a ':' would collide with the prefixed governance keyspaces
-    if ak.is_empty() || ak.contains(':') {
-        return error_response(400, "ak must be non-empty and must not contain ':'");
+    let generated = body["ak"].is_null().then(new_access_key);
+    let Some(ak) = generated.as_deref().or(body["ak"].as_str()) else {
+        return error_response(400, "ak must be a string");
+    };
+    if !gw_config::is_valid_access_key(ak) {
+        return error_response(
+            400,
+            "ak must be non-empty and contain ':' only in the sha256 id form",
+        );
     }
+    let ak_id: Arc<str> = gw_config::resolve_access_key_id(ak).into();
     let default_tenant = match &scope {
         AdminScope::Global => gw_config::DEFAULT_TENANT,
         AdminScope::Tenant(t) => t.as_str(),
@@ -1937,15 +1950,14 @@ async fn admin_key_create(
     if !s.handler.cfg().is_known_tenant(tenant) {
         return error_response(400, format!("unknown tenant `{tenant}`"));
     }
-    let existing = match scoped_key(&s, &scope, ak).await {
+    let existing = match scoped_key(&s, &scope, &ak_id).await {
         Ok(found) => found,
         Err(r) => return r,
     };
     // a platform sanction on an existing key survives a tenant re-create
     let tenant_scoped = matches!(scope, AdminScope::Tenant(_));
     let info = AkInfo {
-        ak_id: gw_state::access_key_fingerprint(ak).into(),
-        ak: ak.to_owned(),
+        ak_id: Arc::clone(&ak_id),
         product: product.to_owned(),
         tenant: tenant.to_owned(),
         owner: body["owner"].as_str().map(str::to_owned),
@@ -1985,18 +1997,19 @@ async fn admin_key_create(
         &scope,
         source,
         "key_create",
-        ak,
+        &ak_id,
         format!("tenant={tenant}"),
     )
     .await;
-    (
-        StatusCode::CREATED,
-        Json(json!({ "ak": ak, "status": "created" })),
-    )
-        .into_response()
+    let mut resp = json!({ "ak_id": &*ak_id, "status": "created" });
+    if let Some(ak) = generated {
+        resp["ak"] = ak.into();
+    }
+    (StatusCode::CREATED, Json(resp)).into_response()
 }
 
-/// PATCH /admin/keys/{ak} — only the fields present in the body change.
+/// PATCH /admin/keys/{ak} — only the fields present in the body change; the
+/// path names the key by id or raw value.
 async fn admin_key_patch(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -2004,7 +2017,8 @@ async fn admin_key_patch(
     Path(ak): Path<String>,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
-    if let Err(r) = scoped_key(&s, &scope, &ak).await {
+    let ak_id = gw_config::resolve_access_key_id(&ak);
+    if let Err(r) = scoped_key(&s, &scope, &ak_id).await {
         return r;
     }
     // absent = leave, null = clear, number = set; malformed (incl. u64 overflow) leaves unchanged
@@ -2030,14 +2044,14 @@ async fn admin_key_patch(
             "lifting a ban or changing a suspension requires the global admin token",
         );
     }
-    let patched = s.handler.state().auth.patch(&ak, &patch).await;
+    let patched = s.handler.state().auth.patch(&ak_id, &patch).await;
     match patched {
         Err(e) => gateway_error(e),
         Ok(Some(info)) => {
-            audit_admin(&s, &scope, source, "key_patch", &ak, String::new()).await;
+            audit_admin(&s, &scope, source, "key_patch", &ak_id, String::new()).await;
             (StatusCode::OK, Json(ak_public_json(&info))).into_response()
         }
-        Ok(None) => error_response(404, format!("key {ak} not found")),
+        Ok(None) => error_response(404, format!("key {ak_id} not found")),
     }
 }
 
@@ -2048,20 +2062,21 @@ async fn admin_key_delete(
     AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
 ) -> Response {
-    if let Err(r) = scoped_key(&s, &scope, &ak).await {
+    let ak_id = gw_config::resolve_access_key_id(&ak);
+    if let Err(r) = scoped_key(&s, &scope, &ak_id).await {
         return r;
     }
-    match s.handler.state().auth.revoke(&ak).await {
+    match s.handler.state().auth.revoke(&ak_id).await {
         Err(e) => gateway_error(e),
         Ok(true) => {
-            audit_admin(&s, &scope, source, "key_delete", &ak, String::new()).await;
+            audit_admin(&s, &scope, source, "key_delete", &ak_id, String::new()).await;
             (
                 StatusCode::OK,
-                Json(json!({ "ak": ak, "status": "revoked" })),
+                Json(json!({ "ak_id": ak_id, "status": "revoked" })),
             )
                 .into_response()
         }
-        Ok(false) => error_response(404, format!("key {ak} not found")),
+        Ok(false) => error_response(404, format!("key {ak_id} not found")),
     }
 }
 
@@ -2246,7 +2261,7 @@ async fn admin_key_list(
             .handler
             .state()
             .auth
-            .authenticate(ak)
+            .get(&gw_config::resolve_access_key_id(ak))
             .await
             .filter(|k| scope.covers(&k.tenant))
             .map(|k| ak_public_json(&k))
@@ -3440,7 +3455,7 @@ async fn messages(
     };
 
     let thinking_audit = s.handler.state().thinking_signatures.clone();
-    let (thinking_context, thinking_verdict) = thinking_audit.review_request(&request, &ak.ak);
+    let (thinking_context, thinking_verdict) = thinking_audit.review_request(&request, &ak.ak_id);
     if thinking_verdict == ReviewVerdict::Mismatch {
         return anthropic_error(
             400,
@@ -4277,7 +4292,7 @@ async fn videos_generations(
         let job = VideoJob {
             id: id.to_owned(),
             tenant: ctx.ak.tenant.clone(),
-            ak: ctx.ak.ak.clone(),
+            ak: String::from(&*ctx.ak.ak_id),
             product: ctx.ak.product.clone(),
             user_id: ctx.effective_user_id().to_owned(),
             model: param
@@ -4354,12 +4369,13 @@ async fn poll_and_settle_video(
         false
     };
     if claimed {
+        let ak_id = gw_config::resolve_access_key_id(&job.ak);
         let settled = admission::settle_and_bill(
             &state,
             &cfg,
             admission::SettleInput {
                 billing: gw_state::BillingInput {
-                    ak: &job.ak,
+                    ak: &ak_id,
                     product: &job.product,
                     tenant: &job.tenant,
                     user_id: &job.user_id,
@@ -4387,7 +4403,7 @@ async fn poll_and_settle_video(
             },
         )
         .await;
-        let submitter = state.auth.authenticate(&job.ak).await;
+        let submitter = state.auth.get(&ak_id).await;
         admission::consume_budgets(
             &state,
             &cfg,
@@ -4863,6 +4879,7 @@ async fn batches_get(
 mod tests {
     use axum::body::Body;
     use axum::http::Request;
+    use gw_config::access_key_id;
     use tower::ServiceExt;
 
     use super::*;
@@ -5129,7 +5146,7 @@ mod tests {
                 release: release.clone(),
             }),
         );
-        let ak = state.auth.authenticate("k").await.unwrap();
+        let ak = state.auth.get(&access_key_id("k")).await.unwrap();
         let request = GatewayRequest {
             is_online: true,
             stream: true,
@@ -5164,7 +5181,7 @@ mod tests {
         assert_eq!(terminal["state"], "client_closed");
         assert_eq!(terminal["stream_committed"], false);
         assert_eq!(state.store.ledger_snapshot(10).await.unwrap().0, 0);
-        assert_eq!(state.governance.quota_used("k").await, 0);
+        assert_eq!(state.governance.quota_used(&access_key_id("k")).await, 0);
     }
 
     #[tokio::test]
@@ -5215,7 +5232,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let keys = body["keys"].as_array().unwrap();
-        let key = |name: &str| keys.iter().find(|k| k["ak"] == name).unwrap();
+        let key = |name: &str| {
+            keys.iter()
+                .find(|k| k["ak_id"] == access_key_id(name))
+                .unwrap()
+        };
         assert_eq!(key("active")["status"], "active");
         assert_eq!(key("active")["available"], true);
         assert_eq!(key("banned")["status"], "banned");
@@ -5337,7 +5358,7 @@ mod tests {
             .unwrap();
         let body = body_json(resp).await;
         assert_eq!(body["count"], 1);
-        assert_eq!(body["keys"][0]["ak"], "k-acme");
+        assert_eq!(body["keys"][0]["ak_id"], access_key_id("k-acme"));
         let resp = router
             .clone()
             .oneshot(get("/admin/keys?ak=k-labs", "acme-token"))
@@ -5891,7 +5912,13 @@ mod tests {
             loader: None,
             config_store: None,
         }));
-        let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
+        let ak = app
+            .handler
+            .state()
+            .auth
+            .get(&access_key_id("k1"))
+            .await
+            .unwrap();
         let cfg = app.handler.cfg();
         let sec = cfg.security_for(&ak.tenant);
 
@@ -5957,7 +5984,13 @@ mod tests {
             loader: None,
             config_store: None,
         }));
-        let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
+        let ak = app
+            .handler
+            .state()
+            .auth
+            .get(&access_key_id("k1"))
+            .await
+            .unwrap();
         let mut frame = json!({"type":"input_text","text":"tell secret now"});
         assert_eq!(rt_inbound_policy(&app, &ak, "", &mut frame).await, Ok(0));
         assert_eq!(
@@ -6071,11 +6104,11 @@ mod tests {
             .handler
             .state()
             .auth
-            .authenticate("ak-demo-123")
+            .get(&access_key_id("ak-demo-123"))
             .await
             .unwrap();
         let gov = || s.handler.state().governance.clone();
-        let used = || async { gov().quota_used(&ak.ak).await };
+        let used = || async { gov().quota_used(&ak.ak_id).await };
 
         let a1 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
             .await
@@ -6097,7 +6130,7 @@ mod tests {
             .await
             .expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
-        gov().quota_settle(&a2.ak.ak, -a2.reserved, a2.at).await;
+        gov().quota_settle(&a2.ak.ak_id, -a2.reserved, a2.at).await;
         assert_eq!(used().await, 100, "dropped turn refunded whole");
 
         let a3 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
@@ -6121,7 +6154,7 @@ mod tests {
             "zero-usage turn writes no ledger row"
         );
 
-        gov().quota_consume(&ak.ak, ak.daily_token_quota).await;
+        gov().quota_consume(&ak.ak_id, ak.daily_token_quota).await;
         let denied = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
             .await
             .err()
@@ -6135,7 +6168,13 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
-        let ak = s.handler.state().auth.authenticate("k1").await.unwrap();
+        let ak = s
+            .handler
+            .state()
+            .auth
+            .get(&access_key_id("k1"))
+            .await
+            .unwrap();
         let a = realtime_gate(&s, &ak, &rt("rt-m"), "")
             .await
             .expect("admit");
@@ -6161,7 +6200,7 @@ mod tests {
         assert_eq!(rec.total_tokens, 150, "100 + 100*0.5 weighted");
         assert_eq!(rec.cost_micros, 150, "billable 100+50 at 1000/1k each");
         assert_eq!(
-            s.handler.state().governance.quota_used(&ak.ak).await,
+            s.handler.state().governance.quota_used(&ak.ak_id).await,
             150,
             "quota settles the weighted total"
         );
@@ -6173,7 +6212,13 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
-        let ak = s.handler.state().auth.authenticate("k1").await.unwrap();
+        let ak = s
+            .handler
+            .state()
+            .auth
+            .get(&access_key_id("k1"))
+            .await
+            .unwrap();
         let pinned = RtModel {
             requested: "rt-pub".into(),
             served: "rt-canary".into(),
@@ -6204,7 +6249,7 @@ mod tests {
             .handler
             .state()
             .auth
-            .authenticate("ak-tpm-tiny")
+            .get(&access_key_id("ak-tpm-tiny"))
             .await
             .unwrap();
         let gov = s.handler.state().governance.clone();
@@ -6213,14 +6258,14 @@ mod tests {
             .await
             .expect("first admits");
         assert_eq!(a1.tpm_reserved.map(|r| r.est), Some(REALTIME_TURN_RESERVE));
-        let daily_before = gov.quota_used(&ak.ak).await;
+        let daily_before = gov.quota_used(&ak.ak_id).await;
 
         assert!(
             realtime_gate(&s, &ak, &rt("gpt-4o"), "").await.is_err(),
             "second turn denied by the TPM reserve"
         );
         assert_eq!(
-            gov.quota_used(&ak.ak).await,
+            gov.quota_used(&ak.ak_id).await,
             daily_before,
             "a TPM-denied turn rolls back its daily reserve"
         );
@@ -6236,7 +6281,13 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::from_yaml(&price(1_000_000)).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
-        let ak = s.handler.state().auth.authenticate("k-rt").await.unwrap();
+        let ak = s
+            .handler
+            .state()
+            .auth
+            .get(&access_key_id("k-rt"))
+            .await
+            .unwrap();
 
         let admit = realtime_gate(&s, &ak, &rt("rt"), "").await.expect("admit");
         s.handler
@@ -6271,7 +6322,7 @@ mod tests {
             .handler
             .state()
             .auth
-            .authenticate("k-shared")
+            .get(&access_key_id("k-shared"))
             .await
             .unwrap();
         let admit = realtime_gate(&s, &shared, &rt("rt"), "alice")
@@ -6292,7 +6343,7 @@ mod tests {
             .handler
             .state()
             .auth
-            .authenticate("k-owned")
+            .get(&access_key_id("k-owned"))
             .await
             .unwrap();
         let admit = realtime_gate(&s, &owned, &rt("rt"), "mallory")

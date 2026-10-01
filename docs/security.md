@@ -27,10 +27,18 @@ response, log line, audit row or trace.
   authentication with a distinct `403`, on every surface (REST, realtime — where
   the key is re-checked per turn and a turn denied for the key's status ends
   the session — batches, where a running batch re-checks the key before every
-  item and fails once it is no longer active — and MCP). Logs and traces carry
-  `ak_id`, a SHA-256 fingerprint of the key, never the credential; the ledger,
-  security-event and retained-content rows store the access key itself so usage
-  joins by it (see the review record below).
+  item and fails once it is no longer active — and MCP).
+- A raw access key enters only through request authentication and the
+  operator's own inputs (the config document, admin calls). Everything the
+  gateway stores or reports names the key by its `ak_id` (`sha256:` plus the
+  first 16 bytes of the key's SHA-256 in hex): the key table, the ledger,
+  security-event, retained-content and audit rows, governance counters, alert
+  subjects, key listings, logs and traces. The config document is kept and
+  returned as written, so declare its keys by `ak_id`. An `ak_id` sent as a key
+  never authenticates. The digest is unsalted, so it protects a high-entropy
+  key only: let `POST /admin/keys` generate the key (omit `ak`). Rows written
+  by a release that stored raw keys keep them until the operator rewrites or
+  prunes them.
 - Admin routes are absent (`404`) until an admin token is configured. Two
   tiers apply: the global token (`admin.token_env`) manages everything; a
   tenant's `admin_token_env` token manages only that tenant. A tenant token on
@@ -152,19 +160,16 @@ content to a tenant under review; a zero `max_reply_bytes` refusing every
 reply and a zero token lifetime defeating the token cache; and one server's
 slow token endpoint stalling another server's first token fetch.
 
-Accepted as is, with the reason: the ledger, security-event and retained-
-content tables store the access key itself (the ledger joins usage by it;
-database read access sits inside the operator boundary — protect the database
-like the config); the listener has no header-read or idle timeout of its own
-(a proxy in front terminates slow clients, which the deployment guidance
-requires anyway); a video download is held in memory for the clip's size; a
-config reload can race one in-flight token fetch for at most one token
-lifetime; duplicate JSON keys parse last-wins here and possibly first-wins on
-a non-compliant upstream (a compliant server behaves identically); the
-cross-tenant key guard reads a two-second key cache before mutating, which
-would need a key to change tenant inside that window; MCP session binding is
-enforced per instance, so a multi-instance deployment must route a session's
-requests to the instance that opened it (sticky by `Mcp-Session-Id`), which
-Streamable HTTP already assumes; a server that returns one constant session id
-locks its session to the first key to use it (a conformant server mints a
-unique id per session).
+Accepted as is, with the reason: the listener has no header-read or idle
+timeout of its own (a proxy in front terminates slow clients, which the
+deployment guidance requires anyway); a video download is held in memory for
+the clip's size; a config reload can race one in-flight token fetch for at
+most one token lifetime; duplicate JSON keys parse last-wins here and possibly
+first-wins on a non-compliant upstream (a compliant server behaves
+identically); the cross-tenant key guard reads a two-second key cache before
+mutating, which would need a key to change tenant inside that window; MCP
+session binding is enforced per instance, so a multi-instance deployment must
+route a session's requests to the instance that opened it (sticky by
+`Mcp-Session-Id`), which Streamable HTTP already assumes; a server that
+returns one constant session id locks its session to the first key to use it
+(a conformant server mints a unique id per session).

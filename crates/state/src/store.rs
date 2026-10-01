@@ -148,7 +148,7 @@ pub struct BatchItemResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BatchJob {
     pub id: String,
-    /// Owning key — a bearer credential, so it's never serialized into a response.
+    /// Owning key's id; rows from older releases may hold the raw key, so it's never serialized.
     #[serde(skip)]
     pub ak: String,
     /// Owning tenant; reads are gated on it. Internal routing, not client-facing.
@@ -3868,20 +3868,7 @@ mod tests {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
         };
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db = format!("gwtest_{nonce}");
-        let admin = sqlx::PgPool::connect(&url).await.expect("pg admin");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
-            .execute(&admin)
-            .await
-            .expect("create test db");
-        let own_url = match url.rfind('/') {
-            Some(i) => format!("{}/{db}", &url[..i]),
-            None => url.clone(),
-        };
+        let (own_url, nonce) = crate::scratch_pg(&url).await;
         let store = PostgresStore::connect(&own_url).await.expect("pg connect");
         let ns = format!("-{nonce}");
         exercise_rollup(&store, &ns).await;

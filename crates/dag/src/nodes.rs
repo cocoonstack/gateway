@@ -39,7 +39,7 @@ impl DagNode for ModelQuotaGate {
         };
         // clone only on the metered path — the common unmetered case stays allocation-free
         let requested = p.model_name.clone();
-        let key = admission::model_quota_key(&ctx.ak.ak, &requested);
+        let key = admission::model_quota_key(&ctx.ak.ak_id, &requested);
         let under = ctx.state.governance.quota_check(&key, limit).await;
         // usage accrues to the requested name either way: a fallback period ends at the daily reset
         ctx.model_quota_key = Some(key);
@@ -800,7 +800,7 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
             ctx.state
                 .governance
                 .refund_reserves(
-                    &ctx.ak.ak,
+                    &ctx.ak.ak_id,
                     ctx.quota_reserved.take().unwrap_or(0),
                     ctx.tpm_reserved.take(),
                     ctx.quota_at,
@@ -866,7 +866,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         &ctx.cfg,
         admission::SettleInput {
             billing: gw_state::BillingInput {
-                ak: &ctx.ak.ak,
+                ak: &ctx.ak.ak_id,
                 product: &ctx.ak.product,
                 tenant: &ctx.ak.tenant,
                 user_id: ctx.effective_user_id(),

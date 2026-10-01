@@ -116,6 +116,26 @@ func TestTenantAdminCannotHijackForeignKeyViaCreate(t *testing.T) {
 	}
 }
 
+func TestKeyCreateReturnsAGeneratedKeyOnceAndListsOnlyIDs(t *testing.T) {
+	handler := testServer(t)
+	manager := loginAs(t, handler, "manager@example.com")
+	rec := request(t, handler, manager, http.MethodPost, "/api/v1/admin/keys", map[string]any{"product": "standard"}, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	var created gateway.CreatedKey
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.AK == "" || !strings.HasPrefix(created.AKID, "sha256:") {
+		t.Fatalf("created = %+v, want a generated key and its id", created)
+	}
+	rec = request(t, handler, manager, http.MethodGet, "/api/v1/admin/keys", nil, false)
+	if body := rec.Body.String(); !strings.Contains(body, created.AKID) || strings.Contains(body, created.AK) {
+		t.Fatalf("list = %s, want the id and never the key", body)
+	}
+}
+
 func TestLoginThrottleLocksAfterRepeatedFailures(t *testing.T) {
 	handler := testServer(t)
 	body, _ := json.Marshal(map[string]string{"email": "admin@example.com", "password": "wrong-password"})

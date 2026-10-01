@@ -37,11 +37,11 @@ impl OfflineHandler {
             }
             // atomic: the job becomes claimable only once all items are saved
             store
-                .batch_enqueue(&ak.ak, &ak.tenant, &model, &items)
+                .batch_enqueue(&ak.ak_id, &ak.tenant, &model, &items)
                 .await
         } else {
             let job = store
-                .batch_create(&ak.ak, &ak.tenant, &model, items.len())
+                .batch_create(&ak.ak_id, &ak.tenant, &model, items.len())
                 .await?;
             let this = self.clone();
             let id = job.id.clone();
@@ -112,7 +112,7 @@ impl OfflineHandler {
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
             }
-            if self.active_key(&ak.ak).await.is_none() {
+            if self.active_key(&ak.ak_id).await.is_none() {
                 break;
             }
             // fence per item, fail CLOSED: at most the in-flight item double-runs (claim 0: none)
@@ -225,8 +225,8 @@ impl OfflineHandler {
             match claimed {
                 Ok(Some((job, claim))) => {
                     // a key revoked/banned/expired since submit stops its queued work
-                    let Some(ak) = self.active_key(&job.ak).await else {
-                        let ak_id = gw_state::access_key_fingerprint(&job.ak);
+                    let ak_id = gw_config::resolve_access_key_id(&job.ak);
+                    let Some(ak) = self.active_key(&ak_id).await else {
                         tracing::warn!(batch = %job.id, ak_id, "claimed batch's key is gone or inactive; failing it");
                         let _ = store
                             .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
@@ -269,8 +269,8 @@ impl OfflineHandler {
         }
     }
 
-    async fn active_key(&self, ak: &str) -> Option<Arc<AkInfo>> {
-        let key = self.online.state().auth.authenticate(ak).await?;
+    async fn active_key(&self, ak_id: &str) -> Option<Arc<AkInfo>> {
+        let key = self.online.state().auth.get(ak_id).await?;
         (key.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active).then_some(key)
     }
 }

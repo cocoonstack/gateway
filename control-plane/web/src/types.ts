@@ -87,7 +87,7 @@ export interface Instance {
 }
 
 export interface AccessKey {
-  ak: string;
+  ak_id: string;
   product: string;
   tenant: string;
   owner?: string | null;

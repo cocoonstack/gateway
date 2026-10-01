@@ -4,6 +4,9 @@ package mock
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +17,8 @@ import (
 
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 )
+
+const keyIDPrefix = "sha256:"
 
 var _ gateway.Client = (*Client)(nil)
 
@@ -28,6 +33,7 @@ type Client struct {
 
 func New() *Client {
 	now := time.Now().Unix()
+	alice, batch, paused := resolveKeyID("ak-acme-alice"), resolveKeyID("ak-acme-batch"), resolveKeyID("ak-labs-paused")
 	return &Client{
 		yaml:    "listen: {host: 0.0.0.0, port: 8080}\nstorage: {}\nmodels:\n  - {name: gpt-4o, protocol: openai-chat}\naccounts:\n  - {name: primary-openai, provider: openai, protocols: [openai-chat]}\ntenants:\n  - {name: acme}\naccess_keys: []\n",
 		version: 3,
@@ -37,22 +43,22 @@ func New() *Client {
 			{ID: 1, CreatedAtEpochSecs: now - 86_400},
 		},
 		keys: map[string]gateway.Key{
-			"ak-acme-alice": {
-				AK: "ak-acme-alice", Product: "standard", Tenant: "acme", Owner: new("alice"),
+			alice: {
+				AKID: alice, Product: "standard", Tenant: "acme", Owner: new("alice"),
 				QPS: 10, DailyTokenQuota: 1_000_000, Status: "active", Available: true,
 			},
-			"ak-acme-batch": {
-				AK: "ak-acme-batch", Product: "batch", Tenant: "acme", QPS: 2,
+			batch: {
+				AKID: batch, Product: "batch", Tenant: "acme", QPS: 2,
 				DailyTokenQuota: 500_000, ExpiresAtEpochSecs: new(now + 30*86_400), Status: "active", Available: true,
 			},
-			"ak-labs-paused": {
-				AK: "ak-labs-paused", Product: "research", Tenant: "labs", QPS: 1,
+			paused: {
+				AKID: paused, Product: "research", Tenant: "labs", QPS: 1,
 				DailyTokenQuota: 100_000, Banned: true, Status: "banned", Available: false,
 			},
 		},
 		audit: []gateway.AuditEntry{
 			{CreatedAtEpochSecs: now - 300, Actor: "global", Scope: "global", Action: "config_publish", Target: "3", SourceIP: "127.0.0.1"},
-			{CreatedAtEpochSecs: now - 900, Actor: "global", Scope: "global", Action: "key_patch", Target: "ak-labs-paused", SourceIP: "127.0.0.1"},
+			{CreatedAtEpochSecs: now - 900, Actor: "global", Scope: "global", Action: "key_patch", Target: paused, SourceIP: "127.0.0.1"},
 		},
 	}
 }
@@ -106,7 +112,7 @@ func (c *Client) Keys(_ context.Context, tenant string, offset, limit int64) ([]
 			keys = append(keys, cloneJSON(key))
 		}
 	}
-	slices.SortFunc(keys, func(a, b gateway.Key) int { return cmp.Compare(a.AK, b.AK) })
+	slices.SortFunc(keys, func(a, b gateway.Key) int { return cmp.Compare(a.AKID, b.AKID) })
 	if offset > 0 {
 		keys = keys[min(offset, int64(len(keys))):]
 	}
@@ -116,29 +122,38 @@ func (c *Client) Keys(_ context.Context, tenant string, offset, limit int64) ([]
 	return keys, nil
 }
 
-func (c *Client) CreateKey(_ context.Context, actingTenant string, key gateway.Key) error {
+func (c *Client) CreateKey(_ context.Context, actingTenant string, key gateway.Key) (gateway.CreatedKey, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if key.AK == "" || key.Product == "" || key.Tenant == "" {
-		return errors.New("ak, product and tenant are required")
+	if key.Product == "" || key.Tenant == "" {
+		return gateway.CreatedKey{}, errors.New("product and tenant are required")
 	}
+	var created gateway.CreatedKey
+	if key.AK == "" {
+		secret := make([]byte, 32)
+		_, _ = rand.Read(secret)
+		created.AK = "gw-" + hex.EncodeToString(secret)
+	}
+	created.AKID = resolveKeyID(cmp.Or(key.AK, created.AK))
 	// the real gateway answers an uncovered existing ak with 404 (scoped_key anti-probing), never 409
-	if existing, ok := c.keys[key.AK]; ok && actingTenant != "" && existing.Tenant != actingTenant {
-		return fmt.Errorf("key %s: %w", key.AK, gateway.ErrNotFound)
+	if existing, ok := c.keys[created.AKID]; ok && actingTenant != "" && existing.Tenant != actingTenant {
+		return gateway.CreatedKey{}, fmt.Errorf("key %s: %w", created.AKID, gateway.ErrNotFound)
 	}
+	key.AKID, key.AK = created.AKID, ""
 	key.Status = "active"
 	key.Available = true
-	c.keys[key.AK] = cloneJSON(key)
-	c.record("key_create", key.AK)
-	return nil
+	c.keys[key.AKID] = cloneJSON(key)
+	c.record("key_create", key.AKID)
+	return created, nil
 }
 
 func (c *Client) PatchKey(_ context.Context, actingTenant, ak string, patch map[string]any) (gateway.Key, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key, ok := c.keys[ak]
+	id := resolveKeyID(ak)
+	key, ok := c.keys[id]
 	if !ok || (actingTenant != "" && key.Tenant != actingTenant) {
-		return gateway.Key{}, fmt.Errorf("key %s: %w", ak, gateway.ErrNotFound)
+		return gateway.Key{}, fmt.Errorf("key %s: %w", id, gateway.ErrNotFound)
 	}
 	if value, ok := patch["qps"].(float64); ok {
 		key.QPS = value
@@ -155,20 +170,21 @@ func (c *Client) PatchKey(_ context.Context, actingTenant, ak string, patch map[
 			key.Status = "active"
 		}
 	}
-	c.keys[ak] = key
-	c.record("key_patch", ak)
+	c.keys[id] = key
+	c.record("key_patch", id)
 	return cloneJSON(key), nil
 }
 
-func (c *Client) DeleteKey(_ context.Context, actingTenant, ak string) error {
+func (c *Client) DeleteKey(_ context.Context, actingTenant, ak string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if key, ok := c.keys[ak]; !ok || (actingTenant != "" && key.Tenant != actingTenant) {
-		return fmt.Errorf("key %s: %w", ak, gateway.ErrNotFound)
+	id := resolveKeyID(ak)
+	if key, ok := c.keys[id]; !ok || (actingTenant != "" && key.Tenant != actingTenant) {
+		return "", fmt.Errorf("key %s: %w", id, gateway.ErrNotFound)
 	}
-	delete(c.keys, ak)
-	c.record("key_delete", ak)
-	return nil
+	delete(c.keys, id)
+	c.record("key_delete", id)
+	return id, nil
 }
 
 func (c *Client) Instances(context.Context) ([]gateway.Instance, error) {
@@ -237,8 +253,8 @@ func (c *Client) SecurityEvents(_ context.Context, tenant string) ([]gateway.Sec
 	now := time.Now().Unix()
 	tenant = cmp.Or(tenant, "acme")
 	return []gateway.SecurityEvent{
-		{CreatedAtEpochSecs: now - 120, RequestID: "req-42", AK: "ak-acme-alice", UserID: "alice", Tenant: tenant, Surface: "chat", Rule: "dlp", Action: "redact", Hits: 1},
-		{CreatedAtEpochSecs: now - 500, RequestID: "req-39", AK: "ak-acme-batch", UserID: "bob", Tenant: tenant, Surface: "batch", Rule: "blocklist", Action: "flag", Hits: 2},
+		{CreatedAtEpochSecs: now - 120, RequestID: "req-42", AK: resolveKeyID("ak-acme-alice"), UserID: "alice", Tenant: tenant, Surface: "chat", Rule: "dlp", Action: "redact", Hits: 1},
+		{CreatedAtEpochSecs: now - 500, RequestID: "req-39", AK: resolveKeyID("ak-acme-batch"), UserID: "bob", Tenant: tenant, Surface: "batch", Rule: "blocklist", Action: "flag", Hits: 2},
 	}, nil
 }
 
@@ -247,6 +263,14 @@ func (c *Client) record(action, target string) {
 		CreatedAtEpochSecs: time.Now().Unix(), Actor: "control-plane", Scope: "global",
 		Action: action, Target: target, SourceIP: "127.0.0.1",
 	})
+}
+
+func resolveKeyID(ak string) string {
+	if strings.HasPrefix(ak, keyIDPrefix) {
+		return ak
+	}
+	sum := sha256.Sum256([]byte(ak))
+	return keyIDPrefix + hex.EncodeToString(sum[:16])
 }
 
 func cloneJSON[T any](value T) T {

@@ -106,7 +106,7 @@ impl BudgetScope {
         }
     }
 
-    /// The alert subject; the key is named by its fingerprint, never the credential.
+    /// The alert subject; the key is named by its `ak_id`, never the credential.
     fn subject(self, ak: &AkInfo, user: &str) -> String {
         match self {
             Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),
@@ -406,7 +406,7 @@ pub async fn check_tenant_rate(
 
 /// Per-AK QPS.
 pub async fn check_ak_rate(gov: &dyn Governance, ak: &AkInfo) -> Result<(), String> {
-    admit(gov.rate_allow(&ak.ak, ak.qps).await, || {
+    admit(gov.rate_allow(&ak.ak_id, ak.qps).await, || {
         format!("rate limit exceeded for key {} (qps {})", ak.ak_id, ak.qps)
     })
 }
@@ -462,7 +462,7 @@ pub async fn reserve_daily(
     at: i64,
 ) -> Result<(), String> {
     admit(
-        gov.quota_reserve(&ak.ak, amount, ak.daily_token_quota, at)
+        gov.quota_reserve(&ak.ak_id, amount, ak.daily_token_quota, at)
             .await,
         || format!("daily token quota exhausted for key {}", ak.ak_id),
     )
@@ -478,7 +478,7 @@ pub async fn reserve_tpm(
         return Ok(None);
     };
     match gov
-        .token_window_reserve(&ak.ak, amount, tpm, gw_consts::MINUTE)
+        .token_window_reserve(&ak.ak_id, amount, tpm, gw_consts::MINUTE)
         .await
     {
         Some(window) => Ok(Some(TpmReserve {
@@ -614,6 +614,8 @@ pub fn month_prefixes() -> [String; 2] {
 
 #[cfg(test)]
 mod tests {
+    use gw_config::access_key_id;
+
     use super::*;
 
     fn record(request_id: impl Into<String>) -> BillingRecord {
@@ -825,7 +827,7 @@ mod tests {
         );
         let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
-        let ak = state.auth.authenticate("k1").await.unwrap();
+        let ak = state.auth.get(&access_key_id("k1")).await.unwrap();
         (cfg, state, ak)
     }
 

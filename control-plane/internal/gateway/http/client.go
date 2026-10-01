@@ -113,12 +113,14 @@ func (c *Client) Keys(ctx context.Context, tenant string, offset, limit int64) (
 	return resp.Keys, nil
 }
 
-func (c *Client) CreateKey(ctx context.Context, actingTenant string, key gateway.Key) error {
+func (c *Client) CreateKey(ctx context.Context, actingTenant string, key gateway.Key) (gateway.CreatedKey, error) {
 	bearer, err := c.mutateBearer(actingTenant)
 	if err != nil {
-		return err
+		return gateway.CreatedKey{}, err
 	}
-	return c.doJSON(ctx, c.primary(), http.MethodPost, "/admin/keys", key, nil, bearer)
+	var created gateway.CreatedKey
+	err = c.doJSON(ctx, c.primary(), http.MethodPost, "/admin/keys", key, &created, bearer)
+	return created, err
 }
 
 func (c *Client) PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (gateway.Key, error) {
@@ -131,12 +133,16 @@ func (c *Client) PatchKey(ctx context.Context, actingTenant, ak string, patch ma
 	return key, err
 }
 
-func (c *Client) DeleteKey(ctx context.Context, actingTenant, ak string) error {
+func (c *Client) DeleteKey(ctx context.Context, actingTenant, ak string) (string, error) {
 	bearer, err := c.mutateBearer(actingTenant)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return c.doJSON(ctx, c.primary(), http.MethodDelete, "/admin/keys/"+url.PathEscape(ak), nil, nil, bearer)
+	var deleted struct {
+		AKID string `json:"ak_id"`
+	}
+	err = c.doJSON(ctx, c.primary(), http.MethodDelete, "/admin/keys/"+url.PathEscape(ak), nil, &deleted, bearer)
+	return deleted.AKID, err
 }
 
 func (c *Client) Instances(ctx context.Context) ([]gateway.Instance, error) {

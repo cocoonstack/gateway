@@ -17,19 +17,20 @@ export default function KeysPage(): ReactElement {
   const path = `/api/v1/admin/keys${filter ? `?tenant=${encodeURIComponent(filter)}` : ""}`;
   const { data, error, reload } = useAPI<{ keys: AccessKey[] }>(path);
   const [creating, setCreating] = useState(false);
+  const [issued, setIssued] = useState<string | null>(null);
   const action = useAction();
 
   function toggle(key: AccessKey) {
     void action.run(async () => {
-      await api(`/api/v1/admin/keys/${encodeURIComponent(key.ak)}`, { method: "PATCH", ...jsonBody({ banned: !key.banned }) });
+      await api(`/api/v1/admin/keys/${encodeURIComponent(key.ak_id)}`, { method: "PATCH", ...jsonBody({ banned: !key.banned }) });
       reload();
     });
   }
 
   function remove(key: AccessKey) {
-    if (!window.confirm(`Revoke ${key.ak}? Requests using it will stop authenticating.`)) return;
+    if (!window.confirm(`Revoke ${key.ak_id}? Requests using it will stop authenticating.`)) return;
     void action.run(async () => {
-      await api(`/api/v1/admin/keys/${encodeURIComponent(key.ak)}`, { method: "DELETE" });
+      await api(`/api/v1/admin/keys/${encodeURIComponent(key.ak_id)}`, { method: "DELETE" });
       reload();
     });
   }
@@ -39,29 +40,30 @@ export default function KeysPage(): ReactElement {
       <PageHeader eyebrow="Credentials" title="Access keys" description="Lifecycle and governance state from the gateway's live key store." actions={<button className="button primary" onClick={() => setCreating(true)}>New key</button>} />
       {session.user.role === "system_admin" && <div className="filter-bar"><label>Tenant filter<input placeholder="All tenants" value={tenant} onChange={(event) => setTenant(event.target.value)} /></label></div>}
       {(error || action.error) && <ErrorNotice message={error || action.error} />}
-      {creating && <CreateKey tenant={tenant || session.user.tenant} tenantLocked={session.user.role === "tenant_admin"} onClose={() => setCreating(false)} onCreated={() => { setCreating(false); reload(); }} />}
+      {issued && <div className="notice notice-success" role="status">New key <code className="key-code">{issued}</code> — copy it now; the gateway keeps only its id. <button onClick={() => setIssued(null)}>Dismiss</button></div>}
+      {creating && <CreateKey tenant={tenant || session.user.tenant} tenantLocked={session.user.role === "tenant_admin"} onClose={() => setCreating(false)} onCreated={(ak) => { setCreating(false); setIssued(ak ?? null); reload(); }} />}
       {!data ? <Loading /> : data.keys.length === 0 ? <Empty>No keys match this tenant.</Empty> : (
         <Card><div className="table-wrap"><table><thead><tr><th>Key</th><th>Tenant / owner</th><th>Status</th><th>QPS</th><th>Daily quota</th><th>Expires</th><th /></tr></thead><tbody>
-          {data.keys.map((key) => <tr key={key.ak}><td><code className="key-code">{key.ak}</code><small className="cell-sub">{key.product}</small></td><td>{key.tenant}<small className="cell-sub">{key.owner || "Shared key"}</small></td><td><Status value={key.status} /></td><td>{key.qps}</td><td>{compact(key.daily_token_quota)}</td><td>{key.expires_at_epoch_secs ? dateTime(key.expires_at_epoch_secs) : "Never"}</td><td><div className="row-actions"><button onClick={() => toggle(key)}>{key.banned ? "Unban" : "Ban"}</button><button className="danger-link" onClick={() => remove(key)}>Revoke</button></div></td></tr>)}
+          {data.keys.map((key) => <tr key={key.ak_id}><td><code className="key-code">{key.ak_id}</code><small className="cell-sub">{key.product}</small></td><td>{key.tenant}<small className="cell-sub">{key.owner || "Shared key"}</small></td><td><Status value={key.status} /></td><td>{key.qps}</td><td>{compact(key.daily_token_quota)}</td><td>{key.expires_at_epoch_secs ? dateTime(key.expires_at_epoch_secs) : "Never"}</td><td><div className="row-actions"><button onClick={() => toggle(key)}>{key.banned ? "Unban" : "Ban"}</button><button className="danger-link" onClick={() => remove(key)}>Revoke</button></div></td></tr>)}
         </tbody></table></div></Card>
       )}
     </>
   );
 }
 
-function CreateKey({ tenant, tenantLocked, onClose, onCreated }: { tenant: string; tenantLocked: boolean; onClose: () => void; onCreated: () => void }) {
+function CreateKey({ tenant, tenantLocked, onClose, onCreated }: { tenant: string; tenantLocked: boolean; onClose: () => void; onCreated: (ak?: string) => void }) {
   const [form, setForm] = useState({ ak: "", product: "standard", tenant, owner: "", qps: 10, daily_token_quota: 1_000_000 });
   const { run, busy, error } = useAction();
   function submit(event: FormEvent) {
     event.preventDefault();
     void run(async () => {
-      await api("/api/v1/admin/keys", { method: "POST", ...jsonBody({ ...form, owner: form.owner || null }) });
-      onCreated();
+      const created = await api<{ ak_id: string; ak?: string }>("/api/v1/admin/keys", { method: "POST", ...jsonBody({ ...form, ak: form.ak || undefined, owner: form.owner || null }) });
+      onCreated(created.ak);
     });
   }
   return (
     <FormModal eyebrow="Credential" title="Create access key" busy={busy} error={error} submitLabel="Create key" busyLabel="Creating…" onClose={onClose} onSubmit={submit}>
-      <label>Key<input value={form.ak} onChange={(event) => setForm({ ...form, ak: event.target.value })} placeholder="ak-team-name" required /></label>
+      <label>Key<input value={form.ak} onChange={(event) => setForm({ ...form, ak: event.target.value })} placeholder="Leave empty to generate" /></label>
       <label>Product<input value={form.product} onChange={(event) => setForm({ ...form, product: event.target.value })} required /></label>
       <label>Tenant<input value={form.tenant} disabled={tenantLocked} onChange={(event) => setForm({ ...form, tenant: event.target.value })} required /></label>
       <label>Owner<input value={form.owner} onChange={(event) => setForm({ ...form, owner: event.target.value })} placeholder="Optional user id" /></label>

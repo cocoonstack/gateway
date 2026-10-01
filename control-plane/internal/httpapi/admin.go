@@ -144,16 +144,17 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 	}
 	p := current(r)
 	key.Tenant = scopedTenant(p, key.Tenant)
-	if key.AK == "" || key.Product == "" || key.Tenant == "" {
-		writeError(w, http.StatusBadRequest, "ak, product and tenant are required")
+	if key.Product == "" || key.Tenant == "" {
+		writeError(w, http.StatusBadRequest, "product and tenant are required")
 		return
 	}
-	if err := s.gateway.CreateKey(r.Context(), actingTenant(p), key); err != nil {
+	created, err := s.gateway.CreateKey(r.Context(), actingTenant(p), key)
+	if err != nil {
 		mapError(r.Context(), w, err)
 		return
 	}
-	s.auditLog(r, "key_create", key.AK)
-	writeJSON(w, http.StatusCreated, map[string]string{statusField: "created", "ak": key.AK})
+	s.auditLog(r, "key_create", created.AKID)
+	writeJSON(w, http.StatusCreated, created)
 }
 
 func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
@@ -173,17 +174,17 @@ func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 		mapError(r.Context(), w, err)
 		return
 	}
-	s.auditLog(r, "key_patch", ak)
+	s.auditLog(r, "key_patch", key.AKID)
 	writeJSON(w, http.StatusOK, key)
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
-	ak := r.PathValue("ak")
-	if err := s.gateway.DeleteKey(r.Context(), actingTenant(current(r)), ak); err != nil {
+	akID, err := s.gateway.DeleteKey(r.Context(), actingTenant(current(r)), r.PathValue("ak"))
+	if err != nil {
 		mapError(r.Context(), w, err)
 		return
 	}
-	s.auditLog(r, "key_delete", ak)
+	s.auditLog(r, "key_delete", akID)
 	w.WriteHeader(http.StatusNoContent)
 }
 

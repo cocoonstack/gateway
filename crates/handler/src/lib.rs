@@ -273,7 +273,7 @@ impl OnlineHandler {
             ctx.state
                 .governance
                 .refund_reserves(
-                    &ctx.ak.ak,
+                    &ctx.ak.ak_id,
                     ctx.quota_reserved.take().unwrap_or(0),
                     ctx.tpm_reserved.take(),
                     ctx.quota_at,
@@ -532,12 +532,12 @@ async fn note_abuse(ctx: &DagContext) {
     }
     let now = gw_state::epoch_secs();
     // fresh read: a concurrent rejection may have suspended the key already
-    match ctx.state.auth.authenticate(&ctx.ak.ak).await {
+    match ctx.state.auth.get(&ctx.ak.ak_id).await {
         Some(fresh) if fresh.status_at(now) != gw_state::KeyStatus::Suspended => {}
         _ => return,
     }
-    // ':' is banned in ak names, so the prefix cannot collide with a real key
-    let counter = format!("abuse:{}", ctx.ak.ak);
+    // an id starts with `sha256:`, so the prefix cannot collide with a key's own counter
+    let counter = format!("abuse:{}", ctx.ak.ak_id);
     let rejects = ctx.state.governance.quota_consume(&counter, 1).await;
     let Some(tier) = tiers
         .iter()
@@ -551,7 +551,7 @@ async fn note_abuse(ctx: &DagContext) {
         suspended_until_epoch_secs: Some(Some(until)),
         ..Default::default()
     };
-    if let Err(e) = ctx.state.auth.patch(&ctx.ak.ak, &patch).await {
+    if let Err(e) = ctx.state.auth.patch(&ctx.ak.ak_id, &patch).await {
         let ak_id = &*ctx.ak.ak_id;
         tracing::warn!(error = %e, ak_id, "abuse suspension patch failed");
         return;
@@ -567,7 +567,7 @@ async fn note_abuse(ctx: &DagContext) {
             actor: "system".to_owned(),
             scope: "global".to_owned(),
             action: "abuse_suspend".to_owned(),
-            target: ctx.ak.ak.clone(),
+            target: String::from(&*ctx.ak.ak_id),
             summary: summary.clone(),
             source_ip: String::new(),
         })
@@ -575,7 +575,7 @@ async fn note_abuse(ctx: &DagContext) {
         .unwrap_or_else(|e| tracing::warn!(error = %e, "abuse audit write failed"));
     ctx.state
         .alerts
-        .emit("abuse_suspend", ctx.ak.ak.clone(), summary);
+        .emit("abuse_suspend", String::from(&*ctx.ak.ak_id), summary);
 }
 
 /// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403
@@ -674,7 +674,7 @@ fn security_event(
     gw_state::SecurityEvent {
         created_at_epoch_secs: gw_state::epoch_secs(),
         request_id: ctx.request.request_id.clone(),
-        ak: ctx.ak.ak.clone(),
+        ak: String::from(&*ctx.ak.ak_id),
         user_id: ctx.effective_user_id().to_owned(),
         tenant: ctx.ak.tenant.clone(),
         surface,
@@ -695,7 +695,7 @@ async fn persist_terminal(
     let record = gw_state::ContentRecord {
         created_at_epoch_secs: now,
         request_id: subject.request_id.clone(),
-        ak: subject.ak.ak.clone(),
+        ak: String::from(&*subject.ak.ak_id),
         user_id: subject.user_id,
         tenant: subject.ak.tenant.clone(),
         kind: "terminal".to_owned(),
@@ -820,7 +820,7 @@ async fn persist_content(
             let record = gw_state::ContentRecord {
                 created_at_epoch_secs: now,
                 request_id: ctx.request.request_id.clone(),
-                ak: ctx.ak.ak.clone(),
+                ak: String::from(&*ctx.ak.ak_id),
                 user_id: ctx.effective_user_id().to_owned(),
                 tenant: ctx.ak.tenant.clone(),
                 kind: kind.to_owned(),
@@ -839,6 +839,7 @@ async fn persist_content(
 
 #[cfg(test)]
 mod tests {
+    use gw_config::access_key_id;
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, ModelParamV2};
 
@@ -873,7 +874,7 @@ mod tests {
         let recording = Arc::new(Recording::default());
         let transport = Arc::clone(&recording);
         let h = OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport);
-        let ak = h.state().auth.authenticate("test").await.unwrap();
+        let ak = h.state().auth.get(&access_key_id("test")).await.unwrap();
         h.run(chat_req("m", "hi"), ak).await.unwrap();
         let recorded = recording.0.lock().unwrap();
         let replay = recorded
@@ -962,7 +963,7 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         }));
-        let ak = h.state().auth.authenticate("test").await.unwrap();
+        let ak = h.state().auth.get(&access_key_id("test")).await.unwrap();
         let running = tokio::spawn({
             let h = h.clone();
             async move { h.run(chat_req("m", "hi"), ak).await }
@@ -984,7 +985,11 @@ mod tests {
     }
 
     async fn ak(h: &OnlineHandler) -> Arc<AkInfo> {
-        h.state().auth.authenticate("ak-demo-123").await.unwrap()
+        h.state()
+            .auth
+            .get(&access_key_id("ak-demo-123"))
+            .await
+            .unwrap()
     }
 
     fn retained_handler(transport: SharedTransport) -> OnlineHandler {
@@ -995,7 +1000,11 @@ mod tests {
     }
 
     async fn retained_ak(h: &OnlineHandler) -> Arc<AkInfo> {
-        h.state().auth.authenticate("retained-ak").await.unwrap()
+        h.state()
+            .auth
+            .get(&access_key_id("retained-ak"))
+            .await
+            .unwrap()
     }
 
     async fn terminal_body(h: &OnlineHandler, request_id: &str) -> serde_json::Value {
@@ -1126,7 +1135,7 @@ mod tests {
                 serde_json::json!({"cached_tokens": 80}),
             )),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         h.run(chat_req("m-cache", "hi"), key).await.unwrap();
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         let rec = &ledger[0];
@@ -1149,7 +1158,7 @@ mod tests {
                 serde_json::json!({"cached_tokens": 0, "cache_write_tokens": 80}),
             )),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         h.run(chat_req("m-cache", "hi"), key).await.unwrap();
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         let rec = &ledger[0];
@@ -1169,7 +1178,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(chat_req("m", "hi"), key).await.unwrap();
         assert!(
             ctx.decisions
@@ -1193,7 +1202,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let turn = |input: serde_json::Value| {
             let mut request = chat_req("pub-r", "");
             request.message.clear();
@@ -1254,7 +1263,7 @@ mod tests {
                 gw_state::SharedConfig::new(cfg, state),
                 Arc::new(RefusingAccount(status)),
             );
-            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
             let first = h.run(chat_req("m", "hi"), key.clone()).await.unwrap();
             assert!(
                 first
@@ -1285,7 +1294,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
         assert_eq!(
             ctx.outcome.expect("outcome").response.model,
@@ -1429,7 +1438,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         )
         .with_moderator(Arc::new(MaskModerator));
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h
             .run(chat_req("gpt-4o", "tell secret now"), key)
             .await
@@ -1460,7 +1469,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         )
         .with_moderator(Arc::new(DegradeModerator));
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
         assert_eq!(
             ctx.outcome.expect("outcome").response.model,
@@ -1488,7 +1497,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         )
         .with_moderator(Arc::new(DegradeModerator));
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h
             .run(thinking_req("pub-m", "hi", "enabled"), key)
             .await
@@ -1519,7 +1528,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         )
         .with_moderator(Arc::new(DegradeModerator));
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(chat_req("fb-m", "hi"), key).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert_eq!(
@@ -1546,7 +1555,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         )
         .with_moderator(Arc::new(DegradeModerator));
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert_eq!(out.response.finish_reason, "content_filter");
@@ -1567,21 +1576,24 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let reject = |k: Arc<AkInfo>| h.run(chat_req("gpt-4o", "hi"), k);
         assert_eq!(
             reject(key.clone()).await.err().map(|e| e.http_status),
             Some(429)
         );
         let now = gw_state::epoch_secs();
-        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        let fresh = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         assert_eq!(
             fresh.status_at(now),
             gw_state::KeyStatus::Active,
             "one reject is under the tier"
         );
-        assert_eq!(reject(key).await.err().map(|e| e.http_status), Some(429));
-        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        assert_eq!(
+            reject(key.clone()).await.err().map(|e| e.http_status),
+            Some(429)
+        );
+        let fresh = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         assert_eq!(
             fresh.status_at(now),
             gw_state::KeyStatus::Suspended,
@@ -1594,13 +1606,16 @@ mod tests {
         );
         let trail = h.state().store.admin_audit_list(10).await.unwrap();
         assert!(
-            trail
-                .iter()
-                .any(|e| e.action == "abuse_suspend" && e.actor == "system" && e.target == "k1"),
+            trail.iter().any(|e| e.action == "abuse_suspend"
+                && e.actor == "system"
+                && e.target == *key.ak_id),
             "audit row: {trail:?}"
         );
         let ev = alerts.recv().await.expect("alert emitted");
-        assert_eq!((ev.kind, ev.subject.as_str()), ("abuse_suspend", "k1"));
+        assert_eq!(
+            (ev.kind, ev.subject.as_str()),
+            ("abuse_suspend", &*key.ak_id)
+        );
     }
 
     #[tokio::test]
@@ -1612,7 +1627,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(chat_req("abab", "hello minimax"), key).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.total_tokens > 0, "engine carries the total");
@@ -1639,12 +1654,12 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let mut item = chat_req("gpt-4o", "hi");
         item.is_online = false;
         let err = h.run(item, key).await.err().expect("qps 0 rejects");
         assert_eq!(err.http_status, 429);
-        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        let fresh = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         assert_eq!(
             fresh.status_at(gw_state::epoch_secs()),
             gw_state::KeyStatus::Active
@@ -1660,7 +1675,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         for _ in 0..2 {
             let mut item = chat_req("gpt-4o", "hi");
             item.is_online = false;
@@ -1683,7 +1698,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         for _ in 0..2 {
             let mut item = chat_req("m1", "hi");
             item.is_online = false;
@@ -1701,7 +1716,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         assert!(h.run(chat_req("gpt-4o", "hi"), key.clone()).await.is_ok());
         let err = h
             .run(chat_req("gpt-4o", "hi"), key)
@@ -1709,7 +1724,7 @@ mod tests {
             .err()
             .expect("hard quota must reject");
         assert_eq!(err.code, gw_consts::ErrCode::QUOTA_EXHAUSTED);
-        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        let fresh = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         assert_eq!(
             fresh.status_at(gw_state::epoch_secs()),
             gw_state::KeyStatus::Active
@@ -1732,7 +1747,7 @@ mod tests {
                 gw_state::SharedConfig::new(cfg, state),
                 Arc::new(gw_engines::MockTransport),
             );
-            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
             let err = h
                 .run(chat_req("gpt-4o", "hi"), key)
                 .await
@@ -1740,7 +1755,7 @@ mod tests {
                 .expect(reason);
             assert_eq!(err.code, gw_consts::ErrCode::POOLED_LIMIT_MSG, "{reason}");
             assert!(err.message.contains(reason), "{err}");
-            let fresh = h.state().auth.authenticate("k1").await.unwrap();
+            let fresh = h.state().auth.get(&access_key_id("k1")).await.unwrap();
             assert_eq!(
                 fresh.status_at(gw_state::epoch_secs()),
                 gw_state::KeyStatus::Active,
@@ -1758,14 +1773,14 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let err = h
             .run(chat_req("gpt-4o", "hi"), key)
             .await
             .err()
             .expect("tpm 0 rejects");
         assert_eq!(err.code, gw_consts::ErrCode::STOP_LIMIT_MSG);
-        let fresh = h.state().auth.authenticate("k1").await.unwrap();
+        let fresh = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         assert_eq!(
             fresh.status_at(gw_state::epoch_secs()),
             gw_state::KeyStatus::Suspended
@@ -1781,7 +1796,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         h.run(chat_req("pub-m", "burn the tiny quota"), key.clone())
             .await
             .unwrap();
@@ -1814,7 +1829,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
 
         let seed = h
             .run(
@@ -1877,7 +1892,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         for _ in 0..8 {
             h.run(chat_req("pub-m", "the same opening turn"), key.clone())
                 .await
@@ -1900,7 +1915,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let req = |content: &str| chat_req("gpt-4o", content);
         h.run(req("first spends past one micro"), key.clone())
             .await
@@ -1936,7 +1951,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let req = |content: &str| chat_req("gpt-4o", content);
         h.run(req("first spends past one micro"), key.clone())
             .await
@@ -1976,7 +1991,7 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let with_user = |content: &str| GatewayRequest {
             is_online: true,
             message: vec![ChatMsg::text("user", content)],
@@ -2324,7 +2339,7 @@ mod tests {
                     param.raw = serde_json::json!({"input": "hi"});
                 }
             }
-            let key = h.state().auth.authenticate("k1").await.unwrap();
+            let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
             let ctx = h.run(request, key).await.unwrap();
             let outcome = ctx.outcome.expect("outcome");
             assert!(outcome.terminal_error.is_some(), "{code} native={native}");
@@ -2361,7 +2376,7 @@ mod tests {
         let mut alerts = h.state().alerts.take_receiver().expect("receiver");
         let request = drained_stream_req("m", "please stream something long");
 
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let ctx = h.run(request, key).await.unwrap();
         assert_eq!(
             ctx.outcome
@@ -2402,7 +2417,7 @@ mod tests {
         let mut request = chat_req("m", "please stream something long");
         request.stream = true;
         request.stream_tx = Some(tx);
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let running = tokio::spawn({
             let h = h.clone();
             async move { h.run(request, key).await }
@@ -2929,7 +2944,7 @@ mod tests {
             .expect("panic must surface as an error");
         assert_eq!(err.http_status, 500);
         assert_eq!(
-            h.state().governance.quota_used(&ak.ak).await,
+            h.state().governance.quota_used(&ak.ak_id).await,
             0,
             "reserves refunded after a panicking pipeline"
         );
@@ -2948,8 +2963,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let key = gw_state::AkInfo {
-            ak_id: gw_state::access_key_fingerprint("ak-t1").into(),
-            ak: "ak-t1".into(),
+            ak_id: access_key_id("ak-t1").into(),
             product: "p".into(),
             tenant: "t1".into(),
             owner: None,
@@ -2978,7 +2992,7 @@ mod tests {
         .unwrap();
         h.reload(without_t1).await.unwrap();
         assert!(
-            h.state().auth.authenticate("ak-t1").await.is_some(),
+            h.state().auth.get(&access_key_id("ak-t1")).await.is_some(),
             "admin key survives the reload"
         );
         let err = h
@@ -3061,7 +3075,7 @@ mod tests {
             banned: Some(true),
             ..Default::default()
         };
-        h.state().auth.patch(&key.ak, &ban).await.unwrap();
+        h.state().auth.patch(&key.ak_id, &ban).await.unwrap();
         let job = off
             .submit(key, "gpt-4o-mini".into(), vec![item("one", "")])
             .await
@@ -3147,7 +3161,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let off = OfflineHandler::new(h.clone());
-        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
         let job = off
             .submit(
                 key,
@@ -3194,7 +3208,7 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let submitter = OfflineHandler::new(online.clone());
-        let ak = state.auth.authenticate("ak-demo-123").await.unwrap();
+        let ak = state.auth.get(&access_key_id("ak-demo-123")).await.unwrap();
 
         assert!(state.store.distributes_batches());
         let job = submitter

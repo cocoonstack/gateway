@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use gw_consts::Protocol;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 /// The implicit tenant for keys that don't declare one: unrestricted unless a
 /// `tenants` entry named `default` gives it limits.
@@ -13,6 +14,9 @@ pub const DEFAULT_TENANT: &str = "default";
 
 /// The repo's default config, embedded so tests and `cargo run` work with zero setup.
 pub const DEFAULT_YAML: &str = include_str!("../../../conf/gateway.yaml");
+
+const AK_ID_PREFIX: &str = "sha256:";
+const AK_ID_HEX_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -117,6 +121,13 @@ pub struct AkConf {
     /// Per-server tool allowlist; a server absent here exposes every tool.
     #[serde(default)]
     pub mcp_tools: HashMap<String, Vec<String>>,
+}
+
+impl AkConf {
+    /// The key's stored identity; `ak` may be the raw key or that id.
+    pub fn id(&self) -> String {
+        resolve_access_key_id(&self.ak)
+    }
 }
 
 /// An upstream MCP server (Streamable HTTP) proxied at `/mcp/{name}`.
@@ -1019,7 +1030,7 @@ impl GatewayConfig {
                 || k.tokens_per_minute.is_some_and(|v| v < 0)
                 || k.model_quotas.values().any(|v| *v < 0)
             {
-                return Err(neg_limit(format!("access key {}", k.ak)));
+                return Err(neg_limit(format!("access key {}", k.id())));
             }
         }
         for t in &self.tenants {
@@ -1116,7 +1127,11 @@ impl GatewayConfig {
             }
         }
         check_unique("model", self.models.iter().map(|m| m.name.as_str()))?;
-        check_unique("access_key", self.access_keys.iter().map(|a| a.ak.as_str()))?;
+        if self.access_keys.iter().any(|k| k.ak.is_empty()) {
+            return Err(ConfigError::EmptyName { kind: "access_key" });
+        }
+        let key_ids: Vec<String> = self.access_keys.iter().map(AkConf::id).collect();
+        check_unique("access_key", key_ids.iter().map(String::as_str))?;
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
@@ -1156,7 +1171,7 @@ impl GatewayConfig {
                 .find(|name| !self.mcp_servers.iter().any(|m| &m.name == *name));
             if let Some(server) = unknown {
                 return Err(ConfigError::UnknownMcpServer {
-                    ak: k.ak.clone(),
+                    ak: k.id(),
                     server: server.clone(),
                 });
             }
@@ -1172,11 +1187,10 @@ impl GatewayConfig {
                 });
             }
         }
-        // a colon in an ak would collide with the prefixed governance keyspaces (`abuse:{ak}`)
         for k in &self.access_keys {
-            if k.ak.contains(':') {
+            if !is_valid_access_key(&k.ak) {
                 return Err(ConfigError::DuplicateName {
-                    kind: "access_key (':' not allowed)",
+                    kind: "access_key (':' only in the sha256 id form)",
                     name: k.ak.clone(),
                 });
             }
@@ -1185,7 +1199,7 @@ impl GatewayConfig {
         for k in &self.access_keys {
             if !self.is_known_tenant(&k.tenant) {
                 return Err(ConfigError::UnknownTenant {
-                    ak: k.ak.clone(),
+                    ak: k.id(),
                     tenant: k.tenant.clone(),
                 });
             }
@@ -1215,7 +1229,7 @@ impl GatewayConfig {
             }
         }
         for k in &self.access_keys {
-            self.check_models_known(format!("access key {}", k.ak), k.model_quotas.keys())?;
+            self.check_models_known(format!("access key {}", k.id()), k.model_quotas.keys())?;
         }
         Ok(())
     }
@@ -1405,6 +1419,41 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
     })
 }
 
+/// A raw access key's stored identity: `sha256:` plus the first 16 digest
+/// bytes in hex. Request auth uses only this, so an id never authenticates.
+pub fn access_key_id(raw: &str) -> String {
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut hex = [0u8; AK_ID_HEX_LEN];
+    let _ = hex::encode_to_slice(&digest[..AK_ID_HEX_LEN / 2], &mut hex);
+    let mut id = String::with_capacity(AK_ID_PREFIX.len() + AK_ID_HEX_LEN);
+    id.push_str(AK_ID_PREFIX);
+    id.push_str(std::str::from_utf8(&hex).unwrap_or_default());
+    id
+}
+
+/// The id a trusted caller (config, admin API, a stored row) names: the value
+/// itself when it is an id, else the raw key's id.
+pub fn resolve_access_key_id(ak_or_id: &str) -> String {
+    if is_access_key_id(ak_or_id) {
+        ak_or_id.to_owned()
+    } else {
+        access_key_id(ak_or_id)
+    }
+}
+
+/// Whether `ak` may name a key: non-empty, with a colon only in the id form,
+/// so a raw key never parses as an id.
+pub fn is_valid_access_key(ak: &str) -> bool {
+    !ak.is_empty() && (!ak.contains(':') || is_access_key_id(ak))
+}
+
+/// Whether `s` is an access-key id rather than a raw key.
+pub fn is_access_key_id(s: &str) -> bool {
+    s.strip_prefix(AK_ID_PREFIX).is_some_and(|h| {
+        h.len() == AK_ID_HEX_LEN && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 /// Cumulative-weight pick over a model's variants by a stable hash, so every
 /// instance maps the same key to the same bucket with no shared state.
 pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> Option<&'a VariantConf> {
@@ -1538,7 +1587,6 @@ fn token_from_env(var: &str) -> Option<String> {
 /// Deterministic hash of the config document — sha256, not `DefaultHasher`,
 /// which is not stable across Rust releases while this feeds fleet-shared cache keys.
 fn stable_hash(yaml: &str) -> u64 {
-    use sha2::{Digest, Sha256};
     let digest = Sha256::digest(yaml.as_bytes());
     u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
 }
@@ -1576,6 +1624,37 @@ fn check_unique<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_key_ids_hash_raw_keys_and_resolve_either_form() {
+        let id = access_key_id("ak-secret");
+        assert_eq!(id, "sha256:41d7cef0ff97ad3b306ff0a0fff45d54");
+        assert!(is_access_key_id(&id));
+        assert_ne!(
+            access_key_id(&id),
+            id,
+            "request auth never passes an id through"
+        );
+        assert_eq!(resolve_access_key_id(&id), id);
+        assert_eq!(resolve_access_key_id("ak-secret"), id);
+        assert!(!is_access_key_id("sha256:41D7CEF0FF97AD3B306FF0A0FFF45D54"));
+
+        let doc = |ak: &str| {
+            GatewayConfig::from_yaml(&format!(
+                "listen: {{host: h, port: 1}}\naccess_keys: [{{ak: '{ak}', product: p, qps: 1, daily_token_quota: 1}}, {{ak: ak-secret, product: p, qps: 1, daily_token_quota: 1}}]"
+            ))
+        };
+        assert!(matches!(
+            doc(&id),
+            Err(ConfigError::DuplicateName {
+                kind: "access_key",
+                ..
+            })
+        ));
+        assert!(doc(&access_key_id("ak-other")).is_ok());
+        assert!(matches!(doc("a:b"), Err(ConfigError::DuplicateName { .. })));
+        assert!(matches!(doc(""), Err(ConfigError::EmptyName { .. })));
+    }
 
     #[test]
     fn generation_is_stable_per_document_and_changes_on_edit() {

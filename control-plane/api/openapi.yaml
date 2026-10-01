@@ -122,7 +122,16 @@ paths:
         required: true
         content: {application/json: {schema: {$ref: "#/components/schemas/AccessKey"}}}
       responses:
-        "201": {description: Key created}
+        "201":
+          description: Key created; `ak` carries a generated key, returned only here
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ak_id]
+                properties:
+                  ak_id: {type: string}
+                  ak: {type: string}
   /admin/keys/{ak}:
     patch:
       summary: Change gateway key limits or lifecycle state
@@ -196,7 +205,7 @@ components:
       name: X-CSRF-Token
   parameters:
     ID: {name: id, in: path, required: true, schema: {type: string}}
-    AK: {name: ak, in: path, required: true, schema: {type: string}}
+    AK: {name: ak, in: path, required: true, description: "The key's ak_id or the key itself", schema: {type: string}}
     Since: {name: since, in: query, schema: {type: integer, format: int64}}
     Until: {name: until, in: query, schema: {type: integer, format: int64}}
     Bucket: {name: bucket, in: query, schema: {type: string, enum: [hour, day]}}
@@ -254,9 +263,10 @@ components:
         role: {type: string, enum: [member, tenant_admin, system_admin]}
     AccessKey:
       type: object
-      required: [ak, product]
+      required: [product]
       properties:
-        ak: {type: string}
+        ak_id: {type: string, readOnly: true, description: "The key's stored identity; listings never carry the key"}
+        ak: {type: string, writeOnly: true, description: "Create only; omit it to have the gateway generate the key"}
         product: {type: string}
         tenant: {type: string}
         owner: {type: [string, "null"]}

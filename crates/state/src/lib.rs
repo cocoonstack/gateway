@@ -12,7 +12,6 @@ use dashmap::DashMap;
 use gw_config::GatewayConfig;
 use gw_consts::Protocol;
 use gw_models::Account;
-use sha2::{Digest, Sha256};
 
 pub mod admission;
 pub mod alerts;
@@ -50,8 +49,7 @@ const FAILS_DECAY: Duration = Duration::from_secs(3_600);
 /// Resolved identity for an authenticated AK.
 #[derive(Debug, Clone)]
 pub struct AkInfo {
-    pub ak: String,
-    /// `ak`'s access-log fingerprint, stamped with the entry so no request re-hashes it.
+    /// The key's stored identity ([`gw_config::access_key_id`]); the raw key is never kept.
     pub ak_id: Arc<str>,
     pub product: String,
     /// Tenant this key belongs to (`gw_config::DEFAULT_TENANT` when undeclared).
@@ -133,8 +131,7 @@ impl AkInfo {
 impl From<&gw_config::AkConf> for AkInfo {
     fn from(k: &gw_config::AkConf) -> Self {
         Self {
-            ak_id: access_key_fingerprint(&k.ak).into(),
-            ak: k.ak.clone(),
+            ak_id: k.id().into(),
             product: k.product.clone(),
             tenant: k.tenant.clone(),
             owner: k.owner.clone(),
@@ -206,12 +203,12 @@ pub enum KeySource {
 /// admin keys survive it (a preserved seam).
 #[derive(Debug, Default)]
 pub struct AkAuth {
-    keys: DashMap<String, (Arc<AkInfo>, KeySource)>,
+    keys: DashMap<Arc<str>, (Arc<AkInfo>, KeySource)>,
 }
 
 impl AkAuth {
-    pub fn authenticate(&self, ak: &str) -> Option<Arc<AkInfo>> {
-        self.keys.get(ak).map(|e| Arc::clone(&e.value().0))
+    pub fn get(&self, ak_id: &str) -> Option<Arc<AkInfo>> {
+        self.keys.get(ak_id).map(|e| Arc::clone(&e.value().0))
     }
 
     /// Insert or replace a key. Config ownership is sticky: an admin write to a
@@ -219,7 +216,7 @@ impl AkAuth {
     /// while a config write claims an admin key. Atomic via the entry lock.
     pub fn put(&self, mut info: AkInfo, source: KeySource) {
         use dashmap::mapref::entry::Entry;
-        match self.keys.entry(info.ak.clone()) {
+        match self.keys.entry(Arc::clone(&info.ak_id)) {
             Entry::Occupied(mut e) => {
                 let sticky_config = e.get().1 == KeySource::Config && source == KeySource::Admin;
                 let source = if sticky_config {
@@ -241,13 +238,13 @@ impl AkAuth {
 
     /// Update quota/lifecycle fields of an existing key in place; returns the
     /// new view. `None` if the key doesn't exist.
-    pub fn patch(&self, ak: &str, patch: &KeyPatch) -> Option<AkInfo> {
-        let mut e = self.keys.get_mut(ak)?;
+    pub fn patch(&self, ak_id: &str, patch: &KeyPatch) -> Option<AkInfo> {
+        let mut e = self.keys.get_mut(ak_id)?;
         Arc::make_mut(&mut e.0).apply_patch(patch);
         Some(e.0.as_ref().clone())
     }
 
-    /// A page of keys, sorted by ak (stable), optionally confined to `tenant`
+    /// A page of keys, sorted by ak_id (stable), optionally confined to `tenant`
     /// and `owner`, `offset..offset+limit` — the filters apply before paging.
     pub fn list(
         &self,
@@ -266,7 +263,7 @@ impl AkAuth {
             })
             .map(|e| Arc::clone(&e.value().0))
             .collect();
-        keys.sort_by(|a, b| a.ak.cmp(&b.ak));
+        keys.sort_by(|a, b| a.ak_id.cmp(&b.ak_id));
         keys.into_iter()
             .skip(offset)
             .take(limit)
@@ -275,37 +272,38 @@ impl AkAuth {
     }
 
     /// Remove a key regardless of source; returns whether it existed.
-    pub fn revoke(&self, ak: &str) -> bool {
-        self.keys.remove(ak).is_some()
+    pub fn revoke(&self, ak_id: &str) -> bool {
+        self.keys.remove(ak_id).is_some()
     }
 
     /// Re-apply the config file's key set, leaving admin-created keys untouched.
     /// Surviving keys are upserted in place (never briefly absent) so a
-    /// concurrent `authenticate` can't spuriously 401 mid-reload.
+    /// concurrent `get` can't spuriously 401 mid-reload.
     pub fn reload_config_keys(&self, keys: &[gw_config::AkConf]) {
-        let wanted: std::collections::HashSet<&str> = keys.iter().map(|k| k.ak.as_str()).collect();
+        let infos: Vec<AkInfo> = keys.iter().map(AkInfo::from).collect();
+        let wanted: std::collections::HashSet<&str> = infos.iter().map(|k| &*k.ak_id).collect();
         self.keys
-            .retain(|ak, (_, src)| *src == KeySource::Admin || wanted.contains(ak.as_str()));
-        for k in keys {
-            self.put(AkInfo::from(k), KeySource::Config);
+            .retain(|id, (_, src)| *src == KeySource::Admin || wanted.contains(&**id));
+        for info in infos {
+            self.put(info, KeySource::Config);
         }
     }
 }
 
 #[async_trait::async_trait]
 impl KeyStore for AkAuth {
-    async fn authenticate(&self, ak: &str) -> Option<Arc<AkInfo>> {
-        AkAuth::authenticate(self, ak)
+    async fn get(&self, ak_id: &str) -> Option<Arc<AkInfo>> {
+        AkAuth::get(self, ak_id)
     }
     async fn put(&self, info: AkInfo, source: KeySource) -> gw_models::GResult<()> {
         AkAuth::put(self, info, source);
         Ok(())
     }
-    async fn patch(&self, ak: &str, patch: &KeyPatch) -> gw_models::GResult<Option<AkInfo>> {
-        Ok(AkAuth::patch(self, ak, patch))
+    async fn patch(&self, ak_id: &str, patch: &KeyPatch) -> gw_models::GResult<Option<AkInfo>> {
+        Ok(AkAuth::patch(self, ak_id, patch))
     }
-    async fn revoke(&self, ak: &str) -> gw_models::GResult<bool> {
-        Ok(AkAuth::revoke(self, ak))
+    async fn revoke(&self, ak_id: &str) -> gw_models::GResult<bool> {
+        Ok(AkAuth::revoke(self, ak_id))
     }
     async fn list(
         &self,
@@ -999,12 +997,6 @@ pub fn epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Stable SHA-256 identifier for correlating an access key in logs.
-pub fn access_key_fingerprint(ak: &str) -> String {
-    let digest = Sha256::digest(ak.as_bytes());
-    format!("sha256:{}", hex::encode(&digest[..16]))
-}
-
 /// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1077,7 +1069,28 @@ fn settle_on(counter: &mut i64, delta: i64) {
 }
 
 #[cfg(test)]
+pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db = format!("gwtest_{nonce}");
+    let admin = sqlx::PgPool::connect(url).await.expect("pg admin");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
+        .execute(&admin)
+        .await
+        .expect("create test db");
+    let own_url = match url.rfind('/') {
+        Some(i) => format!("{}/{db}", &url[..i]),
+        None => url.to_owned(),
+    };
+    (own_url, nonce)
+}
+
+#[cfg(test)]
 mod tests {
+    use gw_config::access_key_id;
+
     use super::*;
 
     fn state() -> GatewayState {
@@ -1131,8 +1144,7 @@ mod tests {
 
     fn ak_info(ak: &str) -> AkInfo {
         AkInfo {
-            ak_id: access_key_fingerprint(ak).into(),
-            ak: ak.into(),
+            ak_id: access_key_id(ak).into(),
             product: "p".into(),
             tenant: "default".into(),
             owner: None,
@@ -1148,14 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn access_key_fingerprint_is_stable_without_exposing_the_key() {
-        let fingerprint = access_key_fingerprint("ak-secret");
-        assert_eq!(fingerprint, "sha256:41d7cef0ff97ad3b306ff0a0fff45d54");
-        assert!(!fingerprint.contains("ak-secret"));
-        assert_ne!(fingerprint, access_key_fingerprint("ak-other"));
-    }
-
-    #[test]
     fn key_list_filters_by_owner_before_paging() {
         let auth = AkAuth::default();
         for (ak, owner) in [("k1", Some("m-1")), ("k2", None), ("k3", Some("m-1"))] {
@@ -1163,12 +1167,14 @@ mod tests {
             info.owner = owner.map(str::to_owned);
             auth.put(info, KeySource::Admin);
         }
+        let mut owned: Vec<String> = ["k1", "k3"].map(access_key_id).into();
+        owned.sort();
         let page: Vec<String> = auth
             .list(None, Some("m-1"), 1, 10)
             .into_iter()
-            .map(|k| k.ak)
+            .map(|k| k.ak_id.to_string())
             .collect();
-        assert_eq!(page, ["k3"]);
+        assert_eq!(page, owned[1..]);
         assert!(auth.list(Some("other"), Some("m-1"), 0, 10).is_empty());
     }
 
@@ -1194,7 +1200,7 @@ mod tests {
         let auth = AkAuth::default();
         auth.put(ak_info("k"), KeySource::Config);
         auth.patch(
-            "k",
+            &access_key_id("k"),
             &KeyPatch {
                 suspended_until_epoch_secs: Some(Some(i64::MAX)),
                 ..Default::default()
@@ -1202,7 +1208,9 @@ mod tests {
         );
         auth.put(ak_info("k"), KeySource::Config);
         assert_eq!(
-            auth.authenticate("k").unwrap().suspended_until_epoch_secs,
+            auth.get(&access_key_id("k"))
+                .unwrap()
+                .suspended_until_epoch_secs,
             Some(i64::MAX),
             "re-applied config key keeps the suspension"
         );
@@ -1274,8 +1282,20 @@ mod tests {
         let shared = SharedConfig::new(cfg, boot);
 
         let snap = shared.load();
-        assert!(snap.state.auth.authenticate("ak-demo-123").await.is_some());
-        assert!(snap.state.auth.authenticate("ak-new").await.is_none());
+        assert!(
+            snap.state
+                .auth
+                .get(&access_key_id("ak-demo-123"))
+                .await
+                .is_some()
+        );
+        assert!(
+            snap.state
+                .auth
+                .get(&access_key_id("ak-new"))
+                .await
+                .is_none()
+        );
 
         let new_cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-new, product: p, qps: 5, daily_token_quota: 100}]",
@@ -1284,8 +1304,20 @@ mod tests {
         shared.reload(new_cfg).await.unwrap();
 
         let snap = shared.load();
-        assert!(snap.state.auth.authenticate("ak-new").await.is_some());
-        assert!(snap.state.auth.authenticate("ak-demo-123").await.is_none());
+        assert!(
+            snap.state
+                .auth
+                .get(&access_key_id("ak-new"))
+                .await
+                .is_some()
+        );
+        assert!(
+            snap.state
+                .auth
+                .get(&access_key_id("ak-demo-123"))
+                .await
+                .is_none()
+        );
         assert_eq!(Arc::as_ptr(&snap.state.store), store_ptr);
         assert_eq!(Arc::as_ptr(&snap.state.health), health_ptr);
         assert!(
@@ -1305,20 +1337,20 @@ mod tests {
         .unwrap();
         auth.reload_config_keys(&new.access_keys);
         assert!(
-            auth.authenticate("ak-config").is_none(),
+            auth.get(&access_key_id("ak-config")).is_none(),
             "old config key dropped"
         );
         assert!(
-            auth.authenticate("ak-config2").is_some(),
+            auth.get(&access_key_id("ak-config2")).is_some(),
             "new config key applied"
         );
         assert!(
-            auth.authenticate("ak-admin").is_some(),
+            auth.get(&access_key_id("ak-admin")).is_some(),
             "admin key preserved"
         );
         let patched = auth
             .patch(
-                "ak-admin",
+                &access_key_id("ak-admin"),
                 &KeyPatch {
                     qps: Some(9.0),
                     tokens_per_minute: Some(Some(5)),
@@ -1330,9 +1362,9 @@ mod tests {
         assert_eq!(patched.qps, 9.0);
         assert_eq!(patched.tokens_per_minute, Some(5));
         assert!(patched.banned);
-        assert!(auth.revoke("ak-admin"));
-        assert!(auth.authenticate("ak-admin").is_none());
-        assert!(!auth.revoke("ak-admin"));
+        assert!(auth.revoke(&access_key_id("ak-admin")));
+        assert!(auth.get(&access_key_id("ak-admin")).is_none());
+        assert!(!auth.revoke(&access_key_id("ak-admin")));
     }
 
     #[test]
@@ -1344,9 +1376,14 @@ mod tests {
         )
         .unwrap();
         auth.reload_config_keys(&cfg.access_keys);
-        assert!(auth.authenticate("ak-keep").is_some());
-        assert!(auth.authenticate("ak-add").is_some());
-        assert_eq!(auth.authenticate("ak-keep").unwrap().daily_token_quota, 20);
+        assert!(auth.get(&access_key_id("ak-keep")).is_some());
+        assert!(auth.get(&access_key_id("ak-add")).is_some());
+        assert_eq!(
+            auth.get(&access_key_id("ak-keep"))
+                .unwrap()
+                .daily_token_quota,
+            20
+        );
     }
 
     #[test]
@@ -1360,7 +1397,7 @@ mod tests {
         .unwrap();
         auth.reload_config_keys(&cfg.access_keys);
         assert!(
-            auth.authenticate("ak-x").is_none(),
+            auth.get(&access_key_id("ak-x")).is_none(),
             "config revocation must not be defeated by a prior admin overwrite"
         );
         auth.put(ak_info("ak-adm"), KeySource::Admin);
@@ -1372,7 +1409,7 @@ mod tests {
         let cfg3 = GatewayConfig::from_yaml("listen: {host: h, port: 1}\naccess_keys: []").unwrap();
         auth.reload_config_keys(&cfg3.access_keys);
         assert!(
-            auth.authenticate("ak-adm").is_none(),
+            auth.get(&access_key_id("ak-adm")).is_none(),
             "config-claimed key is revocable by config"
         );
     }
@@ -1409,7 +1446,7 @@ mod tests {
         );
         let cfg = GatewayConfig::from_yaml(&yaml).unwrap();
         let st = GatewayState::build(&cfg).await.unwrap();
-        assert!(st.auth.authenticate("k1").await.is_some());
+        assert!(st.auth.get(&access_key_id("k1")).await.is_some());
         let f = st
             .store
             .file_put("default", "batch", "x".into())
@@ -1434,10 +1471,14 @@ mod tests {
     async fn auth_lookup() {
         let s = state();
         assert_eq!(
-            s.auth.authenticate("ak-demo-123").await.unwrap().product,
+            s.auth
+                .get(&access_key_id("ak-demo-123"))
+                .await
+                .unwrap()
+                .product,
             "demo"
         );
-        assert!(s.auth.authenticate("nope").await.is_none());
+        assert!(s.auth.get(&access_key_id("nope")).await.is_none());
     }
 
     #[tokio::test]

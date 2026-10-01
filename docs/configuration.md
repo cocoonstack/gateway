@@ -52,7 +52,8 @@ briefly exceed the cap under rollup lag.
 
 ```yaml
 access_keys:
-  - ak: ak-demo-123          # bearer / x-api-key value clients send
+  - ak: ak-demo-123          # bearer / x-api-key value clients send, or its
+                             # `sha256:` ak_id to keep the key out of the config
     product: demo            # product group (for product-level QPM)
     tenant: acme             # optional; absent = the unrestricted `default` tenant
     owner: alice             # optional; binds the key to one end user (authoritative

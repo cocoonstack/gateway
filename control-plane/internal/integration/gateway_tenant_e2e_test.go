@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
+	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 	gatewayhttp "github.com/cocoonstack/gateway/control-plane/internal/gateway/http"
 	"github.com/cocoonstack/gateway/control-plane/internal/httpapi"
 	kvmemory "github.com/cocoonstack/gateway/control-plane/internal/kv/memory"
@@ -76,15 +77,18 @@ func TestTenantTokenChain(t *testing.T) {
 	if rec.StatusCode != http.StatusCreated {
 		t.Fatalf("system admin create labs key = %d, body %s", rec.StatusCode, rec.Body)
 	}
+	labsID := createdKeyID(t, rec)
 	rec = send(t, cp, acme, http.MethodPost, "/api/v1/admin/keys",
 		map[string]any{"ak": acmeKey, "product": "p", "qps": 5, "daily_token_quota": 1_000_000})
 	if rec.StatusCode != http.StatusCreated {
 		t.Fatalf("tenant admin create own key = %d, body %s", rec.StatusCode, rec.Body)
 	}
+	acmeID := createdKeyID(t, rec)
 
 	rec = send(t, cp, acme, http.MethodGet, "/api/v1/admin/keys", nil)
-	if rec.StatusCode != http.StatusOK || !strings.Contains(rec.Body, acmeKey) || strings.Contains(rec.Body, labsKey) {
-		t.Fatalf("tenant admin list = %d, want only own tenant's keys; body %s", rec.StatusCode, rec.Body)
+	if rec.StatusCode != http.StatusOK || !strings.Contains(rec.Body, acmeID) || strings.Contains(rec.Body, labsID) ||
+		strings.Contains(rec.Body, acmeKey) {
+		t.Fatalf("tenant admin list = %d, want only own tenant's key ids; body %s", rec.StatusCode, rec.Body)
 	}
 
 	rec = send(t, cp, acme, http.MethodPatch, "/api/v1/admin/keys/"+labsKey, map[string]any{"banned": true})
@@ -345,4 +349,13 @@ func send(t *testing.T, cp *httptest.Server, session browserSession, method, pat
 	var out bytes.Buffer
 	_, _ = out.ReadFrom(resp.Body)
 	return wireResponse{StatusCode: resp.StatusCode, Body: out.String()}
+}
+
+func createdKeyID(t *testing.T, rec wireResponse) string {
+	t.Helper()
+	var created gateway.CreatedKey
+	if err := json.Unmarshal([]byte(rec.Body), &created); err != nil || created.AKID == "" {
+		t.Fatalf("create reply %s carries no ak_id: %v", rec.Body, err)
+	}
+	return created.AKID
 }
