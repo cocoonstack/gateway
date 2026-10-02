@@ -1208,7 +1208,12 @@ impl GatewayConfig {
                     tenant: k.tenant.clone(),
                 });
             }
-            if k.owner.as_deref().is_none_or(str::is_empty) && self.requires_owner(&k.tenant) {
+            if k.owner.as_deref().is_none_or(str::is_empty)
+                && self
+                    .tenants
+                    .iter()
+                    .any(|t| t.name == k.tenant && t.require_key_owner)
+            {
                 return Err(ConfigError::KeyWithoutOwner {
                     ak: k.id(),
                     tenant: k.tenant.clone(),
@@ -1269,11 +1274,10 @@ impl GatewayConfig {
         name == DEFAULT_TENANT || self.tenants.iter().any(|t| t.name == name)
     }
 
-    /// Whether `tenant` refuses keys without an owner (a linear scan, like [`Self::is_known_tenant`]).
+    /// Whether `tenant` refuses keys without an owner.
     pub fn requires_owner(&self, tenant: &str) -> bool {
-        self.tenants
-            .iter()
-            .any(|t| t.name == tenant && t.require_key_owner)
+        self.find_tenant(tenant)
+            .is_some_and(|t| t.require_key_owner)
     }
 
     fn model_exists(&self, name: &str) -> bool {
