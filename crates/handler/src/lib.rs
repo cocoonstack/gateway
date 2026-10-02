@@ -3193,6 +3193,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ownerless_key_runs_no_batch_item_once_its_tenant_requires_owners() {
+        let base = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o-mini, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: shop}]\naccess_keys: [{ak: k-anon, tenant: shop, product: p, qps: 100, daily_token_quota: 100000}]";
+        let state = Arc::new(GatewayState::from_config(
+            &GatewayConfig::from_yaml(base).unwrap(),
+        ));
+        let flagged = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o-mini, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: shop, require_key_owner: true}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(flagged).unwrap());
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.get(&access_key_id("k-anon")).await.unwrap();
+        let job = OfflineHandler::new(h.clone())
+            .submit(key, "gpt-4o-mini".into(), vec![item("one", "")])
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, gw_state::BatchStatus::Failed);
+        assert!(j.results.is_empty(), "no item may run for an ownerless key");
+    }
+
+    #[tokio::test]
     async fn batch_submitted_after_an_erasure_still_runs() {
         let h = handler();
         let off = OfflineHandler::new(h.clone());

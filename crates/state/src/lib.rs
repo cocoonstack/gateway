@@ -108,6 +108,10 @@ impl AkInfo {
         self.owner.as_deref().filter(|s| !s.is_empty())
     }
 
+    pub fn lacks_required_owner(&self, cfg: &GatewayConfig) -> bool {
+        self.owner_override().is_none() && cfg.requires_owner(&self.tenant)
+    }
+
     /// Apply a partial quota/lifecycle patch.
     pub fn apply_patch(&mut self, patch: &KeyPatch) {
         if let Some(v) = patch.qps {

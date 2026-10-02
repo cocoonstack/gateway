@@ -271,7 +271,9 @@ impl OfflineHandler {
 
     async fn active_key(&self, ak_id: &str) -> Option<Arc<AkInfo>> {
         let key = self.online.state().auth.get(ak_id).await?;
-        (key.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active).then_some(key)
+        (key.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active
+            && !key.lacks_required_owner(&self.online.cfg()))
+        .then_some(key)
     }
 }
 

@@ -387,7 +387,7 @@ async fn realtime_ws(
                 None => None,
             };
             match sub {
-                Some(ak) => match check_key_status(&ak) {
+                Some(ak) => match check_key(&snap.cfg, &ak) {
                     Ok(()) => ak,
                     Err((st, msg)) => return error_response(st, msg),
                 },
@@ -550,9 +550,7 @@ async fn realtime_gate(
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
     let ak = match state.auth.get(&ak.ak_id).await {
-        Some(fresh) if fresh.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active => {
-            fresh
-        }
+        Some(fresh) if check_key(cfg, &fresh).is_ok() => fresh,
         _ => {
             return Err((
                 ErrClass::AccessDenied,
@@ -1399,17 +1397,17 @@ async fn authenticate(
         .get(&gw_config::access_key_id(ak))
         .await
         .ok_or((401, "invalid api key"))?;
-    check_key_status(&info)?;
-    if info.owner_override().is_none() && s.handler.cfg().requires_owner(&info.tenant) {
-        return Err((403, "this tenant requires keys bound to an owner"));
-    }
+    check_key(&s.handler.cfg(), &info)?;
     Ok(info)
 }
 
-/// Lifecycle gate shared by every auth path: banned and expired keys stay in
-/// the table but fail with distinct 403s (unlike a revoked key's 401).
-fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
+/// Lifecycle and owner gate shared by every auth path: banned and expired keys
+/// stay in the table but fail with distinct 403s (unlike a revoked key's 401).
+fn check_key(cfg: &GatewayConfig, info: &AkInfo) -> Result<(), (u16, &'static str)> {
     match info.status_at(gw_state::epoch_secs()) {
+        gw_state::KeyStatus::Active if info.lacks_required_owner(cfg) => {
+            Err((403, "this tenant requires keys bound to an owner"))
+        }
         gw_state::KeyStatus::Active => Ok(()),
         gw_state::KeyStatus::Banned => Err((403, "access key is banned")),
         gw_state::KeyStatus::Expired => Err((403, "access key has expired")),

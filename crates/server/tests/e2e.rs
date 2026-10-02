@@ -4947,6 +4947,82 @@ async fn realtime_authenticates_via_ws_subprotocol() {
 }
 
 #[tokio::test]
+async fn realtime_refuses_an_ownerless_key_once_its_tenant_requires_owners() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let base = r#"
+listen: {host: 127.0.0.1, port: 0}
+accounts:
+  - {name: rt-mock, provider: openai, protocols: ["realtime"]}
+models:
+  - {name: rt-model, protocol: realtime}
+tenants:
+  - {name: shop}
+access_keys:
+  - {ak: ak-anon, tenant: shop, product: rt, qps: 100, daily_token_quota: 1000000}
+"#;
+    let cfg = GatewayConfig::from_yaml(base).unwrap();
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let key = gw_state::AkInfo::from(&cfg.access_keys[0]);
+    state.auth.revoke(&key.ak_id).await.unwrap();
+    state
+        .auth
+        .put(key, gw_state::KeySource::Admin)
+        .await
+        .unwrap();
+    let shared = gw_state::SharedConfig::new(Arc::new(cfg), state);
+    let application = gw_views::app(AppState::with_config(
+        shared.clone(),
+        Arc::new(gw_engines::MockTransport),
+        None,
+    ));
+    let addr = serve_app(application).await;
+    let connect = || {
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "sec-websocket-protocol",
+            "realtime, gw-api-key.ak-anon".parse().unwrap(),
+        );
+        tokio_tungstenite::connect_async(req)
+    };
+    let (mut ws, _) = connect().await.expect("allowed before the flag");
+    let _ = ws.next().await.unwrap().unwrap();
+
+    let flagged = base
+        .replace("{name: shop}", "{name: shop, require_key_owner: true}")
+        .replace("access_keys:\n  - {ak: ak-anon, tenant: shop, product: rt, qps: 100, daily_token_quota: 1000000}\n", "");
+    shared
+        .reload(GatewayConfig::from_yaml(&flagged).unwrap())
+        .await
+        .unwrap();
+    ws.send(Message::text(r#"{"type":"input_text","text":"hi"}"#))
+        .await
+        .unwrap();
+    let mut denied = Value::Null;
+    let ended = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => denied = serde_json::from_str(t.as_str()).unwrap(),
+            Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => break true,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break false,
+        }
+    };
+    assert_eq!(
+        denied["error"]["code"], "access_denied_exception",
+        "{denied}"
+    );
+    assert!(ended, "the open session ends at its next turn");
+    assert!(
+        connect().await.is_err(),
+        "the subprotocol handshake refuses the key"
+    );
+}
+
+#[tokio::test]
 async fn realtime_turns_are_rate_limited() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
