@@ -425,14 +425,11 @@ impl DagNode for BudgetGate {
         "budget"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        admission::check_budgets(
-            ctx.state.governance.as_ref(),
-            &ctx.cfg,
-            &ctx.ak,
-            ctx.effective_user_id(),
-        )
-        .await
-        .map_err(quota_denied)
+        let over = admission::check_budgets(&ctx.state, &ctx.cfg, &ctx.ak, ctx.effective_user_id())
+            .await?
+            .map_err(quota_denied)?;
+        ctx.user_budget = Some(over);
+        Ok(())
     }
 }
 
@@ -899,6 +896,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         &ctx.cfg,
         &ctx.ak,
         ctx.effective_user_id(),
+        ctx.user_budget,
         settled.total_tokens,
         settled.cost_micros,
     )

@@ -9,7 +9,7 @@ use gw_config::GatewayConfig;
 use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{GResult, GatewayError, GatewayRequest, ModelParamV2};
 use gw_state::admission::TpmReserve;
-use gw_state::{AkInfo, GatewayState};
+use gw_state::{AkInfo, GatewayState, UserBudget};
 
 pub struct DagContext {
     pub cfg: Arc<GatewayConfig>,
@@ -45,6 +45,8 @@ pub struct DagContext {
     pub quota_at: i64,
     /// Tokens reserved in the AK TPM window at admission (same lifecycle).
     pub tpm_reserved: Option<TpmReserve>,
+    /// The user's budget override resolved at admission, charged at settlement.
+    pub user_budget: Option<UserBudget>,
     /// Outbound DLP buffered this stream, so billing waits for the view's
     /// delivery result instead of settling inside the DAG.
     pub billing_deferred: bool,
@@ -74,6 +76,7 @@ impl DagContext {
             quota_reserved: None,
             quota_at: 0,
             tpm_reserved: None,
+            user_budget: None,
             billing_deferred: false,
         }
     }

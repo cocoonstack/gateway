@@ -7,11 +7,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gw_config::GatewayConfig;
+use gw_config::{GatewayConfig, TenantConf};
+use gw_models::GResult;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{BillingInput, BillingRecord, Store, billing_record};
-use crate::{AkInfo, GatewayState, Governance, clamp_tokens};
+use crate::{AkInfo, GatewayState, Governance, UserBudget, clamp_tokens};
 
 const LEDGER_QUEUE_CAPACITY: usize = 4_096;
 const LEDGER_BATCH_MAX: usize = 256;
@@ -292,41 +293,55 @@ pub async fn flush_billing(state: &GatewayState) {
 
 /// Daily and monthly budgets (soft caps: check-then-consume, so concurrent
 /// turns can overshoot by one): admit while every configured scope is under its cap.
+/// Admitted yields the user's override for settlement; the outer error is a failed lookup.
 pub async fn check_budgets(
-    gov: &dyn Governance,
+    state: &GatewayState,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
-) -> Result<(), String> {
-    for b in budgets(gov, cfg, ak, user).await {
+) -> GResult<Result<UserBudget, String>> {
+    let over = user_budget(state, ak, user).await?;
+    let gov = state.governance.as_ref();
+    for b in budgets(gov, cfg, ak, user, over).await {
         let under = match b.window {
             Window::Day => gov.quota_check(&b.key, b.limit).await,
             Window::Month => gov.counter_get(&b.key).await < b.limit,
         };
         if !under {
-            return Err(format!(
+            return Ok(Err(format!(
                 "{} {} budget exhausted for {}",
                 b.window.label(),
                 b.scope.unit(),
                 b.scope.subject(ak, user)
-            ));
+            )));
         }
     }
-    Ok(())
+    Ok(Ok(over))
 }
 
-/// Accrue actual usage to the budgets; a scope that reaches its cap raises a
-/// `budget_exhausted` alert (the bus dedups repeats).
+/// Accrue usage under `over`, the override admission resolved (`None` resolves it now);
+/// a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
 pub async fn consume_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
+    over: Option<UserBudget>,
     tokens: i64,
     cost_micros: i64,
 ) {
+    if tokens <= 0 && cost_micros <= 0 {
+        return;
+    }
+    let over = match over {
+        Some(over) => over,
+        None => user_budget(state, ak, user).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "user budget lookup failed at settlement; charging tenant defaults");
+            UserBudget::default()
+        }),
+    };
     let gov = state.governance.as_ref();
-    for b in budgets(gov, cfg, ak, user).await {
+    for b in budgets(gov, cfg, ak, user, over).await {
         let amount = if b.scope.charges_cost() {
             cost_micros
         } else {
@@ -540,29 +555,51 @@ fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(deny()) }
 }
 
-/// The tenant's budgets that apply to `ak` and `user`; empty when none is
-/// configured. With rollover on, a month's cap grows by what the previous
-/// month left unspent, at most one month's cap (one counter read per scope).
+/// `user`'s override in `ak`'s tenant; all-inherit without a user or an override.
+async fn user_budget(state: &GatewayState, ak: &AkInfo, user: &str) -> GResult<UserBudget> {
+    if user.is_empty() {
+        return Ok(UserBudget::default());
+    }
+    Ok(state
+        .user_budgets
+        .get(&ak.tenant, user)
+        .await?
+        .unwrap_or_default())
+}
+
+/// The tenant's caps for `ak` and `user`, `over` replacing its per-user defaults.
+/// With rollover on, a month's cap grows by what the previous month left
+/// unspent, at most one month's cap (one counter read per scope).
 async fn budgets(
     gov: &dyn Governance,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
+    over: UserBudget,
 ) -> Vec<Budget> {
     use BudgetScope::{KeyCost, TenantCost, UserCost, UserTokens};
     use Window::{Day, Month};
-    let Some(t) = cfg.find_tenant(&ak.tenant) else {
-        return Vec::new();
-    };
+    let t = cfg.find_tenant(&ak.tenant);
+    let tv = |f: fn(&TenantConf) -> Option<i64>| t.and_then(f);
+    let user_tokens = over
+        .daily_token_quota
+        .resolve(tv(|t| t.user_daily_token_quota));
+    let user_day = over
+        .daily_cost_quota_micros
+        .resolve(tv(|t| t.user_daily_cost_quota_micros));
+    let user_month = over
+        .monthly_cost_quota_micros
+        .resolve(tv(|t| t.user_monthly_cost_quota_micros));
     let scopes = [
-        (UserTokens, Day, t.user_daily_token_quota),
-        (TenantCost, Day, t.daily_cost_quota_micros),
-        (KeyCost, Day, t.key_daily_cost_quota_micros),
-        (UserCost, Day, t.user_daily_cost_quota_micros),
-        (TenantCost, Month, t.monthly_cost_quota_micros),
-        (KeyCost, Month, t.key_monthly_cost_quota_micros),
-        (UserCost, Month, t.user_monthly_cost_quota_micros),
+        (UserTokens, Day, user_tokens),
+        (TenantCost, Day, tv(|t| t.daily_cost_quota_micros)),
+        (KeyCost, Day, tv(|t| t.key_daily_cost_quota_micros)),
+        (UserCost, Day, user_day),
+        (TenantCost, Month, tv(|t| t.monthly_cost_quota_micros)),
+        (KeyCost, Month, tv(|t| t.key_monthly_cost_quota_micros)),
+        (UserCost, Month, user_month),
     ];
+    let rollover = t.is_some_and(|t| t.monthly_cost_rollover);
     let month = civil_month(crate::epoch_secs());
     let mut out = Vec::new();
     for (scope, window, limit) in scopes {
@@ -576,7 +613,7 @@ async fn budgets(
             Window::Day => scope.key(None, ak, user),
             Window::Month => scope.key(Some(month), ak, user),
         };
-        if window == Window::Month && t.monthly_cost_rollover {
+        if window == Window::Month && rollover {
             let spent = gov
                 .counter_get(&scope.key(Some(previous_month(month)), ak, user))
                 .await;
@@ -841,7 +878,7 @@ mod tests {
             format!("cb:ak:{}", ak.ak_id)
         );
 
-        let untouched = budgets(gov, &cfg, &ak, "").await;
+        let untouched = budgets(gov, &cfg, &ak, "", UserBudget::default()).await;
         assert_eq!(untouched.len(), 1);
         assert!(untouched[0].window == Window::Month);
         assert_eq!(
@@ -850,17 +887,21 @@ mod tests {
         );
 
         gov.counter_add(&prev, 1, MONTH_COUNTER_TTL).await;
-        assert_eq!(budgets(gov, &cfg, &ak, "").await[0].limit, 5);
+        assert_eq!(
+            budgets(gov, &cfg, &ak, "", UserBudget::default()).await[0].limit,
+            5
+        );
         gov.counter_add(&prev, 10, MONTH_COUNTER_TTL).await;
         assert_eq!(
-            budgets(gov, &cfg, &ak, "").await[0].limit,
+            budgets(gov, &cfg, &ak, "", UserBudget::default()).await[0].limit,
             3,
             "an overspent month carries nothing"
         );
 
         let (cfg, state, ak) = monthly_fixture(false).await;
+        let gov = state.governance.as_ref();
         assert_eq!(
-            budgets(state.governance.as_ref(), &cfg, &ak, "").await[0].limit,
+            budgets(gov, &cfg, &ak, "", UserBudget::default()).await[0].limit,
             3
         );
     }
@@ -869,9 +910,12 @@ mod tests {
     async fn monthly_budget_denies_at_the_cap_without_touching_daily_counters() {
         let (cfg, state, ak) = monthly_fixture(false).await;
         let gov = state.governance.as_ref();
-        check_budgets(gov, &cfg, &ak, "").await.unwrap();
-        consume_budgets(&state, &cfg, &ak, "", 10, 3).await;
-        let err = check_budgets(gov, &cfg, &ak, "").await.unwrap_err();
+        check_budgets(&state, &cfg, &ak, "").await.unwrap().unwrap();
+        consume_budgets(&state, &cfg, &ak, "", None, 10, 3).await;
+        let err = check_budgets(&state, &cfg, &ak, "")
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(
             err.starts_with("monthly cost budget exhausted for key:"),
             "{err}"
@@ -879,7 +923,7 @@ mod tests {
         assert_eq!(gov.quota_used(&format!("cb:ak:{}", ak.ak_id)).await, 0);
         gov.quota_reset_all().await;
         assert!(
-            check_budgets(gov, &cfg, &ak, "").await.is_err(),
+            check_budgets(&state, &cfg, &ak, "").await.unwrap().is_err(),
             "the daily reset leaves month counters alone"
         );
     }

@@ -38,7 +38,8 @@ use gw_protocol::openai::{
 };
 use gw_state::admission;
 use gw_state::{
-    AkInfo, GatewayState, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture, VideoJob,
+    AkInfo, GatewayState, ReviewVerdict, ThinkingSignatureAudit, ThinkingStreamCapture, UserBudget,
+    VideoJob,
 };
 use opentelemetry::propagation::Extractor;
 use serde_json::{Value, json};
@@ -50,6 +51,7 @@ mod mcp_auth;
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
+const USER_BUDGET_PAGE_DEFAULT: usize = 200;
 const CONFIG_VERSION_PAGE_DEFAULT: usize = 20;
 const CONTENT_PAGE_DEFAULT: usize = 200;
 const CONTENT_PAGE_MAX: usize = 1_000;
@@ -206,6 +208,13 @@ pub fn app(state: AppState) -> Router {
             post(admin_config_rollback),
         )
         .route("/admin/keys", post(admin_key_create).get(admin_key_list))
+        .route("/admin/tenants/{tenant}/users", get(admin_user_budget_list))
+        .route(
+            "/admin/tenants/{tenant}/users/{user}/budget",
+            get(admin_user_budget_get)
+                .put(admin_user_budget_put)
+                .delete(admin_user_budget_delete),
+        )
         .route("/admin/usage", get(admin_usage))
         .route("/admin/usage/users", get(admin_usage_users))
         .route("/admin/usage/series", get(admin_usage_series))
@@ -482,6 +491,8 @@ struct RealtimeAdmit {
     ak: Arc<AkInfo>,
     /// Effective attribution user, captured at admission so billing and budget agree.
     user: String,
+    /// The user's budget override resolved at admission; `None` when the turn skipped admission.
+    user_budget: Option<gw_state::UserBudget>,
     reserved: i64,
     /// Tokens reserved in the AK TPM window; `None` when the key has no TPM cap.
     tpm_reserved: Option<admission::TpmReserve>,
@@ -574,8 +585,9 @@ async fn realtime_gate(
     admission::check_model_qpm(gov, cfg, &m.served)
         .await
         .map_err(throttled)?;
-    admission::check_budgets(gov, cfg, &ak, ak.attributed_user(hint))
+    let user_budget = admission::check_budgets(state, cfg, &ak, ak.attributed_user(hint))
         .await
+        .map_err(|e| (ErrClass::ServiceUnavailable, e.message))?
         .map_err(quota_exceeded)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
@@ -603,6 +615,7 @@ async fn realtime_gate(
     Ok(RealtimeAdmit {
         ak,
         user,
+        user_budget: Some(user_budget),
         reserved: REALTIME_TURN_RESERVE,
         tpm_reserved,
         at,
@@ -683,6 +696,7 @@ async fn bill_realtime_turn(
         cfg,
         ak,
         admit.user.as_str(),
+        admit.user_budget,
         total,
         settled.cost_micros,
     )
@@ -1085,6 +1099,7 @@ async fn realtime_bridge(
                                         }),
                                         ak: billed,
                                         user,
+                                        user_budget: None,
                                         reserved: 0,
                                         at: gw_state::epoch_secs(),
                                         request_id: gw_handler::new_request_id(),
@@ -1385,6 +1400,9 @@ async fn authenticate(
         .await
         .ok_or((401, "invalid api key"))?;
     check_key_status(&info)?;
+    if info.owner_override().is_none() && s.handler.cfg().requires_owner(&info.tenant) {
+        return Err((403, "this tenant requires keys bound to an owner"));
+    }
     Ok(info)
 }
 
@@ -1946,9 +1964,16 @@ async fn admin_key_create(
     if !scope.covers(tenant) {
         return error_response(403, "tenant admin may only create keys in its own tenant");
     }
+    let cfg = s.handler.cfg();
     // a typo'd tenant would silently create an unrestricted key
-    if !s.handler.cfg().is_known_tenant(tenant) {
+    if !cfg.is_known_tenant(tenant) {
         return error_response(400, format!("unknown tenant `{tenant}`"));
+    }
+    if body["owner"].as_str().is_none_or(str::is_empty) && cfg.requires_owner(tenant) {
+        return error_response(
+            400,
+            format!("tenant `{tenant}` requires an owner on every key"),
+        );
     }
     let existing = match scoped_key(&s, &scope, &ak_id).await {
         Ok(found) => found,
@@ -2078,6 +2103,139 @@ async fn admin_key_delete(
         }
         Ok(false) => error_response(404, format!("key {ak_id} not found")),
     }
+}
+
+/// GET /admin/tenants/{tenant}/users — the tenant's overrides, keyset-paged by user id.
+async fn admin_user_budget_list(
+    State(s): State<AppState>,
+    scope: AdminScope,
+    Path(tenant): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = budget_tenant(&s, &scope, &tenant) {
+        return r;
+    }
+    let after = q.get("after").map_or("", String::as_str);
+    let limit = q_num(&q, "limit", USER_BUDGET_PAGE_DEFAULT).clamp(1, ADMIN_PAGE_MAX);
+    let rows = match s
+        .handler
+        .state()
+        .user_budgets
+        .list(&tenant, after, limit)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return gateway_error(e),
+    };
+    let next = (rows.len() == limit)
+        .then(|| rows.last().map(|(user, _)| user.clone()))
+        .flatten();
+    let users: Vec<Value> = rows
+        .into_iter()
+        .map(|(user, budget)| user_budget_json(user, budget))
+        .collect();
+    let mut resp = json!({ "count": users.len(), "next": next });
+    resp["users"] = Value::Array(users);
+    Json(resp).into_response()
+}
+
+/// GET /admin/tenants/{tenant}/users/{user}/budget — all-inherit when the user has no override.
+async fn admin_user_budget_get(
+    State(s): State<AppState>,
+    scope: AdminScope,
+    Path((tenant, user)): Path<(String, String)>,
+) -> Response {
+    if let Err(r) = budget_tenant(&s, &scope, &tenant) {
+        return r;
+    }
+    match s.handler.state().user_budgets.get(&tenant, &user).await {
+        Ok(budget) => Json(user_budget_json(user, budget.unwrap_or_default())).into_response(),
+        Err(e) => gateway_error(e),
+    }
+}
+
+/// PUT /admin/tenants/{tenant}/users/{user}/budget — replace the caps; all-inherit drops the override.
+async fn admin_user_budget_put(
+    State(s): State<AppState>,
+    scope: AdminScope,
+    AuditSourceIp(source): AuditSourceIp,
+    Path((tenant, user)): Path<(String, String)>,
+    ApiJson(budget): ApiJson<UserBudget>,
+) -> Response {
+    if let Err(r) = budget_tenant(&s, &scope, &tenant) {
+        return r;
+    }
+    if user.is_empty() || user.len() > USER_HINT_MAX_BYTES {
+        return error_response(
+            400,
+            format!("user id must be 1 to {USER_HINT_MAX_BYTES} bytes"),
+        );
+    }
+    let store = &s.handler.state().user_budgets;
+    let written = if budget == UserBudget::default() {
+        store.delete(&tenant, &user).await.map(drop)
+    } else {
+        store.put(&tenant, &user, budget).await
+    };
+    if let Err(e) = written {
+        return gateway_error(e);
+    }
+    audit_admin(
+        &s,
+        &scope,
+        source,
+        "user_budget_put",
+        &format!("{tenant}/{user}"),
+        serde_json::to_string(&budget).unwrap_or_default(),
+    )
+    .await;
+    Json(user_budget_json(user, budget)).into_response()
+}
+
+/// DELETE /admin/tenants/{tenant}/users/{user}/budget — idempotent; the user falls back to the tenant defaults.
+async fn admin_user_budget_delete(
+    State(s): State<AppState>,
+    scope: AdminScope,
+    AuditSourceIp(source): AuditSourceIp,
+    Path((tenant, user)): Path<(String, String)>,
+) -> Response {
+    if let Err(r) = budget_tenant(&s, &scope, &tenant) {
+        return r;
+    }
+    match s.handler.state().user_budgets.delete(&tenant, &user).await {
+        Err(e) => gateway_error(e),
+        Ok(existed) => {
+            if existed {
+                let target = format!("{tenant}/{user}");
+                audit_admin(
+                    &s,
+                    &scope,
+                    source,
+                    "user_budget_delete",
+                    &target,
+                    String::new(),
+                )
+                .await;
+            }
+            Json(user_budget_json(user, UserBudget::default())).into_response()
+        }
+    }
+}
+
+/// Another or an unknown tenant answers 404, so a tenant admin cannot probe tenant names.
+#[allow(clippy::result_large_err)] // mirrors the surrounding admin/lookup helpers
+fn budget_tenant(s: &AppState, scope: &AdminScope, tenant: &str) -> Result<(), Response> {
+    if scope.covers(tenant) && s.handler.cfg().is_known_tenant(tenant) {
+        Ok(())
+    } else {
+        Err(error_response(404, format!("tenant `{tenant}` not found")))
+    }
+}
+
+fn user_budget_json(user: String, budget: UserBudget) -> Value {
+    let mut v = serde_json::to_value(budget).unwrap_or_default();
+    v["user"] = Value::String(user);
+    v
 }
 
 /// GET /admin/config — the current fleet config document. Global admin only.
@@ -4409,6 +4567,7 @@ async fn poll_and_settle_video(
             &cfg,
             submitter.as_deref().unwrap_or(poller),
             &job.user_id,
+            None,
             settled.total_tokens,
             settled.cost_micros,
         )
@@ -5255,6 +5414,187 @@ mod tests {
         assert_eq!(points[0]["total_tokens"], 10);
         assert_eq!(points[1]["total_tokens"], 20);
         assert_eq!(points[1]["cost_micros"], 50);
+    }
+
+    #[tokio::test]
+    async fn user_budget_admin_is_tenant_scoped_and_keys_need_an_owner() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_UBUD_G}\nmodels: [{name: m, protocol: openai-chat}]\ntenants: [{name: acme, admin_token_env: GW_TEST_UBUD_T, require_key_owner: true}, {name: labs}]";
+        // SAFETY: this test owns unique env var names.
+        unsafe {
+            std::env::set_var("GW_TEST_UBUD_G", "root-token");
+            std::env::set_var("GW_TEST_UBUD_T", "acme-token");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let router = app(AppState::new(
+            cfg,
+            state,
+            Arc::new(gw_engines::MockTransport),
+        ));
+        let call = async |method: &str, uri: &str, token: &str, body: Value| {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            (resp.status(), body_json(resp).await)
+        };
+        let u1 = "/admin/tenants/acme/users/u1/budget";
+
+        let set =
+            json!({"daily_cost_quota_micros": 2_000_000, "monthly_cost_quota_micros": "unlimited"});
+        let (status, body) = call("PUT", u1, "acme-token", set).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let want = json!({"user": "u1", "daily_cost_quota_micros": 2_000_000, "monthly_cost_quota_micros": "unlimited", "daily_token_quota": null});
+        assert_eq!(body, want);
+        assert_eq!(call("GET", u1, "acme-token", Value::Null).await.1, want);
+        assert_eq!(call("GET", u1, "root-token", Value::Null).await.1, want);
+
+        let foreign = "/admin/tenants/labs/users/u1/budget";
+        let one = json!({"daily_cost_quota_micros": 1});
+        assert_eq!(
+            call("PUT", foreign, "acme-token", one.clone()).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(
+                "GET",
+                "/admin/tenants/ghost/users",
+                "root-token",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call("PUT", foreign, "root-token", one.clone()).await.0,
+            StatusCode::OK
+        );
+        for bad in [
+            json!({"daily_cost_quota_micros": -5}),
+            json!({"daily_cost": 5}),
+        ] {
+            assert_eq!(
+                call("PUT", u1, "acme-token", bad).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        for u in ["u3", "u2"] {
+            let uri = format!("/admin/tenants/acme/users/{u}/budget");
+            assert_eq!(
+                call("PUT", &uri, "acme-token", one.clone()).await.0,
+                StatusCode::OK
+            );
+        }
+        let (_, page) = call(
+            "GET",
+            "/admin/tenants/acme/users?limit=2",
+            "acme-token",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            (page["count"].clone(), page["next"].clone()),
+            (json!(2), json!("u2"))
+        );
+        assert_eq!(page["users"][1]["user"], "u2");
+        let (_, page) = call(
+            "GET",
+            "/admin/tenants/acme/users?after=u2&limit=2",
+            "acme-token",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(page["users"][0]["user"], "u3");
+        assert_eq!(page["next"], Value::Null);
+
+        let inherit = json!({"user": "u1", "daily_cost_quota_micros": null, "monthly_cost_quota_micros": null, "daily_token_quota": null});
+        let ok_inherit = (StatusCode::OK, inherit);
+        assert_eq!(
+            call("DELETE", u1, "acme-token", Value::Null).await,
+            ok_inherit
+        );
+        assert_eq!(call("GET", u1, "acme-token", Value::Null).await, ok_inherit);
+        assert_eq!(
+            call("DELETE", u1, "acme-token", Value::Null).await,
+            ok_inherit
+        );
+        assert_eq!(
+            call("PUT", u1, "acme-token", one.clone()).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(call("PUT", u1, "acme-token", json!({})).await, ok_inherit);
+        let (_, page) = call(
+            "GET",
+            "/admin/tenants/acme/users",
+            "acme-token",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            page["users"][0]["user"], "u2",
+            "an all-inherit PUT drops the row"
+        );
+
+        let (_, ops) = call("GET", "/admin/audit/ops", "root-token", Value::Null).await;
+        assert!(ops.to_string().contains("user_budget_put"), "{ops}");
+
+        let (status, body) =
+            call("POST", "/admin/keys", "acme-token", json!({"product": "p"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("requires an owner"), "{body}");
+        let owned = json!({"product": "p", "owner": "u1"});
+        assert_eq!(
+            call("POST", "/admin/keys", "acme-token", owned).await.0,
+            StatusCode::CREATED
+        );
+        let labs = json!({"product": "p", "tenant": "labs"});
+        assert_eq!(
+            call("POST", "/admin/keys", "root-token", labs).await.0,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ownerless_key_is_refused_where_the_tenant_requires_owners() {
+        let head = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\n";
+        let before = format!(
+            "{head}tenants: [{{name: shop}}]\naccess_keys: [{{ak: k-anon, tenant: shop, product: p, qps: 10, daily_token_quota: 1000}}, {{ak: k-owned, tenant: shop, owner: u1, product: p, qps: 10, daily_token_quota: 1000}}]"
+        );
+        let state = Arc::new(GatewayState::from_config(
+            &GatewayConfig::from_yaml(&before).unwrap(),
+        ));
+        let after = format!("{head}tenants: [{{name: shop, require_key_owner: true}}]");
+        let cfg = Arc::new(GatewayConfig::from_yaml(&after).unwrap());
+        let router = app(AppState::new(
+            cfg,
+            state,
+            Arc::new(gw_engines::MockTransport),
+        ));
+        for (ak, want) in [
+            ("k-anon", StatusCode::FORBIDDEN),
+            ("k-owned", StatusCode::OK),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {ak}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap();
+            assert_eq!(
+                router.clone().oneshot(req).await.unwrap().status(),
+                want,
+                "{ak}"
+            );
+        }
     }
 
     #[tokio::test]
