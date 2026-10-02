@@ -11,7 +11,8 @@ shared, what stays local, and what the LB needs to do.
 | Account health / cooldown (`HealthStore`) | Redis (`storage.redis_url`) | ✅ when Redis is set — one instance's cooldown benches the account for all |
 | Per-model availability counts (`AvailStore`, behind `/admin/models/status`) | Redis (`storage.redis_url`) | ✅ when Redis is set — every instance's samples land in the same minute buckets (one hour retained); in-process otherwise |
 | Config: keys/models/providers/tenants (`ConfigStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — versioned documents + a change feed |
-| Access-key table (`KeyStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — admin key CRUD is fleet-wide within ~2s and survives restarts; a key's MCP servers and tool allowlists are stored with it |
+| Access-key table (`KeyStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — admin key CRUD is fleet-wide in under a second and survives restarts; a key's MCP servers and tool allowlists are stored with it |
+| Per-user budget overrides (`UserBudgetStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — fleet-wide in under a second; in-process and lost on restart otherwise |
 | Billing ledger / files / batches / video jobs (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres (a video poll may land on any instance; the settle claim is one atomic row update); SQLite stays per-node |
 | Request cache | in-process (moka), or Redis with `shared_cache: true` | ⚠️ per-instance by default; fleet-shared when `shared_cache` is set |
 | Thinking-signature audit | in-process only | ⚠️ per-instance; a continuation landing on another instance finds no anchor and fails open (forwarded, not rejected) |
@@ -66,8 +67,12 @@ document includes `listen`, give each instance its own port with `GW_PORT`
 
 Access keys are higher-churn and have their own seam: `/admin/keys` CRUD
 writes the shared Postgres key table directly (no config publish needed); a
-key created, re-quota'd, banned, or revoked on one instance is live on all
-within the ~2s auth-cache TTL. The table holds key ids, not keys; the first
+key created, re-quota'd, banned, or revoked on one instance is live on all in
+under a second: the write and a Postgres NOTIFY naming the key commit
+together, and every instance drops that key from its auth cache when the
+NOTIFY arrives. A lost listener connection flushes the whole cache, again once
+it is listening, and an entry idle for five minutes or cached for an hour is
+refetched as the backstop for anything missed. The table holds key ids, not keys; the first
 start of a release with ids rewrites an older table in place, so upgrade every
 instance together — an instance still on the older release fails every key
 until it is replaced. The rewrite is one-way: back up the table first, since

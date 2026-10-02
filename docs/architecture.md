@@ -69,7 +69,11 @@ default, so the whole pipeline is testable offline:
   across a fleet.
 - **`KeyStore`** — the live access-key table. `AkAuth` (in-process DashMap)
   by default; `PostgresKeyStore` with `storage.postgres_url` — fleet-shared
-  behind a 2s auth cache, admin key CRUD survives restarts.
+  behind an auth cache each write invalidates fleet-wide by NOTIFY, admin key
+  CRUD survives restarts.
+- **`UserBudgetStore`** — per-user budget overrides inside a tenant. In-process
+  by default; `PostgresUserBudgets` with `storage.postgres_url`, cached and
+  invalidated the same way as keys.
 - **`HealthStore`** — account cooldown/recovery. In-process breaker by
   default; `RedisHealth` with `storage.redis_url` — a tripped account is
   skipped by every instance. Only upstream faults count (5xx, timeouts,

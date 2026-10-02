@@ -92,6 +92,7 @@ tenants:
     key_monthly_cost_quota_micros: 200000000   # optional: $200/month per key
     user_monthly_cost_quota_micros: 40000000   # optional: $40/month per end user
     monthly_cost_rollover: true            # optional: last month's unspent budget carries over (at most one month's cap)
+    require_key_owner: true                # optional: refuse keys without an owner, so per-user caps hold
     security:                # optional; overrides the global `security:` WHOLE for this tenant
       blocklist: ["forbidden"]
       blocklist_action: flag        # block | flag | shadow
