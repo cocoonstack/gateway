@@ -1,23 +1,20 @@
 //! Dynamic access-key storage behind a trait: the in-memory table serves a
 //! single node; Postgres shares one key set across a fleet, fronted by a
-//! short-TTL cache so the hot auth path stays off the network.
+//! cache each write invalidates fleet-wide, so the hot auth path stays off the network.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use gw_models::GResult;
 use sqlx::Row;
 
+use crate::fleet_cache::{FLUSH_ALL, FleetCache};
 use crate::{AkInfo, KeyPatch, KeySource};
 
-/// How long an instance may serve a stale key view: the fleet-wide bound on
-/// create/revoke propagation (a local write invalidates its own cache at once).
-const AUTH_CACHE_TTL: Duration = Duration::from_secs(2);
 /// Bounded so unknown-key probing can't grow the negative cache unboundedly.
-const AUTH_CACHE_MAX: u64 = 100_000;
+const AUTH_CACHE_MAX: u64 = 1_000_000;
 const KEYSTORE_MAX_CONNECTIONS: u32 = 5;
+const KEY_CHANNEL: &str = "gw_keys";
 
 /// The live key table with [`crate::AkAuth`]'s semantics: config keys re-apply
 /// on reload, admin keys survive it, config ownership is sticky. Every key
@@ -48,16 +45,12 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()>;
 }
 
-/// Fleet-shared key table in Postgres: short-TTL cached reads (positive and
-/// negative), writes reach other instances within [`AUTH_CACHE_TTL`].
+/// Fleet-shared key table in Postgres: cached reads (positive and negative),
+/// each write NOTIFYs every instance to drop that key.
 #[derive(Debug)]
 pub struct PostgresKeyStore {
     pool: sqlx::PgPool,
-    cache: moka::future::Cache<String, Option<Arc<AkInfo>>>,
-    /// Bumped on every write: an authenticate that overlapped a write evicts
-    /// its (possibly pre-write) fetch instead of leaving the cache poisoned.
-    /// A write landing after the re-check still self-heals within [`AUTH_CACHE_TTL`].
-    write_epoch: AtomicU64,
+    cache: FleetCache<Option<Arc<AkInfo>>>,
 }
 
 impl PostgresKeyStore {
@@ -106,19 +99,13 @@ impl PostgresKeyStore {
             ],
         )
         .await?;
-        Ok(Self {
-            pool,
-            cache: moka::future::Cache::builder()
-                .max_capacity(AUTH_CACHE_MAX)
-                .time_to_live(AUTH_CACHE_TTL)
-                .build(),
-            write_epoch: AtomicU64::new(0),
-        })
+        let cache = FleetCache::listen(url, KEY_CHANNEL, AUTH_CACHE_MAX).await?;
+        Ok(Self { pool, cache })
     }
 
-    async fn note_write(&self, ak_id: &str) {
-        self.write_epoch.fetch_add(1, Ordering::Release);
-        self.cache.invalidate(ak_id).await;
+    /// The key table's pool, shared with the other low-traffic admin tables.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
     }
 
     async fn fetch(&self, ak_id: &str) -> Result<Option<Arc<AkInfo>>, sqlx::Error> {
@@ -136,21 +123,7 @@ impl PostgresKeyStore {
 #[async_trait]
 impl KeyStore for PostgresKeyStore {
     async fn get(&self, ak_id: &str) -> Option<Arc<AkInfo>> {
-        let fetched_at = AtomicU64::new(u64::MAX);
-        let loaded = self
-            .cache
-            .try_get_with_by_ref(ak_id, async {
-                fetched_at.store(self.write_epoch.load(Ordering::Acquire), Ordering::Release);
-                let info = self.fetch(ak_id).await?;
-                Ok::<_, sqlx::Error>(info)
-            })
-            .await;
-        // checked after publication: a write landing before the insert would find no entry to evict
-        let start = fetched_at.load(Ordering::Acquire);
-        if start != u64::MAX && self.write_epoch.load(Ordering::Acquire) != start {
-            self.cache.invalidate(ak_id).await;
-        }
-        match loaded {
+        match self.cache.get_with(ak_id, self.fetch(ak_id)).await {
             Ok(info) => info,
             Err(e) => {
                 // fail closed: a store outage must not admit unknown keys
@@ -161,11 +134,18 @@ impl KeyStore for PostgresKeyStore {
     }
 
     async fn put(&self, info: AkInfo, source: KeySource) -> GResult<()> {
-        upsert(&self.pool, &info, source)
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin key upsert", e))?;
+        upsert(&mut *tx, &info, source)
             .await
             .map_err(|e| crate::sqlx_err("upsert access key", e))?;
-        self.note_write(&info.ak_id).await;
-        Ok(())
+        self.cache
+            .commit(tx, &info.ak_id)
+            .await
+            .map_err(|e| crate::sqlx_err("commit key upsert", e))
     }
 
     async fn patch(&self, ak_id: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>> {
@@ -203,21 +183,29 @@ impl KeyStore for PostgresKeyStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| crate::sqlx_err("apply patch", e))?;
-        tx.commit()
+        self.cache
+            .commit(tx, ak_id)
             .await
             .map_err(|e| crate::sqlx_err("commit patch", e))?;
-        self.note_write(ak_id).await;
         Ok(Some(info))
     }
 
     async fn revoke(&self, ak_id: &str) -> GResult<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin revoke", e))?;
         let n = sqlx::query("DELETE FROM access_keys WHERE ak_id = $1")
             .bind(ak_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("revoke key", e))?
             .rows_affected();
-        self.note_write(ak_id).await;
+        self.cache
+            .commit(tx, ak_id)
+            .await
+            .map_err(|e| crate::sqlx_err("commit revoke", e))?;
         Ok(n > 0)
     }
 
@@ -262,12 +250,10 @@ impl KeyStore for PostgresKeyStore {
                 .await
                 .map_err(|e| crate::sqlx_err("re-apply config key", e))?;
         }
-        tx.commit()
+        self.cache
+            .commit(tx, FLUSH_ALL)
             .await
-            .map_err(|e| crate::sqlx_err("commit reload", e))?;
-        self.write_epoch.fetch_add(1, Ordering::Release);
-        self.cache.invalidate_all();
-        Ok(())
+            .map_err(|e| crate::sqlx_err("commit reload", e))
     }
 }
 
@@ -400,6 +386,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_key_writes_reach_a_peer_instance_at_once() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let (own_url, _) = crate::scratch_pg(&url).await;
+        let a = PostgresKeyStore::connect(&own_url, 0).await.expect("a");
+        let b = PostgresKeyStore::connect(&own_url, 0).await.expect("b");
+        let id = access_key_id("pk-peer");
+
+        assert!(b.get(&id).await.is_none(), "b caches the miss");
+        let qps = async || b.get(&id).await.map(|k| k.qps);
+        a.put(info("pk-peer", 1.0), KeySource::Admin).await.unwrap();
+        crate::eventually("peer sees the put", async || qps().await == Some(1.0)).await;
+        let patch = KeyPatch {
+            qps: Some(7.0),
+            ..Default::default()
+        };
+        a.patch(&id, &patch).await.unwrap();
+        crate::eventually("peer sees the patch", async || qps().await == Some(7.0)).await;
+        assert!(a.revoke(&id).await.unwrap());
+        crate::eventually("peer sees the revoke", async || qps().await.is_none()).await;
+    }
+
+    #[tokio::test]
     async fn postgres_keystore_semantics_mirror_memory() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
             return;
@@ -411,7 +421,7 @@ mod tests {
             .execute(&ks.pool)
             .await
             .unwrap();
-        ks.cache.invalidate_all();
+        ks.cache.flush().await;
 
         ks.put(info("pk-a", 1.0), KeySource::Admin).await.unwrap();
         assert_eq!(ks.get(&access_key_id("pk-a")).await.unwrap().qps, 1.0);

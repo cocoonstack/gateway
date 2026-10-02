@@ -53,8 +53,16 @@ tenants:
     models: [m1]
   - name: labs
     models: [m1]
+  - name: shop
+    admin_token_env: GW_E2E_SHOP_TOKEN
+    models: [m1]
+    user_daily_cost_quota_micros: 1000000
+    require_key_owner: true
 access_keys: []
 `
+
+// carolID is per run: the shared Redis keeps her budget counters across runs.
+var carolID = "carol-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 
 func TestTenantTokenChain(t *testing.T) {
 	gwBin := os.Getenv("CP_TEST_GW_BIN")
@@ -186,6 +194,89 @@ func TestTenantTokenChain(t *testing.T) {
 	}
 }
 
+func TestUserBudgetChain(t *testing.T) {
+	gwBin := os.Getenv("CP_TEST_GW_BIN")
+	pgURL := os.Getenv("CP_TEST_PG_URL")
+	redisURL := os.Getenv("CP_TEST_REDIS_URL")
+	if gwBin == "" || pgURL == "" || redisURL == "" {
+		t.Skip("CP_TEST_GW_BIN, CP_TEST_PG_URL and CP_TEST_REDIS_URL are required")
+	}
+	gwURL := startGateway(t, gwBin, provisionDatabase(t, pgURL), redisURL)
+	cp := startControlPlane(t, gwURL)
+	shop := login(t, cp, "shop@example.com")
+	acme := login(t, cp, "acme@example.com")
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	budget := "/api/v1/admin/users/carol/budget"
+
+	rec := send(t, cp, shop, http.MethodPut, budget, map[string]any{"daily_cost_quota_micros": 1})
+	if rec.StatusCode != http.StatusOK || !strings.Contains(rec.Body, `"daily_cost_quota_micros":1`) {
+		t.Fatalf("set carol's cap = %d, body %s", rec.StatusCode, rec.Body)
+	}
+	if rec = send(t, cp, acme, http.MethodPut, budget, map[string]any{"daily_cost_quota_micros": 9}); rec.StatusCode != http.StatusNotFound {
+		t.Fatalf("another tenant's admin set carol's cap = %d, want 404; body %s", rec.StatusCode, rec.Body)
+	}
+	if rec = send(t, cp, shop, http.MethodPut, budget, map[string]any{"daily_cost_quota_micros": -1}); rec.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative cap = %d, want the gateway's 400; body %s", rec.StatusCode, rec.Body)
+	}
+
+	rec = send(t, cp, shop, http.MethodPost, "/api/v1/admin/keys", map[string]any{"ak": "ak-e2e-anon-" + suffix, "product": "p", "qps": 5, "daily_token_quota": 1_000_000})
+	if rec.StatusCode != http.StatusBadRequest || !strings.Contains(rec.Body, "requires an owner") {
+		t.Fatalf("ownerless key in an owner-enforcing tenant = %d, body %s", rec.StatusCode, rec.Body)
+	}
+	keys := []string{"ak-e2e-carol-a-" + suffix, "ak-e2e-carol-b-" + suffix}
+	for _, ak := range keys {
+		rec = send(t, cp, shop, http.MethodPost, "/api/v1/admin/keys", map[string]any{"ak": ak, "product": "p", "owner": carolID, "qps": 5, "daily_token_quota": 1_000_000})
+		if rec.StatusCode != http.StatusCreated {
+			t.Fatalf("create carol's key = %d, body %s", rec.StatusCode, rec.Body)
+		}
+	}
+
+	chat := func(ak string) (int, string) {
+		body, err := json.Marshal(map[string]any{"model": "m1", "messages": []map[string]string{{"role": "user", "content": "hello budget"}}})
+		if err != nil {
+			t.Fatalf("encode chat: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, gwURL+"/v1/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("build chat: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+ak)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("chat: %v", err)
+		}
+		defer resp.Body.Close()
+		var out bytes.Buffer
+		_, _ = out.ReadFrom(resp.Body)
+		return resp.StatusCode, out.String()
+	}
+	if code, body := chat(keys[0]); code != http.StatusOK {
+		t.Fatalf("first spend = %d, body %s", code, body)
+	}
+	if code, body := chat(keys[1]); code != http.StatusBadRequest || !strings.Contains(body, "user:shop/"+carolID) {
+		t.Fatalf("second key over carol's cap = %d, want 400 naming the user; body %s", code, body)
+	}
+
+	if rec = send(t, cp, shop, http.MethodPut, budget, map[string]any{"daily_cost_quota_micros": "unlimited"}); rec.StatusCode != http.StatusOK {
+		t.Fatalf("set unlimited = %d, body %s", rec.StatusCode, rec.Body)
+	}
+	if code, body := chat(keys[1]); code != http.StatusOK {
+		t.Fatalf("unlimited carol = %d, body %s", code, body)
+	}
+
+	if rec = send(t, cp, shop, http.MethodDelete, budget, nil); rec.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete override = %d, body %s", rec.StatusCode, rec.Body)
+	}
+	rec = send(t, cp, shop, http.MethodGet, budget, nil)
+	if rec.StatusCode != http.StatusOK || !strings.Contains(rec.Body, `"daily_cost_quota_micros":null`) {
+		t.Fatalf("budget after delete = %d, body %s", rec.StatusCode, rec.Body)
+	}
+	if code, body := chat(keys[1]); code != http.StatusOK {
+		t.Fatalf("carol back on the $1 tenant default = %d, body %s", code, body)
+	}
+}
+
 func provisionDatabase(t *testing.T, baseURL string) string {
 	t.Helper()
 	parsed, err := url.Parse(baseURL)
@@ -227,6 +318,7 @@ func startGateway(t *testing.T, bin, pgURL, redisURL string) string {
 		"GW_TRANSPORT=mock",
 		"GW_E2E_GLOBAL_TOKEN=root-e2e-token",
 		"GW_E2E_ACME_TOKEN=acme-e2e-token",
+		"GW_E2E_SHOP_TOKEN=shop-e2e-token",
 	)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -255,18 +347,20 @@ func startGateway(t *testing.T, bin, pgURL, redisURL string) string {
 
 func startControlPlane(t *testing.T, gwURL string) *httptest.Server {
 	t.Helper()
-	client, err := gatewayhttp.New("gw="+gwURL, "root-e2e-token", map[string]string{"acme": "acme-e2e-token"})
+	client, err := gatewayhttp.New("gw="+gwURL, "root-e2e-token", map[string]string{"acme": "acme-e2e-token", "shop": "shop-e2e-token"})
 	if err != nil {
 		t.Fatalf("build gateway client: %v", err)
 	}
 	store := usermemory.New()
 	for _, seed := range []struct {
-		id, email, tenant string
-		role              user.Role
+		id, email, tenant, gatewayUserID string
+		role                             user.Role
 	}{
-		{"root", "root@example.com", "", user.RoleSystemAdmin},
-		{"acme", "acme@example.com", "acme", user.RoleTenantAdmin},
-		{"labs", "labs@example.com", "labs", user.RoleTenantAdmin},
+		{"root", "root@example.com", "", "", user.RoleSystemAdmin},
+		{"acme", "acme@example.com", "acme", "", user.RoleTenantAdmin},
+		{"labs", "labs@example.com", "labs", "", user.RoleTenantAdmin},
+		{"shopadm", "shop@example.com", "shop", "", user.RoleTenantAdmin},
+		{"carol", "carol@example.com", "shop", carolID, user.RoleMember},
 	} {
 		hash, err := auth.HashPassword("password123!")
 		if err != nil {
@@ -275,7 +369,7 @@ func startControlPlane(t *testing.T, gwURL string) *httptest.Server {
 		now := time.Now().Unix()
 		if err := store.Create(t.Context(), user.User{
 			ID: seed.id, Email: seed.email, DisplayName: seed.id, PasswordHash: hash,
-			Tenant: seed.tenant, Role: seed.role, CreatedAt: now, UpdatedAt: now,
+			Tenant: seed.tenant, GatewayUserID: seed.gatewayUserID, Role: seed.role, CreatedAt: now, UpdatedAt: now,
 		}); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}

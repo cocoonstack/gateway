@@ -842,6 +842,7 @@ mod tests {
     use gw_config::access_key_id;
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, ModelParamV2};
+    use gw_state::{UserBudget, UserCap};
 
     use super::*;
 
@@ -2012,6 +2013,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_override_replaces_only_the_per_user_cap() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 1000}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, user_daily_cost_quota_micros: 1000000, key_daily_cost_quota_micros: 1}]\naccess_keys: [{ak: k1, tenant: t1, owner: u1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k2, tenant: t1, owner: u1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k3, tenant: t1, owner: u2, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = async |ak: &str| h.state().auth.get(&access_key_id(ak)).await.unwrap();
+        let cap = |c: UserCap| UserBudget {
+            daily_cost_quota_micros: c,
+            ..Default::default()
+        };
+        let budgets = &h.state().user_budgets;
+        budgets
+            .put("t1", "u1", cap(UserCap::Limit(1)))
+            .await
+            .unwrap();
+
+        h.run(chat_req("gpt-4o", "u1 on k1"), key("k1").await)
+            .await
+            .unwrap();
+        let err = h
+            .run(chat_req("gpt-4o", "u1 on k2"), key("k2").await)
+            .await
+            .err()
+            .expect("u1's own cap spans both keys");
+        assert!(
+            err.message
+                .contains("daily cost budget exhausted for user:t1/u1"),
+            "{}",
+            err.message
+        );
+        h.run(chat_req("gpt-4o", "u2 inherits"), key("k3").await)
+            .await
+            .unwrap();
+
+        budgets
+            .put("t1", "u1", cap(UserCap::Unlimited))
+            .await
+            .unwrap();
+        h.run(chat_req("gpt-4o", "unlimited u1"), key("k2").await)
+            .await
+            .unwrap();
+        let err = h
+            .run(chat_req("gpt-4o", "unlimited u1 again"), key("k2").await)
+            .await
+            .err()
+            .expect("unlimited leaves the key cap in force");
+        assert!(
+            err.message.contains("daily cost budget exhausted for key:"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_override_store_refuses_attributed_requests() {
+        #[derive(Debug)]
+        struct Down;
+        #[async_trait::async_trait]
+        impl gw_state::UserBudgetStore for Down {
+            async fn get(&self, _: &str, _: &str) -> GResult<Option<UserBudget>> {
+                Err(GatewayError::new(
+                    gw_consts::ErrCode::SYSTEM_ERROR,
+                    503,
+                    "down",
+                ))
+            }
+            async fn put(&self, _: &str, _: &str, _: UserBudget) -> GResult<()> {
+                unreachable!()
+            }
+            async fn delete(&self, _: &str, _: &str) -> GResult<bool> {
+                unreachable!()
+            }
+            async fn list(&self, _: &str, _: &str, _: usize) -> GResult<Vec<(String, UserBudget)>> {
+                unreachable!()
+            }
+        }
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k2, owner: u1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let mut state = GatewayState::from_config(&cfg);
+        state.user_budgets = Arc::new(Down);
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, Arc::new(state)),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let anonymous = h.state().auth.get(&access_key_id("k1")).await.unwrap();
+        h.run(chat_req("gpt-4o", "no user, no lookup"), anonymous)
+            .await
+            .unwrap();
+        let owned = h.state().auth.get(&access_key_id("k2")).await.unwrap();
+        let err = h
+            .run(chat_req("gpt-4o", "u1"), owned)
+            .await
+            .err()
+            .expect("a failed lookup fails closed");
+        assert_eq!(err.http_status, 503);
+    }
+
+    #[tokio::test]
     async fn full_pipeline_openai() {
         let h = handler();
         let ctx = h
@@ -3088,6 +3190,29 @@ mod tests {
             h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn an_ownerless_key_runs_no_batch_item_once_its_tenant_requires_owners() {
+        let base = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o-mini, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: shop}]\naccess_keys: [{ak: k-anon, tenant: shop, product: p, qps: 100, daily_token_quota: 100000}]";
+        let state = Arc::new(GatewayState::from_config(
+            &GatewayConfig::from_yaml(base).unwrap(),
+        ));
+        let flagged = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o-mini, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: shop, require_key_owner: true}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(flagged).unwrap());
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.get(&access_key_id("k-anon")).await.unwrap();
+        let job = OfflineHandler::new(h.clone())
+            .submit(key, "gpt-4o-mini".into(), vec![item("one", "")])
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(j.status, gw_state::BatchStatus::Failed);
+        assert!(j.results.is_empty(), "no item may run for an ownerless key");
     }
 
     #[tokio::test]

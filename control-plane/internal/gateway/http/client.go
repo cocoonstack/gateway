@@ -145,6 +145,31 @@ func (c *Client) DeleteKey(ctx context.Context, actingTenant, ak string) (string
 	return deleted.AKID, err
 }
 
+func (c *Client) UserBudget(ctx context.Context, tenant, userID string) (gateway.UserBudget, error) {
+	var budget gateway.UserBudget
+	err := c.doJSON(ctx, c.primary(), http.MethodGet, budgetPath(tenant, userID), nil, &budget, c.readBearer(tenant))
+	return budget, err
+}
+
+func (c *Client) SetUserBudget(ctx context.Context, actingTenant, tenant, userID string, budget gateway.UserBudget) (gateway.UserBudget, error) {
+	bearer, err := c.mutateBearer(actingTenant)
+	if err != nil {
+		return gateway.UserBudget{}, err
+	}
+	budget.User = ""
+	var stored gateway.UserBudget
+	err = c.doJSON(ctx, c.primary(), http.MethodPut, budgetPath(tenant, userID), budget, &stored, bearer)
+	return stored, err
+}
+
+func (c *Client) DeleteUserBudget(ctx context.Context, actingTenant, tenant, userID string) error {
+	bearer, err := c.mutateBearer(actingTenant)
+	if err != nil {
+		return err
+	}
+	return c.doJSON(ctx, c.primary(), http.MethodDelete, budgetPath(tenant, userID), nil, nil, bearer)
+}
+
 func (c *Client) Instances(ctx context.Context) ([]gateway.Instance, error) {
 	ch := make(chan gateway.Instance, len(c.targets))
 	for _, target := range c.targets {
@@ -325,6 +350,8 @@ func (c *Client) send(req *http.Request, output any) (err error) {
 			message = strings.TrimSpace(string(body))
 		}
 		switch resp.StatusCode {
+		case http.StatusBadRequest:
+			return fmt.Errorf("%w: %s", gateway.ErrInvalid, message)
 		case http.StatusNotFound:
 			return fmt.Errorf("%w: %s", gateway.ErrNotFound, message)
 		case http.StatusConflict:
@@ -363,6 +390,10 @@ func parseTargets(raw string) ([]Target, error) {
 		return nil, errors.New("at least one gateway target is required")
 	}
 	return targets, nil
+}
+
+func budgetPath(tenant, userID string) string {
+	return "/admin/tenants/" + url.PathEscape(tenant) + "/users/" + url.PathEscape(userID) + "/budget"
 }
 
 func scopeQuery(scope gateway.Scope) url.Values {

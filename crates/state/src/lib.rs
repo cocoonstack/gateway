@@ -16,8 +16,10 @@ use gw_models::Account;
 pub mod admission;
 pub mod alerts;
 pub mod avail;
+pub mod budgets;
 pub mod configstore;
 pub mod content;
+mod fleet_cache;
 pub mod governance;
 pub mod health;
 pub mod keystore;
@@ -28,6 +30,7 @@ pub mod thinking_signature;
 
 pub use alerts::{AlertBus, AlertEvent};
 pub use avail::{AvailState, AvailStore, classify};
+pub use budgets::{MemoryUserBudgets, PostgresUserBudgets, UserBudget, UserBudgetStore, UserCap};
 pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
 pub use content::{ContentRecord, can_seal};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
@@ -103,6 +106,10 @@ impl AkInfo {
     /// The non-empty `owner` identity when this key overrides attribution.
     pub fn owner_override(&self) -> Option<&str> {
         self.owner.as_deref().filter(|s| !s.is_empty())
+    }
+
+    pub fn lacks_required_owner(&self, cfg: &GatewayConfig) -> bool {
+        self.owner_override().is_none() && cfg.requires_owner(&self.tenant)
     }
 
     /// Apply a partial quota/lifecycle patch.
@@ -768,6 +775,8 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
 pub struct GatewayState {
     /// Live key table (admin edits survive a reload); Postgres for fleet-shared.
     pub auth: Arc<dyn KeyStore>,
+    /// Per-user budget overrides; Postgres for fleet-shared.
+    pub user_budgets: Arc<dyn UserBudgetStore>,
     pub pool: AccountPool,
     pub governance: Arc<dyn Governance>,
     /// Durable records (ledger/files/batches); sqlite/postgres when configured.
@@ -794,6 +803,7 @@ impl Default for GatewayState {
         let store: Arc<dyn Store> = Arc::new(MemoryStore::default());
         Self {
             auth: Arc::new(AkAuth::default()),
+            user_budgets: Arc::new(MemoryUserBudgets::default()),
             pool: AccountPool::default(),
             governance: Arc::new(MemoryGovernance::default()),
             store: store.clone(),
@@ -847,6 +857,8 @@ impl GatewayState {
             let ks =
                 PostgresKeyStore::connect(&st.postgres_url, st.postgres_max_connections).await?;
             ks.reload_config_keys(&cfg.access_keys).await?;
+            state.user_budgets =
+                Arc::new(PostgresUserBudgets::connect(ks.pool().clone(), &st.postgres_url).await?);
             state.auth = Arc::new(ks);
             tracing::info!("key store = postgres (config keys seeded)");
             state.store = Arc::new(
@@ -908,6 +920,7 @@ impl GatewayState {
         prev.auth.reload_config_keys(&cfg.access_keys).await?;
         Ok(Self {
             auth: prev.auth.clone(),
+            user_budgets: prev.user_budgets.clone(),
             pool: AccountPool::from_config(cfg),
             governance: prev.governance.clone(),
             store: prev.store.clone(),
@@ -1080,6 +1093,18 @@ pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
         None => url.to_owned(),
     };
     (own_url, nonce)
+}
+
+#[cfg(test)]
+pub(crate) async fn eventually(what: &str, mut ok: impl AsyncFnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !ok().await {
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{what} did not happen within 1s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(test)]

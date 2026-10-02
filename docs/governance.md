@@ -77,8 +77,8 @@ models:
 | Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
 | Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
 | Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
-| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (soft) |
-| Monthly cost | pooled per tenant / per key / per end user | `tenants[].monthly_cost_quota_micros`, `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` (UTC calendar month; soft; `monthly_cost_rollover` carries the unspent remainder) |
+| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (soft), per-user override via `/admin/tenants/{tenant}/users/{user}/budget` |
+| Monthly cost | pooled per tenant / per key / per end user | `tenants[].monthly_cost_quota_micros`, `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` (UTC calendar month; soft; `monthly_cost_rollover` carries the unspent remainder); the per-user cap takes a per-user override |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |
 | QPM | per product | `products[].qpm` |
@@ -274,6 +274,31 @@ the daily reset down to the current and previous month. Rollover costs one
 extra counter read per configured monthly scope at admission and one at
 settlement; without it the monthly check is the same single read as the daily
 one.
+**Per-user overrides.** The tenant's `user_daily_cost_quota_micros`,
+`user_monthly_cost_quota_micros` and `user_daily_token_quota` are defaults for
+every user. `PUT /admin/tenants/{tenant}/users/{user}/budget` gives one user
+their own value for any of the three: a cap, `"unlimited"`, or null to inherit
+(see [API](api.md)). The counter stays the user's, summed over all of their
+keys, so the cap holds however many keys the user has. An override replaces
+only the per-user scope; the tenant pool and per-key caps still apply, and the
+tightest cap wins. A tenant with per-key $10/day, a $50/day pool and a user at
+$5/day stops that user at $5. `"unlimited"` lifts only the per-user cap: that
+user still stops at the per-key cap and draws on the pool, and their spend
+keeps counting, so a cap set later starts from what they already spent. A
+user cap applies even when the tenant sets no per-user default, but a per-user
+counter only runs while some cap or `"unlimited"` applies to that user: set a
+tenant default (overriding the exceptions) so a cap added mid-month sees the
+month's spend. Overrides live in Postgres with `storage.postgres_url`
+(in-process, lost on restart, without it) and are cached per instance; a
+request with an attributed user costs one in-process lookup at admission,
+carried to settlement, and a request without one costs none. If that lookup
+fails (cache miss and Postgres unreachable), the request is refused with `503`
+rather than run uncapped: falling back to the tenant default would loosen a
+user capped below it. Per-user caps follow attribution, so a key without an
+`owner` lets the caller pick the user it is charged to; with
+`require_key_owner: true` a tenant refuses to create such keys, and a key
+without an owner that predates the flag is refused at authentication (`403`).
+
 Keys without a tenant take a declared `default` tenant's budgets. Reaching any
 budget raises a `budget_exhausted` alert on the webhook — subject
 `tenant:<name>`, `key:<ak_id>` or `user:<tenant>/<id>`, detail the

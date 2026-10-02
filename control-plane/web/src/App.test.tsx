@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -42,7 +42,27 @@ describe("role navigation", () => {
   });
 });
 
-function mockAPI(role: Role) {
+describe("user budgets", () => {
+  it("lets a tenant admin set a user's daily cap in dollars", async () => {
+    const users = { users: [{ id: "u-1", email: "carol@example.com", display_name: "Carol", tenant: "tenant-a", gateway_user_id: "carol", role: "member", disabled: false, created_at: 1, updated_at: 1 }] };
+    const budget = { user: "carol", daily_cost_quota_micros: null, monthly_cost_quota_micros: "unlimited", daily_token_quota: null };
+    const calls = mockAPI("tenant_admin", (path) => (path.endsWith("/budget") ? budget : path.startsWith("/api/v1/admin/users") ? users : undefined));
+    render(<MemoryRouter initialEntries={["/users"]}><App /></MemoryRouter>);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Budget" }));
+    expect(screen.queryByRole("button", { name: "Add user" })).not.toBeInTheDocument();
+    fireEvent.change(await screen.findByRole("combobox", { name: "Daily cost (USD) mode" }), { target: { value: "limit" } });
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Daily cost (USD) limit" }), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
+
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
+    const put = calls.find((c) => c.method === "PUT");
+    expect(put?.path).toBe("/api/v1/admin/users/u-1/budget");
+    expect(JSON.parse(put?.body ?? "{}")).toEqual({ daily_cost_quota_micros: 2_000_000, monthly_cost_quota_micros: "unlimited", daily_token_quota: null });
+  });
+});
+
+function mockAPI(role: Role, route: (path: string) => unknown = () => undefined) {
   const session: Session = {
     csrf_token: "csrf-test",
     user: {
@@ -57,12 +77,15 @@ function mockAPI(role: Role) {
       updated_at: 1,
     },
   };
-  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+  const calls: { method: string; path: string; body: string }[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = typeof input === "string" ? input : input.toString();
-    const body = path.startsWith("/api/v1/session") ? session : overview;
+    calls.push({ method: init?.method ?? "GET", path, body: typeof init?.body === "string" ? init.body : "" });
+    const body = path.startsWith("/api/v1/session") ? session : route(path) ?? overview;
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
   }));
+  return calls;
 }

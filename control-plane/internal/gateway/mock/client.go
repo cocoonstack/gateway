@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"slices"
@@ -20,6 +21,8 @@ import (
 
 const keyIDPrefix = "sha256:"
 
+type budgetKey struct{ tenant, user string }
+
 var _ gateway.Client = (*Client)(nil)
 
 type Client struct {
@@ -28,6 +31,7 @@ type Client struct {
 	version  int64
 	versions []gateway.ConfigVersion
 	keys     map[string]gateway.Key
+	budgets  map[budgetKey]gateway.UserBudget
 	audit    []gateway.AuditEntry
 }
 
@@ -55,6 +59,9 @@ func New() *Client {
 				AKID: paused, Product: "research", Tenant: "labs", QPS: 1,
 				DailyTokenQuota: 100_000, Banned: true, Status: "banned", Available: false,
 			},
+		},
+		budgets: map[budgetKey]gateway.UserBudget{
+			{"acme", "alice"}: {DailyCostQuotaMicros: jsontext.Value("5000000")},
 		},
 		audit: []gateway.AuditEntry{
 			{CreatedAtEpochSecs: now - 300, Actor: "global", Scope: "global", Action: "config_publish", Target: "3", SourceIP: "127.0.0.1"},
@@ -185,6 +192,37 @@ func (c *Client) DeleteKey(_ context.Context, actingTenant, ak string) (string, 
 	delete(c.keys, id)
 	c.record("key_delete", id)
 	return id, nil
+}
+
+func (c *Client) UserBudget(_ context.Context, tenant, userID string) (gateway.UserBudget, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	budget := c.budgets[budgetKey{tenant, userID}]
+	budget.User = userID
+	return budget, nil
+}
+
+func (c *Client) SetUserBudget(_ context.Context, actingTenant, tenant, userID string, budget gateway.UserBudget) (gateway.UserBudget, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if actingTenant != "" && tenant != actingTenant {
+		return gateway.UserBudget{}, fmt.Errorf("tenant %s: %w", tenant, gateway.ErrNotFound)
+	}
+	c.budgets[budgetKey{tenant, userID}] = budget
+	c.record("user_budget_put", tenant+"/"+userID)
+	budget.User = userID
+	return budget, nil
+}
+
+func (c *Client) DeleteUserBudget(_ context.Context, actingTenant, tenant, userID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if actingTenant != "" && tenant != actingTenant {
+		return fmt.Errorf("tenant %s: %w", tenant, gateway.ErrNotFound)
+	}
+	delete(c.budgets, budgetKey{tenant, userID})
+	c.record("user_budget_delete", tenant+"/"+userID)
+	return nil
 }
 
 func (c *Client) Instances(context.Context) ([]gateway.Instance, error) {

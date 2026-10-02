@@ -160,9 +160,10 @@ td strong { color: #334640; font-weight: 650; }
 .modal-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 22px; }
 .modal-head .icon-button { color: #61706c; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 17px; }
-.form-grid label, .login-panel label { display: flex; flex-direction: column; gap: 7px; color: #61706c; font-size: 10px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+.form-grid label, .login-panel label, .cap-field legend { display: flex; flex-direction: column; gap: 7px; color: #61706c; font-size: 10px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
 .form-grid input, .form-grid select, .login-panel input { font-size: 12px; text-transform: none; }
-.form-grid .notice, .form-actions { grid-column: 1 / -1; }
+.form-grid .notice, .form-actions, .form-grid .cell-sub { grid-column: 1 / -1; }
+.cap-field { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 0; border: 0; }
 .form-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 5px; }
 
 .tab-list { display: flex; gap: 3px; padding: 3px; border: 1px solid #d8dfd8; border-radius: 9px; background: #fff; }

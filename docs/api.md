@@ -373,9 +373,13 @@ regardless.
 | GET | `/admin/config/versions` | retained config versions, newest first (the store keeps the newest 20); `?limit=` (default 20) (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/versions/{id}/rollback` | republish a retained document as a new head and reload (global token; needs `storage.postgres_url`) |
 | GET | `/admin/keys` | list keys by `ak_id` (never the key itself) with computed `status` / `available`, `?offset=&limit=` paged (default 200, every listing caps `limit` at 10 000; a tenant token sees only its own tenant's); `?owner=` keeps one owner's keys, filtered before paging (empty is 400); `?ak=` exact lookup (the key or its `ak_id`) answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
-| POST | `/admin/keys` | create/replace a key: `{ak?, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution); answers `{ak_id, status}`. Without `ak` the gateway generates the key and returns it once as `ak`; `ak` may also be an existing `ak_id` to replace that key's settings |
+| POST | `/admin/keys` | create/replace a key: `{ak?, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution; a tenant with `require_key_owner` refuses a key without one, 400); answers `{ak_id, status}`. Without `ak` the gateway generates the key and returns it once as `ak`; `ak` may also be an existing `ak_id` to replace that key's settings |
 | PATCH | `/admin/keys/{ak}` | `{ak}` is the `ak_id` (preferred: a raw key in a URL reaches access logs) or the key; update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` / `suspended_until_epoch_secs` (null lifts an abuse suspension early); a tenant token may set `banned: true` but can neither lift a ban nor touch `suspended_until_epoch_secs` (403) |
 | DELETE | `/admin/keys/{ak}` | revoke a key (`{ak}` as for PATCH) |
+| PUT | `/admin/tenants/{tenant}/users/{user}/budget` | set one end user's own caps: `{daily_cost_quota_micros?, monthly_cost_quota_micros?, daily_token_quota?}`, each a non-negative integer, `"unlimited"`, or absent/null to inherit the tenant's per-user default; replaces the user's previous override (an all-inherit body drops it); answers the stored override; a tenant token reaches only its own tenant (another or an unknown tenant is 404) |
+| GET | `/admin/tenants/{tenant}/users/{user}/budget` | the user's override; all-null when the user has none (404 means only an unknown or foreign tenant) |
+| DELETE | `/admin/tenants/{tenant}/users/{user}/budget` | drop the override, idempotent; the user is back on the tenant defaults |
+| GET | `/admin/tenants/{tenant}/users` | the tenant's overrides by user id, `?after=&limit=` keyset-paged (default 200); `next` is the following page's `after`, null on the last page |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 (operator-only margin basis) |
 | GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; `?tenant=` filter for the global token; tenant-scoped (vendor cost redacted like `/admin/usage/users`), maximum 400 points |
@@ -402,8 +406,8 @@ A terminal row reports the request outcome only; optional prompt/response rows
 remain best-effort and may be absent.
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a
-tenant's `admin_token_env` token manages only that tenant's keys, usage, and
-content-safety events, scoped to its own tenant (cross-tenant keys answer 404;
+tenant's `admin_token_env` token manages only that tenant's keys, user budget
+overrides, usage, and content-safety events, scoped to its own tenant (cross-tenant keys answer 404;
 reload, config-publish, and the cross-tenant `/admin/audit/ops` trail answer
 403).
 
@@ -421,5 +425,7 @@ any instance publishing via `PUT /admin/config`.
 Keys have their own lifecycle: the config file's `access_keys` are the boot
 baseline and are re-applied on every reload, while keys created via
 `/admin/keys` survive reloads. With `storage.postgres_url` set the key table is
-fleet-shared and persistent — a key created on one instance is valid on all
-within ~2s and survives restarts.
+fleet-shared and persistent — a key created, changed, or revoked on one
+instance is live on all in under a second (each write NOTIFYs every instance to
+drop its cached copy) and survives restarts. User budget overrides share the
+same mechanism.

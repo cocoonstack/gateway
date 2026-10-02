@@ -84,8 +84,8 @@ paths:
         "200": {description: Instance states, content: {application/json: {schema: {type: object}}}}
   /admin/users:
     get:
-      summary: List control-plane identities
-      x-role: system_admin
+      summary: List control-plane identities; a tenant admin sees only its own tenant's
+      x-role: tenant_admin_or_system_admin
       responses:
         "200": {description: Users, content: {application/json: {schema: {type: object}}}}
     post:
@@ -105,6 +105,35 @@ paths:
         content: {application/json: {schema: {type: object}}}
       responses:
         "200": {description: Updated user, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}
+  /admin/users/{id}/budget:
+    get:
+      summary: A tenant user's gateway budget override; all-null when the user inherits the tenant defaults
+      x-role: tenant_admin_or_system_admin
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+      responses:
+        "200": {description: Budget, content: {application/json: {schema: {$ref: "#/components/schemas/UserBudget"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+    put:
+      summary: Replace a tenant user's gateway budget override
+      x-role: tenant_admin_or_system_admin
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/UserBudget"}}}
+      responses:
+        "200": {description: Stored budget, content: {application/json: {schema: {$ref: "#/components/schemas/UserBudget"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+    delete:
+      summary: Drop the override; the user is back on the tenant defaults
+      x-role: tenant_admin_or_system_admin
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+      responses:
+        "204": {description: Removed}
+        "404": {$ref: "#/components/responses/Error"}
   /admin/keys:
     get:
       summary: List live gateway access-key lifecycle state
@@ -279,6 +308,19 @@ components:
         banned: {type: boolean}
         status: {type: string, enum: [active, banned, expired, suspended]}
         available: {type: boolean}
+    UserBudget:
+      type: object
+      description: "Each cap is a non-negative integer, \"unlimited\", or null to inherit the tenant's per-user default"
+      properties:
+        user: {type: string, readOnly: true, description: "The gateway identity the caps apply to"}
+        daily_cost_quota_micros: {$ref: "#/components/schemas/Cap"}
+        monthly_cost_quota_micros: {$ref: "#/components/schemas/Cap"}
+        daily_token_quota: {$ref: "#/components/schemas/Cap"}
+    Cap:
+      oneOf:
+        - {type: integer, format: int64, minimum: 0}
+        - {type: string, enum: [unlimited]}
+        - {type: "null"}
     ConfigDocument:
       type: object
       required: [version, yaml]

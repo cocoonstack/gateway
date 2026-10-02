@@ -42,6 +42,8 @@ pub enum ConfigError {
     EmptyName { kind: &'static str },
     #[error("access key `{ak}` references undeclared tenant `{tenant}`")]
     UnknownTenant { ak: String, tenant: String },
+    #[error("access key `{ak}` has no owner, which tenant `{tenant}` requires")]
+    KeyWithoutOwner { ak: String, tenant: String },
     #[error("access key `{ak}` references unknown mcp server `{server}`")]
     UnknownMcpServer { ak: String, server: String },
     #[error("mcp server `{server}`: {reason}")]
@@ -674,6 +676,9 @@ pub struct TenantConf {
     /// Carry the previous month's unspent monthly budget into the current month, at most one month's cap.
     #[serde(default)]
     pub monthly_cost_rollover: bool,
+    /// Refuse keys without an `owner`, so per-user caps cannot be sidestepped.
+    #[serde(default)]
+    pub require_key_owner: bool,
     /// Content-safety policy for this tenant; `None` = use the global `security:`.
     #[serde(default)]
     pub security: Option<SecurityConf>,
@@ -1203,6 +1208,17 @@ impl GatewayConfig {
                     tenant: k.tenant.clone(),
                 });
             }
+            if k.owner.as_deref().is_none_or(str::is_empty)
+                && self
+                    .tenants
+                    .iter()
+                    .any(|t| t.name == k.tenant && t.require_key_owner)
+            {
+                return Err(ConfigError::KeyWithoutOwner {
+                    ak: k.id(),
+                    tenant: k.tenant.clone(),
+                });
+            }
         }
         for t in &self.tenants {
             for m in t.models.iter().flatten() {
@@ -1256,6 +1272,12 @@ impl GatewayConfig {
     /// also works during `validate()`, before the indices are built.
     pub fn is_known_tenant(&self, name: &str) -> bool {
         name == DEFAULT_TENANT || self.tenants.iter().any(|t| t.name == name)
+    }
+
+    /// Whether `tenant` refuses keys without an owner.
+    pub fn requires_owner(&self, tenant: &str) -> bool {
+        self.find_tenant(tenant)
+            .is_some_and(|t| t.require_key_owner)
     }
 
     fn model_exists(&self, name: &str) -> bool {
@@ -1955,6 +1977,18 @@ access_keys: [{ak: k1, tenant: ghost, product: p, qps: 1, daily_token_quota: 10}
             GatewayConfig::from_yaml(undeclared),
             Err(ConfigError::UnknownTenant { .. })
         ));
+
+        let ownerless = r#"
+listen: {host: h, port: 1}
+tenants: [{name: t1, require_key_owner: true}]
+access_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 10}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(ownerless),
+            Err(ConfigError::KeyWithoutOwner { .. })
+        ));
+        let owned = ownerless.replace("tenant: t1,", "tenant: t1, owner: u1,");
+        assert!(GatewayConfig::from_yaml(&owned).is_ok());
 
         let bad_model = r#"
 listen: {host: h, port: 1}

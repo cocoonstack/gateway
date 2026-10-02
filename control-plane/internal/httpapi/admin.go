@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -36,6 +37,9 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		mapError(r.Context(), w, err)
 		return
+	}
+	if p := current(r); p.User.Role == user.RoleTenantAdmin {
+		users = slices.DeleteFunc(users, func(u user.User) bool { return u.Tenant != p.User.Tenant })
 	}
 	for idx := range users {
 		users[idx] = publicUser(users[idx])
@@ -188,6 +192,50 @@ func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) getUserBudget(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.budgetSubject(w, r)
+	if !ok {
+		return
+	}
+	budget, err := s.gateway.UserBudget(r.Context(), u.Tenant, gatewayUserID(u))
+	if err != nil {
+		mapError(r.Context(), w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, budget)
+}
+
+func (s *Server) putUserBudget(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.budgetSubject(w, r)
+	if !ok {
+		return
+	}
+	var budget gateway.UserBudget
+	if !decodeJSON(w, r, maxJSONBody, &budget) {
+		return
+	}
+	stored, err := s.gateway.SetUserBudget(r.Context(), actingTenant(current(r)), u.Tenant, gatewayUserID(u), budget)
+	if err != nil {
+		mapError(r.Context(), w, err)
+		return
+	}
+	s.auditLog(r, "user_budget_put", u.ID)
+	writeJSON(w, http.StatusOK, stored)
+}
+
+func (s *Server) deleteUserBudget(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.budgetSubject(w, r)
+	if !ok {
+		return
+	}
+	if err := s.gateway.DeleteUserBudget(r.Context(), actingTenant(current(r)), u.Tenant, gatewayUserID(u)); err != nil {
+		mapError(r.Context(), w, err)
+		return
+	}
+	s.auditLog(r, "user_budget_delete", u.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	doc, err := s.gateway.Config(r.Context())
 	if err != nil {
@@ -274,6 +322,20 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+// budgetSubject is the tenant user a budget route names; a tenant admin reaches only its own tenant.
+func (s *Server) budgetSubject(w http.ResponseWriter, r *http.Request) (user.User, bool) {
+	u, err := s.users.ByID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		mapError(r.Context(), w, err)
+		return user.User{}, false
+	}
+	if p := current(r); u.Tenant == "" || (p.User.Role == user.RoleTenantAdmin && u.Tenant != p.User.Tenant) {
+		writeError(w, http.StatusNotFound, "user not found")
+		return user.User{}, false
+	}
+	return u, true
 }
 
 func writeUserSaveError(w http.ResponseWriter, err error) {

@@ -12,6 +12,15 @@ export interface User {
   updated_at: number;
 }
 
+export type Cap = number | "unlimited" | null;
+
+export interface UserBudget {
+  user: string;
+  daily_cost_quota_micros: Cap;
+  monthly_cost_quota_micros: Cap;
+  daily_token_quota: Cap;
+}
+
 export interface Session {
   user: User;
   csrf_token: string;
