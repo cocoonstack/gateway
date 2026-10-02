@@ -44,7 +44,7 @@ const navItems: NavItem[] = [
   { to: "/availability", label: "Availability", icon: "◉", minRole: "member", page: <AvailabilityPage /> },
   { to: "/keys", label: "Access keys", icon: "⌘", minRole: "tenant_admin", page: <KeysPage /> },
   { to: "/audit", label: "Audit", icon: "≣", minRole: "tenant_admin", page: <AuditPage /> },
-  { to: "/users", label: "Users & roles", icon: "♙", minRole: "system_admin", page: <UsersPage /> },
+  { to: "/users", label: "Users & roles", icon: "♙", minRole: "tenant_admin", page: <UsersPage /> },
   { to: "/configuration", label: "Configuration", icon: "⌗", minRole: "system_admin", page: <ConfigPage /> },
 ];
 

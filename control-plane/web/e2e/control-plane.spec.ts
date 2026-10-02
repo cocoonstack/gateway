@@ -53,6 +53,31 @@ test("a generated key is shown once and listed only by its id", async ({ page })
   await expect(page.getByText(key)).toHaveCount(0);
 });
 
+test("a tenant admin edits a user's budget and sees only its tenant", async ({ page }) => {
+  await page.goto("/");
+  await signIn(page, "manager@example.com", "manager123!");
+
+  await page.getByRole("link", { name: "Users & roles" }).click();
+  await expect(page.getByText("alice", { exact: true })).toBeVisible();
+  await expect(page.getByText("admin@example.com")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Add user" })).toHaveCount(0);
+
+  const aliceBudget = page.getByRole("row", { name: /Alice Chen/ }).getByRole("button", { name: "Budget" });
+  await aliceBudget.click();
+  await expect(page.getByRole("spinbutton", { name: "Daily cost (USD) limit" })).toHaveValue("5");
+  await page.getByRole("combobox", { name: "Monthly cost (USD) mode" }).selectOption("limit");
+  await page.getByRole("spinbutton", { name: "Monthly cost (USD) limit" }).fill("40");
+  await page.getByRole("button", { name: "Save budget" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  await aliceBudget.click();
+  await expect(page.getByRole("spinbutton", { name: "Monthly cost (USD) limit" })).toHaveValue("40");
+  await page.getByRole("button", { name: "Reset to tenant defaults" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await aliceBudget.click();
+  await expect(page.getByRole("combobox", { name: "Daily cost (USD) mode" })).toHaveValue("inherit");
+});
+
 test("failed login shows an error and grants nothing", async ({ page }) => {
   await page.goto("/");
   await page.getByLabel("Email").fill("admin@example.com");

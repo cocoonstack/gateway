@@ -10,19 +10,19 @@ keys, audit data and configuration all cross the Rust gateway admin HTTP API.
 | Role | Scope | UI and API access |
 | --- | --- | --- |
 | `member` | One gateway tenant and user ID | Own usage, charges and model availability |
-| `tenant_admin` | One gateway tenant | Tenant usage, key lifecycle and security events |
-| `system_admin` | Global | Fleet economics, instances/accounts, users, keys, audit and configuration |
+| `tenant_admin` | One gateway tenant | Tenant usage, key lifecycle, security events, and the tenant's users with their gateway budgets |
+| `system_admin` | Global | Fleet economics, instances/accounts, users and their budgets, keys, audit and configuration |
 
 The Go service derives tenant/user filters from the authenticated session. It
 never trusts browser-supplied scope for a member or tenant administrator, and it
 removes vendor cost from non-system responses.
 
-Tenant boundaries on key mutations are enforced by the **gateway**, not this
+Tenant boundaries on key and budget mutations are enforced by the **gateway**, not this
 process: when a tenant administrator acts, the control plane authenticates with
 that tenant's scoped gateway admin token (`CP_GATEWAY_TENANT_TOKENS`, matching
 the gateway's per-tenant `admin_token_env`), so the gateway's own
 `AdminScope` checks draw the line atomically. Mutations fail closed — a tenant
-admin without a configured tenant token cannot mutate keys at all. The gateway
+admin without a configured tenant token cannot mutate keys or budgets at all. The gateway
 additionally redacts vendor cost for tenant-scoped tokens server-side.
 
 Every request carries an `X-Request-ID` (caller-supplied or generated): it is

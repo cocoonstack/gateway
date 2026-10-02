@@ -116,6 +116,51 @@ func TestTenantAdminCannotHijackForeignKeyViaCreate(t *testing.T) {
 	}
 }
 
+func TestTenantAdminManagesBudgetsOfItsOwnTenantUsers(t *testing.T) {
+	handler := testServer(t)
+	manager := loginAs(t, handler, "manager@example.com")
+
+	rec := request(t, handler, manager, http.MethodGet, "/api/v1/admin/users", nil, false)
+	if rec.Code != http.StatusOK || bytes.Contains(rec.Body.Bytes(), []byte("admin@example.com")) {
+		t.Fatalf("tenant admin user list = %d, want only its tenant; body = %s", rec.Code, rec.Body.String())
+	}
+
+	set := map[string]any{"daily_cost_quota_micros": 2_000_000, "monthly_cost_quota_micros": "unlimited"}
+	rec = request(t, handler, manager, http.MethodPut, "/api/v1/admin/users/member/budget", set, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put budget = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	want := `{"user":"alice","daily_cost_quota_micros":2000000,"monthly_cost_quota_micros":"unlimited","daily_token_quota":null}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Fatalf("put budget body = %s, want %s", got, want)
+	}
+	rec = request(t, handler, manager, http.MethodGet, "/api/v1/admin/users/member/budget", nil, false)
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Fatalf("get budget body = %s, want %s", got, want)
+	}
+
+	rec = request(t, handler, manager, http.MethodPut, "/api/v1/admin/users/admin/budget", set, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("budget for a user outside the tenant = %d, want 404", rec.Code)
+	}
+
+	rec = request(t, handler, manager, http.MethodDelete, "/api/v1/admin/users/member/budget", nil, true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete budget = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = request(t, handler, manager, http.MethodGet, "/api/v1/admin/users/member/budget", nil, false)
+	inherit := `{"user":"alice","daily_cost_quota_micros":null,"monthly_cost_quota_micros":null,"daily_token_quota":null}`
+	if got := strings.TrimSpace(rec.Body.String()); got != inherit {
+		t.Fatalf("budget after delete = %s, want %s", got, inherit)
+	}
+
+	member := loginAs(t, handler, "user@example.com")
+	rec = request(t, handler, member, http.MethodGet, "/api/v1/admin/users/member/budget", nil, false)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("member reading budgets = %d, want 403", rec.Code)
+	}
+}
+
 func TestKeyCreateReturnsAGeneratedKeyOnceAndListsOnlyIDs(t *testing.T) {
 	handler := testServer(t)
 	manager := loginAs(t, handler, "manager@example.com")

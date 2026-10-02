@@ -72,6 +72,7 @@ func TestSchemasMirrorGoTypes(t *testing.T) {
 		{"User", user.User{}},
 		{"UserCreate", userCreate{}},
 		{"AccessKey", gateway.Key{}},
+		{"UserBudget", gateway.UserBudget{}},
 	} {
 		t.Run(tt.schema, func(t *testing.T) {
 			properties, required := schemaFields(t, spec, tt.schema)

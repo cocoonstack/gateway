@@ -3,12 +3,14 @@ package gateway
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"errors"
 )
 
 var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("conflict")
+	ErrInvalid  = errors.New("invalid request")
 )
 
 type UsageRow struct {
@@ -76,6 +78,14 @@ type CreatedKey struct {
 	AK   string `json:"ak,omitempty"`
 }
 
+// UserBudget is one user's caps inside a tenant; the gateway validates each cap.
+type UserBudget struct {
+	User                   string         `json:"user,omitempty"`
+	DailyCostQuotaMicros   jsontext.Value `json:"daily_cost_quota_micros"`
+	MonthlyCostQuotaMicros jsontext.Value `json:"monthly_cost_quota_micros"`
+	DailyTokenQuota        jsontext.Value `json:"daily_token_quota"`
+}
+
 type Account struct {
 	Name      string   `json:"name"`
 	Provider  string   `json:"provider"`
@@ -139,6 +149,9 @@ type Client interface {
 	CreateKey(ctx context.Context, actingTenant string, key Key) (CreatedKey, error)
 	PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (Key, error)
 	DeleteKey(ctx context.Context, actingTenant, ak string) (string, error)
+	UserBudget(ctx context.Context, tenant, userID string) (UserBudget, error)
+	SetUserBudget(ctx context.Context, actingTenant, tenant, userID string, budget UserBudget) (UserBudget, error)
+	DeleteUserBudget(ctx context.Context, actingTenant, tenant, userID string) error
 	Instances(ctx context.Context) ([]Instance, error)
 	Config(ctx context.Context) (ConfigDocument, error)
 	ValidateConfig(ctx context.Context, yaml string) (map[string]any, error)

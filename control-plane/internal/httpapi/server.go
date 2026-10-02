@@ -85,9 +85,12 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/usage/series", s.requireAuth(http.HandlerFunc(s.usageSeries)))
 	mux.Handle("GET /api/v1/models/status", s.requireAuth(http.HandlerFunc(s.models)))
 	mux.Handle("GET /api/v1/admin/instances", s.requireSystem(http.HandlerFunc(s.instances)))
-	mux.Handle("GET /api/v1/admin/users", s.requireSystem(http.HandlerFunc(s.listUsers)))
+	mux.Handle("GET /api/v1/admin/users", s.requireAdmin(http.HandlerFunc(s.listUsers)))
 	mux.Handle("POST /api/v1/admin/users", s.requireSystem(http.HandlerFunc(s.createUser)))
 	mux.Handle("PATCH /api/v1/admin/users/{id}", s.requireSystem(http.HandlerFunc(s.patchUser)))
+	mux.Handle("GET /api/v1/admin/users/{id}/budget", s.requireAdmin(http.HandlerFunc(s.getUserBudget)))
+	mux.Handle("PUT /api/v1/admin/users/{id}/budget", s.requireAdmin(http.HandlerFunc(s.putUserBudget)))
+	mux.Handle("DELETE /api/v1/admin/users/{id}/budget", s.requireAdmin(http.HandlerFunc(s.deleteUserBudget)))
 	mux.Handle("GET /api/v1/admin/keys", s.requireAdmin(http.HandlerFunc(s.listKeys)))
 	mux.Handle("POST /api/v1/admin/keys", s.requireAdmin(http.HandlerFunc(s.createKey)))
 	mux.Handle("PATCH /api/v1/admin/keys/{ak}", s.requireAdmin(http.HandlerFunc(s.patchKey)))
@@ -238,8 +241,13 @@ func scopeFor(u user.User) gateway.Scope {
 	case user.RoleTenantAdmin:
 		return gateway.Scope{Tenant: u.Tenant}
 	default:
-		return gateway.Scope{Tenant: u.Tenant, User: cmp.Or(u.GatewayUserID, u.ID)}
+		return gateway.Scope{Tenant: u.Tenant, User: gatewayUserID(u)}
 	}
+}
+
+// gatewayUserID is the identity the gateway attributes and budgets the user under.
+func gatewayUserID(u user.User) string {
+	return cmp.Or(u.GatewayUserID, u.ID)
 }
 
 func scopedTenant(p principal, requested string) string {
@@ -338,6 +346,8 @@ func mapError(ctx context.Context, w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, user.ErrConflict), errors.Is(err, gateway.ErrConflict):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, gateway.ErrInvalid):
+		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		log.WithFunc("httpapi.mapError").Errorf(ctx, err, "request failed rid=%s", gateway.RequestIDFrom(ctx))
 		writeError(w, http.StatusBadGateway, err.Error())
