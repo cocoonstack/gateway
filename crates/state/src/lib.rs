@@ -18,6 +18,7 @@ pub mod alerts;
 pub mod avail;
 pub mod configstore;
 pub mod content;
+mod fleet_cache;
 pub mod governance;
 pub mod health;
 pub mod keystore;
@@ -1080,6 +1081,18 @@ pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
         None => url.to_owned(),
     };
     (own_url, nonce)
+}
+
+#[cfg(test)]
+pub(crate) async fn eventually(what: &str, mut ok: impl AsyncFnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !ok().await {
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{what} did not happen within 1s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(test)]
