@@ -3983,22 +3983,31 @@ async fn run_family(
     messages: Vec<ChatMsg>,
     user_id: Option<String>,
 ) -> Result<DagContext, Response> {
+    let request = family_request(s, model, mt, typed, messages, user_id)?;
+    run_pipeline(s, request, ak).await.map_err(gateway_error)
+}
+
+#[allow(clippy::result_large_err)]
+fn family_request(
+    s: &AppState,
+    model: String,
+    mt: gw_consts::Protocol,
+    typed: TypedParams,
+    messages: Vec<ChatMsg>,
+    user_id: Option<String>,
+) -> Result<GatewayRequest, Response> {
     if let Some(refusal) = wrong_surface(s, &model, mt) {
         return Err(refusal);
     }
     let mut param = ModelParamV2::with_name(mt, model);
     param.typed = Some(typed);
-    let request = GatewayRequest {
+    Ok(GatewayRequest {
         is_online: true,
         message: messages,
         model_param_v2: Some(param),
         user_id,
         ..Default::default()
-    };
-    match run_pipeline(s, request, ak).await {
-        Ok(ctx) => Ok(ctx),
-        Err(e) => Err(gateway_error(e)),
-    }
+    })
 }
 
 /// The shared tail of the message-less typed-param families: pipeline, access log, native payload.
@@ -4421,51 +4430,52 @@ async fn videos_generations(
         image: body.get_mut("image").map(Value::take),
     });
     let user = user_hint(hint, &body["user"]);
-    let mut ctx = match run_family(
-        &s,
-        ak,
-        model,
-        gw_consts::Protocol::Video,
-        typed,
-        vec![],
-        user,
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
+    let request = match family_request(&s, model, gw_consts::Protocol::Video, typed, vec![], user) {
+        Ok(request) => request,
         Err(resp) => return resp,
     };
-    log_access("videos", &ctx, started);
-    let outcome = ctx.outcome.take();
-    // async iff a handle and no delivered video: a sync Kling reply carries a task_id too
-    let handle = outcome
-        .as_ref()
-        .filter(|o| o.response.message.is_empty())
-        .and_then(|o| gw_engines::families::video_handle(o.response.response_v2.as_ref()?));
-    if let Some(id) = handle {
-        let param = ctx.request.model_param_v2.as_ref();
-        let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-        let job = VideoJob {
-            id: id.to_owned(),
-            tenant: ctx.ak.tenant.clone(),
-            ak: String::from(&*ctx.ak.ak_id),
-            product: ctx.ak.product.clone(),
-            user_id: ctx.effective_user_id().to_owned(),
-            model: param
-                .and_then(|p| p.fallback_from.as_deref())
-                .unwrap_or(served)
-                .to_owned(),
-            served_model: served.to_owned(),
-            account: ctx.request.account_name().to_owned(),
-            unit_price_micros: ctx.cfg.unit_price_for_tenant(&ctx.ak.tenant, served),
-            created_at_epoch_secs: gw_state::epoch_secs(),
+    match tokio::spawn(async move {
+        let mut ctx = match s.handler.run(request, ak).await {
+            Ok(ctx) => ctx,
+            Err(e) => return gateway_error(e),
         };
-        if let Err(e) = s.handler.state().store.video_job_put(job).await {
-            tracing::error!(error = %e, video = %id, "video job not stored; the vendor's clip is orphaned");
-            return gateway_error(e);
+        log_access("videos", &ctx, started);
+        let outcome = ctx.outcome.take();
+        // async iff a handle and no delivered video: a sync Kling reply carries a task_id too
+        let handle = outcome
+            .as_ref()
+            .filter(|o| o.response.message.is_empty())
+            .and_then(|o| gw_engines::families::video_handle(o.response.response_v2.as_ref()?));
+        if let Some(id) = handle {
+            let param = ctx.request.model_param_v2.as_ref();
+            let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+            let job = VideoJob {
+                id: id.to_owned(),
+                tenant: ctx.ak.tenant.clone(),
+                ak: String::from(&*ctx.ak.ak_id),
+                product: ctx.ak.product.clone(),
+                user_id: ctx.effective_user_id().to_owned(),
+                model: param
+                    .and_then(|p| p.fallback_from.as_deref())
+                    .unwrap_or(served)
+                    .to_owned(),
+                served_model: served.to_owned(),
+                account: ctx.request.account_name().to_owned(),
+                unit_price_micros: ctx.cfg.unit_price_for_tenant(&ctx.ak.tenant, served),
+                created_at_epoch_secs: gw_state::epoch_secs(),
+            };
+            if let Err(e) = s.handler.state().store.video_job_put(job).await {
+                tracing::error!(error = %e, video = %id, "video job not stored; the vendor's clip is orphaned");
+                return gateway_error(e);
+            }
         }
+        terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
+    })
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => gateway_error(GatewayError::internal(format!("video submit task failed: {e}"))),
     }
-    terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
 }
 
 /// The shared head of both video read routes: spend the caller's rate limits,
@@ -4473,7 +4483,7 @@ async fn videos_generations(
 #[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
 async fn admit_video_job(
     s: &AppState,
-    ak: &AkInfo,
+    ak: Arc<AkInfo>,
     id: &str,
 ) -> Result<
     (
@@ -4486,7 +4496,7 @@ async fn admit_video_job(
     let state = s.handler.state();
     let cfg = s.handler.cfg();
     let gov = state.governance.as_ref();
-    if let Err(denied) = admission::check_request_rates(gov, &cfg, ak).await {
+    if let Err(denied) = admission::check_request_rates(gov, &cfg, &ak).await {
         return Err(error_response(429, denied));
     }
     let found = state.store.video_job_get(id).await;
@@ -4497,81 +4507,74 @@ async fn admit_video_job(
             format!("account {} is no longer configured", job.account),
         ));
     };
-    let poll = poll_and_settle_video(s, ak, &job, &account).await?;
-    Ok((job, account, poll))
-}
-
-#[allow(clippy::result_large_err)] // once per request; boxing would noise every call site
-async fn poll_and_settle_video(
-    s: &AppState,
-    poller: &AkInfo,
-    job: &VideoJob,
-    account: &Arc<gw_models::Account>,
-) -> Result<gw_engines::families::VideoPoll, Response> {
-    let state = s.handler.state();
-    let cfg = s.handler.cfg();
-    let poll = gw_engines::families::video_poll(s.handler.transport.as_ref(), account, &job.id)
+    let poll = gw_engines::families::video_poll(s.handler.transport.as_ref(), &account, &job.id)
         .await
         .map_err(gateway_error)?;
-    // fail closed: an unclaimable settle errors out so the client's retry re-attempts the
-    // billing; a done without billable units leaves the claim for a later, complete poll
-    let claimed = if poll.done && (poll.units > 0 || poll.vendor_cost.is_some()) {
-        state
+    if !poll.done || (poll.units <= 0 && poll.vendor_cost.is_none()) {
+        return Ok((job, account, poll));
+    }
+    match tokio::spawn(async move {
+        let claimed = state
             .store
             .video_job_settle(&job.id)
             .await
-            .map_err(gateway_error)?
-    } else {
-        false
-    };
-    if claimed {
-        let ak_id = gw_config::resolve_access_key_id(&job.ak);
-        let settled = admission::settle_and_bill(
-            &state,
-            &cfg,
-            admission::SettleInput {
-                billing: gw_state::BillingInput {
-                    ak: &ak_id,
-                    product: &job.product,
-                    tenant: &job.tenant,
-                    user_id: &job.user_id,
-                    request_id: &job.id,
-                    requested_model: &job.model,
-                    served_model: &job.served_model,
-                    protocol: gw_consts::Protocol::Video.as_str(),
-                    account: &job.account,
-                    prompt: 0,
-                    completion: 0,
-                    billable_prompt: 0,
-                    billable_completion: 0,
-                    total: 0,
-                    units: poll.units,
-                    discount: 1.0,
-                    ptu_spillover: false,
-                    estimated: false,
-                    vendor_cost: poll.vendor_cost,
-                    unit_price: Some(job.unit_price_micros),
+            .map_err(gateway_error)?;
+        if claimed {
+            let ak_id = gw_config::resolve_access_key_id(&job.ak);
+            let settled = admission::settle_and_bill(
+                &state,
+                &cfg,
+                admission::SettleInput {
+                    billing: gw_state::BillingInput {
+                        ak: &ak_id,
+                        product: &job.product,
+                        tenant: &job.tenant,
+                        user_id: &job.user_id,
+                        request_id: &job.id,
+                        requested_model: &job.model,
+                        served_model: &job.served_model,
+                        protocol: gw_consts::Protocol::Video.as_str(),
+                        account: &job.account,
+                        prompt: 0,
+                        completion: 0,
+                        billable_prompt: 0,
+                        billable_completion: 0,
+                        total: 0,
+                        units: poll.units,
+                        discount: 1.0,
+                        ptu_spillover: false,
+                        estimated: false,
+                        vendor_cost: poll.vendor_cost,
+                        unit_price: Some(job.unit_price_micros),
+                    },
+                    reserved: 0,
+                    tpm_reserved: None,
+                    reserved_at: gw_state::epoch_secs(),
+                    model_quota_key: None,
                 },
-                reserved: 0,
-                tpm_reserved: None,
-                reserved_at: gw_state::epoch_secs(),
-                model_quota_key: None,
-            },
-        )
-        .await;
-        let submitter = state.auth.get(&ak_id).await;
-        admission::consume_budgets(
-            &state,
-            &cfg,
-            submitter.as_deref().unwrap_or(poller),
-            &job.user_id,
-            None,
-            settled.total_tokens,
-            settled.cost_micros,
-        )
-        .await;
+            )
+            .await;
+            let submitter = state.auth.get(&ak_id).await;
+            admission::consume_budgets(
+                &state,
+                &cfg,
+                submitter.as_deref().unwrap_or(&ak),
+                &job.user_id,
+                None,
+                settled.total_tokens,
+                settled.cost_micros,
+            )
+            .await;
+        }
+        Ok((job, account, poll))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(gateway_error(GatewayError::internal(format!(
+            "video settle task failed: {e}"
+        )))),
     }
-    Ok(poll)
 }
 
 /// GET /v1/videos/{id} — the vendor's poll, proxied; the first `done` bills the poll's billable units.
@@ -4580,7 +4583,7 @@ async fn videos_get(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    match admit_video_job(&s, &ak, &id).await {
+    match admit_video_job(&s, ak, &id).await {
         Ok((_, _, poll)) => (
             StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
             Json(poll.body),
@@ -4597,7 +4600,7 @@ async fn videos_content(
     Authed(ak): Authed,
     Path(id): Path<String>,
 ) -> Response {
-    let (job, account, poll) = match admit_video_job(&s, &ak, &id).await {
+    let (job, account, poll) = match admit_video_job(&s, ak, &id).await {
         Ok(admitted) => admitted,
         Err(resp) => return resp,
     };
