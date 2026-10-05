@@ -55,6 +55,19 @@ async fn request_span_exports_route_pipeline_fields_and_the_caller_context() {
         .expect("request");
     let resp = app.clone().oneshot(chat).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let video = Request::builder()
+        .method("POST")
+        .uri("/v1/videos/generations")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer ak-demo-123")
+        .body(Body::from(
+            r#"{"model":"grok-imagine-video","prompt":"a cat","duration":2}"#,
+        ))
+        .expect("request");
+    assert_eq!(
+        app.clone().oneshot(video).await.unwrap().status(),
+        StatusCode::OK
+    );
     let miss = Request::builder()
         .uri("/v1/nothing")
         .header("authorization", "Bearer ak-demo-123")
@@ -92,6 +105,18 @@ async fn request_span_exports_route_pipeline_fields_and_the_caller_context() {
         "0af7651916cd43dd8448eb211c80319c"
     );
     assert_eq!(chat.parent_span_id.to_string(), "b7ad6b7169203331");
+    let video = spans
+        .iter()
+        .find(|s| s.name == "/v1/videos/generations")
+        .unwrap_or_else(|| panic!("video span missing in {names:?}"));
+    let a = attrs(video);
+    assert_eq!(a.get("gw.surface").map(String::as_str), Some("videos"));
+    assert_eq!(a["gw.model"], "grok-imagine-video");
+    assert!(
+        a["gw.request_id"].starts_with("req-"),
+        "{}",
+        a["gw.request_id"]
+    );
     let miss = spans
         .iter()
         .find(|s| s.name == "GET")
