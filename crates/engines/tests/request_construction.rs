@@ -177,7 +177,7 @@ async fn messages_tool_choice_preserves_parallel_policy_on_openai_wires() {
 }
 
 #[tokio::test]
-async fn native_system_blocks_never_reach_an_openai_wire() {
+async fn native_system_blocks_stay_inside_the_openai_wire_shapes() {
     for (protocol, reply) in [
         (Protocol::OpenaiChat, OPENAI_OK),
         (Protocol::Responses, RESPONSES_OK),
@@ -205,7 +205,8 @@ async fn native_system_blocks_never_reach_an_openai_wire() {
         if protocol == Protocol::OpenaiChat {
             assert_eq!(
                 b["messages"][0],
-                serde_json::json!({"role": "system", "content": "You are terse."})
+                serde_json::json!({"role": "system", "content": [{"type": "text",
+                "text": "You are terse.", "cache_control": {"type": "ephemeral"}}]})
             );
         } else {
             assert_eq!(b["instructions"], "You are terse.");
@@ -2049,6 +2050,36 @@ async fn converse_parallel_tool_calls_follow_the_model_family() {
         assert!(b.get("parallel_tool_calls").is_none());
         assert!(b.get("tool_choice").is_none());
     }
+}
+
+#[tokio::test]
+async fn tool_result_cache_control_survives_the_openai_wire() {
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4.1-mini");
+    let mut tool_turn = ChatMsg::text("assistant", String::new());
+    tool_turn.parts = Some(serde_json::json!([
+        {"type":"tool_use","id":"toolu_1","name":"now","input":{}}
+    ]));
+    let mut results = ChatMsg::text("user", String::new());
+    results.parts = Some(serde_json::json!([
+        {"type":"tool_result","tool_use_id":"toolu_1","content":"12:00"},
+        {"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"13:00"}],
+         "cache_control":{"type":"ephemeral","ttl":"1h"}}
+    ]));
+    req.message.extend([tool_turn, results]);
+    OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    let messages = b["messages"].as_array().unwrap();
+    let n = messages.len();
+    assert_eq!(
+        messages[n - 2],
+        serde_json::json!({"role":"tool","tool_call_id":"toolu_1","content":"12:00"})
+    );
+    assert_eq!(
+        messages[n - 1],
+        serde_json::json!({"role":"tool","tool_call_id":"toolu_2","content":[{"type":"text",
+            "text":"13:00","cache_control":{"type":"ephemeral","ttl":"1h"}}]})
+    );
 }
 
 #[tokio::test]

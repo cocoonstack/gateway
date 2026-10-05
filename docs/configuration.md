@@ -164,7 +164,12 @@ cache-read rate; it is per model and off by default because a long one-shot
 prompt would pay the cache-write premium for nothing. A `/v1/messages` client
 that sends `system` as blocks with its own `cache_control` (including
 `ttl: 1h`) keeps them as sent; the gateway only marks the last system block
-when that block carries no breakpoint of its own. `variants` splits a
+when that block carries no breakpoint of its own. On an openai-chat model
+the client's own breakpoints on system blocks, message blocks and
+`tool_result` ride through as OpenAI content parts, which OpenRouter honors
+for Anthropic models; a breakpoint on a tool definition does not (Gemini's
+compatible endpoint rejects the field), and a later breakpoint covers the
+tools anyway. `variants` splits a
 public name across other declared same-protocol models (one level):
 entitlement and the per-(AK, model) daily counter judge the public name,
 billing prices the served variant, and the response echoes the requested

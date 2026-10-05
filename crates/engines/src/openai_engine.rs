@@ -113,7 +113,10 @@ impl OpenAiEngine {
                 // a cross-protocol (anthropic→openai) request carries its system outside messages
                 let mut system = Map::with_capacity(2);
                 system.insert("role".into(), "system".into());
-                system.insert("content".into(), Value::String(s));
+                system.insert(
+                    "content".into(),
+                    p.system_blocks.unwrap_or(Value::String(s)),
+                );
                 if let Some(Value::Array(msgs)) = body.get_mut("messages") {
                     msgs.insert(0, Value::Object(system));
                 }
@@ -495,10 +498,18 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
                 Value::Array(blocks) => gw_protocol::anthropic::blocks_text(&blocks),
                 _ => String::new(),
             };
+            let content = match part.get_mut("cache_control").map(Value::take) {
+                Some(cache_control) => Value::Array(vec![object([
+                    ("type", "text".into()),
+                    ("text", text.into()),
+                    ("cache_control", cache_control),
+                ])]),
+                None => Value::String(text),
+            };
             let mut result = Map::with_capacity(3);
             result.insert("role".into(), "tool".into());
             result.insert("tool_call_id".into(), part["tool_use_id"].take());
-            result.insert("content".into(), Value::String(text));
+            result.insert("content".into(), content);
             out.push(Value::Object(result));
         }
     }
