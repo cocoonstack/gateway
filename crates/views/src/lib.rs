@@ -4434,43 +4434,46 @@ async fn videos_generations(
         Ok(request) => request,
         Err(resp) => return resp,
     };
-    match tokio::spawn(async move {
-        let mut ctx = match s.handler.run(request, ak).await {
-            Ok(ctx) => ctx,
-            Err(e) => return gateway_error(e),
-        };
-        log_access("videos", &ctx, started);
-        let outcome = ctx.outcome.take();
-        // async iff a handle and no delivered video: a sync Kling reply carries a task_id too
-        let handle = outcome
-            .as_ref()
-            .filter(|o| o.response.message.is_empty())
-            .and_then(|o| gw_engines::families::video_handle(o.response.response_v2.as_ref()?));
-        if let Some(id) = handle {
-            let param = ctx.request.model_param_v2.as_ref();
-            let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-            let job = VideoJob {
-                id: id.to_owned(),
-                tenant: ctx.ak.tenant.clone(),
-                ak: String::from(&*ctx.ak.ak_id),
-                product: ctx.ak.product.clone(),
-                user_id: ctx.effective_user_id().to_owned(),
-                model: param
-                    .and_then(|p| p.fallback_from.as_deref())
-                    .unwrap_or(served)
-                    .to_owned(),
-                served_model: served.to_owned(),
-                account: ctx.request.account_name().to_owned(),
-                unit_price_micros: ctx.cfg.unit_price_for_tenant(&ctx.ak.tenant, served),
-                created_at_epoch_secs: gw_state::epoch_secs(),
+    match tokio::spawn(
+        async move {
+            let mut ctx = match s.handler.run(request, ak).await {
+                Ok(ctx) => ctx,
+                Err(e) => return gateway_error(e),
             };
-            if let Err(e) = s.handler.state().store.video_job_put(job).await {
-                tracing::error!(error = %e, video = %id, "video job not stored; the vendor's clip is orphaned");
-                return gateway_error(e);
+            log_access("videos", &ctx, started);
+            let outcome = ctx.outcome.take();
+            // async iff a handle and no delivered video: a sync Kling reply carries a task_id too
+            let handle = outcome
+                .as_ref()
+                .filter(|o| o.response.message.is_empty())
+                .and_then(|o| gw_engines::families::video_handle(o.response.response_v2.as_ref()?));
+            if let Some(id) = handle {
+                let param = ctx.request.model_param_v2.as_ref();
+                let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+                let job = VideoJob {
+                    id: id.to_owned(),
+                    tenant: ctx.ak.tenant.clone(),
+                    ak: String::from(&*ctx.ak.ak_id),
+                    product: ctx.ak.product.clone(),
+                    user_id: ctx.effective_user_id().to_owned(),
+                    model: param
+                        .and_then(|p| p.fallback_from.as_deref())
+                        .unwrap_or(served)
+                        .to_owned(),
+                    served_model: served.to_owned(),
+                    account: ctx.request.account_name().to_owned(),
+                    unit_price_micros: ctx.cfg.unit_price_for_tenant(&ctx.ak.tenant, served),
+                    created_at_epoch_secs: gw_state::epoch_secs(),
+                };
+                if let Err(e) = s.handler.state().store.video_job_put(job).await {
+                    tracing::error!(error = %e, video = %id, "video job not stored; the vendor's clip is orphaned");
+                    return gateway_error(e);
+                }
             }
+            terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
         }
-        terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
-    })
+        .in_current_span(),
+    )
     .await
     {
         Ok(resp) => resp,
@@ -4513,61 +4516,64 @@ async fn admit_video_job(
     if !poll.done || (poll.units <= 0 && poll.vendor_cost.is_none()) {
         return Ok((job, account, poll));
     }
-    match tokio::spawn(async move {
-        let claimed = state
-            .store
-            .video_job_settle(&job.id)
-            .await
-            .map_err(gateway_error)?;
-        if claimed {
-            let ak_id = gw_config::resolve_access_key_id(&job.ak);
-            let settled = admission::settle_and_bill(
-                &state,
-                &cfg,
-                admission::SettleInput {
-                    billing: gw_state::BillingInput {
-                        ak: &ak_id,
-                        product: &job.product,
-                        tenant: &job.tenant,
-                        user_id: &job.user_id,
-                        request_id: &job.id,
-                        requested_model: &job.model,
-                        served_model: &job.served_model,
-                        protocol: gw_consts::Protocol::Video.as_str(),
-                        account: &job.account,
-                        prompt: 0,
-                        completion: 0,
-                        billable_prompt: 0,
-                        billable_completion: 0,
-                        total: 0,
-                        units: poll.units,
-                        discount: 1.0,
-                        ptu_spillover: false,
-                        estimated: false,
-                        vendor_cost: poll.vendor_cost,
-                        unit_price: Some(job.unit_price_micros),
+    match tokio::spawn(
+        async move {
+            let claimed = state
+                .store
+                .video_job_settle(&job.id)
+                .await
+                .map_err(gateway_error)?;
+            if claimed {
+                let ak_id = gw_config::resolve_access_key_id(&job.ak);
+                let settled = admission::settle_and_bill(
+                    &state,
+                    &cfg,
+                    admission::SettleInput {
+                        billing: gw_state::BillingInput {
+                            ak: &ak_id,
+                            product: &job.product,
+                            tenant: &job.tenant,
+                            user_id: &job.user_id,
+                            request_id: &job.id,
+                            requested_model: &job.model,
+                            served_model: &job.served_model,
+                            protocol: gw_consts::Protocol::Video.as_str(),
+                            account: &job.account,
+                            prompt: 0,
+                            completion: 0,
+                            billable_prompt: 0,
+                            billable_completion: 0,
+                            total: 0,
+                            units: poll.units,
+                            discount: 1.0,
+                            ptu_spillover: false,
+                            estimated: false,
+                            vendor_cost: poll.vendor_cost,
+                            unit_price: Some(job.unit_price_micros),
+                        },
+                        reserved: 0,
+                        tpm_reserved: None,
+                        reserved_at: gw_state::epoch_secs(),
+                        model_quota_key: None,
                     },
-                    reserved: 0,
-                    tpm_reserved: None,
-                    reserved_at: gw_state::epoch_secs(),
-                    model_quota_key: None,
-                },
-            )
-            .await;
-            let submitter = state.auth.get(&ak_id).await;
-            admission::consume_budgets(
-                &state,
-                &cfg,
-                submitter.as_deref().unwrap_or(&ak),
-                &job.user_id,
-                None,
-                settled.total_tokens,
-                settled.cost_micros,
-            )
-            .await;
+                )
+                .await;
+                let submitter = state.auth.get(&ak_id).await;
+                admission::consume_budgets(
+                    &state,
+                    &cfg,
+                    submitter.as_deref().unwrap_or(&ak),
+                    &job.user_id,
+                    None,
+                    settled.total_tokens,
+                    settled.cost_micros,
+                )
+                .await;
+            }
+            Ok((job, account, poll))
         }
-        Ok((job, account, poll))
-    })
+        .in_current_span(),
+    )
     .await
     {
         Ok(result) => result,
