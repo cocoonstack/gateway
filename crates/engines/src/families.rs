@@ -388,7 +388,6 @@ fn decode_b64(payload: &str, what: &str) -> GResult<Vec<u8>> {
 pub enum AudioKind {
     Tts,
     Stt,
-    Other,
 }
 
 pub struct AudioEngine {
@@ -477,16 +476,6 @@ impl ModelEngine for AudioEngine {
                 let (ext, content_type) = audio_kind(&audio);
                 form.file("file", &format!("audio.{ext}"), content_type, &audio);
                 self.base.post_form(path, form).await?
-            }
-            AudioKind::Other => {
-                let mut b = json!({"model": model});
-                b["raw"] = self.base.take_raw();
-                self.base
-                    .round_trip(
-                        &self.base.openai_url("mock://api.openai.com", "audio/other"),
-                        b,
-                    )
-                    .await?
             }
         };
         let message = match self.kind {
@@ -1132,30 +1121,6 @@ impl ModelEngine for DecisionsEngine {
         out.response.total_tokens = input.saturating_add(output);
         out.response.raw_usage = raw_usage;
         Ok(out)
-    }
-}
-
-base_engine!(PassthroughEngine);
-
-#[async_trait::async_trait]
-impl ModelEngine for PassthroughEngine {
-    /// Dedicated integration surfaces: request body passed through as-is,
-    /// placeholder protocol (byte-level alignment deferred).
-    async fn run(&mut self) -> GResult<EngineOutcome> {
-        let model = self.base.model_name()?.to_owned();
-        // the arbitrary vendor blob moves — json! would re-copy it whole
-        let mut body = json!({"model": model});
-        body["payload"] = self.base.take_raw();
-        let (status, v) = self
-            .base
-            .round_trip(&self.base.vendor_url("passthrough"), body)
-            .await?;
-        let message = if v["ok"].as_bool().unwrap_or(false) {
-            "ok"
-        } else {
-            "error"
-        };
-        Ok(family_outcome(message.to_owned(), model, v, status))
     }
 }
 
@@ -2089,9 +2054,6 @@ mod tests {
         );
         let out = s.run().await.unwrap();
         assert!(out.response.message.contains("result 1 for rust dag"));
-
-        let mut p = PassthroughEngine::new(req(Protocol::Passthrough, "e2b", None), t());
-        assert_eq!(p.run().await.unwrap().response.message, "ok");
     }
 
     #[tokio::test]

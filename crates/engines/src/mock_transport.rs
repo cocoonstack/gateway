@@ -633,12 +633,8 @@ impl MockTransport {
             return Self::ok_json(json!({"text": "[mock-stt] translated audio"}));
         }
         let body = Self::parse(&req.body, "audio")?;
-        if req.url.ends_with("/audio/speech") {
-            let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
-            Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
-        } else {
-            Self::ok_json(json!({"audio_b64": MOCK_B64, "kind": "audio-other"}))
-        }
+        let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
+        Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
     }
 
     /// Async hosts answer a handle on submit; a poll's state is spelled by the
@@ -817,11 +813,6 @@ impl MockTransport {
         Self::ok_json(json!({"query": q, "results": results}))
     }
 
-    fn passthrough_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        Self::ok_json(json!({"ok": true, "protocol": req.protocol.as_str(), "echo": body}))
-    }
-
     /// Legacy text-completions reply (the `.../completions` endpoint):
     /// `choices[].text` (not chat's message.content), usage same as openai.
     fn completions_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
@@ -950,8 +941,6 @@ impl Transport for MockTransport {
         } else if u.contains("/v1/completions") {
             // `/v1/chat/completions` does NOT contain `/v1/completions` — legacy endpoint only
             self.completions_reply(&req)
-        } else if u.contains("/passthrough") {
-            self.passthrough_reply(&req)
         } else {
             self.openai_reply(&req)
         }

@@ -11,8 +11,7 @@ use crate::claude_engine::ClaudeEngine;
 use crate::engine::ModelEngine;
 use crate::families::{
     AudioEngine, AudioKind, CompletionsEngine, DecisionsEngine, EmbeddingsEngine, ImageEngine,
-    ModerationsEngine, PassthroughEngine, RerankEngine, ResponsesEngine, SearchEngine,
-    VertexEngine, VideoEngine,
+    ModerationsEngine, RerankEngine, ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
 };
 use crate::openai_engine::OpenAiEngine;
 use crate::transport::SharedTransport;
@@ -37,13 +36,11 @@ pub fn get_engine(
         Protocol::Image => Box::new(ImageEngine::new(request, transport)),
         Protocol::Tts => Box::new(AudioEngine::new(request, transport, AudioKind::Tts)),
         Protocol::Stt => Box::new(AudioEngine::new(request, transport, AudioKind::Stt)),
-        Protocol::Audio => Box::new(AudioEngine::new(request, transport, AudioKind::Other)),
         Protocol::Video => Box::new(VideoEngine::new(request, transport)),
         Protocol::Search => Box::new(SearchEngine::new(request, transport)),
         Protocol::Moderations => Box::new(ModerationsEngine::new(request, transport)),
         Protocol::Rerank => Box::new(RerankEngine::new(request, transport)),
         Protocol::Decisions => Box::new(DecisionsEngine::new(request, transport)),
-        Protocol::Passthrough => Box::new(PassthroughEngine::new(request, transport)),
         Protocol::Ernie => Box::new(ErnieEngine::new(request, transport)),
         Protocol::MinimaxV1 => Box::new(MinimaxV1Engine::new(request, transport)),
         Protocol::AwsEmbed => Box::new(AwsEmbedEngine::new(request, transport)),

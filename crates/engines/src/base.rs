@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::transport::{Headers, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
-/// The offline base of the generic vendor families (search, rerank, video, passthrough).
+/// The offline base of the generic vendor families (search, rerank, video).
 pub const VENDOR_SENTINEL: &str = "mock://api.vendor.com";
 
 pub(crate) struct Base {
@@ -79,7 +79,7 @@ impl Base {
     }
 
     /// `{base}/v1/{path}` for the generic vendor families (search, rerank,
-    /// video, passthrough) — the mock sentinel is theirs to share.
+    /// video) — the mock sentinel is theirs to share.
     pub fn vendor_url(&self, path: &str) -> String {
         self.openai_url(VENDOR_SENTINEL, path)
     }
