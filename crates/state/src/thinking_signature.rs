@@ -239,6 +239,8 @@ impl ThinkingSignatureAudit {
             });
         if matched {
             ReviewVerdict::Match
+        } else if entry.fingerprints.len() >= MAX_ANCHOR_FINGERPRINTS {
+            ReviewVerdict::Miss
         } else {
             ReviewVerdict::Mismatch
         }
@@ -1031,6 +1033,15 @@ mod tests {
         assert_eq!(first, ReviewVerdict::Match);
         assert_eq!(second, ReviewVerdict::Match);
         assert_eq!(tampered, ReviewVerdict::Mismatch);
+
+        for later in ["sig-3", "sig-4", "sig-5"] {
+            remember(&audit, "key-a", "claude", "", later, "call_1");
+        }
+        let (_, evicted) = audit.review_request(
+            &continuation("claude", "", "sig-first", "call_1", "call_1"),
+            "key-a",
+        );
+        assert_eq!(evicted, ReviewVerdict::Miss);
     }
 
     #[test]
