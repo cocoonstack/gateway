@@ -593,10 +593,10 @@ impl MockTransport {
     /// Decisions reply: a typed answer per question, the first choice option
     /// picked, input billed at one micro-dollar a token in `usage.cost`.
     fn decisions_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body = Self::parse(&req.body, "decisions")?;
+        let mut body = Self::parse(&req.body, "decisions")?;
         let mut answers = serde_json::Map::new();
-        if let Some(questions) = body["questions"].as_object() {
-            for (name, q) in questions {
+        if let Value::Object(questions) = body["questions"].take() {
+            for (name, mut q) in questions {
                 let answer = match q["type"].as_str().unwrap_or_default() {
                     "choice" => {
                         let pick = q["criteria"]
@@ -606,20 +606,36 @@ impl MockTransport {
                         json!({"type": "choice", "choice": pick, "confidence": 1.0,
                                "probabilities": {pick: 1.0}})
                     }
-                    "score" => json!({"type": "score", "score": 0.0, "confidence": 1.0}),
+                    "score" => {
+                        let mut legend = serde_json::Map::new();
+                        let mut probabilities = serde_json::Map::new();
+                        if let Value::Array(criteria) = q["criteria"].take() {
+                            for (index, level) in criteria.into_iter().enumerate() {
+                                let key = index.to_string();
+                                legend.insert(key.clone(), level);
+                                probabilities
+                                    .insert(key, if index == 0 { 1.0 } else { 0.0 }.into());
+                            }
+                        }
+                        let mut answer = json!({"type": "score", "score": 0.0, "confidence": 1.0});
+                        answer["legend"] = legend.into();
+                        answer["probabilities"] = probabilities.into();
+                        answer
+                    }
                     _ => json!({"type": "noul", "noul": 0.5}),
                 };
-                answers.insert(name.clone(), answer);
+                answers.insert(name, answer);
             }
         }
         let input = Self::tokens(&String::from_utf8_lossy(&req.body));
-        Self::ok_json(json!({
+        let mut reply = json!({
             "id": "gen-dec-mock",
-            "model": body["model"],
             "provider": "mock",
-            "answers": answers,
             "usage": {"input_tokens": input, "output_tokens": 0, "cost": input as f64 / 1e6},
-        }))
+        });
+        reply["model"] = body["model"].take();
+        reply["answers"] = answers.into();
+        Self::ok_json(reply)
     }
 
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {

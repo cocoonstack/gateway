@@ -1,5 +1,7 @@
 //! The default node set for the online chat pipeline.
 
+use std::io::{self, Write};
+
 use gw_consts::{ErrCode, Protocol};
 use gw_models::{GResult, GatewayError};
 use gw_state::admission;
@@ -242,18 +244,22 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
 /// Cheap admission estimate: ~chars/4 prompt heuristic + requested max_tokens,
 /// saturating and capped so caller-controlled input can't wrap the counters.
 fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
-    let prompt: usize = req.message.iter().map(|m| m.content.len()).sum();
-    let max_out = req
-        .model_param_v2
-        .as_ref()
-        .and_then(|p| p.typed.as_ref())
+    let typed = req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref());
+    let prompt = if let Some(gw_models::TypedParams::Decisions(p)) = typed {
+        let mut bytes = PromptBytes(0);
+        let _ = serde_json::to_writer(&mut bytes, &p.fields);
+        bytes.0
+    } else {
+        req.message.iter().map(|m| m.content.len()).sum()
+    };
+    let max_out = typed
         .and_then(|t| match t {
             gw_models::TypedParams::Chat(c) => c.max_tokens,
             _ => None,
         })
         .unwrap_or(DEFAULT_COMPLETION_RESERVE)
         .clamp(0, MAX_RESERVE);
-    ((prompt as i64 / 4).max(1))
+    (((prompt / 4).min(MAX_RESERVE as usize) as i64).max(1))
         .saturating_add(max_out)
         .min(MAX_RESERVE)
 }
@@ -995,6 +1001,19 @@ pub fn default_layers() -> Vec<Layer> {
             ],
         },
     ]
+}
+
+struct PromptBytes(usize);
+
+impl Write for PromptBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {

@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -13,6 +14,7 @@ use gw_engines::transport::{
 };
 use gw_state::GatewayState;
 use serde_json::{Value, json};
+use tokio::sync::{Notify, Semaphore};
 use tower::ServiceExt;
 
 mod common;
@@ -54,6 +56,8 @@ const UPSTREAM_REPLY: &str = r#"{
 #[derive(Debug, Default)]
 struct OpenRouter {
     seen: Mutex<Vec<UpstreamRequest>>,
+    started: Notify,
+    release: Option<Semaphore>,
 }
 
 impl OpenRouter {
@@ -82,6 +86,10 @@ impl OpenRouter {
 impl Transport for OpenRouter {
     async fn send(&self, req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
         self.seen.lock().unwrap().push(req);
+        if let Some(release) = &self.release {
+            self.started.notify_one();
+            release.acquire().await.unwrap().forget();
+        }
         Ok(UpstreamResponse {
             status: 200,
             body: UpstreamBody::Json(bytes::Bytes::from_static(UPSTREAM_REPLY.as_bytes())),
@@ -271,15 +279,88 @@ async fn an_endpoint_less_decisions_account_answers_from_the_mock() {
         .oneshot(post(
             "/v1/decisions",
             Some("k"),
-            &json!({"model": "jev", "state": "x", "questions": {"q": {"type": "noul", "instructions": "y?"}}})
-                .to_string(),
+            &json!({"model": "jev", "state": "x", "questions": {
+                "q": {"type": "noul", "instructions": "y?"},
+                "score": {"type": "score", "instructions": "How urgent?",
+                          "criteria": ["Low", {"severity": "Medium"}, ["High"]]}
+            }})
+            .to_string(),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let got = body_json(resp).await;
     assert_eq!(got["answers"]["q"]["type"], "noul");
+    assert_eq!(
+        got["answers"]["score"],
+        json!({
+            "type": "score", "score": 0.0, "confidence": 1.0,
+            "legend": {"0": "Low", "1": {"severity": "Medium"}, "2": ["High"]},
+            "probabilities": {"0": 1.0, "1": 0.0, "2": 0.0}
+        })
+    );
     let rows = state.store.ledger_snapshot(10).await.unwrap().1;
     assert_eq!(rows[0].cost_micros, rows[0].vendor_cost_micros);
     assert!(rows[0].cost_micros > 0, "{:?}", rows[0]);
+}
+
+#[tokio::test]
+async fn large_decisions_reserve_daily_quota_and_tpm_while_in_flight() {
+    for uri in ["/v1/decisions", "/v1/systemone"] {
+        for field in ["state", "questions"] {
+            for (daily, tpm, status) in [
+                (1024, None, StatusCode::BAD_REQUEST),
+                (1_000_000, Some(1024), StatusCode::TOO_MANY_REQUESTS),
+            ] {
+                let mut cfg = GatewayConfig::from_yaml(
+                    &CONFIG.replace(", user_daily_cost_quota_micros: 20", ""),
+                )
+                .unwrap();
+                cfg.access_keys[0].daily_token_quota = daily;
+                cfg.access_keys[0].tokens_per_minute = tpm;
+                let state = Arc::new(GatewayState::from_config(&cfg));
+                let vendor = Arc::new(OpenRouter {
+                    release: Some(Semaphore::new(0)),
+                    ..Default::default()
+                });
+                let app = gw_views::app(gw_views::AppState::new(
+                    Arc::new(cfg),
+                    state.clone(),
+                    vendor.clone(),
+                ));
+                let mut body: Value = serde_json::from_str(DECISION).unwrap();
+                if field == "state" {
+                    body["state"] = json!({"tree": [{"text": "word ".repeat(4096)}]});
+                } else {
+                    body["questions"]["save"]["instructions"] =
+                        json!({"context": ["word ".repeat(4096)]});
+                }
+                let body = body.to_string();
+                let first = tokio::spawn(app.clone().oneshot(post(uri, Some("ak-box"), &body)));
+                tokio::time::timeout(Duration::from_secs(2), vendor.started.notified())
+                    .await
+                    .expect("first request reached the upstream");
+                let second = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    app.oneshot(post(uri, Some("ak-box"), &body)),
+                )
+                .await;
+                vendor.release.as_ref().unwrap().add_permits(2);
+                assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+                let response = second
+                    .expect("second request must be refused before the upstream")
+                    .unwrap();
+                assert_eq!(response.status(), status, "{uri} {field} {tpm:?}");
+                assert_eq!(vendor.calls(), 1);
+                assert_eq!(state.store.ledger_snapshot(10).await.unwrap().0, 1);
+                assert_eq!(
+                    state
+                        .governance
+                        .quota_used(&gw_config::access_key_id("ak-box"))
+                        .await,
+                    546
+                );
+            }
+        }
+    }
 }
