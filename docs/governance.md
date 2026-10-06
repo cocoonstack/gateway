@@ -211,7 +211,9 @@ models:
 
 `security.dlp_redact` redacts emails and phone numbers from inbound content
 (chat messages, the Responses body, and the family typed params) and from the
-outbound message; `security.blocklist` rejects requests containing listed terms
+outbound message — it guards against accidental leaks and matches within each
+text field, so a value a client cuts across two content parts or spells out is
+not caught; `security.blocklist` rejects requests containing listed terms
 with a `content_filter` finish (not billed).
 
 ```yaml
