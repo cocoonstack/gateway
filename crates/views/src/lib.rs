@@ -657,7 +657,7 @@ async fn bill_realtime_turn(
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak_id, &m.requested));
-    let settled = admission::settle_and_bill(
+    admission::settle_and_bill(
         state,
         cfg,
         admission::SettleInput {
@@ -687,17 +687,9 @@ async fn bill_realtime_turn(
             tpm_reserved: admit.tpm_reserved,
             reserved_at: admit.at,
             model_quota_key,
+            budget_ak: ak,
+            user_budget: admit.user_budget,
         },
-    )
-    .await;
-    admission::consume_budgets(
-        state,
-        cfg,
-        ak,
-        admit.user.as_str(),
-        admit.user_budget,
-        total,
-        settled.cost_micros,
     )
     .await;
     if !estimated {
@@ -4583,7 +4575,8 @@ async fn admit_video_job(
                 .map_err(gateway_error)?;
             if claimed {
                 let ak_id = gw_config::resolve_access_key_id(&job.ak);
-                let settled = admission::settle_and_bill(
+                let submitter = state.auth.get(&ak_id).await;
+                admission::settle_and_bill(
                     &state,
                     &cfg,
                     admission::SettleInput {
@@ -4613,18 +4606,9 @@ async fn admit_video_job(
                         tpm_reserved: None,
                         reserved_at: gw_state::epoch_secs(),
                         model_quota_key: None,
+                        budget_ak: submitter.as_deref().unwrap_or(&ak),
+                        user_budget: None,
                     },
-                )
-                .await;
-                let submitter = state.auth.get(&ak_id).await;
-                admission::consume_budgets(
-                    &state,
-                    &cfg,
-                    submitter.as_deref().unwrap_or(&ak),
-                    &job.user_id,
-                    None,
-                    settled.total_tokens,
-                    settled.cost_micros,
                 )
                 .await;
             }

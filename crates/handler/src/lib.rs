@@ -259,8 +259,8 @@ impl OnlineHandler {
         let mut tried = 0;
         let mut throttled = 0;
         loop {
-            ctx.fallback_ahead = !ctx.request.replays_reasoning_output()
-                && next_fallback(&snap.cfg, &ctx, tried).is_some();
+            ctx.fallback_ahead = next_fallback(&snap.cfg, &ctx, tried).is_some()
+                && !ctx.request.replays_reasoning_output();
             // a panicking node must refund too; the refund reads only whole-written ctx fields
             let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
                 .catch_unwind()

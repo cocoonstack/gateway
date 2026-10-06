@@ -50,6 +50,9 @@ pub struct SettleInput<'a> {
     pub reserved_at: i64,
     /// Per-(AK, model) counter to accrue; `None` = no cap configured.
     pub model_quota_key: Option<String>,
+    /// The key whose budgets the call charges, and the user override admission resolved.
+    pub budget_ak: &'a AkInfo,
+    pub user_budget: Option<UserBudget>,
 }
 
 /// One budget: its window, governance counter and cap.
@@ -302,19 +305,21 @@ pub async fn check_budgets(
 ) -> GResult<Result<UserBudget, String>> {
     let over = user_budget(state, ak, user).await?;
     let gov = state.governance.as_ref();
-    for b in budgets(gov, cfg, ak, user, over).await {
-        let under = match b.window {
+    let budgets = budgets(gov, cfg, ak, user, over).await;
+    let under = futures::future::join_all(budgets.iter().map(|b| async move {
+        match b.window {
             Window::Day => gov.quota_check(&b.key, b.limit).await,
             Window::Month => gov.counter_get(&b.key).await < b.limit,
-        };
-        if !under {
-            return Ok(Err(format!(
-                "{} {} budget exhausted for {}",
-                b.window.label(),
-                b.scope.unit(),
-                b.scope.subject(ak, user)
-            )));
         }
+    }))
+    .await;
+    if let Some((b, _)) = budgets.iter().zip(under).find(|(_, under)| !under) {
+        return Ok(Err(format!(
+            "{} {} budget exhausted for {}",
+            b.window.label(),
+            b.scope.unit(),
+            b.scope.subject(ak, user)
+        )));
     }
     Ok(Ok(over))
 }
@@ -341,20 +346,26 @@ pub async fn consume_budgets(
         }),
     };
     let gov = state.governance.as_ref();
-    for b in budgets(gov, cfg, ak, user, over).await {
+    let budgets = budgets(gov, cfg, ak, user, over).await;
+    let used = futures::future::join_all(budgets.iter().map(|b| async move {
         let amount = if b.scope.charges_cost() {
             cost_micros
         } else {
             tokens
         };
         if amount <= 0 {
-            continue;
+            return None;
         }
-        let used = match b.window {
+        Some(match b.window {
             Window::Day => gov.quota_consume(&b.key, amount).await,
             Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
-        };
-        if used >= b.limit {
+        })
+    }))
+    .await;
+    for (b, used) in budgets.iter().zip(used) {
+        if let Some(used) = used
+            && used >= b.limit
+        {
             state.alerts.emit(
                 "budget_exhausted",
                 b.scope.subject(ak, user),
@@ -512,7 +523,7 @@ pub async fn reserve_tpm(
     }
 }
 
-/// What a settled request cost, for the budgets and the decision trail.
+/// What a settled request cost, for the decision trail.
 pub struct Settled {
     pub total_tokens: i64,
     pub cost_micros: i64,
@@ -545,8 +556,23 @@ pub async fn settle_and_bill(
                 .await;
         }
     };
+    let charge_budgets = consume_budgets(
+        state,
+        cfg,
+        s.budget_ak,
+        s.billing.user_id,
+        s.user_budget,
+        settled.total_tokens,
+        settled.cost_micros,
+    );
     let write_ledger = state.billing.write(record);
-    tokio::join!(settle_daily, consume_model, settle_tpm, write_ledger);
+    tokio::join!(
+        settle_daily,
+        consume_model,
+        settle_tpm,
+        charge_budgets,
+        write_ledger
+    );
     settled
 }
 
@@ -604,11 +630,10 @@ async fn budgets(
         (KeyCost, Month, tv(|t| t.key_monthly_cost_quota_micros)),
         (UserCost, Month, user_month),
     ];
-    let rollover = t.is_some_and(|t| t.monthly_cost_rollover);
     let month = civil_month(crate::epoch_secs());
     let mut out = Vec::new();
     for (scope, window, limit) in scopes {
-        let Some(mut limit) = limit else {
+        let Some(limit) = limit else {
             continue;
         };
         if scope.is_per_user() && user.is_empty() {
@@ -618,18 +643,27 @@ async fn budgets(
             Window::Day => scope.key(None, ak, user),
             Window::Month => scope.key(Some(month), ak, user),
         };
-        if window == Window::Month && rollover {
-            let spent = gov
-                .counter_get(&scope.key(Some(previous_month(month)), ak, user))
-                .await;
-            limit = limit.saturating_add((limit - spent).clamp(0, limit));
-        }
         out.push(Budget {
             scope,
             window,
             key,
             limit,
         });
+    }
+    if t.is_some_and(|t| t.monthly_cost_rollover) {
+        let months = out.iter().filter(|b| b.window == Window::Month);
+        let spent = futures::future::join_all(months.map(|b| {
+            let key = b.scope.key(Some(previous_month(month)), ak, user);
+            async move { gov.counter_get(&key).await }
+        }))
+        .await;
+        for (b, spent) in out
+            .iter_mut()
+            .filter(|b| b.window == Window::Month)
+            .zip(spent)
+        {
+            b.limit = b.limit.saturating_add((b.limit - spent).clamp(0, b.limit));
+        }
     }
     out
 }

@@ -898,17 +898,9 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
             tpm_reserved,
             reserved_at: ctx.quota_at,
             model_quota_key,
+            budget_ak: &ctx.ak,
+            user_budget: ctx.user_budget,
         },
-    )
-    .await;
-    admission::consume_budgets(
-        ctx.state.as_ref(),
-        &ctx.cfg,
-        &ctx.ak,
-        ctx.effective_user_id(),
-        ctx.user_budget,
-        settled.total_tokens,
-        settled.cost_micros,
     )
     .await;
     ctx.decide(
