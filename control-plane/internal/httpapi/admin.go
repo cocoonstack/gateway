@@ -252,7 +252,7 @@ func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.gateway.ValidateConfig(r.Context(), body.YAML)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		mapError(r.Context(), w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

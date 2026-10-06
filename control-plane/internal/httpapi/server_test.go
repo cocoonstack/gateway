@@ -68,6 +68,16 @@ func TestSystemAdminConfigAndInstances(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("validate status = %d, body = %s", rec.Code, rec.Body.String())
 	}
+	invalid := map[string]string{"yaml": "nope: true\n"}
+	for _, route := range []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/admin/config/validate"},
+		{http.MethodPut, "/api/v1/admin/config"},
+	} {
+		rec = request(t, handler, admin, route.method, route.path, invalid, true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s %s invalid yaml status = %d, want 400", route.method, route.path, rec.Code)
+		}
+	}
 }
 
 func TestTenantAdminCannotMutateAnotherTenantKey(t *testing.T) {

@@ -142,7 +142,7 @@ func (c *Client) CreateKey(_ context.Context, actingTenant string, key gateway.K
 		created.AK = "gw-" + hex.EncodeToString(secret)
 	}
 	created.AKID = resolveKeyID(cmp.Or(key.AK, created.AK))
-	// the real gateway answers an uncovered existing ak with 404 (scoped_key anti-probing), never 409
+	// The real gateway answers an uncovered existing ak with 404 (scoped_key anti-probing), never 409.
 	if existing, ok := c.keys[created.AKID]; ok && actingTenant != "" && existing.Tenant != actingTenant {
 		return gateway.CreatedKey{}, fmt.Errorf("key %s: %w", created.AKID, gateway.ErrNotFound)
 	}
@@ -240,7 +240,7 @@ func (c *Client) Config(context.Context) (gateway.ConfigDocument, error) {
 
 func (c *Client) ValidateConfig(_ context.Context, yaml string) (map[string]any, error) {
 	if !strings.Contains(yaml, "listen:") || !strings.Contains(yaml, "models:") {
-		return nil, errors.New("invalid config: listen and models are required")
+		return nil, fmt.Errorf("%w: listen and models are required", gateway.ErrInvalid)
 	}
 	return map[string]any{"valid": true, "models": strings.Count(yaml, "name:")}, nil
 }
