@@ -2639,9 +2639,12 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
-    let vendor_priced = b
-        .vendor_cost
-        .filter(|_| b.protocol == gw_consts::Protocol::Decisions.as_str());
+    let vendor_priced = b.vendor_cost.filter(|_| {
+        b.protocol == gw_consts::Protocol::Decisions.as_str()
+            && cfg
+                .find_tenant(b.tenant)
+                .is_none_or(|t| !t.model_prices.contains_key(b.served_model))
+    });
     let units = clamp_tokens(b.units);
     let unit_price = b
         .unit_price

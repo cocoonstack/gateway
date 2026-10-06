@@ -99,9 +99,13 @@ impl Transport for OpenRouter {
 }
 
 fn gateway() -> (Router, Arc<GatewayState>, Arc<OpenRouter>) {
+    gateway_with(CONFIG)
+}
+
+fn gateway_with(yaml: &str) -> (Router, Arc<GatewayState>, Arc<OpenRouter>) {
     // SAFETY: one process-constant value under a name only this file reads.
     unsafe { std::env::set_var("GW_TEST_JEV_UPSTREAM_KEY", "sk-or-upstream") };
-    let cfg = Arc::new(GatewayConfig::from_yaml(CONFIG).unwrap());
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
     let vendor = Arc::new(OpenRouter::default());
     let app = gw_views::app(gw_views::AppState::new(cfg, state.clone(), vendor.clone()));
@@ -233,6 +237,66 @@ async fn a_decision_bills_the_vendor_cost_to_the_user() {
         "usage.cost wins over the 900000 per 1k list price"
     );
     assert_eq!(row.vendor_cost_micros, 20);
+}
+
+#[tokio::test]
+async fn a_versioned_openrouter_endpoint_keeps_both_decision_paths() {
+    let (app, _, vendor) = gateway_with(
+        &CONFIG
+            .replace(
+                "kind: openrouter,",
+                "kind: openrouter, endpoint: \"https://openrouter.ai/api/v1\",",
+            )
+            .replace(", user_daily_cost_quota_micros: 20", ""),
+    );
+    for (uri, want) in [
+        ("/v1/decisions", "https://openrouter.ai/api/alpha/decisions"),
+        ("/v1/systemone", "https://openrouter.ai/api/v1/systemone"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post(uri, Some("ak-box"), DECISION))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(vendor.last().0, want);
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_price_override_wins_over_the_vendor_cost() {
+    let (app, state, _) = gateway_with(&CONFIG.replace(
+        "user_daily_cost_quota_micros: 20}",
+        "model_prices: {typesafe/jev-1.13: {input_price_per_1k_micros: 1000}}}",
+    ));
+    let resp = app
+        .oneshot(post("/v1/decisions", Some("ak-box"), DECISION))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = state.store.ledger_snapshot(10).await.unwrap().1;
+    assert_eq!(rows[0].cost_micros, 476);
+    assert_eq!(rows[0].vendor_cost_micros, 20);
+}
+
+#[tokio::test]
+async fn a_variant_served_decision_echoes_the_requested_name() {
+    let (app, _, vendor) = gateway_with(
+        &CONFIG
+            .replace(
+                "  - {name: gpt-4o, provider: openrouter}",
+                "  - {name: gpt-4o, provider: openrouter}\n  - {name: jev, protocol: decisions, provider: openrouter, variants: [{model: jev-1.13, weight: 1}]}",
+            )
+            .replace("models: [typesafe/jev-1.13,", "models: [jev, typesafe/jev-1.13,"),
+    );
+    let body = DECISION.replace("typesafe/jev-1.13", "jev");
+    let resp = app
+        .oneshot(post("/v1/decisions", Some("ak-box"), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(vendor.last().2["model"], "jev-1.13");
+    assert_eq!(body_json(resp).await["model"], "jev");
 }
 
 #[tokio::test]

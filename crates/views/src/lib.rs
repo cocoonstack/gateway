@@ -4027,6 +4027,20 @@ async fn family_response(
     match run_family(s, ak, model, mt, typed, vec![], user_id).await {
         Ok(mut ctx) => {
             log_access(surface, &ctx, started);
+            if let Some(requested) = ctx
+                .request
+                .model_param_v2
+                .as_ref()
+                .and_then(|p| p.fallback_from.as_deref())
+                && let Some(body) = ctx
+                    .outcome
+                    .as_mut()
+                    .and_then(|o| o.response.response_v2.as_mut())
+                    .and_then(Value::as_object_mut)
+                && body.contains_key("model")
+            {
+                body.insert("model".to_owned(), requested.into());
+            }
             let response = response_v2_or_500(ctx.outcome.take(), engine);
             terminal_response(&ctx, response).await
         }

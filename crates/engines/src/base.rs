@@ -302,16 +302,22 @@ pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, 
 
 /// `{base}/v1/{path}`, or `{base}/{path}` when the base already names its version (`/v2`, `/compatible-mode/v1`).
 pub fn versioned_url(base: &str, path: &str) -> String {
-    let versioned = base.rsplit('/').next().is_some_and(|segment| {
-        segment.len() > 1
-            && segment.starts_with('v')
-            && segment[1..].bytes().all(|b| b.is_ascii_digit())
-    });
-    if versioned {
-        format!("{base}/{path}")
-    } else {
+    if unversioned(base) == base {
         format!("{base}/v1/{path}")
+    } else {
+        format!("{base}/{path}")
     }
+}
+
+/// `base` without a trailing version segment (`/v1`, `/v4`).
+pub fn unversioned(base: &str) -> &str {
+    base.rsplit_once('/')
+        .filter(|(_, segment)| {
+            segment.len() > 1
+                && segment.starts_with('v')
+                && segment[1..].bytes().all(|b| b.is_ascii_digit())
+        })
+        .map_or(base, |(root, _)| root)
 }
 
 fn ensure_json_content_type(headers: &mut Headers) {

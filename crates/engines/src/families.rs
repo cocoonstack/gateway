@@ -1149,7 +1149,7 @@ impl ModelEngine for DecisionsEngine {
         let url = if p.system_one {
             versioned_url(base, "systemone")
         } else {
-            format!("{base}/alpha/decisions")
+            format!("{}/alpha/decisions", crate::base::unversioned(base))
         };
         let mut body = p.fields;
         body.insert("model".to_owned(), model.as_str().into());
