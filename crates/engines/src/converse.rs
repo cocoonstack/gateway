@@ -196,7 +196,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let tools: Vec<Value> = match body.remove("tools") {
         Some(Value::Array(tools)) => tools
             .into_iter()
-            .flat_map(|tool| tool_spec(tool, claude, caches))
+            .flat_map(|tool| tool_spec(tool, claude))
             .collect(),
         _ => Vec::new(),
     };
@@ -427,11 +427,11 @@ fn content_block(mut block: Value, documents: &mut usize, caches: bool) -> Vec<V
 
 /// `strict` reaches Bedrock only for Claude — the other families reject the
 /// field outright ("This model doesn't support the strict field").
-fn tool_spec(mut tool: Value, claude: bool, caches: bool) -> Vec<Value> {
+fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
     let cache_control = tool
         .get_mut("cache_control")
         .map(Value::take)
-        .filter(|_| caches);
+        .filter(|_| claude);
     let mut spec = Map::with_capacity(4);
     spec.insert(
         "name".into(),
@@ -575,6 +575,7 @@ mod tests {
             nova["messages"][0]["content"][1],
             json!({"cachePoint": {"type": "default"}})
         );
+        assert!(!nova["toolConfig"].to_string().contains("cachePoint"));
     }
 
     #[test]
