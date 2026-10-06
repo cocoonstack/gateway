@@ -126,7 +126,6 @@ impl KeyStore for PostgresKeyStore {
         match self.cache.get_with(ak_id, self.fetch(ak_id)).await {
             Ok(info) => info,
             Err(e) => {
-                // fail closed: a store outage must not admit unknown keys
                 tracing::warn!(error = %e, "key store unreachable; auth fails closed");
                 None
             }

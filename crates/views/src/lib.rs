@@ -131,7 +131,6 @@ impl AppState {
         }))
     }
 
-    /// Attach the fleet config store (enables `PUT /admin/config`).
     pub fn with_config_store(mut self, store: Arc<gw_state::PostgresConfigStore>) -> Self {
         Arc::make_mut(&mut self.0).config_store = Some(store);
         self
@@ -344,7 +343,7 @@ fn status_label(status: StatusCode) -> Cow<'static, str> {
     }
 }
 
-/// In-band realtime error event; never terminal, only a Close frame or disconnect ends the session.
+/// In-band realtime error event; the caller decides whether the session ends.
 fn rt_error(class: ErrClass, message: impl Into<Cow<'static, str>>) -> Value {
     let mut event = json!({"type":"error","error":{
         "type": class.openai_type(),
@@ -1608,8 +1607,7 @@ fn q_num<T: std::str::FromStr>(q: &HashMap<String, String>, key: &str, default: 
     q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Write one realtime security event (`user` already resolved). The shared sink
-/// for realtime blocklist/regex hits, moderation denials, and inbound DLP hits.
+/// Write one realtime security event (`user` already resolved).
 async fn write_rt_event(
     s: &AppState,
     ak: &AkInfo,

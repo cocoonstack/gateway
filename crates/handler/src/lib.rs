@@ -567,8 +567,8 @@ async fn note_abuse(ctx: &DagContext) {
         .emit("abuse_suspend", String::from(&*ctx.ak.ak_id), summary);
 }
 
-/// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403
-/// refusal, or a 502/503 the gateway raised for a connection failure or an exhausted pool.
+/// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403 refusal,
+/// or a 5xx the gateway raised for a connection failure or an exhausted pool.
 fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
         Some(status) => status >= 500 || matches!(status, 401..=403 | 429),

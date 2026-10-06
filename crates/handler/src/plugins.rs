@@ -374,7 +374,7 @@ fn for_each_message_text(
     n
 }
 
-/// The ONE tail field list all scans traverse; `raw` gets the media-aware walk.
+/// The ONE tail field list all scans traverse; a Responses `raw` gets the media-aware walk.
 fn for_each_param_text(
     param: &mut ModelParamV2,
     skip_derived: bool,

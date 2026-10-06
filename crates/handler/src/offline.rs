@@ -75,7 +75,7 @@ impl OfflineHandler {
         // skip items a prior executor recorded; a read failure fails the job (re-running re-bills)
         let prior = match store.batch_get(id).await {
             Ok(Some(job)) => job.results,
-            Ok(None) => return, // the batch row vanished; nothing to run
+            Ok(None) => return,
             Err(e) => {
                 tracing::error!(error = %e, batch = %id, "batch resume read failed; failing to avoid re-billing");
                 // fenced: a reclaimed stale worker must not clobber the new owner's status
@@ -107,7 +107,7 @@ impl OfflineHandler {
         };
         for (index, mut item) in items.into_iter().enumerate() {
             if lost.load(Relaxed) {
-                break; // reclaimed by another instance; stop running new items
+                break;
             }
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
@@ -194,7 +194,6 @@ impl OfflineHandler {
         if lost.load(Relaxed) {
             return; // the reclaiming instance owns the terminal status now
         }
-        // fenced terminal status, derived atomically from the persisted results
         if let Err(e) = store.batch_finalize(id, claim).await {
             tracing::error!(error = %e, batch = %id, "batch finalize failed");
         }

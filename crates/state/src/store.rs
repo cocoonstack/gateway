@@ -592,7 +592,7 @@ pub struct MemoryStore {
     jobs: DashMap<String, (BatchJob, i64)>,
     videos: DashMap<String, (VideoJob, bool)>,
     seq: AtomicUsize,
-    /// oldest records beyond this are pruned on write; 0 = unlimited.
+    /// rolled records beyond this are pruned; 0 = unlimited.
     ledger_max_rows: usize,
     prune_seq: AtomicUsize,
 }
@@ -2623,11 +2623,9 @@ pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_model
     }
 }
 
-/// Price one call into a [`BillingRecord`] (tenant price for the served model,
-/// vendor cost from the account; a decisions call charges the vendor's reported
-/// cost), shared by the pipeline and the realtime surface; prompt/completion
-/// keep the vendor counts, `total_tokens` is the weighted platform total quota
-/// metering consumed.
+/// Price one call into a [`BillingRecord`]: the tenant price for the served model (a decisions
+/// reply's `usage.cost` when the tenant has no override), the account's vendor cost, and
+/// `total_tokens` as the weighted platform total; prompt/completion keep the vendor counts.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),

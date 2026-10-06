@@ -21,34 +21,26 @@ pub struct DagContext {
 
     /// engine result, set by the model_access layer.
     pub outcome: Option<EngineOutcome>,
-    /// decision trail as (stage, detail); joined only when read, so the hot
-    /// path allocates the detail once instead of a second joined string.
+    /// Decision trail as (stage, detail), joined only when read.
     pub decisions: Vec<(&'static str, String)>,
-    /// Request-level cache hit (downstream nodes short-circuit on this and skip
-    /// account/engine/billing).
+    /// Request-level cache hit: later nodes skip account, engine and billing.
     pub cache_hit: bool,
-    /// The handler will retry an upstream fault on a fallback model, so this
-    /// attempt's failure is not the client-visible outcome.
+    /// A fallback model retries this attempt's upstream fault, so its failure is not the outcome.
     pub fallback_ahead: bool,
     pub(crate) request_limits_admitted: bool,
     /// This request's cache key (computed by cache_lookup, reused by cache_store).
     pub cache_key: Option<String>,
-    /// Governance key for the (AK, model) daily counter — set by model_quota
-    /// only when a cap is configured, consumed at billing time (unconfigured
-    /// pairs never touch a counter).
+    /// Governance key for the (AK, model) daily counter; set only when a cap is configured.
     pub model_quota_key: Option<String>,
-    /// Tokens reserved against the AK daily quota at admission; settled to
-    /// actual usage at billing, refunded whole if the pipeline fails.
+    /// Tokens recorded against the AK daily quota; settled at billing, refunded on failure.
     pub quota_reserved: Option<i64>,
-    /// Admission timestamp (unix secs), so the daily-quota settle/refund hits the
-    /// same UTC-day bucket the reserve did even if the request crosses midnight.
+    /// Admission unix secs, so the daily settle or refund lands in the reserve's UTC-day bucket.
     pub quota_at: i64,
     /// Tokens reserved in the AK TPM window at admission (same lifecycle).
     pub tpm_reserved: Option<TpmReserve>,
     /// The user's budget override resolved at admission, charged at settlement.
     pub user_budget: Option<UserBudget>,
-    /// Outbound DLP buffered this stream, so billing waits for the view's
-    /// delivery result instead of settling inside the DAG.
+    /// Outbound DLP buffered this stream; billing waits for the view's delivery result.
     pub billing_deferred: bool,
 }
 
@@ -93,9 +85,7 @@ impl DagContext {
             .ok_or_else(|| GatewayError::internal("model param missing after resolve_model"))
     }
 
-    /// The effective end user: the key's `owner` (authoritative) else request
-    /// metadata; `""` when neither is present. Resolution lives on [`AkInfo`] so
-    /// REST and realtime can't diverge on an empty owner.
+    /// The effective end user: the key's `owner`, else request metadata, else `""`.
     pub fn effective_user_id(&self) -> &str {
         self.ak
             .attributed_user(self.request.user_id.as_deref().unwrap_or_default())

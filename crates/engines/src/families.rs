@@ -485,11 +485,11 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        // duration-priced transcription reports `usage.seconds` (or `duration`)
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
         );
+        // duration-priced transcription reports `usage.seconds` (or `duration`)
         if self.kind == AudioKind::Stt {
             units = whole_seconds(&v["usage"]["seconds"])
                 .or_else(|| whole_seconds(&v["duration"]))
@@ -578,8 +578,8 @@ pub struct VideoPoll {
     pub status: u16,
     pub body: Value,
     pub done: bool,
-    /// Billable units on `done`: the clip's whole seconds when the vendor
-    /// reports a duration, else the number of delivered videos.
+    /// Billable units on `done`: the clip's whole seconds when the vendor reports
+    /// a duration, else the delivered-video count where the dialect reports one.
     pub units: i64,
     pub vendor_cost: Option<i64>,
 }
@@ -1380,7 +1380,6 @@ impl ResponsesEngine {
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 
-    /// Non-streaming Responses reply: full `output` array + `usage`.
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
         let mut v: Value = serde_json::from_slice(bytes)
             .map_err(|e| crate::engine::unparsed_reply(status, "parse responses reply", e))?;

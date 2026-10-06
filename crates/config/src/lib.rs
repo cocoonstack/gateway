@@ -577,7 +577,7 @@ pub struct StorageConf {
     /// Share the response cache in Redis too (needs `redis_url`).
     #[serde(default)]
     pub shared_cache: bool,
-    /// Keep at most this many billing records (oldest pruned first); 0 = unlimited.
+    /// Prune rolled billing records beyond this many; 0 = unlimited.
     #[serde(default)]
     pub ledger_max_rows: u64,
     /// Postgres pool size for the store and key-table pools; 0 = their built-in defaults.
