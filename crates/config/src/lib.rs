@@ -235,8 +235,8 @@ pub struct ModelConf {
     /// at the cache-read rate. Pair with `token_rate`.
     #[serde(default)]
     pub prompt_cache: bool,
-    /// Models tried in order when this one fails upstream (5xx, connection
-    /// failure, or a vendor 429) before any byte reached the client; the
+    /// Models tried in order when this one fails upstream (5xx, 429, 401-403, connection
+    /// failure, no healthy account) before any byte reached the client; the
     /// caller's tenant must be entitled to the one served.
     #[serde(default)]
     pub fallback_models: Vec<String>,

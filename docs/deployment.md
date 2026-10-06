@@ -7,7 +7,7 @@ Download a tagged release tarball (Linux/macOS, x86_64/arm64) and extract the
 
 ```bash
 # substitute the release tag and target platform
-VERSION=v0.2.2
+VERSION=vX.Y.Z  # a tag from the Releases page
 OS=linux      # or darwin
 ARCH=amd64    # or arm64
 curl --proto '=https' --tlsv1.2 -LsSf -o gw.tar.gz \
@@ -74,8 +74,8 @@ storage:
 ```
 
 - **Durable records** (ledger, files, batches, async video jobs — pruned 30
-  days after submit): SQLite when `sqlite_path` is set (survives restarts),
-  otherwise in-memory. The single-node SQLite store
+  days after submit): Postgres when `postgres_url` is set (fleet-shared), else
+  SQLite when `sqlite_path` is set (survives restarts), otherwise in-memory. The single-node SQLite store
   sweeps orphaned `pending`/`running` batch jobs to `failed` on startup; the
   Postgres store deliberately does not (another live instance may still be
   executing them — stale claims are requeued via the fleet drain instead).

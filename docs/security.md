@@ -166,8 +166,9 @@ deployment guidance requires anyway); a video download is held in memory for
 the clip's size; a config reload can race one in-flight token fetch for at
 most one token lifetime; duplicate JSON keys parse last-wins here and possibly
 first-wins on a non-compliant upstream (a compliant server behaves
-identically); the cross-tenant key guard reads a two-second key cache before
-mutating, which would need a key to change tenant inside that window; MCP
+identically); the cross-tenant key guard reads the instance's key cache before
+mutating (with Postgres a key write invalidates it fleet-wide by NOTIFY within
+about a second), which would need a key to change tenant inside that window; MCP
 session binding is enforced per instance, so a multi-instance deployment must
 route a session's requests to the instance that opened it (sticky by
 `Mcp-Session-Id`), which Streamable HTTP already assumes; a server that

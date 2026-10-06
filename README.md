@@ -42,13 +42,13 @@ curl -sN localhost:8080/v1/messages \
 
 # Your own config
 GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
-gw --version                       # --help lists the env vars; there are no other flags
+gw --version                       # --help names the config env vars; there are no other flags
 
 # Go live: give an account `endpoint` + `api_key_env` in the config — that's it.
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
 ```
 
-Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Performance](docs/performance.md) · [Security](docs/security.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
+Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Running a fleet](docs/multi-instance.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Performance](docs/performance.md) · [Security](docs/security.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
 
 ## Docker
 
@@ -61,8 +61,8 @@ docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
 
 The image binds `0.0.0.0` (`GW_HOST`) and ships a `/health` HEALTHCHECK.
 Published multi-arch (amd64 + arm64) to `ghcr.io/cocoonstack/gateway` on `v*`
-tags, alongside `ghcr.io/cocoonstack/gateway-control-plane` and control-plane
-binary tarballs (linux/darwin × amd64/arm64) on the GitHub Release.
+tags, alongside `ghcr.io/cocoonstack/gateway-control-plane`, and `gw` plus
+control-plane binary tarballs (linux/darwin × amd64/arm64) on the GitHub Release.
 
 ## Development
 

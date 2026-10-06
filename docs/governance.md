@@ -114,9 +114,12 @@ day; the TPM reserve settles only into the minute window that admitted it — a
 request that outlives its window leaves the next window's reservations alone. Charged price is the model's list price, or
 a tenant's `model_prices` override; when an account declares `cost_*_price` the
 ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
+A `protocol: decisions` model without a tenant override charges the vendor's
+reported `usage.cost` instead of the list price, and the cost budgets count
+that charge.
 Surfaces that meter no tokens bill per unit instead — TTS characters,
-transcription seconds, rerank search units, generated images, generated video
-seconds — at the model's `unit_price_micros` (see
+transcription seconds, rerank search units, web searches (one unit per query),
+generated images, generated video seconds — at the model's `unit_price_micros` (see
 [Configuration](configuration.md)); the unit count rides on the ledger row and
 the usage aggregates as `billed_units`. An async video bills when its poll first
 sees `done`: the submit row carries 0 units, the completion row (its
@@ -258,8 +261,8 @@ fallback-model degrade), while the reserved per-key daily quota hard-caps spend.
 The daily cost budgets — `daily_cost_quota_micros` pooled over the tenant's
 keys, `key_daily_cost_quota_micros` per key, `user_daily_cost_quota_micros`
 per end user — are soft caps of the same kind over the ledger's charged
-`cost_micros` (list price or the tenant's `model_prices`, so unit-priced
-surfaces count too); they apply on every surface, realtime and batch included,
+`cost_micros` (list price, the tenant's `model_prices`, or a decisions reply's
+`usage.cost`, so unit-priced surfaces count too); they apply on every surface, realtime and batch included,
 and a response-cache hit, which bills nothing, counts nothing.
 The monthly counterparts — `monthly_cost_quota_micros`,
 `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` — meter the

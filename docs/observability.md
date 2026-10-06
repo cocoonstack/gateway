@@ -19,7 +19,7 @@
 | `gateway_mcp_requests_total` | counter | `server` (configured name), `method` (initialize / tools/list / tools/call / resources / prompts / ping / stream / other), `result` (HTTP status, denied, upstream_error, reply_unreadable, masked, blocked) |
 | `gateway_model_fallbacks_total` | counter | `from`, `to` |
 
-`gateway_requests_total` is recorded by router middleware, so every response —
+`gateway_requests_total` is recorded by router middleware, so every gateway response (the `/metrics` scrape itself excepted) —
 including error statuses and the realtime WebSocket upgrade — is counted, which
 makes error-rate dashboards possible. All labels are bounded by the config, never by a
 caller: route templates, status codes, protocol/stage names, configured MCP

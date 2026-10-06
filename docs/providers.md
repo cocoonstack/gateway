@@ -61,6 +61,20 @@ Jina reports `usage.total_tokens`, which bills as prompt tokens; Cohere bills
 by search units (`meta.billed_units.search_units`), priced by the model's
 `unit_price_micros`. Both verified live.
 
+### Decisions
+
+`/v1/decisions` and `/v1/systemone` serve System One models through the
+`openrouter` preset. The preset's default wire is openai-chat, so a decisions
+model names its protocol:
+
+```yaml
+models:
+  - {name: typesafe/jev-1.13, provider: openrouter, protocol: decisions}
+```
+
+The reply's `usage.cost` is the charge unless the tenant sets a `model_prices`
+override for the model.
+
 ## Native (non-OpenAI) wire engines
 
 Some vendors are addressed in their own wire dialect rather than an
@@ -176,8 +190,8 @@ each account's observed call latency — an exponentially weighted average of
 completed calls, kept per instance — so the fastest account of a tier takes
 the traffic while an account never or not recently (60 s) sampled ranks first
 and gets probed; equal ranks stay round-robin. The realtime surface keeps
-round-robin. On an upstream 5xx the failed account is excluded and another is tried
-once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
+round-robin. On an upstream 5xx or a 401/402/403 credential or billing refusal
+the failed account is excluded and another is tried once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
 an account into cooldown (`stability.failure_threshold` / `cooldown_seconds`),
 and it auto-recovers on expiry. A streaming response that already sent bytes to
 the client is never failed over, but a provider error that breaks such a stream

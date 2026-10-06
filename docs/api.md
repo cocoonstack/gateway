@@ -47,7 +47,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/chat/completions` | streaming + non-streaming |
 | POST | `/v1/completions` | legacy text completion (`prompt`) |
-| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort` from an effort or a thinking budget, and `store: false` unless the client sets it, as on Chat Completions) and streams as that surface's own frames — image parts and the typed `response_format` do not cross onto that wire, though an extra `text.format` rides through as any unknown field does; a `refusal` output part, streamed or buffered, is returned as the reply text; a model on any other wire is not served from `/v1/responses`, whose body has no normalized turns |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort` from an effort or a thinking budget, and `store: false` unless the client sets it, as on Chat Completions) and streams as that surface's own frames — image parts become `input_image` items and `response_format` becomes `text.format`; a `refusal` output part, streamed or buffered, is returned as the reply text; a model on any other wire is not served from `/v1/responses`, whose body has no normalized turns |
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
@@ -66,33 +66,6 @@ realtime upgrade uses, and the request is refused before dispatch so no engine
 builds a body for it and no upstream call is made. Two pairings are not identity
 and are served normally: an `aws-embed` model answers `/v1/embeddings`, and
 `/v1/completions` carries its prompt as a turn, so any wire answers it.
-
-## Rerank
-
-| Method | Path | Notes |
-|--------|------|-------|
-| POST | `/v1/rerank` | Cohere/Jina-compatible: `{model, query, documents, top_n?}` → `{results: [{index, relevance_score}]}` |
-
-## Search
-
-| Method | Path | Notes |
-|--------|------|-------|
-| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}` (`count` defaults to 3, clamped to 1-20); a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
-
-## Decisions
-
-| Method | Path | Notes |
-|--------|------|-------|
-| POST | `/v1/decisions` | System One typed decisions (TypeSafe Jev), OpenRouter's Decisions API: `{model, state, questions}` → `{id, model, provider, answers, usage}` |
-| POST | `/v1/systemone` | the same on the TypeSafe SDK's path (point the SDK's base URL at the gateway) |
-
-Both serve `protocol: decisions` models. Every body field but `model` goes to
-the vendor as sent, `/v1/decisions` to `{endpoint}/alpha/decisions` and
-`/v1/systemone` to `{endpoint}/v1/systemone`, and the vendor's reply comes back
-whole, its `id` included, so one call can be looked up in OpenRouter's
-generation history. The ledger records `usage.input_tokens` and
-`usage.output_tokens` and charges `usage.cost` as reported; the model's price
-list applies only to a reply without it.
 
 ### Chat completions
 
@@ -165,6 +138,36 @@ reports the reasoning share when the vendor does, and
 too. Cache writes ride inside `prompt_tokens` on this wire, so a client can
 reconcile the write premium; the Responses surface reports the same two under
 `input_tokens_details`.
+
+## Rerank
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/rerank` | Cohere/Jina-compatible: `{model, query, documents, top_n?}` → `{results: [{index, relevance_score}]}` |
+
+## Search
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}` (`count` defaults to 3, clamped to 1-20); a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
+
+## Decisions
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/decisions` | System One typed decisions (TypeSafe Jev), OpenRouter's Decisions API: `{model, state, questions}` → `{id, model, provider, answers, usage}` |
+| POST | `/v1/systemone` | the same on the TypeSafe SDK's path (point the SDK's base URL at the gateway) |
+
+Both serve `protocol: decisions` models. Every body field but `model` goes to
+the vendor as sent, `/v1/decisions` to `{endpoint}/alpha/decisions` (a trailing
+`/v1` on the endpoint is dropped for this path) and `/v1/systemone` to
+`{endpoint}/v1/systemone`, and the vendor's reply comes back whole, its `id`
+included, so one call can be looked up in OpenRouter's generation history; when
+a variant or fallback served the call, its `model` field names the requested
+model. The ledger records `usage.input_tokens` and `usage.output_tokens` and
+charges `usage.cost` as reported unless the tenant sets a `model_prices`
+override for the model; the model's price list applies only to a reply without
+a cost.
 
 ## Anthropic-compatible
 
@@ -299,7 +302,7 @@ gateway log.
 | GET | `/v1/files/{id}/content` | raw content |
 | DELETE | `/v1/files/{id}` | delete an uploaded file (tenant-owned) |
 | POST | `/v1/batches` | `{"input_file_id":"..."}` or inline `{"items":[...]}`; answers `202` with `{id, status, total}` |
-| GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results `{index, ok, message, total_tokens, finish_reason?, tool_calls?}` (`finish_reason` is absent for an item that failed before it produced an outcome) |
+| GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results `{index, ok, message, total_tokens, finish_reason?, tool_calls?, user?}` (`finish_reason` is absent for an item that failed before it produced an outcome; `user` is the item's effective end user when attributed) |
 
 Each JSONL line is `{"body": {...}}` and each inline item is a
 `/v1/chat/completions` request body. Every item runs on the batch's `model`, or

@@ -4,7 +4,7 @@ Cargo workspace, 11 crates, strictly layered — lower layers never depend
 on higher ones:
 
 ```
-server → {views, task} → handler → {dag, engines} → {models, state} → {protocol, config} → consts
+server → {views, task} → handler → dag → {engines, state} → {models, protocol, config} → consts
 ```
 
 | Crate       | Layer | Role |
