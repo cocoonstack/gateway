@@ -171,7 +171,8 @@ mutating (with Postgres a key write invalidates it fleet-wide by NOTIFY within
 about a second), which would need a key to change tenant inside that window; MCP
 session binding is enforced per instance, so a multi-instance deployment must
 route a session's requests sticky by `Mcp-Session-Id` (the id-less initialize
-may land on another instance, so a second key holding the id before the
-client's first follow-up could bind it there first); a server that
+may land on another instance, where ownership binds only from a reply that
+carries the id, so a second key holding the id could use the session there
+until one does); a server that
 returns one constant session id locks its session to the first key to use it
 (a conformant server mints a unique id per session).
