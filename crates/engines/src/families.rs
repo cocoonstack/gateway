@@ -1229,7 +1229,7 @@ impl ResponsesEngine {
             if m.role == gw_consts::role::TOOL {
                 input.push(function_call_output(
                     m.tool_call_id.unwrap_or_default().into(),
-                    m.content.into(),
+                    tool_output(m.parts.unwrap_or_else(|| m.content.into())),
                 ));
                 continue;
             }
@@ -1243,11 +1243,7 @@ impl ResponsesEngine {
                 && m.parts
                     .as_ref()
                     .and_then(Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| matches!(b["type"].as_str(), Some("image" | "image_url")))
-                    });
+                    .is_some_and(|blocks| blocks.iter().any(is_image_part));
             let mut items = Vec::new();
             if let Some(Value::Array(blocks)) = m.parts {
                 for mut block in blocks {
@@ -1264,18 +1260,7 @@ impl ResponsesEngine {
                         )),
                         Some("tool_result") => input.push(function_call_output(
                             block["tool_use_id"].take(),
-                            match block["content"].take() {
-                                Value::Array(parts) if parts.iter().any(is_image_part) => {
-                                    Value::Array(
-                                        parts.into_iter().filter_map(output_item).collect(),
-                                    )
-                                }
-                                Value::Array(parts) => {
-                                    gw_protocol::anthropic::blocks_text(&parts).into()
-                                }
-                                Value::String(s) => s.into(),
-                                _ => Value::String(String::new()),
-                            },
+                            tool_output(block["content"].take()),
                         )),
                         _ => {}
                     }
@@ -1396,17 +1381,10 @@ impl ResponsesEngine {
     }
 
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let mut v: Value = serde_json::from_slice(bytes)
+        let v: Value = serde_json::from_slice(bytes)
             .map_err(|e| crate::engine::unparsed_reply(status, "parse responses reply", e))?;
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
-        }
-        // the verbatim body must not leak the served variant either
-        if let Some(requested) = self.base.model_override()
-            && let Some(body) = v.as_object_mut()
-            && body.contains_key("model")
-        {
-            body.insert("model".to_owned(), requested.into());
         }
         let native = self.base.request.preserve_responses_wire;
         let (text, mut tool_calls) = responses_output(&v);
@@ -1564,6 +1542,17 @@ fn function_call_output(call_id: Value, output: Value) -> Value {
         ("call_id", call_id),
         ("output", output),
     ])
+}
+
+fn tool_output(content: Value) -> Value {
+    match content {
+        Value::Array(parts) if parts.iter().any(is_image_part) => {
+            Value::Array(parts.into_iter().filter_map(output_item).collect())
+        }
+        Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts).into(),
+        Value::String(s) => s.into(),
+        _ => Value::String(String::new()),
+    }
 }
 
 fn is_image_part(part: &Value) -> bool {
@@ -2237,6 +2226,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_chat_tool_message_screenshot_reaches_the_responses_wire() {
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.message = vec![ChatMsg {
+            tool_call_id: Some("call_1".into()),
+            parts: Some(serde_json::json!([{"type": "text", "text": "shot"},
+                {"type": "image_url", "image_url": {"url": "https://x/s.png"}}])),
+            ..ChatMsg::text("tool", "shot")
+        }];
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["input"][0]["output"],
+            serde_json::json!([{"type": "input_text", "text": "shot"},
+                {"type": "input_image", "image_url": "https://x/s.png"}])
+        );
+    }
+
     #[test]
     fn a_response_format_joins_the_clients_text_object() {
         let typed = TypedParams::Chat(gw_models::ChatParams {
@@ -2549,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_reply_names_the_requested_model() {
+    fn responses_reply_keeps_the_vendor_model_for_the_cache() {
         let mut request = req(Protocol::Responses, "gpt-5-served", None);
         let param = request.model_param_v2.as_mut().unwrap();
         param.raw = json!({"input": "go"});
@@ -2561,7 +2567,10 @@ mod tests {
                 br#"{"id":"r","object":"response","model":"gpt-5-served-2026","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
             )
             .unwrap();
-        assert_eq!(out.response.response_v2.unwrap()["model"], "gpt-5-public");
+        assert_eq!(
+            out.response.response_v2.unwrap()["model"],
+            "gpt-5-served-2026"
+        );
     }
 
     #[tokio::test]

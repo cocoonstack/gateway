@@ -115,7 +115,7 @@ impl ClaudeEngine {
         let mut client_cap = false;
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
-        let mut native_system = (marked && anthropic_fields).then(|| {
+        let mut native_system = marked.then(|| {
             Value::Array(
                 system_parts
                     .into_iter()

@@ -144,6 +144,7 @@ impl Events {
 /// `additionalModelRequestFields`.
 pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let claude = claude_model(model);
+    let caches = claude || model.contains("amazon.nova");
     let reasoning = reasoning_family(model);
     let mut out = Map::with_capacity(6);
     let mut documents = 0;
@@ -152,7 +153,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
             Value::String(text) => vec![object([("text", text.into())])],
             Value::Array(blocks) => blocks
                 .into_iter()
-                .flat_map(|b| content_block(b, &mut documents))
+                .flat_map(|b| content_block(b, &mut documents, caches))
                 .collect(),
             _ => Vec::new(),
         };
@@ -163,7 +164,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let messages: Vec<Value> = match body.remove("messages") {
         Some(Value::Array(messages)) => messages
             .into_iter()
-            .map(|m| message(m, &mut documents))
+            .map(|m| message(m, &mut documents, caches))
             .collect(),
         _ => Vec::new(),
     };
@@ -195,7 +196,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let tools: Vec<Value> = match body.remove("tools") {
         Some(Value::Array(tools)) => tools
             .into_iter()
-            .flat_map(|tool| tool_spec(tool, claude))
+            .flat_map(|tool| tool_spec(tool, claude, caches))
             .collect(),
         _ => Vec::new(),
     };
@@ -302,12 +303,12 @@ fn block_event(kind: &str, index: u64, key: &str, payload: Value) -> Value {
     ])
 }
 
-fn message(mut m: Value, documents: &mut usize) -> Value {
+fn message(mut m: Value, documents: &mut usize, caches: bool) -> Value {
     let content = match m["content"].take() {
         Value::String(text) => vec![object([("text", text.into())])],
         Value::Array(blocks) => blocks
             .into_iter()
-            .flat_map(|b| content_block(b, documents))
+            .flat_map(|b| content_block(b, documents, caches))
             .collect(),
         _ => Vec::new(),
     };
@@ -327,8 +328,11 @@ fn carries_tool_block(message: &Value) -> bool {
 
 /// One Messages content block as Converse blocks; a `cache_control` marker
 /// becomes a following `cachePoint`.
-fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
-    let cache_control = block.get_mut("cache_control").map(Value::take);
+fn content_block(mut block: Value, documents: &mut usize, caches: bool) -> Vec<Value> {
+    let cache_control = block
+        .get_mut("cache_control")
+        .map(Value::take)
+        .filter(|_| caches);
     let mapped = match block["type"].as_str() {
         Some("text") => object([("text", block["text"].take())]),
         Some("image") => {
@@ -384,7 +388,7 @@ fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
                 Value::String(text) => vec![object([("text", text.into())])],
                 Value::Array(blocks) => blocks
                     .into_iter()
-                    .flat_map(|b| content_block(b, documents))
+                    .flat_map(|b| content_block(b, documents, caches))
                     .filter(|b| b.get("cachePoint").is_none())
                     .collect(),
                 _ => Vec::new(),
@@ -423,8 +427,11 @@ fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
 
 /// `strict` reaches Bedrock only for Claude — the other families reject the
 /// field outright ("This model doesn't support the strict field").
-fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
-    let cache_control = tool.get_mut("cache_control").map(Value::take);
+fn tool_spec(mut tool: Value, claude: bool, caches: bool) -> Vec<Value> {
+    let cache_control = tool
+        .get_mut("cache_control")
+        .map(Value::take)
+        .filter(|_| caches);
     let mut spec = Map::with_capacity(4);
     spec.insert(
         "name".into(),
@@ -544,6 +551,31 @@ fn stop_reason(converse: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_points_reach_only_the_families_that_cache() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({
+                "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}],
+                "tools": [{"name": "now", "input_schema": {"type": "object"},
+                           "cache_control": {"type": "ephemeral"}}]
+            }))
+            .unwrap()
+        };
+        let grok = request(body(), "us.xai.grok-4.6").to_string();
+        assert!(!grok.contains("cachePoint"), "{grok}");
+        let nova = request(body(), "us.amazon.nova-pro-v1:0");
+        assert_eq!(
+            nova["system"][1],
+            json!({"cachePoint": {"type": "default"}})
+        );
+        assert_eq!(
+            nova["messages"][0]["content"][1],
+            json!({"cachePoint": {"type": "default"}})
+        );
+    }
 
     #[test]
     fn messages_body_transcodes_to_converse() {
