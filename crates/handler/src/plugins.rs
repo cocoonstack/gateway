@@ -272,7 +272,26 @@ pub fn apply_moderation_mask(
             masker.apply(text)
         }
     });
+    if masker.hits > 0 {
+        rederive_flat_text(request);
+    }
     Ok(masker.hits)
+}
+
+fn rederive_flat_text(request: &mut GatewayRequest) {
+    for msg in &mut request.message {
+        if let Some(serde_json::Value::Array(parts)) = &msg.parts {
+            msg.content = gw_protocol::anthropic::blocks_text(parts);
+        }
+    }
+    if let Some(gw_models::TypedParams::Chat(p)) = request
+        .model_param_v2
+        .as_mut()
+        .and_then(|param| param.typed.as_mut())
+        && let Some(serde_json::Value::Array(blocks)) = &p.system_blocks
+    {
+        p.system = Some(gw_protocol::anthropic::blocks_text(blocks)).filter(|s| !s.is_empty());
+    }
 }
 
 /// Moderator mask spans applied to one realtime frame, addressing its collected text.
@@ -313,16 +332,17 @@ fn for_each_request_text(
     f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
     let mut n = 0;
+    let derived = signed != SignedThinking::Skip;
     for msg in &mut request.message {
         let policy = if msg.role == gw_consts::role::AI {
             signed
         } else {
             SignedThinking::Visit
         };
-        n += for_each_message_text(msg, policy, f);
+        n += for_each_message_text(msg, policy, derived, f);
     }
     if let Some(param) = request.model_param_v2.as_mut() {
-        n += for_each_param_text(param, &mut |s| f(s, false));
+        n += for_each_param_text(param, derived, &mut |s| f(s, false));
     }
     n
 }
@@ -331,9 +351,14 @@ fn for_each_request_text(
 fn for_each_message_text(
     msg: &mut ChatMsg,
     signed: SignedThinking,
+    skip_derived: bool,
     f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
-    let mut n = f(&mut msg.content, false);
+    let mut n = if skip_derived && msg.parts.is_some() {
+        0
+    } else {
+        f(&mut msg.content, false)
+    };
     if let Some(parts) = &mut msg.parts {
         n += walk_part_text(parts, signed, f);
     }
@@ -352,6 +377,7 @@ fn for_each_message_text(
 /// The ONE tail field list all scans traverse; `raw` gets the media-aware walk.
 fn for_each_param_text(
     param: &mut ModelParamV2,
+    skip_derived: bool,
     f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
     let mut n = if matches!(param.protocol, gw_consts::Protocol::Responses) {
@@ -360,7 +386,7 @@ fn for_each_param_text(
         walk_json_strings(&mut param.raw, f)
     };
     if let Some(typed) = param.typed.as_mut() {
-        n += for_each_typed_text(typed, f);
+        n += for_each_typed_text(typed, skip_derived, f);
     }
     n
 }
@@ -368,12 +394,17 @@ fn for_each_param_text(
 /// The ONE typed-param field list scan and DLP traverse, forwarded client JSON included.
 fn for_each_typed_text(
     typed: &mut gw_models::TypedParams,
+    skip_derived: bool,
     f: &mut impl FnMut(&mut String) -> usize,
 ) -> usize {
     use gw_models::TypedParams as T;
     match typed {
         T::Chat(p) => {
-            let mut n = p.system.as_mut().map(&mut *f).unwrap_or(0);
+            let mut n = if skip_derived && p.system_blocks.is_some() {
+                0
+            } else {
+                p.system.as_mut().map(&mut *f).unwrap_or(0)
+            };
             if let Some(blocks) = p.system_blocks.as_mut() {
                 n += walk_json_strings(blocks, f);
             }
@@ -1895,6 +1926,38 @@ mod tests {
                 "flat extra prose under media-like keys must be scanned ({proto:?})"
             );
         }
+    }
+
+    #[test]
+    fn block_form_text_is_reviewed_once_and_masked_in_both_copies() {
+        let mut msg = ChatMsg::text("user", "call 555 now");
+        msg.parts = Some(serde_json::json!([{"type": "text", "text": "call 555 now"}]));
+        let mut param =
+            gw_models::ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, "m");
+        param.typed = Some(gw_models::TypedParams::Chat(gw_models::ChatParams {
+            system: Some("be brief".into()),
+            system_blocks: Some(serde_json::json!([{"type": "text", "text": "be brief"}])),
+            ..Default::default()
+        }));
+        let mut request = GatewayRequest {
+            message: vec![msg],
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        let reviewed = inbound_text(&mut request);
+        assert_eq!(reviewed.matches("555").count(), 1, "{reviewed}");
+        assert_eq!(reviewed.matches("be brief").count(), 1, "{reviewed}");
+        let start = reviewed.find("555").unwrap();
+        let span = start..start + 3;
+        assert_eq!(
+            apply_moderation_mask(&mut request, std::slice::from_ref(&span)),
+            Ok(1)
+        );
+        assert_eq!(request.message[0].content, "call [MASKED] now");
+        assert_eq!(
+            request.message[0].parts.as_ref().unwrap()[0]["text"],
+            "call [MASKED] now"
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ description = "Business orchestration: build DagContext, run the layered DAG."
 metrics = { workspace = true }
 gw-consts = { workspace = true }
 gw-models = { workspace = true }
+gw-protocol = { workspace = true }
 gw-config = { workspace = true }
 gw-state = { workspace = true }
 tracing = { workspace = true }

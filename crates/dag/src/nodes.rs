@@ -228,6 +228,9 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     h.update(ctx.cfg.generation().to_le_bytes());
     h.update(b"native-anthropic-wire-v1");
     h.update([u8::from(ctx.request.preserve_anthropic_wire)]);
+    if let Some(beta) = &ctx.request.anthropic_beta {
+        h.update(beta.as_bytes());
+    }
     h.update(param.model_name.as_bytes());
     // serialize straight into the hasher — no throwaway buffers for a multi-KB history
     serde_json::to_writer(&mut h, &ctx.request.message).ok()?;

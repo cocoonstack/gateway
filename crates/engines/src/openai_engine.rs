@@ -39,6 +39,9 @@ impl OpenAiEngine {
                     if let Some(id) = m.tool_call_id {
                         msg.insert("tool_call_id".into(), id.into());
                     }
+                    if let Some(name) = m.name {
+                        msg.insert("name".into(), name.into());
+                    }
                     if let Some(reasoning) = m.reasoning_content {
                         msg.insert("reasoning_content".into(), reasoning.into());
                     }
@@ -472,10 +475,24 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
     if role == gw_consts::role::AI {
         let mut prose = String::new();
         let mut tool_use = Vec::new();
+        let mut details = Vec::new();
         for part in parts {
             match part["type"].as_str() {
-                Some("thinking") => prose.push_str(part["thinking"].as_str().unwrap_or_default()),
-                Some("redacted_thinking") => {}
+                Some("thinking") => {
+                    prose.push_str(part["thinking"].as_str().unwrap_or_default());
+                    if part["signature"].as_str().is_some_and(|s| !s.is_empty()) {
+                        let index = details.len();
+                        details.extend(gw_protocol::reasoning::thinking_block_to_detail(
+                            part, index,
+                        ));
+                    }
+                }
+                Some("redacted_thinking") => {
+                    let index = details.len();
+                    details.extend(gw_protocol::reasoning::thinking_block_to_detail(
+                        part, index,
+                    ));
+                }
                 Some("tool_use") => tool_use.push(part),
                 _ => content.push(gw_protocol::anthropic::image_to_image_url(part)),
             }
@@ -483,6 +500,9 @@ fn native_turn(role: &str, parts: Vec<Value>, reasoning: Option<String>, out: &m
         if !tool_use.is_empty() {
             let calls = gw_protocol::anthropic::tool_use_to_tool_calls(tool_use, &mut 0);
             msg.insert("tool_calls".into(), Value::Array(calls));
+        }
+        if !details.is_empty() {
+            msg.insert("reasoning_details".into(), Value::Array(details));
         }
         if let Some(reasoning) = reasoning.or((!prose.is_empty()).then_some(prose)) {
             msg.insert("reasoning_content".into(), reasoning.into());
@@ -567,6 +587,42 @@ mod tests {
             model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn signed_thinking_replays_as_reasoning_details() {
+        let mut out = Vec::new();
+        native_turn(
+            gw_consts::role::AI,
+            vec![
+                serde_json::json!({"type": "thinking", "thinking": "weigh", "signature": "sig-1"}),
+                serde_json::json!({"type": "redacted_thinking", "data": "blob"}),
+                serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "now", "input": {}}),
+            ],
+            None,
+            &mut out,
+        );
+        assert_eq!(out[0]["reasoning_content"], "weigh");
+        assert_eq!(
+            out[0]["reasoning_details"],
+            serde_json::json!([
+                {"type": "reasoning.text", "text": "weigh", "signature": "sig-1",
+                    "format": "anthropic-claude-v1", "index": 0},
+                {"type": "reasoning.encrypted", "data": "blob",
+                    "format": "anthropic-claude-v1", "index": 1},
+            ])
+        );
+        let mut unsigned = Vec::new();
+        native_turn(
+            gw_consts::role::AI,
+            vec![
+                serde_json::json!({"type": "thinking", "thinking": "weigh", "signature": ""}),
+                serde_json::json!({"type": "text", "text": "ok"}),
+            ],
+            None,
+            &mut unsigned,
+        );
+        assert!(unsigned[0].get("reasoning_details").is_none());
     }
 
     #[tokio::test]

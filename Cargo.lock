@@ -932,6 +932,7 @@ dependencies = [
  "gw-dag",
  "gw-engines",
  "gw-models",
+ "gw-protocol",
  "gw-state",
  "metrics",
  "regex",

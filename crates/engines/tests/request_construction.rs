@@ -2104,3 +2104,32 @@ async fn native_system_blocks_keep_the_clients_cache_control() {
         "the client's breakpoint and ttl survive; prompt_cache adds none on top"
     );
 }
+
+#[tokio::test]
+async fn chat_system_parts_keep_their_cache_control_on_the_anthropic_wire() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.message[0].parts = Some(serde_json::json!([
+        {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]));
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["system"],
+        serde_json::json!([{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}])
+    );
+
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.message[0].parts = Some(serde_json::json!([{"type": "text", "text": "be brief"}]));
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(t.body_json()["system"], "be brief");
+}
+
+#[tokio::test]
+async fn a_participant_name_reaches_the_openai_wire() {
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4.1-mini");
+    req.message[1].name = Some("alice".into());
+    OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(t.body_json()["messages"][1]["name"], "alice");
+}

@@ -3117,6 +3117,7 @@ fn chat_request(body: ChatCompletionRequest) -> (Vec<ChatMsg>, ModelParamV2) {
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.map(Value::Array),
                 tool_call_id: m.tool_call_id,
+                name: m.name,
                 reasoning_content: m.reasoning_content,
                 reasoning_details: m.reasoning_details.map(Value::Array),
             }
@@ -3332,6 +3333,7 @@ fn chat_stream_response(
         model: String,
         pending_finish: Option<Cow<'static, str>>,
         tool_index: usize,
+        tool_calls: bool,
     }
     impl SseEncodeState for St {
         fn queue(&mut self) -> &mut VecDeque<Event> {
@@ -3372,6 +3374,7 @@ fn chat_stream_response(
                         }
                     }
                     if let Some(tc) = c.tool_calls.take() {
+                        self.tool_calls = true;
                         let chunk = ChatCompletionChunk::tool_calls(
                             &self.id,
                             self.created,
@@ -3384,7 +3387,7 @@ fn chat_stream_response(
                     }
                     if let Some(fr) = c.finish_reason {
                         // held back until usage arrives so the final frame carries both
-                        self.pending_finish = Some(finish_openai(fr));
+                        self.pending_finish = Some(chat_finish(fr, self.tool_calls));
                     }
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
@@ -3420,6 +3423,7 @@ fn chat_stream_response(
             model,
             pending_finish: None,
             tool_index: 0,
+            tool_calls: false,
         },
     )
 }
@@ -3653,8 +3657,15 @@ async fn messages(
     let content = match outcome.response.anthropic_content.take() {
         Some(Value::Array(blocks)) => blocks,
         _ => {
-            let mut blocks = Vec::new();
-            if !outcome.response.reasoning.is_empty() {
+            let mut blocks: Vec<Value> = outcome
+                .response
+                .reasoning_details
+                .take()
+                .into_iter()
+                .flatten()
+                .filter_map(gw_protocol::reasoning::detail_to_thinking_block)
+                .collect();
+            if blocks.is_empty() && !outcome.response.reasoning.is_empty() {
                 blocks.push(object([
                     ("type", "thinking".into()),
                     ("thinking", take(&mut outcome.response.reasoning).into()),
@@ -3799,6 +3810,33 @@ fn messages_stream_response(
             }
         }
 
+        fn apply_signed_detail(&mut self, detail: Value) {
+            let Some(Value::Object(mut block)) =
+                gw_protocol::reasoning::detail_to_thinking_block(detail)
+            else {
+                return;
+            };
+            self.ensure_message_start();
+            if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+                self.close_block(BlockKind::Thinking);
+                let idx = self.next_idx;
+                self.next_idx += 1;
+                let mut start = json!({"type":"content_block_start","index":idx});
+                start["content_block"] = Value::Object(block);
+                self.queue.push_back(Self::ev("content_block_start", start));
+                self.queue.push_back(Self::ev(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":idx}),
+                ));
+            } else if let Some(Value::String(signature)) = block.remove("signature") {
+                let idx = self.open_block(BlockKind::Thinking);
+                self.queue.push_back(Self::ev(
+                    "content_block_delta",
+                    block_delta(idx, "signature_delta", "signature", signature),
+                ));
+            }
+        }
+
         fn slot(&mut self, kind: BlockKind) -> &mut Option<usize> {
             match kind {
                 BlockKind::Text => &mut self.text_idx,
@@ -3902,6 +3940,11 @@ fn messages_stream_response(
                             "content_block_delta",
                             block_delta(idx, "thinking_delta", "thinking", take(&mut c.reasoning)),
                         ));
+                    }
+                    if let Some(details) = c.reasoning_details.take() {
+                        for detail in details {
+                            self.apply_signed_detail(detail);
+                        }
                     }
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
