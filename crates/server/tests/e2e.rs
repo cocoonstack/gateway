@@ -3519,11 +3519,26 @@ accounts: [{name: a, provider: openai, protocols: ["responses"]}]
 #[tokio::test]
 async fn batch_requires_items_or_file() {
     let app = app();
+    for body in [r#"{"model":"gpt-4o-mini"}"#, "[]", "5", r#""x""#] {
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/batches", Some("ak-demo-123"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let upload = json!({"purpose": "batch", "file": "5\n[1]"}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/files", Some("ak-demo-123"), &upload))
+        .await
+        .unwrap();
+    let file_id = body_json(resp).await["id"].as_str().unwrap().to_owned();
     let resp = app
         .oneshot(post(
             "/v1/batches",
             Some("ak-demo-123"),
-            r#"{"model":"gpt-4o-mini"}"#,
+            &json!({"input_file_id": file_id}).to_string(),
         ))
         .await
         .unwrap();

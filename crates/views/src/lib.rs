@@ -4960,7 +4960,8 @@ async fn batches_submit(
             let Ok(mut req) = serde_json::from_str::<Value>(line) else {
                 return error_response(400, "input file line is not valid json");
             };
-            match batch_item(req["body"].take(), hint.as_deref()) {
+            let body = req.get_mut("body").map(Value::take).unwrap_or_default();
+            match batch_item(body, hint.as_deref()) {
                 Ok((item, line_model)) => {
                     if model.is_empty() {
                         model = line_model;
@@ -4970,7 +4971,7 @@ async fn batches_submit(
                 Err(e) => return error_response(400, e),
             }
         }
-    } else if let Some(items) = body["items"].as_array_mut() {
+    } else if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {
         for it in items {
             match batch_item(it.take(), hint.as_deref()) {
                 Ok((item, _)) => batch_items.push(item),
