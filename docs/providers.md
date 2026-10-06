@@ -73,7 +73,8 @@ models:
 ```
 
 The reply's `usage.cost` is the charge unless the tenant sets a `model_prices`
-override for the model.
+override for the model. Verified live: both paths, with the preset endpoint
+and with `endpoint: https://openrouter.ai/api/v1`.
 
 ## Native (non-OpenAI) wire engines
 
