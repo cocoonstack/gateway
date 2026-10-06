@@ -755,7 +755,7 @@ impl MockTransport {
             } else if id.contains("failed") {
                 json!({"status": "failed", "error": "mock generation failed"})
             } else {
-                json!({"status": "done", "progress": 100,
+                json!({"status": "done", "progress": 100, "model": "mock-video",
                        "video": {"url": format!("mock://videos/{id}.mp4"), "duration": 2},
                        "usage": {"cost_in_usd_ticks": 1_600_000_000}})
             });

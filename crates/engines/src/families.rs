@@ -1229,7 +1229,7 @@ impl ResponsesEngine {
             if m.role == gw_consts::role::TOOL {
                 input.push(function_call_output(
                     m.tool_call_id.unwrap_or_default().into(),
-                    m.content,
+                    m.content.into(),
                 ));
                 continue;
             }
@@ -1239,18 +1239,24 @@ impl ResponsesEngine {
                 "user"
             };
             let mut calls = Vec::new();
-            let (mut items, mut image) = (Vec::new(), false);
+            let image = role == "user"
+                && m.parts
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| matches!(b["type"].as_str(), Some("image" | "image_url")))
+                    });
+            let mut items = Vec::new();
             if let Some(Value::Array(blocks)) = m.parts {
                 for mut block in blocks {
                     match block["type"].as_str() {
-                        Some("text") => items.push(object([
+                        Some("text") if image => items.push(object([
                             ("type", "input_text".into()),
                             ("text", block["text"].take()),
                         ])),
-                        Some("image" | "image_url") => {
-                            image = true;
-                            items.push(input_image(block));
-                        }
+                        Some("image" | "image_url") if image => items.push(input_image(block)),
                         Some("tool_use") => calls.push(function_call(
                             block["id"].take(),
                             block["name"].take(),
@@ -1259,9 +1265,16 @@ impl ResponsesEngine {
                         Some("tool_result") => input.push(function_call_output(
                             block["tool_use_id"].take(),
                             match block["content"].take() {
-                                Value::String(s) => s,
-                                Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts),
-                                _ => String::new(),
+                                Value::Array(parts) if parts.iter().any(is_image_part) => {
+                                    Value::Array(
+                                        parts.into_iter().filter_map(output_item).collect(),
+                                    )
+                                }
+                                Value::Array(parts) => {
+                                    gw_protocol::anthropic::blocks_text(&parts).into()
+                                }
+                                Value::String(s) => s.into(),
+                                _ => Value::String(String::new()),
                             },
                         )),
                         _ => {}
@@ -1286,7 +1299,7 @@ impl ResponsesEngine {
                     ));
                 }
             }
-            if image && role == "user" {
+            if image {
                 input.push(object([
                     ("role", role.into()),
                     ("content", Value::Array(items)),
@@ -1317,11 +1330,13 @@ impl ResponsesEngine {
                     Value::Array(tools.into_iter().map(responses_tool).collect()),
                 );
             }
-            if let Some(format) = p.response_format {
-                body.insert(
-                    "text".to_owned(),
-                    object([("format", responses_format(format))]),
-                );
+            if let Some(format) = p.response_format
+                && let Some(text) = body
+                    .entry("text")
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+            {
+                text.insert("format".to_owned(), responses_format(format));
             }
             if let Some(v) = p.tool_choice {
                 if let Some(parallel) = crate::openai_engine::parallel_tool_calls(&v) {
@@ -1543,12 +1558,27 @@ fn function_call(call_id: Value, name: Value, arguments: Value) -> Value {
     ])
 }
 
-fn function_call_output(call_id: Value, output: String) -> Value {
+fn function_call_output(call_id: Value, output: Value) -> Value {
     object([
         ("type", "function_call_output".into()),
         ("call_id", call_id),
-        ("output", output.into()),
+        ("output", output),
     ])
+}
+
+fn is_image_part(part: &Value) -> bool {
+    matches!(part["type"].as_str(), Some("image" | "image_url"))
+}
+
+fn output_item(mut part: Value) -> Option<Value> {
+    match part["type"].as_str() {
+        Some("text") => Some(object([
+            ("type", "input_text".into()),
+            ("text", part["text"].take()),
+        ])),
+        Some("image" | "image_url") => Some(input_image(part)),
+        _ => None,
+    }
 }
 
 /// A Responses `status`/`incomplete_details.reason` in the shared finish vocabulary.
@@ -2024,7 +2054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_and_search_and_passthrough() {
+    async fn video_and_search() {
         let mut v = VideoEngine::new(
             req(
                 Protocol::Video,
@@ -2183,6 +2213,42 @@ mod tests {
         assert_eq!(
             body["text"],
             serde_json::json!({"format": {"type": "json_object"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_result_screenshot_reaches_the_responses_wire() {
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.message = vec![ChatMsg {
+            parts: Some(
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "shot"}, {"type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}]),
+            ),
+            ..ChatMsg::text("user", "")
+        }];
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{"type": "function_call_output", "call_id": "toolu_1", "output": [
+                {"type": "input_text", "text": "shot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ]}])
+        );
+    }
+
+    #[test]
+    fn a_response_format_joins_the_clients_text_object() {
+        let typed = TypedParams::Chat(gw_models::ChatParams {
+            response_format: Some(serde_json::json!({"type": "json_object"})),
+            ..Default::default()
+        });
+        let mut r = req(Protocol::Responses, "gpt-5-responses", Some(typed));
+        r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"text": {"verbosity": "low"}});
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"verbosity": "low", "format": {"type": "json_object"}})
         );
     }
 

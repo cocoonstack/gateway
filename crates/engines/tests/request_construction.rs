@@ -2133,3 +2133,19 @@ async fn a_participant_name_reaches_the_openai_wire() {
     OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     assert_eq!(t.body_json()["messages"][1]["name"], "alice");
 }
+
+#[tokio::test]
+async fn a_marked_chat_system_stays_plain_for_a_non_claude_converse_model() {
+    let t = RecordingTransport::new(
+        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AwsConverse, "us.xai.grok-4.6");
+    req.message[0].parts = Some(serde_json::json!([
+        {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}
+    ]));
+    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["system"],
+        serde_json::json!([{"text": "be brief"}])
+    );
+}

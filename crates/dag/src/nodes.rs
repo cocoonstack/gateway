@@ -211,8 +211,8 @@ impl DagNode for CacheLookup {
     }
 }
 
-/// Cache key: sha256 of config generation, wire flags, model, messages, typed and raw params;
-/// not keyed by tenant (entitlement gates first, a split would only shrink hits).
+/// Cache key: sha256 of config generation, wire flags, beta header, model, messages, typed and
+/// raw params; not keyed by tenant (entitlement gates first, a split would only shrink hits).
 fn cache_key_of(ctx: &DagContext) -> Option<String> {
     use sha2::{Digest, Sha256};
     let param = ctx.request.model_param_v2.as_ref()?;
@@ -288,7 +288,7 @@ impl DagNode for QuotaCheck {
             .map_err(quota_denied)?;
         ctx.quota_reserved = Some(reserved);
         ctx.quota_at = at;
-        ctx.decide("quota_check", format!("reserved {est}"));
+        ctx.decide("quota_check", format!("reserved {reserved}"));
         Ok(())
     }
 }

@@ -3756,8 +3756,8 @@ fn messages_stream_response(
             ));
         }
 
-        /// A text or (for a non-Anthropic model's reasoning prose) unsigned
-        /// thinking block; thinking precedes text, so opening text closes it.
+        /// A text or (for a non-Anthropic model's reasoning) thinking block;
+        /// thinking precedes text, so opening text closes it.
         fn open_block(&mut self, kind: BlockKind) -> usize {
             if let Some(idx) = *self.slot(kind) {
                 return idx;
@@ -4050,20 +4050,6 @@ async fn family_response(
     match run_family(s, ak, model, mt, typed, vec![], user_id).await {
         Ok(mut ctx) => {
             log_access(surface, &ctx, started);
-            if let Some(requested) = ctx
-                .request
-                .model_param_v2
-                .as_ref()
-                .and_then(|p| p.fallback_from.as_deref())
-                && let Some(body) = ctx
-                    .outcome
-                    .as_mut()
-                    .and_then(|o| o.response.response_v2.as_mut())
-                    .and_then(Value::as_object_mut)
-                && body.contains_key("model")
-            {
-                body.insert("model".to_owned(), requested.into());
-            }
             let response = response_v2_or_500(ctx.outcome.take(), mt);
             terminal_response(&ctx, response).await
         }
@@ -4620,11 +4606,19 @@ async fn videos_get(
     Path(id): Path<String>,
 ) -> Response {
     match admit_video_job(&s, ak, &id).await {
-        Ok((_, _, poll)) => (
-            StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
-            Json(poll.body),
-        )
-            .into_response(),
+        Ok((job, _, mut poll)) => {
+            if job.model != job.served_model
+                && let Some(body) = poll.body.as_object_mut()
+                && body.contains_key("model")
+            {
+                body.insert("model".to_owned(), job.model.into());
+            }
+            (
+                StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
+                Json(poll.body),
+            )
+                .into_response()
+        }
         Err(resp) => resp,
     }
 }

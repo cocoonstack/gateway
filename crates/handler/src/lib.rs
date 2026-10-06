@@ -313,6 +313,15 @@ impl OnlineHandler {
             .and_then(|p| p.fallback_from.clone())
             && let Some(outcome) = ctx.outcome.as_mut()
         {
+            if let Some(body) = outcome
+                .response
+                .response_v2
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                && body.contains_key("model")
+            {
+                body.insert("model".to_owned(), requested.as_str().into());
+            }
             outcome.response.model = requested;
         }
 

@@ -1735,6 +1735,7 @@ models:
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["model"], "vid-pub");
 
     let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
     let rows: Vec<&Value> = j["records"]

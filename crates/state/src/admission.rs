@@ -330,62 +330,6 @@ pub async fn check_budgets(
     Ok(Ok(over))
 }
 
-/// Accrue usage under `over`, the override admission resolved (`None` resolves it now);
-/// a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
-pub async fn consume_budgets(
-    state: &GatewayState,
-    cfg: &GatewayConfig,
-    ak: &AkInfo,
-    user: &str,
-    over: Option<UserBudget>,
-    tokens: i64,
-    cost_micros: i64,
-) {
-    if tokens <= 0 && cost_micros <= 0 {
-        return;
-    }
-    let over = match over {
-        Some(over) => over,
-        None => user_budget(state, ak, user).await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "user budget lookup failed at settlement; charging tenant defaults");
-            UserBudget::default()
-        }),
-    };
-    let gov = state.governance.as_ref();
-    let budgets = budgets(gov, cfg, ak, user, over).await;
-    let used = futures::future::join_all(budgets.iter().map(|b| async move {
-        let amount = if b.scope.charges_cost() {
-            cost_micros
-        } else {
-            tokens
-        };
-        if amount <= 0 {
-            return None;
-        }
-        Some(match b.window {
-            Window::Day => gov.quota_consume(&b.key, amount).await,
-            Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
-        })
-    }))
-    .await;
-    for (b, used) in budgets.iter().zip(used) {
-        if let Some(used) = used
-            && used >= b.limit
-        {
-            state.alerts.emit(
-                "budget_exhausted",
-                b.scope.subject(ak, user),
-                format!(
-                    "{} {} budget: {used} of {}",
-                    b.window.label(),
-                    b.scope.unit(),
-                    b.limit
-                ),
-            );
-        }
-    }
-}
-
 pub fn model_quota_key(ak_id: &str, model: &str) -> String {
     format!("{ak_id}|{model}")
 }
@@ -405,7 +349,7 @@ pub fn swap_to_fallback(
     tenant: &str,
     param: &mut gw_models::ModelParamV2,
 ) -> FallbackSwap {
-    let chat = matches!(param.typed, None | Some(gw_models::TypedParams::Chat(_)));
+    let chat = matches!(param.typed, Some(gw_models::TypedParams::Chat(_)));
     let Some(fb) = cfg
         .find_tenant(tenant)
         .and_then(|t| t.fallback_model.as_deref())
@@ -582,6 +526,62 @@ pub fn month_prefixes() -> [String; 2] {
     [month_prefix(month), month_prefix(previous_month(month))]
 }
 
+/// Accrue usage under `over`, the override admission resolved (`None` resolves it now);
+/// a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
+async fn consume_budgets(
+    state: &GatewayState,
+    cfg: &GatewayConfig,
+    ak: &AkInfo,
+    user: &str,
+    over: Option<UserBudget>,
+    tokens: i64,
+    cost_micros: i64,
+) {
+    if tokens <= 0 && cost_micros <= 0 {
+        return;
+    }
+    let over = match over {
+        Some(over) => over,
+        None => user_budget(state, ak, user).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "user budget lookup failed at settlement; charging tenant defaults");
+            UserBudget::default()
+        }),
+    };
+    let gov = state.governance.as_ref();
+    let budgets = budgets(gov, cfg, ak, user, over).await;
+    let used = futures::future::join_all(budgets.iter().map(|b| async move {
+        let amount = if b.scope.charges_cost() {
+            cost_micros
+        } else {
+            tokens
+        };
+        if amount <= 0 {
+            return None;
+        }
+        Some(match b.window {
+            Window::Day => gov.quota_consume(&b.key, amount).await,
+            Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
+        })
+    }))
+    .await;
+    for (b, used) in budgets.iter().zip(used) {
+        if let Some(used) = used
+            && used >= b.limit
+        {
+            state.alerts.emit(
+                "budget_exhausted",
+                b.scope.subject(ak, user),
+                format!(
+                    "{} {} budget: {used} of {}",
+                    b.window.label(),
+                    b.scope.unit(),
+                    b.limit
+                ),
+            );
+        }
+    }
+}
+
 fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(deny()) }
 }
@@ -724,6 +724,11 @@ mod tests {
             FallbackSwap::Unconfigured
         ));
         assert_eq!(family.model_name, "emb");
+        let mut native = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "emb");
+        assert!(matches!(
+            swap_to_fallback(&cfg, "t", &mut native),
+            FallbackSwap::Unconfigured
+        ));
         let mut chat = gw_models::ModelParamV2::with_name(
             gw_consts::Protocol::AnthropicMessages,
             "other-chat",
