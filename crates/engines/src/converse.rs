@@ -411,6 +411,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
                 && let Some(first) = content.iter().position(|b| b.get("image").is_some())
             {
                 siblings = content.split_off(first);
+                content.extend(siblings.extract_if(.., |b| b.get("document").is_some()));
             }
             if content.is_empty() {
                 content.push(json!({"json": {}}));
@@ -579,14 +580,21 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": [
                     {"type": "text", "text": "shot"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
-                    {"type": "text", "text": "after"}]}]}]}))
+                    {"type": "text", "text": "after"},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "log"}}]}]}]}))
             .unwrap()
         };
         let gpt = request(body(), "openai.gpt-6-luna");
         let content = &gpt["messages"][0]["content"];
         assert_eq!(
-            content[0]["toolResult"]["content"],
-            json!([{"text": "shot"}])
+            content[0]["toolResult"]["content"][0],
+            json!({"text": "shot"})
+        );
+        assert!(
+            content[0]["toolResult"]["content"][1]
+                .get("document")
+                .is_some(),
+            "{content}"
         );
         assert!(content[1].get("image").is_some(), "{content}");
         assert_eq!(content[2], json!({"text": "after"}));
