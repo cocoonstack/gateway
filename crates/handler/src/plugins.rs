@@ -392,6 +392,7 @@ fn for_each_typed_text(
         T::Search(p) => f(&mut p.query),
         T::Moderation(p) => p.input.iter_mut().map(&mut *f).sum(),
         T::Rerank(p) => f(&mut p.query) + p.documents.iter_mut().map(&mut *f).sum::<usize>(),
+        T::Decisions(p) => p.fields.values_mut().map(|v| walk_json_strings(v, f)).sum(),
         T::AudioStt(_) => 0,
     }
 }

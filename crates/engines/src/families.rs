@@ -1134,6 +1134,42 @@ fn rerank_tokens(v: &Value) -> i64 {
         .saturating_add(crate::engine::tok(&v["meta"]["tokens"]["output_tokens"]))
 }
 
+base_engine!(DecisionsEngine);
+
+#[async_trait::async_trait]
+impl ModelEngine for DecisionsEngine {
+    /// System One decisions on OpenRouter: `{model, state, questions}` → typed
+    /// `answers`, the reply passed through whole; `usage.cost` is the charge.
+    async fn run(&mut self) -> GResult<EngineOutcome> {
+        let model = self.base.model_name()?.to_owned();
+        let Some(TypedParams::Decisions(p)) = self.base.take_typed() else {
+            return Err(GatewayError::bad_request("decisions params are required"));
+        };
+        let base = self.base.base_url(VENDOR_SENTINEL);
+        let url = if p.system_one {
+            versioned_url(base, "systemone")
+        } else {
+            format!("{base}/alpha/decisions")
+        };
+        let mut body = p.fields;
+        body.insert("model".to_owned(), model.as_str().into());
+        let (status, v) = self.base.round_trip(&url, Value::Object(body)).await?;
+        let usage = &v["usage"];
+        let (input, output) = (
+            crate::engine::tok(&usage["input_tokens"]),
+            crate::engine::tok(&usage["output_tokens"]),
+        );
+        let raw_usage = (!usage.is_null()).then(|| usage.clone());
+        let answers = v["answers"].as_object().map_or(0, Map::len);
+        let mut out = family_outcome(format!("{answers} answers"), model, v, status);
+        out.response.prompt_tokens = input;
+        out.response.completion_tokens = output;
+        out.response.total_tokens = input.saturating_add(output);
+        out.response.raw_usage = raw_usage;
+        Ok(out)
+    }
+}
+
 base_engine!(PassthroughEngine);
 
 #[async_trait::async_trait]

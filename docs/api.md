@@ -79,6 +79,21 @@ and are served normally: an `aws-embed` model answers `/v1/embeddings`, and
 |--------|------|-------|
 | POST | `/v1/search` | web search as a routed backend: `{model, query, count?}` (`count` defaults to 3, clamped to 1-20); a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
 
+## Decisions
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/decisions` | System One typed decisions (TypeSafe Jev), OpenRouter's Decisions API: `{model, state, questions}` → `{id, model, provider, answers, usage}` |
+| POST | `/v1/systemone` | the same on the TypeSafe SDK's path (point the SDK's base URL at the gateway) |
+
+Both serve `protocol: decisions` models. Every body field but `model` goes to
+the vendor as sent, `/v1/decisions` to `{endpoint}/alpha/decisions` and
+`/v1/systemone` to `{endpoint}/v1/systemone`, and the vendor's reply comes back
+whole, its `id` included, so one call can be looked up in OpenRouter's
+generation history. The ledger records `usage.input_tokens` and
+`usage.output_tokens` and charges `usage.cost` as reported; the model's price
+list applies only to a reply without it.
+
 ### Chat completions
 
 ```bash

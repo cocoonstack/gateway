@@ -2624,9 +2624,10 @@ pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_model
 }
 
 /// Price one call into a [`BillingRecord`] (tenant price for the served model,
-/// vendor cost from the account), shared by the pipeline and the realtime
-/// surface; prompt/completion keep the vendor counts, `total_tokens` is the
-/// weighted platform total quota metering consumed.
+/// vendor cost from the account; a decisions call charges the vendor's reported
+/// cost), shared by the pipeline and the realtime surface; prompt/completion
+/// keep the vendor counts, `total_tokens` is the weighted platform total quota
+/// metering consumed.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
@@ -2638,6 +2639,9 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
+    let vendor_priced = b
+        .vendor_cost
+        .filter(|_| b.protocol == gw_consts::Protocol::Decisions.as_str());
     let units = clamp_tokens(b.units);
     let unit_price = b
         .unit_price
@@ -2676,10 +2680,12 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: discounted(
-            gw_models::cost_micros(billable_prompt, billable_completion, charged)
-                .saturating_add(unit_cost),
-        ),
+        cost_micros: vendor_priced.unwrap_or_else(|| {
+            discounted(
+                gw_models::cost_micros(billable_prompt, billable_completion, charged)
+                    .saturating_add(unit_cost),
+            )
+        }),
         vendor_cost_micros: b.vendor_cost.unwrap_or_else(|| {
             discounted(
                 gw_models::cost_micros(billable_prompt, billable_completion, vendor)

@@ -590,6 +590,38 @@ impl MockTransport {
         }))
     }
 
+    /// Decisions reply: a typed answer per question, the first choice option
+    /// picked, input billed at one micro-dollar a token in `usage.cost`.
+    fn decisions_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let body = Self::parse(&req.body, "decisions")?;
+        let mut answers = serde_json::Map::new();
+        if let Some(questions) = body["questions"].as_object() {
+            for (name, q) in questions {
+                let answer = match q["type"].as_str().unwrap_or_default() {
+                    "choice" => {
+                        let pick = q["criteria"]
+                            .as_object()
+                            .and_then(|c| c.keys().next())
+                            .map_or("", String::as_str);
+                        json!({"type": "choice", "choice": pick, "confidence": 1.0,
+                               "probabilities": {pick: 1.0}})
+                    }
+                    "score" => json!({"type": "score", "score": 0.0, "confidence": 1.0}),
+                    _ => json!({"type": "noul", "noul": 0.5}),
+                };
+                answers.insert(name.clone(), answer);
+            }
+        }
+        let input = Self::tokens(&String::from_utf8_lossy(&req.body));
+        Self::ok_json(json!({
+            "id": "gen-dec-mock",
+            "model": body["model"],
+            "provider": "mock",
+            "answers": answers,
+            "usage": {"input_tokens": input, "output_tokens": 0, "cost": input as f64 / 1e6},
+        }))
+    }
+
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         if req.url.ends_with("/audio/transcriptions") {
             let language = Self::form_field(&req.body, "language");
@@ -898,6 +930,9 @@ impl Transport for MockTransport {
         }
         if req.protocol == Protocol::Search {
             return self.search_reply(&req);
+        }
+        if req.protocol == Protocol::Decisions {
+            return self.decisions_reply(&req);
         }
         let u = req.url.as_str();
         if u.contains("/model/") {

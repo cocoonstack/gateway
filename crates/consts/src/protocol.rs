@@ -55,6 +55,8 @@ pub enum Protocol {
     Moderations,
     /// document rerank (Cohere/Jina-compatible shape)
     Rerank,
+    /// System One typed decisions (TypeSafe Jev via OpenRouter)
+    Decisions,
 }
 
 impl Protocol {
@@ -82,6 +84,7 @@ impl Protocol {
         Protocol::Dashscope,
         Protocol::Moderations,
         Protocol::Rerank,
+        Protocol::Decisions,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -109,6 +112,7 @@ impl Protocol {
             Protocol::Dashscope => "dashscope",
             Protocol::Moderations => "moderations",
             Protocol::Rerank => "rerank",
+            Protocol::Decisions => "decisions",
         }
     }
 
@@ -139,7 +143,7 @@ mod tests {
         for &p in Protocol::ALL {
             assert_eq!(Protocol::from_wire(p.as_str()), Some(p));
         }
-        assert_eq!(Protocol::ALL.len(), 23);
+        assert_eq!(Protocol::ALL.len(), 24);
         assert!(Protocol::from_wire("nope").is_none());
     }
 }

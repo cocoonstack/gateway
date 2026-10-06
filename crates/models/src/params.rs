@@ -29,6 +29,8 @@ pub enum TypedParams {
     Moderation(ModerationParams),
     /// document rerank (cohere / jina / voyage compatible)
     Rerank(RerankParams),
+    /// System One typed decisions (TypeSafe Jev)
+    Decisions(DecisionParams),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -180,6 +182,16 @@ pub struct RerankParams {
     pub documents: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_n: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DecisionParams {
+    /// The TypeSafe SDK's `/v1/systemone` path rather than the Decisions API.
+    #[serde(default)]
+    pub system_one: bool,
+    /// The client's body without `model` (`state`, `questions`, ...), forwarded as sent.
+    #[serde(default)]
+    pub fields: serde_json::Map<String, Value>,
 }
 
 fn one() -> i64 {

@@ -187,6 +187,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/moderations", post(moderations))
         .route("/v1/search", post(search))
         .route("/v1/rerank", post(rerank))
+        .route("/v1/decisions", post(decisions))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/batches", post(batches_submit))
         .route("/v1/batches/{id}", get(batches_get))
         .route("/v1/files", post(files_upload))
@@ -4851,6 +4853,62 @@ async fn rerank(
         user_hint(hint, &body["user"]),
         "rerank",
         "rerank",
+        started,
+    )
+    .await
+}
+
+/// POST /v1/decisions — System One typed decisions (OpenRouter's Decisions API): `{model, state, questions}`.
+async fn decisions(
+    State(s): State<AppState>,
+    UserHint(hint): UserHint,
+    Authed(ak): Authed,
+    ApiJson(body): ApiJson<Value>,
+) -> Response {
+    decisions_response(&s, ak, hint, body, false, "decisions").await
+}
+
+/// POST /v1/systemone — the same decisions on the TypeSafe SDK's path.
+async fn systemone(
+    State(s): State<AppState>,
+    UserHint(hint): UserHint,
+    Authed(ak): Authed,
+    ApiJson(body): ApiJson<Value>,
+) -> Response {
+    decisions_response(&s, ak, hint, body, true, "systemone").await
+}
+
+async fn decisions_response(
+    s: &AppState,
+    ak: Arc<AkInfo>,
+    hint: Option<String>,
+    body: Value,
+    system_one: bool,
+    surface: &'static str,
+) -> Response {
+    let started = Instant::now();
+    let mut fields = match body {
+        Value::Object(fields) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let model = match fields.remove("model") {
+        Some(Value::String(m)) => m,
+        _ => String::new(),
+    };
+    if model.is_empty() || !fields.contains_key("state") || !fields.contains_key("questions") {
+        return error_response(400, "model, state, and questions are required");
+    }
+    let user_id = user_hint(hint, fields.get("user").unwrap_or(&Value::Null));
+    let typed = TypedParams::Decisions(gw_models::DecisionParams { system_one, fields });
+    family_response(
+        s,
+        ak,
+        model,
+        gw_consts::Protocol::Decisions,
+        typed,
+        user_id,
+        surface,
+        "decisions",
         started,
     )
     .await

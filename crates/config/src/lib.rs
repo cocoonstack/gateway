@@ -1461,7 +1461,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         },
         "openrouter" => ProviderPreset {
             endpoint: "https://openrouter.ai/api",
-            wires: &["openai-chat"],
+            wires: &["openai-chat", "decisions"],
             default_model_wire: "openai-chat",
         },
         "moonshot" => ProviderPreset {
