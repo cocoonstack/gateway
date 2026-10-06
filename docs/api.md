@@ -47,7 +47,7 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 |--------|------|-------|
 | POST | `/v1/chat/completions` | streaming + non-streaming |
 | POST | `/v1/completions` | legacy text completion (`prompt`) |
-| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort` from an effort or a thinking budget, and `store: false` unless the client sets it, as on Chat Completions) and streams as that surface's own frames — image parts become `input_image` items and `response_format` becomes `text.format`; a `refusal` output part, streamed or buffered, is returned as the reply text; a model on any other wire is not served from `/v1/responses`, whose body has no normalized turns |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming; the body (`reasoning`, `include`, reasoning items) and the vendor's event stream pass through verbatim; a `responses` model reached from `/v1/chat/completions` or `/v1/messages` gets its Responses body built from the normalized turns (`input` items, `instructions`, `function_call`/`function_call_output`, `max_output_tokens`, flattened tools, `reasoning.effort` from an effort or a thinking budget, and `store: false` unless the client sets it, as on Chat Completions) and streams as that surface's own frames — image parts (top-level, and inside a `tool_result`) become `input_image` items and `response_format` becomes `text.format`; a `refusal` output part, streamed or buffered, is returned as the reply text; a model on any other wire is not served from `/v1/responses`, whose body has no normalized turns |
 | POST | `/v1/embeddings` | |
 | POST | `/v1/images/generations` | |
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
@@ -161,7 +161,8 @@ reconcile the write premium; the Responses surface reports the same two under
 Both serve `protocol: decisions` models. Every body field but `model` goes to
 the vendor as sent, `/v1/decisions` to `{endpoint}/alpha/decisions` (a trailing
 `/v1` on the endpoint is dropped for this path) and `/v1/systemone` to
-`{endpoint}/v1/systemone`, and the vendor's reply comes back whole, its `id`
+`{endpoint}/v1/systemone` (`{endpoint}/systemone` when the endpoint already ends
+in a version segment), and the vendor's reply comes back whole, its `id`
 included, so one call can be looked up in OpenRouter's generation history; when
 a variant or fallback served the call, its `model` field names the requested
 model. The ledger records `usage.input_tokens` and `usage.output_tokens` and
@@ -198,9 +199,12 @@ reports
 `stop_reason: tool_use` even where the vendor said `stop` (OpenAI does for a
 forced tool). On an OpenAI-protocol
 model, `thinking` (a budget, or `output_config.effort`) becomes
-`reasoning_effort` and the model's reasoning prose comes back as an unsigned
-`thinking` block ahead of the answer (streamed as `thinking_delta`); replaying
-it sends the prose on as `reasoning_content`.
+`reasoning_effort` and the model's reasoning prose comes back as a `thinking`
+block ahead of the answer (streamed as `thinking_delta`), signed when the
+vendor's `reasoning_details` carry a signature (a `signature_delta` when
+streaming; encrypted units arrive as `redacted_thinking`); replaying a block
+sends its prose on as `reasoning_content`, and a signed or redacted block as
+`reasoning_details` too.
 
 ### Extended thinking
 

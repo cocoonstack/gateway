@@ -30,7 +30,7 @@ on jemalloc as its global allocator.
 
 | Variable | Effect |
 |----------|--------|
-| `GW_CONFIG` | config file path; unset uses the embedded demo config |
+| `GW_CONFIG` | config file path; unset uses the embedded demo config (with `storage.postgres_url` the config store's newest version replaces it; the file only seeds an empty store) |
 | `GW_HOST` | override `listen.host` (containers set `0.0.0.0`) |
 | `GW_PORT` | override `listen.port` |
 | `GW_TRANSPORT` | `mock` (zero egress) / `http` (no mock) / unset (auto-route) |

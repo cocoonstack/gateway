@@ -28,7 +28,9 @@ its keys, a model entitlement allowlist (unlisted models 403 and disappear
 from `GET /v1/models`), per-model daily-token quota defaults (each key metered
 separately against the same value; per-key `model_quotas` override), and an
 optional `fallback_model` — an over-quota request degrades to it instead of
-failing (the response echoes the requested model name; the ledger records both
+failing (a typed-family request such as embeddings, rerank or decisions only
+when the fallback's protocol serves its surface, else it is denied; the
+response echoes the requested model name; the ledger records both
 requested and served; a model's own `fallback_models` chain for upstream
 failures is a separate mechanism, below). The per-key daily cap stays the hard backstop, and
 unconfigured (key, model) pairs never touch a counter.

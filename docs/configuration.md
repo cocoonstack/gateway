@@ -82,7 +82,7 @@ tenants:
     models: [gpt-4o, gpt-4o-mini]   # entitlement allowlist; absent = every model
     model_quotas:            # per-model daily-token defaults, applied per key
       gpt-4o: 100000
-    fallback_model: gpt-4o-mini     # over-quota requests degrade here instead of failing
+    fallback_model: gpt-4o-mini     # over-quota requests degrade here instead of failing (a typed surface only to a model of its protocol)
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
     model_prices:            # optional per-model charged-price override for this tenant
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
