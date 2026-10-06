@@ -340,7 +340,7 @@ fn carries_tool_block(message: &Value) -> bool {
 }
 
 /// One Messages content block as Converse blocks; a `cache_control` marker
-/// becomes a following `cachePoint`.
+/// becomes a following `cachePoint` for the families that cache.
 fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec<Value> {
     let cache_control = block
         .get_mut("cache_control")
