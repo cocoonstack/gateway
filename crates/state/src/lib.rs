@@ -361,17 +361,6 @@ impl std::fmt::Debug for RateLimiter {
     }
 }
 
-fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
-    let quota = if qps < 1.0 {
-        governor::Quota::with_period(Duration::from_secs_f64(1.0 / qps))
-            .unwrap_or_else(|| governor::Quota::per_second(NonZeroU32::MIN))
-    } else {
-        let per_sec = qps.round().clamp(1.0, u32::MAX as f64) as u32;
-        governor::Quota::per_second(NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MIN))
-    };
-    Arc::new(governor::RateLimiter::direct(quota))
-}
-
 /// Saturating counters per governance key; the daily-quota instance is reset by the gw-task job.
 #[derive(Debug, Default)]
 pub struct QuotaStore {
@@ -536,11 +525,6 @@ impl AccountPool {
         };
         Some(Arc::clone(top[idx]))
     }
-}
-
-/// Whether `a` can serve protocol `p`, honoring a model's provider binding.
-fn serves(a: &Arc<Account>, p: Protocol, provider: Option<&str>) -> bool {
-    a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want)
 }
 
 #[derive(Debug)]
@@ -738,34 +722,6 @@ impl ResponseCache for RedisResponseCache {
         {
             tracing::warn!(error = %e, "redis cache put failed");
         }
-    }
-}
-
-fn redis_cache_key(key: &str) -> String {
-    format!("gw:cache:{key}")
-}
-
-struct PerEntryTtl;
-
-impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTtl {
-    fn expire_after_create(
-        &self,
-        _key: &String,
-        value: &(gw_models::GatewayResponse, Duration),
-        _created_at: Instant,
-    ) -> Option<Duration> {
-        Some(value.1)
-    }
-
-    // re-putting resets the TTL; moka's default would keep the original deadline
-    fn expire_after_update(
-        &self,
-        _key: &String,
-        value: &(gw_models::GatewayResponse, Duration),
-        _updated_at: Instant,
-        _duration_until_expiry: Option<Duration>,
-    ) -> Option<Duration> {
-        Some(value.1)
     }
 }
 
@@ -988,6 +944,30 @@ impl std::fmt::Debug for SharedConfig {
     }
 }
 
+struct PerEntryTtl;
+
+impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTtl {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &(gw_models::GatewayResponse, Duration),
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(value.1)
+    }
+
+    // re-putting resets the TTL; moka's default would keep the original deadline
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &(gw_models::GatewayResponse, Duration),
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.1)
+    }
+}
+
 /// Current unix seconds (0 if the clock reads before the epoch).
 pub fn epoch_secs() -> i64 {
     epoch_millis() / 1000
@@ -1043,6 +1023,26 @@ pub(crate) async fn redis_connect(url: &str) -> Result<redis::aio::ConnectionMan
     redis::aio::ConnectionManager::new(client)
         .await
         .map_err(|e| format!("redis connect: {e}"))
+}
+
+fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
+    let quota = if qps < 1.0 {
+        governor::Quota::with_period(Duration::from_secs_f64(1.0 / qps))
+            .unwrap_or_else(|| governor::Quota::per_second(NonZeroU32::MIN))
+    } else {
+        let per_sec = qps.round().clamp(1.0, u32::MAX as f64) as u32;
+        governor::Quota::per_second(NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MIN))
+    };
+    Arc::new(governor::RateLimiter::direct(quota))
+}
+
+/// Whether `a` can serve protocol `p`, honoring a model's provider binding.
+fn serves(a: &Arc<Account>, p: Protocol, provider: Option<&str>) -> bool {
+    a.protocols.contains(&p) && provider.is_none_or(|want| a.provider == want)
+}
+
+fn redis_cache_key(key: &str) -> String {
+    format!("gw:cache:{key}")
 }
 
 /// The entry for `key`, inserting `init()` on first use — the key String is

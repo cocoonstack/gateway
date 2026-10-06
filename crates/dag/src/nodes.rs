@@ -237,6 +237,19 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     Some(hex::encode(h.finalize()))
 }
 
+struct PromptBytes(usize);
+
+impl Write for PromptBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Admission estimate: ~bytes/4 prompt plus the requested max_tokens, saturating and capped.
 fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
     let typed = req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref());
@@ -734,39 +747,6 @@ impl BillTokens {
     }
 }
 
-async fn bill_aborted_stream(
-    ctx: &mut DagContext,
-    delivered_completion: Option<i64>,
-) -> GResult<()> {
-    let response = &ctx
-        .outcome
-        .as_ref()
-        .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
-        .response;
-    let enc = crate::token_estimate::default_encoder();
-    let param = ctx.request.model_param_v2.as_ref();
-    let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
-        gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
-        _ => None,
-    });
-    let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-    let prompt = if response.prompt_tokens > 0 {
-        response.prompt_tokens
-    } else {
-        crate::token_estimate::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
-    };
-    let completion = delivered_completion
-        .unwrap_or_else(|| enc.encode_len(&response.message) as i64)
-        .max(0);
-    let rate =
-        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
-    ctx.decide(
-        "cost_calc",
-        format!("aborted stream, billed {prompt}+{completion}"),
-    );
-    bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
-}
-
 /// Close a buffered stream's billing: refund before delivery, bill estimates after a partial one.
 pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
     if !ctx.billing_deferred {
@@ -805,6 +785,39 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
             Ok(())
         }
     }
+}
+
+async fn bill_aborted_stream(
+    ctx: &mut DagContext,
+    delivered_completion: Option<i64>,
+) -> GResult<()> {
+    let response = &ctx
+        .outcome
+        .as_ref()
+        .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
+        .response;
+    let enc = crate::token_estimate::default_encoder();
+    let param = ctx.request.model_param_v2.as_ref();
+    let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
+        gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
+        _ => None,
+    });
+    let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+    let prompt = if response.prompt_tokens > 0 {
+        response.prompt_tokens
+    } else {
+        crate::token_estimate::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
+    };
+    let completion = delivered_completion
+        .unwrap_or_else(|| enc.encode_len(&response.message) as i64)
+        .max(0);
+    let rate =
+        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
+    ctx.decide(
+        "cost_calc",
+        format!("aborted stream, billed {prompt}+{completion}"),
+    );
+    bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
 }
 
 fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
@@ -980,19 +993,6 @@ pub fn default_layers() -> Vec<Layer> {
             ],
         },
     ]
-}
-
-struct PromptBytes(usize);
-
-impl Write for PromptBytes {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.saturating_add(bytes.len());
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn cache_ttl_seconds(cfg: &gw_config::GatewayConfig, model_name: &str) -> Option<u64> {

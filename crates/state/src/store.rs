@@ -532,46 +532,6 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     }
 }
 
-#[derive(Debug, Default)]
-struct MemoryLedger {
-    rows: Vec<BillingRecord>,
-    request_ids: HashSet<String>,
-}
-
-#[derive(Debug, Default)]
-struct MemoryContent {
-    rows: Vec<crate::ContentRecord>,
-    terminal_keys: HashSet<(String, String, String)>,
-}
-
-impl MemoryContent {
-    fn push_terminal(&mut self, record: crate::ContentRecord) {
-        if self.terminal_keys.insert(Self::terminal_key(&record)) {
-            self.rows.push(record);
-        }
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
-        let before = self.rows.len();
-        self.rows.retain(|record| {
-            let retained = keep(record);
-            if !retained && record.kind == "terminal" {
-                self.terminal_keys.remove(&Self::terminal_key(record));
-            }
-            retained
-        });
-        (before - self.rows.len()) as u64
-    }
-
-    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
-        (
-            record.tenant.clone(),
-            record.user_id.clone(),
-            record.request_id.clone(),
-        )
-    }
-}
-
 /// In-process store: append-only ledger, DashMap-backed files and batches.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
@@ -1036,6 +996,46 @@ impl Store for MemoryStore {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+struct MemoryContent {
+    rows: Vec<crate::ContentRecord>,
+    terminal_keys: HashSet<(String, String, String)>,
+}
+
+impl MemoryContent {
+    fn push_terminal(&mut self, record: crate::ContentRecord) {
+        if self.terminal_keys.insert(Self::terminal_key(&record)) {
+            self.rows.push(record);
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
+        let before = self.rows.len();
+        self.rows.retain(|record| {
+            let retained = keep(record);
+            if !retained && record.kind == "terminal" {
+                self.terminal_keys.remove(&Self::terminal_key(record));
+            }
+            retained
+        });
+        (before - self.rows.len()) as u64
+    }
+
+    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
+        (
+            record.tenant.clone(),
+            record.user_id.clone(),
+            record.request_id.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryLedger {
+    rows: Vec<BillingRecord>,
+    request_ids: HashSet<String>,
 }
 
 /// Positional row → record mappers shared by the SQL backends (fields decode in

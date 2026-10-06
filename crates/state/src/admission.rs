@@ -55,69 +55,10 @@ pub struct SettleInput<'a> {
     pub user_budget: Option<UserBudget>,
 }
 
-/// One budget: its window, governance counter and cap.
-struct Budget {
-    scope: BudgetScope,
-    window: Window,
-    key: String,
-    limit: i64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Window {
-    Day,
-    Month,
-}
-
-impl Window {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Day => "daily",
-            Self::Month => "monthly",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum BudgetScope {
-    UserTokens,
-    TenantCost,
-    KeyCost,
-    UserCost,
-}
-
-impl BudgetScope {
-    fn is_per_user(self) -> bool {
-        matches!(self, Self::UserTokens | Self::UserCost)
-    }
-
-    fn charges_cost(self) -> bool {
-        !matches!(self, Self::UserTokens)
-    }
-
-    fn unit(self) -> &'static str {
-        if self.charges_cost() { "cost" } else { "token" }
-    }
-
-    /// The governance counter: user scopes carry the tenant, month counters their calendar month.
-    fn key(self, month: Option<(i64, u32)>, ak: &AkInfo, user: &str) -> String {
-        let prefix = month.map_or(String::new(), month_prefix);
-        match self {
-            Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
-            Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
-            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak_id),
-            Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
-        }
-    }
-
-    /// The alert subject; the key is named by its `ak_id`, never the credential.
-    fn subject(self, ak: &AkInfo, user: &str) -> String {
-        match self {
-            Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),
-            Self::TenantCost => format!("tenant:{}", ak.tenant),
-            Self::KeyCost => format!("key:{}", ak.ak_id),
-        }
-    }
+/// What a settled request cost, for the decision trail.
+pub struct Settled {
+    pub total_tokens: i64,
+    pub cost_micros: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +197,71 @@ impl BillingLedger {
         }
         batch.clear();
         committed
+    }
+}
+
+/// One budget: its window, governance counter and cap.
+struct Budget {
+    scope: BudgetScope,
+    window: Window,
+    key: String,
+    limit: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Window {
+    Day,
+    Month,
+}
+
+impl Window {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "daily",
+            Self::Month => "monthly",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BudgetScope {
+    UserTokens,
+    TenantCost,
+    KeyCost,
+    UserCost,
+}
+
+impl BudgetScope {
+    fn is_per_user(self) -> bool {
+        matches!(self, Self::UserTokens | Self::UserCost)
+    }
+
+    fn charges_cost(self) -> bool {
+        !matches!(self, Self::UserTokens)
+    }
+
+    fn unit(self) -> &'static str {
+        if self.charges_cost() { "cost" } else { "token" }
+    }
+
+    /// The governance counter: user scopes carry the tenant, month counters their calendar month.
+    fn key(self, month: Option<(i64, u32)>, ak: &AkInfo, user: &str) -> String {
+        let prefix = month.map_or(String::new(), month_prefix);
+        match self {
+            Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
+            Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
+            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak_id),
+            Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
+        }
+    }
+
+    /// The alert subject; the key is named by its `ak_id`, never the credential.
+    fn subject(self, ak: &AkInfo, user: &str) -> String {
+        match self {
+            Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),
+            Self::TenantCost => format!("tenant:{}", ak.tenant),
+            Self::KeyCost => format!("key:{}", ak.ak_id),
+        }
     }
 }
 
@@ -521,12 +527,6 @@ pub async fn reserve_tpm(
             ak.ak_id
         )),
     }
-}
-
-/// What a settled request cost, for the decision trail.
-pub struct Settled {
-    pub total_tokens: i64,
-    pub cost_micros: i64,
 }
 
 /// Settle reserves to actuals, accrue the per-(AK, model) counter and write the

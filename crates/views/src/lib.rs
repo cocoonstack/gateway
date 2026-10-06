@@ -49,6 +49,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 mod mcp;
 mod mcp_auth;
 
+/// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
+pub const TRACE_TARGET: &str = "gw::trace";
+
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
 const USER_BUDGET_PAGE_DEFAULT: usize = 200;
@@ -57,8 +60,6 @@ const CONTENT_PAGE_DEFAULT: usize = 200;
 const CONTENT_PAGE_MAX: usize = 1_000;
 const USAGE_SERIES_MAX_POINTS: i64 = 400;
 const STREAM_CHANNEL_CAP: usize = 64;
-/// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
-pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
 const ADMIN_PAGE_MAX: usize = 10_000;
 const NO_CONFIG_STORE: &str = "config store not configured (set storage.postgres_url)";
@@ -86,22 +87,6 @@ impl std::ops::Deref for AppState {
     fn deref(&self) -> &AppInner {
         &self.0
     }
-}
-
-#[derive(Clone)]
-pub struct AppInner {
-    pub handler: OnlineHandler,
-    pub offline: OfflineHandler,
-    /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
-    pub mcp: reqwest::Client,
-    /// Upstream MCP credentials, OAuth tokens cached per server.
-    pub mcp_auth: Arc<mcp_auth::McpAuth>,
-    /// MCP session id → the `ak_id` of the key that opened it.
-    pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
-    /// Reloads config from its source; `None` = reload not wired (tests).
-    pub loader: Option<ConfigLoader>,
-    /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
-    pub config_store: Option<Arc<gw_state::PostgresConfigStore>>,
 }
 
 impl AppState {
@@ -146,23 +131,20 @@ impl AppState {
     }
 }
 
-/// The MCP proxy's client: no redirects, so a server or token endpoint cannot
-/// steer a credentialed request elsewhere.
-fn mcp_client() -> reqwest::Client {
-    #[allow(clippy::expect_used)]
-    // build fails only when TLS cannot initialize, where Client::new panics too
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("mcp client builds");
-    client
-}
-
-fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
-    moka::sync::Cache::builder()
-        .max_capacity(MCP_SESSION_CAP)
-        .time_to_live(MCP_SESSION_TTL)
-        .build()
+#[derive(Clone)]
+pub struct AppInner {
+    pub handler: OnlineHandler,
+    pub offline: OfflineHandler,
+    /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
+    pub mcp: reqwest::Client,
+    /// Upstream MCP credentials, OAuth tokens cached per server.
+    pub mcp_auth: Arc<mcp_auth::McpAuth>,
+    /// MCP session id → the `ak_id` of the key that opened it.
+    pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
+    /// Reloads config from its source; `None` = reload not wired (tests).
+    pub loader: Option<ConfigLoader>,
+    /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
+    pub config_store: Option<Arc<gw_state::PostgresConfigStore>>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -236,6 +218,25 @@ pub fn app(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(track_requests))
         .layer(axum::extract::DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
+}
+
+/// The MCP proxy's client: no redirects, so a server or token endpoint cannot
+/// steer a credentialed request elsewhere.
+fn mcp_client() -> reqwest::Client {
+    #[allow(clippy::expect_used)]
+    // build fails only when TLS cannot initialize, where Client::new panics too
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mcp client builds");
+    client
+}
+
+fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
+    moka::sync::Cache::builder()
+        .max_capacity(MCP_SESSION_CAP)
+        .time_to_live(MCP_SESSION_TTL)
+        .build()
 }
 
 /// Route fallback: the envelope's 404 instead of axum's bare one.

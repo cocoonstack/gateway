@@ -259,6 +259,58 @@ pub fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
     }
 }
 
+pub(crate) fn normalize_tool_choice_openai(mut choice: Value) -> Value {
+    match choice["type"].as_str() {
+        Some("auto") => "auto".into(),
+        Some("none") => "none".into(),
+        Some("any") => "required".into(),
+        Some("tool") => {
+            let name = choice["name"].take();
+            object([
+                ("type", "function".into()),
+                ("function", object([("name", name)])),
+            ])
+        }
+        _ => choice,
+    }
+}
+
+/// The OpenAI `parallel_tool_calls` an Anthropic-shaped `tool_choice` implies.
+pub(crate) fn parallel_tool_calls(choice: &Value) -> Option<Value> {
+    choice["disable_parallel_tool_use"]
+        .as_bool()
+        .map(|disabled| (!disabled).into())
+}
+
+/// The client's `reasoning_effort`, else one derived from `output_config.effort` or a budget;
+/// `disabled` is `none` on OpenAI's reasoning families, and `adaptive` alone leaves the default.
+pub(crate) fn reasoning_effort(
+    reasoning: gw_models::ReasoningParam,
+    model: &str,
+) -> Option<Cow<'static, str>> {
+    if let Some(effort) = reasoning.effort {
+        return Some(effort);
+    }
+    if let Some(Value::String(effort)) = reasoning
+        .output_config
+        .and_then(|mut config| config.get_mut("effort").map(Value::take))
+    {
+        return Some(Cow::Owned(effort));
+    }
+    let thinking = reasoning.thinking.as_ref();
+    let budget = reasoning.budget_tokens.or_else(|| {
+        thinking
+            .filter(|thinking| thinking["type"] == "enabled")
+            .and_then(|thinking| thinking["budget_tokens"].as_i64())
+    });
+    match budget {
+        Some(budget) => Some(Cow::Borrowed(gw_protocol::reasoning::budget_effort(budget))),
+        None => (thinking.is_some_and(|thinking| thinking["type"] == "disabled")
+            && gw_protocol::reasoning::openai_reasoning_family(model))
+        .then_some(Cow::Borrowed("none")),
+    }
+}
+
 /// Apply one decoded SSE event to the accumulating response.
 fn apply_sse_event(
     mut v: Value,
@@ -403,58 +455,6 @@ fn normalize_tools_openai(tools: Value) -> Value {
             })
             .collect(),
     )
-}
-
-pub(crate) fn normalize_tool_choice_openai(mut choice: Value) -> Value {
-    match choice["type"].as_str() {
-        Some("auto") => "auto".into(),
-        Some("none") => "none".into(),
-        Some("any") => "required".into(),
-        Some("tool") => {
-            let name = choice["name"].take();
-            object([
-                ("type", "function".into()),
-                ("function", object([("name", name)])),
-            ])
-        }
-        _ => choice,
-    }
-}
-
-/// The OpenAI `parallel_tool_calls` an Anthropic-shaped `tool_choice` implies.
-pub(crate) fn parallel_tool_calls(choice: &Value) -> Option<Value> {
-    choice["disable_parallel_tool_use"]
-        .as_bool()
-        .map(|disabled| (!disabled).into())
-}
-
-/// The client's `reasoning_effort`, else one derived from `output_config.effort` or a budget;
-/// `disabled` is `none` on OpenAI's reasoning families, and `adaptive` alone leaves the default.
-pub(crate) fn reasoning_effort(
-    reasoning: gw_models::ReasoningParam,
-    model: &str,
-) -> Option<Cow<'static, str>> {
-    if let Some(effort) = reasoning.effort {
-        return Some(effort);
-    }
-    if let Some(Value::String(effort)) = reasoning
-        .output_config
-        .and_then(|mut config| config.get_mut("effort").map(Value::take))
-    {
-        return Some(Cow::Owned(effort));
-    }
-    let thinking = reasoning.thinking.as_ref();
-    let budget = reasoning.budget_tokens.or_else(|| {
-        thinking
-            .filter(|thinking| thinking["type"] == "enabled")
-            .and_then(|thinking| thinking["budget_tokens"].as_i64())
-    });
-    match budget {
-        Some(budget) => Some(Cow::Borrowed(gw_protocol::reasoning::budget_effort(budget))),
-        None => (thinking.is_some_and(|thinking| thinking["type"] == "disabled")
-            && gw_protocol::reasoning::openai_reasoning_family(model))
-        .then_some(Cow::Borrowed("none")),
-    }
 }
 
 fn is_native_block(block: &Value) -> bool {
