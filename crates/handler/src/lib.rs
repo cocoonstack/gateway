@@ -584,7 +584,7 @@ fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
         Some(status) => status >= 500 || matches!(status, 401..=403 | 429),
         None => {
-            e.http_status >= 502
+            (e.http_status >= 502 && e.code != gw_consts::ErrCode::DB_READ)
                 || (e.http_status == 429 && e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO)
         }
     }
@@ -2071,16 +2071,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_override_store_refuses_attributed_requests() {
-        #[derive(Debug)]
-        struct Down;
+        #[derive(Debug, Default)]
+        struct Down(std::sync::atomic::AtomicUsize);
         #[async_trait::async_trait]
         impl gw_state::UserBudgetStore for Down {
             async fn get(&self, _: &str, _: &str) -> GResult<Option<UserBudget>> {
-                Err(GatewayError::new(
-                    gw_consts::ErrCode::SYSTEM_ERROR,
-                    503,
-                    "down",
-                ))
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(GatewayError::new(gw_consts::ErrCode::DB_READ, 503, "down"))
             }
             async fn put(&self, _: &str, _: &str, _: UserBudget) -> GResult<()> {
                 unreachable!()
@@ -2092,10 +2089,11 @@ mod tests {
                 unreachable!()
             }
         }
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k2, owner: u1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat, fallback_models: [gpt-4o-mini]}, {name: gpt-4o-mini, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k2, owner: u1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let mut state = GatewayState::from_config(&cfg);
-        state.user_budgets = Arc::new(Down);
+        let down = Arc::new(Down::default());
+        state.user_budgets = down.clone();
         let h = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, Arc::new(state)),
             Arc::new(gw_engines::MockTransport),
@@ -2111,6 +2109,11 @@ mod tests {
             .err()
             .expect("a failed lookup fails closed");
         assert_eq!(err.http_status, 503);
+        assert_eq!(
+            down.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a store outage is not an upstream fault to fall back from"
+        );
     }
 
     #[tokio::test]

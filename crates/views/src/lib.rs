@@ -600,14 +600,13 @@ async fn realtime_gate(
         ));
     }
     let at = gw_state::epoch_secs();
-    admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
+    let reserved = admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
         .await
         .map_err(quota_exceeded)?;
     let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
-        Ok(reserved) => reserved,
+        Ok(tpm) => tpm,
         Err(denied) => {
-            gov.quota_settle(&ak.ak_id, -REALTIME_TURN_RESERVE, at)
-                .await;
+            gov.quota_settle(&ak.ak_id, -reserved, at).await;
             return Err((ErrClass::Throttling, denied));
         }
     };
@@ -616,7 +615,7 @@ async fn realtime_gate(
         ak,
         user,
         user_budget: Some(user_budget),
-        reserved: REALTIME_TURN_RESERVE,
+        reserved,
         tpm_reserved,
         at,
         request_id: gw_handler::new_request_id(),

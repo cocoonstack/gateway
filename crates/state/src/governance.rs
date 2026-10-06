@@ -24,10 +24,17 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     /// Daily quota: is `key` under `limit`?
     async fn quota_check(&self, key: &str, limit: i64) -> bool;
     /// Admission with reservation: admit while spent-before < `limit`, atomically
-    /// adding `amount` so in-flight requests count; false = nothing reserved.
+    /// adding `amount` so in-flight requests count; returns the amount recorded
+    /// (0 when a failed round-trip admitted without it), `None` = denied.
     /// `at_epoch_secs` pins the day bucket so the paired settle lands on the
     /// same day across midnight.
-    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at_epoch_secs: i64) -> bool;
+    async fn quota_reserve(
+        &self,
+        key: &str,
+        amount: i64,
+        limit: i64,
+        at_epoch_secs: i64,
+    ) -> Option<i64>;
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
     /// bucket the paired reserve used (`at_epoch_secs`).
     async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
@@ -95,8 +102,8 @@ impl Governance for MemoryGovernance {
     async fn quota_check(&self, key: &str, limit: i64) -> bool {
         self.quota.check(key, limit)
     }
-    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> bool {
-        self.quota.reserve(key, amount, limit)
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> Option<i64> {
+        self.quota.reserve(key, amount, limit).then_some(amount)
     }
     async fn quota_settle(&self, key: &str, delta: i64, _at: i64) {
         self.quota.settle(key, delta);
@@ -253,10 +260,16 @@ impl Governance for RedisGovernance {
             }
         }
     }
-    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> bool {
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> Option<i64> {
         self.reserve_capped(quota_key_at(key, at), amount, limit, QUOTA_TTL_MS)
             .await
-            .is_some()
+            .map(|window| {
+                if window == UNRECORDED_WINDOW {
+                    0
+                } else {
+                    amount
+                }
+            })
     }
     async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
@@ -418,8 +431,8 @@ mod tests {
 
         let rkey = format!("r{}", std::process::id());
         let now = crate::epoch_secs();
-        assert!(g.quota_reserve(&rkey, 300, 100, now).await);
-        assert!(!g.quota_reserve(&rkey, 300, 100, now).await);
+        assert_eq!(g.quota_reserve(&rkey, 300, 100, now).await, Some(300));
+        assert_eq!(g.quota_reserve(&rkey, 300, 100, now).await, None);
         g.quota_settle(&rkey, 15 - 300, now).await;
         assert_eq!(g.quota_used(&rkey).await, 15);
         let minute = Duration::from_secs(60);
@@ -463,21 +476,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reserve_redis_never_recorded_reports_zero() {
+        let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
+            return;
+        };
+        let g = RedisGovernance::connect(&url).await.expect("redis connect");
+        let key = format!("u{}", std::process::id());
+        let now = crate::epoch_secs();
+        let mut conn = g.conn.clone();
+        let _: () = redis::cmd("SET")
+            .arg(quota_key_at(&key, now))
+            .arg("not-a-counter")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(g.quota_reserve(&key, 300, 100, now).await, Some(0));
+        let _: i64 = redis::cmd("DEL")
+            .arg(quota_key_at(&key, now))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn reserve_then_settle_semantics() {
         let g = MemoryGovernance::default();
         let now = crate::epoch_secs();
-        assert!(
+        assert_eq!(
             g.quota_reserve("k", 300, 100, now).await,
+            Some(300),
             "admit while under"
         );
-        assert!(
-            !g.quota_reserve("k", 300, 100, now).await,
+        assert_eq!(
+            g.quota_reserve("k", 300, 100, now).await,
+            None,
             "in-flight counts"
         );
         g.quota_settle("k", 15 - 300, now).await;
         assert_eq!(g.quota_used("k").await, 15);
-        assert!(
+        assert_eq!(
             g.quota_reserve("k", 300, 100, now).await,
+            Some(300),
             "back under after settle"
         );
         g.quota_settle("k", -300, now).await;

@@ -388,9 +388,16 @@ pub fn swap_to_fallback(
     tenant: &str,
     param: &mut gw_models::ModelParamV2,
 ) -> FallbackSwap {
+    let chat = matches!(param.typed, None | Some(gw_models::TypedParams::Chat(_)));
     let Some(fb) = cfg
         .find_tenant(tenant)
         .and_then(|t| t.fallback_model.as_deref())
+        .filter(|fb| {
+            chat || cfg
+                .find_model(fb)
+                .and_then(|m| m.protocol())
+                .is_some_and(|p| p.serves(param.protocol))
+        })
     else {
         return FallbackSwap::Unconfigured;
     };
@@ -469,18 +476,16 @@ pub async fn check_model_qpm(
     )
 }
 
-/// Reserve `amount` against the AK daily quota on the `at` day bucket.
+/// Reserve `amount` against the AK daily quota on the `at` day bucket; yields the amount recorded.
 pub async fn reserve_daily(
     gov: &dyn Governance,
     ak: &AkInfo,
     amount: i64,
     at: i64,
-) -> Result<(), String> {
-    admit(
-        gov.quota_reserve(&ak.ak_id, amount, ak.daily_token_quota, at)
-            .await,
-        || format!("daily token quota exhausted for key {}", ak.ak_id),
-    )
+) -> Result<i64, String> {
+    gov.quota_reserve(&ak.ak_id, amount, ak.daily_token_quota, at)
+        .await
+        .ok_or_else(|| format!("daily token quota exhausted for key {}", ak.ak_id))
 }
 
 /// Reserve `amount` in the AK TPM window; `Ok(None)` when the key has no TPM cap.
@@ -670,6 +675,30 @@ mod tests {
             ptu_spillover: false,
             estimated: false,
         }
+    }
+
+    #[test]
+    fn a_typed_family_never_degrades_to_a_model_of_another_protocol() {
+        let cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: chat, protocol: openai-chat}, {name: other-chat, protocol: anthropic-messages}, {name: emb, protocol: embeddings}]\ntenants: [{name: t, models: [chat, other-chat, emb], fallback_model: chat}]",
+        )
+        .unwrap();
+        let mut family = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Embeddings, "emb");
+        family.typed = Some(gw_models::TypedParams::Embeddings(Default::default()));
+        assert!(matches!(
+            swap_to_fallback(&cfg, "t", &mut family),
+            FallbackSwap::Unconfigured
+        ));
+        assert_eq!(family.model_name, "emb");
+        let mut chat = gw_models::ModelParamV2::with_name(
+            gw_consts::Protocol::AnthropicMessages,
+            "other-chat",
+        );
+        chat.typed = Some(gw_models::TypedParams::Chat(Default::default()));
+        assert!(matches!(
+            swap_to_fallback(&cfg, "t", &mut chat),
+            FallbackSwap::Swapped(..)
+        ));
     }
 
     #[tokio::test]

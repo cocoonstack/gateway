@@ -276,10 +276,10 @@ impl DagNode for QuotaCheck {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = reserve_estimate(&ctx.request);
         let at = gw_state::epoch_secs();
-        admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
+        let reserved = admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
             .map_err(quota_denied)?;
-        ctx.quota_reserved = Some(est);
+        ctx.quota_reserved = Some(reserved);
         ctx.quota_at = at;
         ctx.decide("quota_check", format!("reserved {est}"));
         Ok(())
@@ -413,6 +413,7 @@ impl DagNode for AkTpmLimit {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = ctx
             .quota_reserved
+            .filter(|&reserved| reserved > 0)
             .unwrap_or_else(|| reserve_estimate(&ctx.request));
         ctx.tpm_reserved = admission::reserve_tpm(ctx.state.governance.as_ref(), &ctx.ak, est)
             .await
