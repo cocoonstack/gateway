@@ -407,8 +407,10 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
                     .collect(),
                 _ => Vec::new(),
             };
-            if family == Family::Other {
-                (siblings, content) = content.into_iter().partition(|b| b.get("image").is_some());
+            if family == Family::Other
+                && let Some(first) = content.iter().position(|b| b.get("image").is_some())
+            {
+                siblings = content.split_off(first);
             }
             if content.is_empty() {
                 content.push(json!({"json": {}}));
@@ -576,7 +578,8 @@ mod tests {
             serde_json::from_value(json!({"messages": [{"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": [
                     {"type": "text", "text": "shot"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}]}]}))
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+                    {"type": "text", "text": "after"}]}]}]}))
             .unwrap()
         };
         let gpt = request(body(), "openai.gpt-6-luna");
@@ -586,6 +589,7 @@ mod tests {
             json!([{"text": "shot"}])
         );
         assert!(content[1].get("image").is_some(), "{content}");
+        assert_eq!(content[2], json!({"text": "after"}));
         let claude = request(body(), "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
         assert!(
             claude["messages"][0]["content"][0]["toolResult"]["content"][1]
