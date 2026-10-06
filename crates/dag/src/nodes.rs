@@ -262,7 +262,7 @@ fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
         })
         .unwrap_or(DEFAULT_COMPLETION_RESERVE)
         .clamp(0, MAX_RESERVE);
-    (((prompt / 4).min(MAX_RESERVE as usize) as i64).max(1))
+    ((prompt as i64 / 4).max(1))
         .saturating_add(max_out)
         .min(MAX_RESERVE)
 }

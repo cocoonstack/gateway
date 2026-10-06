@@ -69,30 +69,21 @@ where
             let mut dec = SseDecoder::default();
             let mut sent_any = false;
             while let Some(item) = s.next().await {
+                let fed = item.and_then(|bytes| {
+                    dec.feed(&bytes).map_err(|message| StreamFault {
+                        timeout: false,
+                        message,
+                    })
+                });
                 // after commit a fault aborts (terminal frame); before commit it may fail over
-                let bytes = match item {
-                    Ok(b) => b,
+                let events = match fed {
+                    Ok(events) => events,
                     Err(fault) if sent_any => {
                         tracing::warn!(vendor, error = %fault.message, "upstream stream failed mid-response");
                         abort_frame(&tx, &mut out, fault.stream_error()).await;
                         break;
                     }
                     Err(fault) => return Err(fault.into_error()),
-                };
-                let events = match dec.feed(&bytes) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        let fault = StreamFault {
-                            timeout: false,
-                            message: e,
-                        };
-                        if sent_any {
-                            tracing::warn!(vendor, error = %fault.message, "upstream stream failed mid-response");
-                            abort_frame(&tx, &mut out, fault.stream_error()).await;
-                            break;
-                        }
-                        return Err(fault.into_error());
-                    }
                 };
                 for data in events {
                     // a bad frame after commit aborts: a replay would splice a second generation

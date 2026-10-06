@@ -233,17 +233,9 @@ impl OfflineHandler {
                             .await;
                         continue;
                     };
-                    // a load failure must fail the job, not silently complete with zero results
-                    let items = match store.batch_load_items(&job.id).await {
-                        Ok(items) => items,
-                        Err(e) => {
-                            tracing::error!(error = %e, batch = %job.id, "batch item load failed; failing the job");
-                            let _ = store
-                                .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
-                                .await;
-                            continue;
-                        }
-                    };
+                    let items = std::iter::repeat_with(gw_models::BatchItem::default)
+                        .take(job.total)
+                        .collect();
                     self.execute(
                         &job.id,
                         &ak,

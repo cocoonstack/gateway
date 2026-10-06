@@ -162,6 +162,21 @@ impl RedisGovernance {
         })
     }
 
+    async fn get_or_zero(&self, key: String) -> i64 {
+        let mut conn = self.conn.clone();
+        match redis::cmd("GET")
+            .arg(&key)
+            .query_async::<Option<i64>>(&mut conn)
+            .await
+        {
+            Ok(v) => v.unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(error = %e, key, "redis read failed; treating as 0");
+                0
+            }
+        }
+    }
+
     /// Reserve `amount` against `limit` on a self-expiring key: admit while
     /// spent-before < limit (the reservation may overshoot once; the settle
     /// corrects), rolling the increment back on denial; returns the key's expiry
@@ -247,18 +262,7 @@ impl Governance for RedisGovernance {
         self.quota_used(key).await < limit
     }
     async fn quota_used(&self, key: &str) -> i64 {
-        let mut conn = self.conn.clone();
-        match redis::cmd("GET")
-            .arg(quota_key(key))
-            .query_async::<Option<i64>>(&mut conn)
-            .await
-        {
-            Ok(v) => v.unwrap_or(0),
-            Err(e) => {
-                tracing::warn!(error = %e, key, "redis quota read failed; treating as 0");
-                0
-            }
-        }
+        self.get_or_zero(quota_key(key)).await
     }
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> Option<i64> {
         self.reserve_capped(quota_key_at(key, at), amount, limit, QUOTA_TTL_MS)
@@ -296,18 +300,7 @@ impl Governance for RedisGovernance {
         // no-op: keys carry their UTC day, and a per-instance sweep would wipe the shared keyspace
     }
     async fn counter_get(&self, key: &str) -> i64 {
-        let mut conn = self.conn.clone();
-        match redis::cmd("GET")
-            .arg(counter_key(key))
-            .query_async::<Option<i64>>(&mut conn)
-            .await
-        {
-            Ok(v) => v.unwrap_or(0),
-            Err(e) => {
-                tracing::warn!(error = %e, key, "redis counter read failed; treating as 0");
-                0
-            }
-        }
+        self.get_or_zero(counter_key(key)).await
     }
     async fn counter_add(&self, key: &str, amount: i64, ttl: Duration) -> i64 {
         self.incr_window(&counter_key(key), amount, ttl).await

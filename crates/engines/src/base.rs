@@ -210,6 +210,20 @@ impl Base {
         self.send_bytes(url, headers, bytes, stream).await
     }
 
+    pub async fn post_form(
+        &self,
+        path: &str,
+        form: crate::multipart::Form,
+    ) -> GResult<(u16, Value)> {
+        let (content_type, body) = form.finish();
+        let headers = vec![
+            ("content-type", content_type),
+            ("authorization", format!("Bearer {}", self.api_key())),
+        ];
+        let url = self.openai_url("mock://api.openai.com", path);
+        parse_json_reply(self.send_bytes(&url, headers, body, false).await?)
+    }
+
     /// Build and send an upstream POST from pre-serialized bytes — the SigV4
     /// engines sign the exact payload they send.
     pub async fn send_bytes(

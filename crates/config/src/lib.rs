@@ -322,7 +322,7 @@ pub struct LongContextConf {
 }
 
 /// Upstream account slot (mock credentials unless a live endpoint is configured).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AccountConf {
     pub name: String,
     pub provider: String,
@@ -460,41 +460,35 @@ pub struct CompiledRule {
 
 /// Account stability policy (in-memory).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct StabilityConf {
     /// Enters cooldown after this many consecutive failures.
-    #[serde(default = "default_failure_threshold")]
     pub failure_threshold: usize,
     /// Cooldown duration (seconds); auto-recovers on expiry.
-    #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
     /// Minutes of per-model success/error counts the status API judges over.
     /// Capped at 60: the availability store retains one hour of buckets.
-    #[serde(default = "default_availability_window_minutes")]
     pub availability_window_minutes: i64,
     /// Window error rate at or above which a model reports `unstable`.
-    #[serde(default = "default_unstable_error_rate")]
     pub unstable_error_rate: f64,
     /// Window error rate at or above which a model reports `unavailable`.
-    #[serde(default = "default_unavailable_error_rate")]
     pub unavailable_error_rate: f64,
     /// Rank same-priority accounts by their observed call latency (per instance) instead of round-robin.
-    #[serde(default)]
     pub latency_routing: bool,
     /// Below this many window samples the verdict is `no_data`.
-    #[serde(default = "default_availability_min_samples")]
     pub availability_min_samples: u64,
 }
 
 impl Default for StabilityConf {
     fn default() -> Self {
         Self {
-            failure_threshold: default_failure_threshold(),
-            cooldown_seconds: default_cooldown_seconds(),
-            availability_window_minutes: default_availability_window_minutes(),
-            unstable_error_rate: default_unstable_error_rate(),
-            unavailable_error_rate: default_unavailable_error_rate(),
+            failure_threshold: 3,
+            cooldown_seconds: 30,
+            availability_window_minutes: 5,
+            unstable_error_rate: 0.1,
+            unavailable_error_rate: 0.5,
             latency_routing: false,
-            availability_min_samples: default_availability_min_samples(),
+            availability_min_samples: 20,
         }
     }
 }
@@ -517,12 +511,11 @@ pub struct AbuseConf {
 
 /// Outbound alert webhook. Advisory: delivery failures are logged and dropped.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct AlertsConf {
     /// Env var naming the webhook URL; empty = alerts disabled.
-    #[serde(default)]
     pub webhook_url_env: String,
     /// Repeat alerts for the same (kind, subject) are muted this long.
-    #[serde(default = "default_alert_dedup_seconds")]
     pub dedup_seconds: u64,
 }
 
@@ -537,7 +530,7 @@ impl Default for AlertsConf {
     fn default() -> Self {
         Self {
             webhook_url_env: String::new(),
-            dedup_seconds: default_alert_dedup_seconds(),
+            dedup_seconds: 300,
         }
     }
 }
@@ -864,19 +857,9 @@ impl GatewayConfig {
                 self.accounts.push(AccountConf {
                     name: p.name.clone(),
                     provider: p.name.clone(),
-                    kind: String::new(),
                     priority: 1,
-                    tier: String::new(),
-                    cost_input_price_per_1k_micros: 0,
-                    cost_output_price_per_1k_micros: 0,
-                    cost_unit_price_micros: 0,
-                    timeout_seconds: None,
-                    connect_retries: None,
-                    retry_status: None,
-                    endpoint: String::new(),
-                    api_key_env: String::new(),
-                    secret_key_env: String::new(),
                     protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
+                    ..Default::default()
                 });
             }
             // an empty endpoint would answer from the mock transport with fabricated successes
@@ -1509,25 +1492,6 @@ fn default_priority() -> i32 {
     1
 }
 
-fn default_failure_threshold() -> usize {
-    3
-}
-fn default_availability_window_minutes() -> i64 {
-    5
-}
-fn default_unstable_error_rate() -> f64 {
-    0.1
-}
-fn default_unavailable_error_rate() -> f64 {
-    0.5
-}
-fn default_availability_min_samples() -> u64 {
-    20
-}
-fn default_cooldown_seconds() -> u64 {
-    30
-}
-
 fn default_guardrail_version() -> String {
     "DRAFT".to_owned()
 }
@@ -1554,10 +1518,6 @@ fn default_max_request_bytes() -> usize {
 
 fn default_max_live_streams() -> usize {
     64
-}
-
-fn default_alert_dedup_seconds() -> u64 {
-    300
 }
 
 /// Normalize a security policy at load: lower-case the blocklist and compile

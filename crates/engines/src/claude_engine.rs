@@ -300,11 +300,7 @@ impl ClaudeEngine {
             message: text,
             reasoning,
             reasoning_details: (!reasoning_details.is_empty()).then_some(reasoning_details),
-            tool_calls: if tool_use.is_empty() {
-                None
-            } else {
-                Some(Value::Array(tool_use))
-            },
+            tool_calls: (!tool_use.is_empty()).then_some(Value::Array(tool_use)),
             model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
             finish_reason: crate::engine::take_string(&mut v, "/stop_reason").unwrap_or_default(),
             stop_sequence: crate::engine::take_string(&mut v, "/stop_sequence"),

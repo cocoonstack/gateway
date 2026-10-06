@@ -833,24 +833,19 @@ async fn realtime_session(
 fn client_text_to_upstream(
     t: axum::extract::ws::Utf8Bytes,
 ) -> tokio_tungstenite::tungstenite::Message {
-    let b = bytes::Bytes::from(t);
-    match tokio_tungstenite::tungstenite::Utf8Bytes::try_from(b.clone()) {
-        Ok(u) => tokio_tungstenite::tungstenite::Message::Text(u),
-        Err(_) => {
-            tokio_tungstenite::tungstenite::Message::text(String::from_utf8_lossy(&b).into_owned())
-        }
-    }
+    tokio_tungstenite::tungstenite::Message::Text(
+        tokio_tungstenite::tungstenite::Utf8Bytes::try_from(bytes::Bytes::from(t))
+            .unwrap_or_default(),
+    )
 }
 
 /// The reverse direction of [`client_text_to_upstream`].
 fn upstream_text_to_client(
     t: tokio_tungstenite::tungstenite::Utf8Bytes,
 ) -> axum::extract::ws::Message {
-    let b = bytes::Bytes::from(t);
-    match axum::extract::ws::Utf8Bytes::try_from(b.clone()) {
-        Ok(u) => axum::extract::ws::Message::Text(u),
-        Err(_) => axum::extract::ws::Message::Text(String::from_utf8_lossy(&b).into_owned().into()),
-    }
+    axum::extract::ws::Message::Text(
+        axum::extract::ws::Utf8Bytes::try_from(bytes::Bytes::from(t)).unwrap_or_default(),
+    )
 }
 
 /// Bridge one realtime session to a real upstream: relay plus auth, gates and per-turn billing.
@@ -1118,22 +1113,17 @@ async fn realtime_bridge(
                             turn_ended = true;
                         }
                         // outbound DLP per frame: a span straddling deltas is beyond an unbuffered relay
-                        let n = if relay {
-                            gw_handler::plugins::dlp_redact_realtime_frame(
+                        let mut n = 0;
+                        if relay {
+                            n = gw_handler::plugins::dlp_redact_realtime_frame(
                                 s.handler.cfg().security_for(&ak.tenant),
                                 &mut v,
-                            )
-                        } else {
-                            0
-                        };
-                        if relay {
+                            );
                             let (text, opaque) = realtime_output_delta(&v);
-                            output_units = text.map_or(0, |text| {
-                                let tokens = gw_dag::token_estimate::default_encoder()
-                                    .encode_len(text);
-                                tokens as i64
-                            });
-                            output_units = output_units.saturating_add(opaque as i64);
+                            let encoder = gw_dag::token_estimate::default_encoder();
+                            output_units = text
+                                .map_or(0, |text| encoder.encode_len(text) as i64)
+                                .saturating_add(opaque as i64);
                         }
                         if n > 0 {
                             redacted = Some(v);
@@ -4056,7 +4046,6 @@ async fn family_response(
     typed: TypedParams,
     user_id: Option<String>,
     surface: &'static str,
-    engine: &str,
     started: Instant,
 ) -> Response {
     match run_family(s, ak, model, mt, typed, vec![], user_id).await {
@@ -4076,7 +4065,7 @@ async fn family_response(
             {
                 body.insert("model".to_owned(), requested.into());
             }
-            let response = response_v2_or_500(ctx.outcome.take(), engine);
+            let response = response_v2_or_500(ctx.outcome.take(), mt);
             terminal_response(&ctx, response).await
         }
         Err(resp) => resp,
@@ -4101,14 +4090,17 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
 
 /// The engine's native payload; a content block answers 400 with the block
 /// message (these surfaces have no in-band content_filter shape).
-fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
+fn response_v2_or_500(
+    outcome: Option<gw_engines::EngineOutcome>,
+    mt: gw_consts::Protocol,
+) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
         Some(o) => match o.response.response_v2 {
             Some(v) => (StatusCode::OK, Json(v)).into_response(),
-            None => error_response(500, format!("{engine} engine returned no payload")),
+            None => error_response(500, format!("{mt} engine returned no payload")),
         },
-        None => error_response(500, format!("{engine} engine returned no payload")),
+        None => error_response(500, format!("{mt} engine returned no payload")),
     }
 }
 
@@ -4225,7 +4217,7 @@ async fn responses(
         Err(e) => return gateway_error(e),
     };
     log_access("responses", &ctx, started);
-    let response = response_v2_or_500(ctx.outcome.take(), "responses");
+    let response = response_v2_or_500(ctx.outcome.take(), gw_consts::Protocol::Responses);
     terminal_response(&ctx, response).await
 }
 
@@ -4385,7 +4377,6 @@ async fn embeddings(
         typed,
         user_hint(hint, &body["user"]),
         "embeddings",
-        "embeddings",
         started,
     )
     .await
@@ -4417,7 +4408,6 @@ async fn images_generations(
         typed,
         user_hint(hint, &body["user"]),
         "images",
-        "image",
         started,
     )
     .await
@@ -4453,7 +4443,6 @@ async fn images_edits(
         typed,
         user_hint(hint, &body["user"]),
         "images_edits",
-        "image",
         started,
     )
     .await
@@ -4520,7 +4509,7 @@ async fn videos_generations(
                     return gateway_error(e);
                 }
             }
-            terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
+            terminal_response(&ctx, response_v2_or_500(outcome, gw_consts::Protocol::Video)).await
         }
         .in_current_span(),
     )
@@ -4772,37 +4761,22 @@ async fn audio_transcribe(
         language: body["language"].as_str().map(str::to_owned),
         translate,
     });
-    let mut ctx = match run_family(
-        &s,
-        ak,
-        model,
-        gw_consts::Protocol::Stt,
-        typed,
-        vec![],
-        user_hint(hint, &body["user"]),
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
     let surface = if translate {
         "audio_translations"
     } else {
         "audio_transcriptions"
     };
-    log_access(surface, &ctx, started);
-    let outcome = ctx.outcome.take();
-    let response = match outcome {
-        Some(o) if o.block.block => error_response(400, o.response.message),
-        // the vendor body verbatim (text plus usage/segments/language when sent)
-        Some(o) => match o.response.response_v2 {
-            Some(body) => (StatusCode::OK, Json(body)).into_response(),
-            None => error_response(500, "stt engine returned no payload"),
-        },
-        None => error_response(500, "stt engine returned no outcome"),
-    };
-    terminal_response(&ctx, response).await
+    family_response(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::Stt,
+        typed,
+        user_hint(hint, &body["user"]),
+        surface,
+        started,
+    )
+    .await
 }
 
 /// POST /v1/moderations — OpenAI moderations shape; input may be a string or
@@ -4827,7 +4801,6 @@ async fn moderations(
         gw_consts::Protocol::Moderations,
         typed,
         user_hint(hint, &body["user"]),
-        "moderations",
         "moderations",
         started,
     )
@@ -4858,7 +4831,6 @@ async fn search(
         gw_consts::Protocol::Search,
         typed,
         user_hint(hint, &body["user"]),
-        "search",
         "search",
         started,
     )
@@ -4891,7 +4863,6 @@ async fn rerank(
         gw_consts::Protocol::Rerank,
         typed,
         user_hint(hint, &body["user"]),
-        "rerank",
         "rerank",
         started,
     )
@@ -4948,7 +4919,6 @@ async fn decisions_response(
         typed,
         user_id,
         surface,
-        "decisions",
         started,
     )
     .await

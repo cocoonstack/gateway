@@ -33,10 +33,7 @@ impl EngineOutcome {
         Self {
             response,
             http_code,
-            block: Block::allow(),
-            chunks: Vec::new(),
-            streamed_live: false,
-            terminal_error: None,
+            ..Default::default()
         }
     }
 

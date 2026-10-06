@@ -990,10 +990,7 @@ impl std::fmt::Debug for SharedConfig {
 
 /// Current unix seconds (0 if the clock reads before the epoch).
 pub fn epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    epoch_millis() / 1000
 }
 
 /// Unix milliseconds; erasure markers use this so an erase-then-resubmit in

@@ -285,12 +285,7 @@ impl ModelEngine for EmbeddingsEngine {
 
 /// The uniform family-engine tail: a summary message plus the native payload,
 /// finished at "stop".
-fn family_outcome(
-    message: String,
-    model: String,
-    v: serde_json::Value,
-    status: u16,
-) -> EngineOutcome {
+fn family_outcome(message: String, model: String, v: Value, status: u16) -> EngineOutcome {
     EngineOutcome::with_status(
         GatewayResponse {
             message,
@@ -345,23 +340,7 @@ impl ModelEngine for ImageEngine {
                 let (ext, content_type) = image_kind(&mask);
                 form.file("mask", &format!("mask.{ext}"), content_type, &mask);
             }
-            let (content_type, body) = form.finish();
-            let headers = vec![
-                ("content-type", content_type),
-                ("authorization", format!("Bearer {}", self.base.api_key())),
-            ];
-            let reply = self
-                .base
-                .send_bytes(
-                    &self
-                        .base
-                        .openai_url("mock://api.openai.com", "images/edits"),
-                    headers,
-                    body,
-                    false,
-                )
-                .await?;
-            let (status, v) = crate::base::parse_json_reply(reply)?;
+            let (status, v) = self.base.post_form("images/edits", form).await?;
             (status, v, true)
         } else {
             let mut body = json!({"model": model, "n": n});
@@ -470,7 +449,7 @@ impl ModelEngine for AudioEngine {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         (status, object([("audio_b64", b64.into())]))
                     }
-                    body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
+                    body => parse_json_reply(crate::transport::UpstreamResponse {
                         status,
                         body,
                         headers: reply.headers,
@@ -497,21 +476,7 @@ impl ModelEngine for AudioEngine {
                 }
                 let (ext, content_type) = audio_kind(&audio);
                 form.file("file", &format!("audio.{ext}"), content_type, &audio);
-                let (content_type, body) = form.finish();
-                let headers = vec![
-                    ("content-type", content_type),
-                    ("authorization", format!("Bearer {}", self.base.api_key())),
-                ];
-                let reply = self
-                    .base
-                    .send_bytes(
-                        &self.base.openai_url("mock://api.openai.com", path),
-                        headers,
-                        body,
-                        false,
-                    )
-                    .await?;
-                crate::base::parse_json_reply(reply)?
+                self.base.post_form(path, form).await?
             }
             AudioKind::Other => {
                 let mut b = json!({"model": model});
@@ -1264,7 +1229,7 @@ impl ResponsesEngine {
     fn build_body(&mut self) -> GResult<Value> {
         let mut body = match self.base.take_raw() {
             Value::Object(raw) => raw,
-            _ => serde_json::Map::new(),
+            _ => Map::new(),
         };
         if !self.base.request.preserve_responses_wire {
             self.cross_protocol_body(&mut body)?;
@@ -1284,7 +1249,7 @@ impl ResponsesEngine {
     }
 
     /// A Responses body from the chat/messages turns and the typed params.
-    fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) -> GResult<()> {
+    fn cross_protocol_body(&mut self, body: &mut Map<String, Value>) -> GResult<()> {
         let system = self.base.system_text();
         if !system.is_empty() {
             body.entry("instructions").or_insert(system.into());
@@ -1371,7 +1336,7 @@ impl ResponsesEngine {
         }
         body.insert("input".to_owned(), Value::Array(input));
         body.insert("stream".to_owned(), self.base.request.stream.into());
-        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
+        if let Some(TypedParams::Chat(p)) = self.base.take_typed() {
             if let Some(v) = p.max_tokens {
                 body.insert("max_output_tokens".to_owned(), v.into());
             }
