@@ -346,6 +346,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
         .get_mut("cache_control")
         .map(Value::take)
         .filter(|_| family != Family::Other);
+    let mut siblings = Vec::new();
     let mapped = match block["type"].as_str() {
         Some("text") => object([("text", block["text"].take())]),
         Some("image") => {
@@ -406,6 +407,9 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
                     .collect(),
                 _ => Vec::new(),
             };
+            if family == Family::Other {
+                (siblings, content) = content.into_iter().partition(|b| b.get("image").is_some());
+            }
             if content.is_empty() {
                 content.push(json!({"json": {}}));
             }
@@ -432,6 +436,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
         _ => return Vec::new(),
     };
     let mut blocks = vec![mapped];
+    blocks.extend(siblings);
     if let Some(control) = cache_control {
         blocks.push(cache_point(control, family == Family::Claude));
     }
@@ -564,6 +569,30 @@ fn stop_reason(converse: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_result_image_nests_only_where_bedrock_takes_it() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "shot"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}]}]}))
+            .unwrap()
+        };
+        let gpt = request(body(), "openai.gpt-6-luna");
+        let content = &gpt["messages"][0]["content"];
+        assert_eq!(
+            content[0]["toolResult"]["content"],
+            json!([{"text": "shot"}])
+        );
+        assert!(content[1].get("image").is_some(), "{content}");
+        let claude = request(body(), "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        assert!(
+            claude["messages"][0]["content"][0]["toolResult"]["content"][1]
+                .get("image")
+                .is_some()
+        );
+    }
 
     #[test]
     fn a_tool_error_status_reaches_only_the_families_that_take_it() {
