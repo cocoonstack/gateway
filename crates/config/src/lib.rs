@@ -38,6 +38,8 @@ pub enum ConfigError {
     VideoModelNeedsProvider { model: String },
     #[error("duplicate {kind} name `{name}`")]
     DuplicateName { kind: &'static str, name: String },
+    #[error("invalid {kind} `{name}`")]
+    InvalidName { kind: &'static str, name: String },
     #[error("{kind} with an empty name")]
     EmptyName { kind: &'static str },
     #[error("access key `{ak}` references undeclared tenant `{tenant}`")]
@@ -1186,15 +1188,15 @@ impl GatewayConfig {
         // a colon in a tenant name would alias another tenant's `ub:{tenant}:{user}` budget key
         for t in &self.tenants {
             if t.name.contains(':') {
-                return Err(ConfigError::DuplicateName {
-                    kind: "tenant (':' not allowed in name)",
+                return Err(ConfigError::InvalidName {
+                    kind: "tenant name (':' not allowed)",
                     name: t.name.clone(),
                 });
             }
         }
         for k in &self.access_keys {
             if !is_valid_access_key(&k.ak) {
-                return Err(ConfigError::DuplicateName {
+                return Err(ConfigError::InvalidName {
                     kind: "access_key (':' only in the sha256 id form)",
                     name: k.ak.clone(),
                 });
@@ -1674,7 +1676,7 @@ mod tests {
             })
         ));
         assert!(doc(&access_key_id("ak-other")).is_ok());
-        assert!(matches!(doc("a:b"), Err(ConfigError::DuplicateName { .. })));
+        assert!(matches!(doc("a:b"), Err(ConfigError::InvalidName { .. })));
         assert!(matches!(doc(""), Err(ConfigError::EmptyName { .. })));
     }
 
@@ -2192,7 +2194,7 @@ tenants: [{name: t1}, {name: t1}]
         assert!(
             matches!(
                 GatewayConfig::from_yaml(colon_ak),
-                Err(ConfigError::DuplicateName { .. })
+                Err(ConfigError::InvalidName { .. })
             ),
             "':' in an ak collides with governance prefixes"
         );
@@ -2236,7 +2238,10 @@ tenants: [{name: t1}, {name: t1}]
 
         let colon = "listen: {host: h, port: 1}\ntenants: [{name: 'a:b'}]";
         assert!(
-            GatewayConfig::from_yaml(colon).is_err(),
+            matches!(
+                GatewayConfig::from_yaml(colon),
+                Err(ConfigError::InvalidName { .. })
+            ),
             "a colon in a tenant name is rejected (budget-key aliasing)"
         );
 
