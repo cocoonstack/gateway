@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 /// Markers of the Bedrock ids whose family takes `reasoning_config`.
 const REASONING_CONFIG_MARKERS: [&str; 2] = ["openai.gpt-", "xai.grok-"];
+const IMAGE_BESIDE_TOOL_RESULT_MARKERS: [&str; 3] = ["openai.gpt-", "xai.grok-", "moonshotai.kimi"];
 
 /// Converse stream events as the Anthropic event sequence.
 #[derive(Debug)]
@@ -144,6 +145,7 @@ impl Events {
 enum Family {
     Claude,
     Nova,
+    ImageBeside,
     Other,
 }
 
@@ -155,6 +157,11 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
         Family::Claude
     } else if model.contains("amazon.nova") {
         Family::Nova
+    } else if IMAGE_BESIDE_TOOL_RESULT_MARKERS
+        .iter()
+        .any(|m| model.contains(m))
+    {
+        Family::ImageBeside
     } else {
         Family::Other
     };
@@ -345,7 +352,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
     let cache_control = block
         .get_mut("cache_control")
         .map(Value::take)
-        .filter(|_| family != Family::Other);
+        .filter(|_| matches!(family, Family::Claude | Family::Nova));
     let mut siblings = Vec::new();
     let mapped = match block["type"].as_str() {
         Some("text") => object([("text", block["text"].take())]),
@@ -407,7 +414,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
                     .collect(),
                 _ => Vec::new(),
             };
-            if family == Family::Other
+            if family == Family::ImageBeside
                 && let Some(first) = content.iter().position(|b| b.get("image").is_some())
             {
                 siblings = content.split_off(first);
@@ -420,7 +427,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
                 ("toolUseId", block["tool_use_id"].take()),
                 ("content", Value::Array(content)),
             ]);
-            if family != Family::Other && block["is_error"] == true {
+            if matches!(family, Family::Claude | Family::Nova) && block["is_error"] == true {
                 result["status"] = "error".into();
             }
             object([("toolResult", result)])
@@ -598,12 +605,20 @@ mod tests {
         );
         assert!(content[1].get("image").is_some(), "{content}");
         assert_eq!(content[2], json!({"text": "after"}));
-        let claude = request(body(), "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
-        assert!(
-            claude["messages"][0]["content"][0]["toolResult"]["content"][1]
-                .get("image")
-                .is_some()
-        );
+        let kimi = request(body(), "us.moonshotai.kimi-k3");
+        assert!(kimi["messages"][0]["content"][1].get("image").is_some());
+        for model in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.meta.llama4-maverick-17b-instruct-v1:0",
+        ] {
+            let nested = request(body(), model);
+            assert!(
+                nested["messages"][0]["content"][0]["toolResult"]["content"][1]
+                    .get("image")
+                    .is_some(),
+                "{model}: {nested}"
+            );
+        }
     }
 
     #[test]
