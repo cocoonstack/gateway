@@ -128,12 +128,16 @@ impl ModelEngine for AwsEmbedEngine {
             }
         };
         let mut data = Vec::with_capacity(texts.len());
-        let (status, prompt_tokens) = if model.starts_with("cohere.") {
+        let (status, prompt_tokens) = if model.contains("cohere.") {
             // bedrock's cohere embed requires an input_type; the gateway embeds for retrieval storage
             let mut body = json!({"input_type": "search_document"});
             body["texts"] = Value::Array(texts.into_iter().map(Value::String).collect());
             let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
-            if let Value::Array(rows) = v["embeddings"].take() {
+            let rows = match v["embeddings"].take() {
+                Value::Object(mut by_type) => by_type.remove("float").unwrap_or_default(),
+                rows => rows,
+            };
+            if let Value::Array(rows) = rows {
                 data.extend(rows.into_iter().enumerate().map(embedding_row));
             }
             (st, bedrock_input_tokens(&headers, 0))
@@ -593,6 +597,20 @@ mod tests {
         assert_eq!(v["data"].as_array().unwrap().len(), 3);
         assert_eq!(out.response.prompt_tokens, 12);
         assert_eq!(v["usage"]["prompt_tokens"], 12);
+    }
+
+    #[tokio::test]
+    async fn cohere_v4_on_an_inference_profile_answers_its_float_embeddings() {
+        let mut e = AwsEmbedEngine::new(
+            embed_req("us.cohere.embed-v4:0", &["only text"], None),
+            Arc::new(BedrockReply(
+                r#"{"embeddings":{"float":[[0.5,0.25]]}}"#,
+                3,
+                0,
+            )),
+        );
+        let v = e.run().await.unwrap().response.response_v2.unwrap();
+        assert_eq!(v["data"][0]["embedding"], json!([0.5, 0.25]));
     }
 
     #[tokio::test]
