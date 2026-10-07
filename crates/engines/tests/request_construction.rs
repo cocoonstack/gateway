@@ -756,6 +756,16 @@ async fn embed_request_shape_with_sigv4() {
     );
     assert_eq!(t.header("accept").as_deref(), Some("application/json"));
     assert!(auth.contains("SignedHeaders=") && auth.contains("Signature="));
+    assert!(b.get("output_dimension").is_none());
+
+    let t = RecordingTransport::new(r#"{"embeddings":{"float":[[0.5]]}}"#);
+    let mut req = chat_req(Protocol::AwsEmbed, "us.cohere.embed-v4:0");
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Embeddings(EmbeddingParams {
+        input: vec!["first".into()],
+        dimensions: Some(256),
+    }));
+    let _ = AwsEmbedEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(t.body_json()["output_dimension"], 256);
 }
 
 #[tokio::test]

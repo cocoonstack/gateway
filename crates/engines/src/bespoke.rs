@@ -132,6 +132,9 @@ impl ModelEngine for AwsEmbedEngine {
             // bedrock's cohere embed requires an input_type; the gateway embeds for retrieval storage
             let mut body = json!({"input_type": "search_document"});
             body["texts"] = Value::Array(texts.into_iter().map(Value::String).collect());
+            if let Some(d) = dimensions {
+                body["output_dimension"] = json!(d);
+            }
             let (st, mut v, headers) = bedrock_invoke(&mut self.base, &model, body).await?;
             let rows = match v["embeddings"].take() {
                 Value::Object(mut by_type) => by_type.remove("float").unwrap_or_default(),
