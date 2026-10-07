@@ -18,7 +18,7 @@ access_keys:
     tokens_per_minute: 600   # optional TPM window
     expires_at_epoch_secs: 1767225600  # optional; expired keys 403
     banned: false            # optional; banned keys 403
-    model_quotas: {gpt-4o: 200000}     # optional per-model daily degrade thresholds
+    model_quotas: {gpt-4o: 200000}     # optional per-model daily caps
 ```
 
 ## Tenants
@@ -29,9 +29,12 @@ from `GET /v1/models`), per-model daily-token quota defaults (each key metered
 separately against the same value; per-key `model_quotas` override), and an
 optional `fallback_model` — an over-quota request degrades to it (a
 typed-family request such as embeddings, rerank or decisions only when the
-fallback's protocol serves its surface); with no usable fallback the request
-is served by the model it named, so a per-model quota is a degrade trigger,
-not a cap (the response echoes the requested model name; the ledger records both
+fallback's protocol serves its surface). With no usable fallback — none
+configured, one whose protocol cannot serve the surface, a request that
+already names the fallback, or one that engages or replays reasoning and so
+stays on its model —
+the request is refused with `400 service_quota_exceeded_exception` (a degraded
+response echoes the requested model name; the ledger records both
 requested and served; a model's own `fallback_models` chain for upstream
 failures is a separate mechanism, below). The per-key daily cap stays the hard backstop, and
 unconfigured (key, model) pairs never touch a counter.
@@ -53,7 +56,8 @@ reservations are refunded). Tenant/key QPS and product QPM spend at most one
 permit per external request: the first hop that reaches them takes it and later
 hops reuse it, and a request served from the cache never reaches them. The
 per-model daily counter follows the hop's target, including when that target
-degrades to the tenant fallback. A fallback the caller's tenant is not entitled to is
+degrades to the tenant fallback; a hop over its quota with no usable tenant fallback ends
+the chain with that refusal. A fallback the caller's tenant is not entitled to is
 skipped, the response echoes the requested name, the ledger records both
 requested and served (`served_model`), the decision trail carries
 `fallback: <from> -> <to>: <why>`, and `gateway_model_fallbacks_total{from, to}`
@@ -76,7 +80,7 @@ models:
 | QPS | per access key | `access_keys[].qps` |
 | QPS | pooled per tenant | `tenants[].qps` |
 | Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
-| Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override (degrade trigger, not a cap) |
+| Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override (over it: the tenant `fallback_model`, else refused) |
 | Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
 | Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
 | Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
@@ -86,8 +90,9 @@ models:
 | QPM | per model | `models[].qpm` |
 | QPM | per product | `products[].qpm` |
 
-Exceeding a QPS, QPM or TPM limit returns `429`; the daily-token, cost-budget
-and per-user caps return `400 service_quota_exceeded_exception`. QPS uses a smooth GCRA
+Exceeding a QPS, QPM or TPM limit returns `429`; the daily-token, per-model
+(with no usable fallback), cost-budget and per-user caps return
+`400 service_quota_exceeded_exception`. QPS uses a smooth GCRA
 limiter in-process (in Redis: a fixed 1s window for qps ≥ 1, a 1/qps-second
 window below); the token/window counters are fixed windows. When Redis is
 configured and unreachable, limits fail open (requests pass) and a warning is

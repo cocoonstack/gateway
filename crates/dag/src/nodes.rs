@@ -14,8 +14,8 @@ const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// Reservation cap, so a hostile `max_tokens` cannot overflow the estimate or the counter.
 const MAX_RESERVE: i64 = 1_000_000;
 
-/// preprocess/model_quota: soft per-(AK, model) daily cap (AK override, else tenant default);
-/// over it degrades to the tenant fallback model, so it runs before resolve_model.
+/// preprocess/model_quota: per-(AK, model) daily cap (AK override, else tenant default);
+/// over it degrades to the tenant fallback model or denies, so it runs before resolve_model.
 pub struct ModelQuotaGate;
 
 #[async_trait::async_trait]
@@ -38,36 +38,25 @@ impl DagNode for ModelQuotaGate {
         // clone only on the metered path — the common unmetered case stays allocation-free
         let requested = p.model_name.clone();
         let key = admission::model_quota_key(&ctx.ak.ak_id, &requested);
-        let under = ctx.state.governance.quota_check(&key, limit).await;
-        // usage accrues to the requested name either way: a fallback period ends at the daily reset
+        if !ctx.state.governance.quota_check(&key, limit).await {
+            // a reasoning request stays on its model, so it never degrades
+            let pinned = ctx.request.pins_reasoning_route();
+            let (cfg, tenant) = (&ctx.cfg, &ctx.ak.tenant);
+            let swapped = ctx
+                .request
+                .model_param_v2
+                .as_mut()
+                .filter(|_| !pinned)
+                .map(|p| admission::swap_to_fallback(cfg, tenant, p));
+            let Some(admission::FallbackSwap::Swapped(from, fb)) = swapped else {
+                return Err(quota_denied(format!(
+                    "model quota exhausted for `{requested}`"
+                )));
+            };
+            ctx.decide("model_quota", format!("{from} over {limit}, serving {fb}"));
+        }
+        // usage accrues to the requested name: a fallback period ends at the daily reset
         ctx.model_quota_key = Some(key);
-        if under {
-            return Ok(());
-        }
-        // reasoning replay pins one model; over quota then reads like "no fallback configured"
-        if ctx.request.pins_reasoning_route() {
-            ctx.decide(
-                "model_quota",
-                format!("{requested} over {limit}, reasoning route pinned"),
-            );
-            return Ok(());
-        }
-        let (cfg, tenant) = (&ctx.cfg, &ctx.ak.tenant);
-        let swapped = ctx
-            .request
-            .model_param_v2
-            .as_mut()
-            .map(|p| admission::swap_to_fallback(cfg, tenant, p));
-        let note = match swapped {
-            Some(admission::FallbackSwap::Swapped(from, fb)) => {
-                format!("{from} over {limit}, serving {fb}")
-            }
-            Some(admission::FallbackSwap::AlreadyServing) => {
-                format!("{requested} over {limit}, already the fallback")
-            }
-            _ => format!("{requested} over {limit}, no fallback"),
-        };
-        ctx.decide("model_quota", note);
         Ok(())
     }
 }

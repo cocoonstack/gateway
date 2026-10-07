@@ -217,7 +217,8 @@ Requests that engage reasoning on any surface (`thinking: {"type": "enabled"
 | "adaptive"}`, a `reasoning_effort`, or a continuation carrying signed
 blocks or `reasoning_details`) are pinned to their requested model: over-quota
 fallback and moderation degrade will not move them, because a signature only
-replays against the model that produced it. A variant split is sticky instead:
+replays against the model that produced it, so over a per-model quota they are
+refused with `400 service_quota_exceeded_exception`. A variant split is sticky instead:
 per user id when the request carries one, else per conversation, keyed on the
 first user turn that a signed replay keeps verbatim, so every turn lands on the
 variant that produced the reasoning, including on a model that thinks without

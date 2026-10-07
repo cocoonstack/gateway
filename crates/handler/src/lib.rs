@@ -1820,8 +1820,46 @@ mod tests {
         assert_eq!(rec.served_model, "fb-m");
     }
 
+    #[tokio::test]
+    async fn model_quota_without_a_usable_fallback_denies() {
+        for tenant in [
+            "{name: t1, model_quotas: {pub-m: 1}}",
+            "{name: t1, fallback_model: pub-m, model_quotas: {pub-m: 1}}",
+        ] {
+            let yaml = format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: pub-m, protocol: openai-chat}}]\naccounts: [{{name: a1, provider: openai, protocols: ['openai-chat']}}]\ntenants: [{tenant}]\naccess_keys: [{{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}}]"
+            );
+            let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(gw_engines::MockTransport),
+            );
+            let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
+            h.run(chat_req("pub-m", "burn the tiny quota"), key.clone())
+                .await
+                .unwrap();
+            let err = h
+                .run(chat_req("pub-m", "over quota now"), key)
+                .await
+                .err()
+                .expect("no usable fallback denies");
+            assert_eq!(
+                (err.code, err.http_status),
+                (gw_consts::ErrCode::QUOTA_EXHAUSTED, 400),
+                "{tenant}"
+            );
+            assert!(
+                err.message.contains("model quota exhausted for `pub-m`"),
+                "{err}"
+            );
+            let (count, _) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+            assert_eq!(count, 1, "{tenant}");
+        }
+    }
+
     async fn assert_thinking_conversation_sticky(thinking_type: &str) {
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: anthropic-messages, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: anthropic-messages}, {name: fb-m, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: ['anthropic-messages']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 100000}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(
@@ -1845,25 +1883,33 @@ mod tests {
             seed.decisions
         );
 
-        let mut assistant = ChatMsg::text("assistant", String::new());
-        assistant.parts = Some(serde_json::json!([
-            {"type":"thinking","thinking":"summary","signature":"opaque"},
-            {"type":"tool_use","id":"tool-1","name":"probe","input":{}}
-        ]));
-        let mut tool_result = ChatMsg::text("user", String::new());
-        tool_result.parts = Some(serde_json::json!([
-            {"type":"tool_result","tool_use_id":"tool-1","content":"done"}
-        ]));
-        let mut continuation = chat_req("pub-m", "start thinking");
-        continuation.preserve_anthropic_wire = true;
-        continuation.message.extend([assistant, tool_result]);
-        let continued = h.run(continuation, key).await.unwrap();
+        let continuation = || {
+            let mut assistant = ChatMsg::text("assistant", String::new());
+            assistant.parts = Some(serde_json::json!([
+                {"type":"thinking","thinking":"summary","signature":"opaque"},
+                {"type":"tool_use","id":"tool-1","name":"probe","input":{}}
+            ]));
+            let mut tool_result = ChatMsg::text("user", String::new());
+            tool_result.parts = Some(serde_json::json!([
+                {"type":"tool_result","tool_use_id":"tool-1","content":"done"}
+            ]));
+            let mut req = chat_req("pub-m", "start thinking");
+            req.preserve_anthropic_wire = true;
+            req.message.extend([assistant, tool_result]);
+            req
+        };
+        h.run(continuation(), key.clone()).await.unwrap();
+        let quota_key = gw_state::admission::model_quota_key(&key.ak_id, "pub-m");
+        h.state().governance.quota_consume(&quota_key, 100000).await;
+        let denied = h
+            .run(continuation(), key)
+            .await
+            .err()
+            .expect("an over-quota continuation cannot degrade");
+        assert_eq!(denied.code, gw_consts::ErrCode::QUOTA_EXHAUSTED);
         assert!(
-            continued.decisions.iter().any(|(node, decision)| {
-                *node == "model_quota" && decision.contains("reasoning route pinned")
-            }),
-            "over-quota continuation must not fall back: {:?}",
-            continued.decisions
+            denied.message.contains("model quota exhausted for `pub-m`"),
+            "{denied}"
         );
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 2);

@@ -69,7 +69,7 @@ access_keys:
     tokens_per_minute: 600   # optional TPM window limit
     expires_at_epoch_secs: 1767225600  # optional expiry (403 after)
     banned: false            # optional; a banned key 403s but stays listed
-    model_quotas:            # optional per-model daily degrade thresholds (override tenant defaults)
+    model_quotas:            # optional per-model daily caps (override tenant defaults)
       gpt-4o: 200000
 ```
 
@@ -82,7 +82,7 @@ tenants:
     models: [gpt-4o, gpt-4o-mini]   # entitlement allowlist; absent = every model
     model_quotas:            # per-model daily-token defaults, applied per key
       gpt-4o: 100000
-    fallback_model: gpt-4o-mini     # over-quota requests degrade here (a typed surface only to a model of its protocol); without one they stay on the requested model
+    fallback_model: gpt-4o-mini     # over-quota requests degrade here (a typed surface only to a model of its protocol); without a usable one they are refused
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
     model_prices:            # optional per-model charged-price override for this tenant
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
