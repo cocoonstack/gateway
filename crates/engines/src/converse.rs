@@ -427,7 +427,7 @@ fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec
                 ("toolUseId", block["tool_use_id"].take()),
                 ("content", Value::Array(content)),
             ]);
-            if matches!(family, Family::Claude | Family::Nova) && block["is_error"] == true {
+            if block["is_error"] == true {
                 result["status"] = "error".into();
             }
             object([("toolResult", result)])
@@ -622,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_error_status_reaches_only_the_families_that_take_it() {
+    fn a_tool_error_status_reaches_every_family() {
         let body = || -> Map<String, Value> {
             serde_json::from_value(json!({"messages": [{"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "broken", "is_error": true}]}]}))
@@ -633,12 +633,13 @@ mod tests {
             claude["messages"][0]["content"][0]["toolResult"]["status"],
             "error"
         );
-        let grok = request(body(), "us.xai.grok-4.6");
-        assert!(
-            grok["messages"][0]["content"][0]["toolResult"]
-                .get("status")
-                .is_none()
-        );
+        for model in ["us.xai.grok-4.6", "us.meta.llama3-3-70b-instruct-v1:0"] {
+            let out = request(body(), model);
+            assert_eq!(
+                out["messages"][0]["content"][0]["toolResult"]["status"], "error",
+                "{model}"
+            );
+        }
     }
 
     #[test]
