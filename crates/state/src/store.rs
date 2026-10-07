@@ -532,46 +532,6 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     }
 }
 
-#[derive(Debug, Default)]
-struct MemoryLedger {
-    rows: Vec<BillingRecord>,
-    request_ids: HashSet<String>,
-}
-
-#[derive(Debug, Default)]
-struct MemoryContent {
-    rows: Vec<crate::ContentRecord>,
-    terminal_keys: HashSet<(String, String, String)>,
-}
-
-impl MemoryContent {
-    fn push_terminal(&mut self, record: crate::ContentRecord) {
-        if self.terminal_keys.insert(Self::terminal_key(&record)) {
-            self.rows.push(record);
-        }
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
-        let before = self.rows.len();
-        self.rows.retain(|record| {
-            let retained = keep(record);
-            if !retained && record.kind == "terminal" {
-                self.terminal_keys.remove(&Self::terminal_key(record));
-            }
-            retained
-        });
-        (before - self.rows.len()) as u64
-    }
-
-    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
-        (
-            record.tenant.clone(),
-            record.user_id.clone(),
-            record.request_id.clone(),
-        )
-    }
-}
-
 /// In-process store: append-only ledger, DashMap-backed files and batches.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
@@ -592,7 +552,7 @@ pub struct MemoryStore {
     jobs: DashMap<String, (BatchJob, i64)>,
     videos: DashMap<String, (VideoJob, bool)>,
     seq: AtomicUsize,
-    /// oldest records beyond this are pruned on write; 0 = unlimited.
+    /// rolled records beyond this are pruned; 0 = unlimited.
     ledger_max_rows: usize,
     prune_seq: AtomicUsize,
 }
@@ -1036,6 +996,46 @@ impl Store for MemoryStore {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+struct MemoryContent {
+    rows: Vec<crate::ContentRecord>,
+    terminal_keys: HashSet<(String, String, String)>,
+}
+
+impl MemoryContent {
+    fn push_terminal(&mut self, record: crate::ContentRecord) {
+        if self.terminal_keys.insert(Self::terminal_key(&record)) {
+            self.rows.push(record);
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&crate::ContentRecord) -> bool) -> u64 {
+        let before = self.rows.len();
+        self.rows.retain(|record| {
+            let retained = keep(record);
+            if !retained && record.kind == "terminal" {
+                self.terminal_keys.remove(&Self::terminal_key(record));
+            }
+            retained
+        });
+        (before - self.rows.len()) as u64
+    }
+
+    fn terminal_key(record: &crate::ContentRecord) -> (String, String, String) {
+        (
+            record.tenant.clone(),
+            record.user_id.clone(),
+            record.request_id.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryLedger {
+    rows: Vec<BillingRecord>,
+    request_ids: HashSet<String>,
 }
 
 /// Positional row → record mappers shared by the SQL backends (fields decode in
@@ -2623,10 +2623,9 @@ pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_model
     }
 }
 
-/// Price one call into a [`BillingRecord`] (tenant price for the served model,
-/// vendor cost from the account), shared by the pipeline and the realtime
-/// surface; prompt/completion keep the vendor counts, `total_tokens` is the
-/// weighted platform total quota metering consumed.
+/// Price one call into a [`BillingRecord`]: the tenant price for the served model (a decisions
+/// reply's `usage.cost` when the tenant has no override), the account's vendor cost, and
+/// `total_tokens` as the weighted platform total; prompt/completion keep the vendor counts.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
@@ -2638,6 +2637,12 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
+    let vendor_priced = b.vendor_cost.filter(|_| {
+        b.protocol == gw_consts::Protocol::Decisions.as_str()
+            && cfg
+                .find_tenant(b.tenant)
+                .is_none_or(|t| !t.model_prices.contains_key(b.served_model))
+    });
     let units = clamp_tokens(b.units);
     let unit_price = b
         .unit_price
@@ -2676,10 +2681,12 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: discounted(
-            gw_models::cost_micros(billable_prompt, billable_completion, charged)
-                .saturating_add(unit_cost),
-        ),
+        cost_micros: vendor_priced.unwrap_or_else(|| {
+            discounted(
+                gw_models::cost_micros(billable_prompt, billable_completion, charged)
+                    .saturating_add(unit_cost),
+            )
+        }),
         vendor_cost_micros: b.vendor_cost.unwrap_or_else(|| {
             discounted(
                 gw_models::cost_micros(billable_prompt, billable_completion, vendor)

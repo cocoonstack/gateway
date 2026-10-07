@@ -50,71 +50,15 @@ pub struct SettleInput<'a> {
     pub reserved_at: i64,
     /// Per-(AK, model) counter to accrue; `None` = no cap configured.
     pub model_quota_key: Option<String>,
+    /// The key whose budgets the call charges, and the user override admission resolved.
+    pub budget_ak: &'a AkInfo,
+    pub user_budget: Option<UserBudget>,
 }
 
-/// One budget: its window, governance counter and cap.
-struct Budget {
-    scope: BudgetScope,
-    window: Window,
-    key: String,
-    limit: i64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Window {
-    Day,
-    Month,
-}
-
-impl Window {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Day => "daily",
-            Self::Month => "monthly",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum BudgetScope {
-    UserTokens,
-    TenantCost,
-    KeyCost,
-    UserCost,
-}
-
-impl BudgetScope {
-    fn is_per_user(self) -> bool {
-        matches!(self, Self::UserTokens | Self::UserCost)
-    }
-
-    fn charges_cost(self) -> bool {
-        !matches!(self, Self::UserTokens)
-    }
-
-    fn unit(self) -> &'static str {
-        if self.charges_cost() { "cost" } else { "token" }
-    }
-
-    /// The governance counter: user scopes carry the tenant, month counters their calendar month.
-    fn key(self, month: Option<(i64, u32)>, ak: &AkInfo, user: &str) -> String {
-        let prefix = month.map_or(String::new(), month_prefix);
-        match self {
-            Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
-            Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
-            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak_id),
-            Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
-        }
-    }
-
-    /// The alert subject; the key is named by its `ak_id`, never the credential.
-    fn subject(self, ak: &AkInfo, user: &str) -> String {
-        match self {
-            Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),
-            Self::TenantCost => format!("tenant:{}", ak.tenant),
-            Self::KeyCost => format!("key:{}", ak.ak_id),
-        }
-    }
+/// What a settled request cost, for the decision trail.
+pub struct Settled {
+    pub total_tokens: i64,
+    pub cost_micros: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +200,71 @@ impl BillingLedger {
     }
 }
 
+/// One budget: its window, governance counter and cap.
+struct Budget {
+    scope: BudgetScope,
+    window: Window,
+    key: String,
+    limit: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Window {
+    Day,
+    Month,
+}
+
+impl Window {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "daily",
+            Self::Month => "monthly",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BudgetScope {
+    UserTokens,
+    TenantCost,
+    KeyCost,
+    UserCost,
+}
+
+impl BudgetScope {
+    fn is_per_user(self) -> bool {
+        matches!(self, Self::UserTokens | Self::UserCost)
+    }
+
+    fn charges_cost(self) -> bool {
+        !matches!(self, Self::UserTokens)
+    }
+
+    fn unit(self) -> &'static str {
+        if self.charges_cost() { "cost" } else { "token" }
+    }
+
+    /// The governance counter: user scopes carry the tenant, month counters their calendar month.
+    fn key(self, month: Option<(i64, u32)>, ak: &AkInfo, user: &str) -> String {
+        let prefix = month.map_or(String::new(), month_prefix);
+        match self {
+            Self::UserTokens => format!("{prefix}ub:{}:{user}", ak.tenant),
+            Self::TenantCost => format!("{prefix}cb:tenant:{}", ak.tenant),
+            Self::KeyCost => format!("{prefix}cb:ak:{}", ak.ak_id),
+            Self::UserCost => format!("{prefix}cb:user:{}:{user}", ak.tenant),
+        }
+    }
+
+    /// The alert subject; the key is named by its `ak_id`, never the credential.
+    fn subject(self, ak: &AkInfo, user: &str) -> String {
+        match self {
+            Self::UserTokens | Self::UserCost => format!("user:{}/{user}", ak.tenant),
+            Self::TenantCost => format!("tenant:{}", ak.tenant),
+            Self::KeyCost => format!("key:{}", ak.ak_id),
+        }
+    }
+}
+
 // the row is the common variant; boxing it would add an allocation per request
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -302,71 +311,23 @@ pub async fn check_budgets(
 ) -> GResult<Result<UserBudget, String>> {
     let over = user_budget(state, ak, user).await?;
     let gov = state.governance.as_ref();
-    for b in budgets(gov, cfg, ak, user, over).await {
-        let under = match b.window {
+    let budgets = budgets(gov, cfg, ak, user, over).await;
+    let under = futures::future::join_all(budgets.iter().map(|b| async move {
+        match b.window {
             Window::Day => gov.quota_check(&b.key, b.limit).await,
             Window::Month => gov.counter_get(&b.key).await < b.limit,
-        };
-        if !under {
-            return Ok(Err(format!(
-                "{} {} budget exhausted for {}",
-                b.window.label(),
-                b.scope.unit(),
-                b.scope.subject(ak, user)
-            )));
         }
+    }))
+    .await;
+    if let Some((b, _)) = budgets.iter().zip(under).find(|(_, under)| !under) {
+        return Ok(Err(format!(
+            "{} {} budget exhausted for {}",
+            b.window.label(),
+            b.scope.unit(),
+            b.scope.subject(ak, user)
+        )));
     }
     Ok(Ok(over))
-}
-
-/// Accrue usage under `over`, the override admission resolved (`None` resolves it now);
-/// a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
-pub async fn consume_budgets(
-    state: &GatewayState,
-    cfg: &GatewayConfig,
-    ak: &AkInfo,
-    user: &str,
-    over: Option<UserBudget>,
-    tokens: i64,
-    cost_micros: i64,
-) {
-    if tokens <= 0 && cost_micros <= 0 {
-        return;
-    }
-    let over = match over {
-        Some(over) => over,
-        None => user_budget(state, ak, user).await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "user budget lookup failed at settlement; charging tenant defaults");
-            UserBudget::default()
-        }),
-    };
-    let gov = state.governance.as_ref();
-    for b in budgets(gov, cfg, ak, user, over).await {
-        let amount = if b.scope.charges_cost() {
-            cost_micros
-        } else {
-            tokens
-        };
-        if amount <= 0 {
-            continue;
-        }
-        let used = match b.window {
-            Window::Day => gov.quota_consume(&b.key, amount).await,
-            Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
-        };
-        if used >= b.limit {
-            state.alerts.emit(
-                "budget_exhausted",
-                b.scope.subject(ak, user),
-                format!(
-                    "{} {} budget: {used} of {}",
-                    b.window.label(),
-                    b.scope.unit(),
-                    b.limit
-                ),
-            );
-        }
-    }
 }
 
 pub fn model_quota_key(ak_id: &str, model: &str) -> String {
@@ -388,9 +349,16 @@ pub fn swap_to_fallback(
     tenant: &str,
     param: &mut gw_models::ModelParamV2,
 ) -> FallbackSwap {
+    let chat = matches!(param.typed, Some(gw_models::TypedParams::Chat(_)));
     let Some(fb) = cfg
         .find_tenant(tenant)
         .and_then(|t| t.fallback_model.as_deref())
+        .filter(|fb| {
+            chat || cfg
+                .find_model(fb)
+                .and_then(|m| m.protocol())
+                .is_some_and(|p| p.serves(param.protocol))
+        })
     else {
         return FallbackSwap::Unconfigured;
     };
@@ -469,18 +437,16 @@ pub async fn check_model_qpm(
     )
 }
 
-/// Reserve `amount` against the AK daily quota on the `at` day bucket.
+/// Reserve `amount` against the AK daily quota on the `at` day bucket; yields the amount recorded.
 pub async fn reserve_daily(
     gov: &dyn Governance,
     ak: &AkInfo,
     amount: i64,
     at: i64,
-) -> Result<(), String> {
-    admit(
-        gov.quota_reserve(&ak.ak_id, amount, ak.daily_token_quota, at)
-            .await,
-        || format!("daily token quota exhausted for key {}", ak.ak_id),
-    )
+) -> Result<i64, String> {
+    gov.quota_reserve(&ak.ak_id, amount, ak.daily_token_quota, at)
+        .await
+        .ok_or_else(|| format!("daily token quota exhausted for key {}", ak.ak_id))
 }
 
 /// Reserve `amount` in the AK TPM window; `Ok(None)` when the key has no TPM cap.
@@ -505,12 +471,6 @@ pub async fn reserve_tpm(
             ak.ak_id
         )),
     }
-}
-
-/// What a settled request cost, for the budgets and the decision trail.
-pub struct Settled {
-    pub total_tokens: i64,
-    pub cost_micros: i64,
 }
 
 /// Settle reserves to actuals, accrue the per-(AK, model) counter and write the
@@ -540,8 +500,23 @@ pub async fn settle_and_bill(
                 .await;
         }
     };
+    let charge_budgets = consume_budgets(
+        state,
+        cfg,
+        s.budget_ak,
+        s.billing.user_id,
+        s.user_budget,
+        settled.total_tokens,
+        settled.cost_micros,
+    );
     let write_ledger = state.billing.write(record);
-    tokio::join!(settle_daily, consume_model, settle_tpm, write_ledger);
+    tokio::join!(
+        settle_daily,
+        consume_model,
+        settle_tpm,
+        charge_budgets,
+        write_ledger
+    );
     settled
 }
 
@@ -549,6 +524,62 @@ pub async fn settle_and_bill(
 pub fn month_prefixes() -> [String; 2] {
     let month = civil_month(crate::epoch_secs());
     [month_prefix(month), month_prefix(previous_month(month))]
+}
+
+/// Accrue usage under `over`, the override admission resolved (`None` resolves it now);
+/// a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
+async fn consume_budgets(
+    state: &GatewayState,
+    cfg: &GatewayConfig,
+    ak: &AkInfo,
+    user: &str,
+    over: Option<UserBudget>,
+    tokens: i64,
+    cost_micros: i64,
+) {
+    if tokens <= 0 && cost_micros <= 0 {
+        return;
+    }
+    let over = match over {
+        Some(over) => over,
+        None => user_budget(state, ak, user).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "user budget lookup failed at settlement; charging tenant defaults");
+            UserBudget::default()
+        }),
+    };
+    let gov = state.governance.as_ref();
+    let budgets = budgets(gov, cfg, ak, user, over).await;
+    let used = futures::future::join_all(budgets.iter().map(|b| async move {
+        let amount = if b.scope.charges_cost() {
+            cost_micros
+        } else {
+            tokens
+        };
+        if amount <= 0 {
+            return None;
+        }
+        Some(match b.window {
+            Window::Day => gov.quota_consume(&b.key, amount).await,
+            Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
+        })
+    }))
+    .await;
+    for (b, used) in budgets.iter().zip(used) {
+        if let Some(used) = used
+            && used >= b.limit
+        {
+            state.alerts.emit(
+                "budget_exhausted",
+                b.scope.subject(ak, user),
+                format!(
+                    "{} {} budget: {used} of {}",
+                    b.window.label(),
+                    b.scope.unit(),
+                    b.limit
+                ),
+            );
+        }
+    }
 }
 
 fn admit(ok: bool, deny: impl FnOnce() -> String) -> Result<(), String> {
@@ -599,11 +630,10 @@ async fn budgets(
         (KeyCost, Month, tv(|t| t.key_monthly_cost_quota_micros)),
         (UserCost, Month, user_month),
     ];
-    let rollover = t.is_some_and(|t| t.monthly_cost_rollover);
     let month = civil_month(crate::epoch_secs());
     let mut out = Vec::new();
     for (scope, window, limit) in scopes {
-        let Some(mut limit) = limit else {
+        let Some(limit) = limit else {
             continue;
         };
         if scope.is_per_user() && user.is_empty() {
@@ -613,18 +643,27 @@ async fn budgets(
             Window::Day => scope.key(None, ak, user),
             Window::Month => scope.key(Some(month), ak, user),
         };
-        if window == Window::Month && rollover {
-            let spent = gov
-                .counter_get(&scope.key(Some(previous_month(month)), ak, user))
-                .await;
-            limit = limit.saturating_add((limit - spent).clamp(0, limit));
-        }
         out.push(Budget {
             scope,
             window,
             key,
             limit,
         });
+    }
+    if t.is_some_and(|t| t.monthly_cost_rollover) {
+        let months = out.iter().filter(|b| b.window == Window::Month);
+        let spent = futures::future::join_all(months.map(|b| {
+            let key = b.scope.key(Some(previous_month(month)), ak, user);
+            async move { gov.counter_get(&key).await }
+        }))
+        .await;
+        for (b, spent) in out
+            .iter_mut()
+            .filter(|b| b.window == Window::Month)
+            .zip(spent)
+        {
+            b.limit = b.limit.saturating_add((b.limit - spent).clamp(0, b.limit));
+        }
     }
     out
 }
@@ -670,6 +709,35 @@ mod tests {
             ptu_spillover: false,
             estimated: false,
         }
+    }
+
+    #[test]
+    fn a_typed_family_never_degrades_to_a_model_of_another_protocol() {
+        let cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\nmodels: [{name: chat, protocol: openai-chat}, {name: other-chat, protocol: anthropic-messages}, {name: emb, protocol: embeddings}]\ntenants: [{name: t, models: [chat, other-chat, emb], fallback_model: chat}]",
+        )
+        .unwrap();
+        let mut family = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Embeddings, "emb");
+        family.typed = Some(gw_models::TypedParams::Embeddings(Default::default()));
+        assert!(matches!(
+            swap_to_fallback(&cfg, "t", &mut family),
+            FallbackSwap::Unconfigured
+        ));
+        assert_eq!(family.model_name, "emb");
+        let mut native = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "emb");
+        assert!(matches!(
+            swap_to_fallback(&cfg, "t", &mut native),
+            FallbackSwap::Unconfigured
+        ));
+        let mut chat = gw_models::ModelParamV2::with_name(
+            gw_consts::Protocol::AnthropicMessages,
+            "other-chat",
+        );
+        chat.typed = Some(gw_models::TypedParams::Chat(Default::default()));
+        assert!(matches!(
+            swap_to_fallback(&cfg, "t", &mut chat),
+            FallbackSwap::Swapped(..)
+        ));
     }
 
     #[tokio::test]

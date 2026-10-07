@@ -1,4 +1,4 @@
-// Package auth implements local password and opaque-session authentication.
+// Package auth implements local password hashing and opaque token generation.
 package auth
 
 import (

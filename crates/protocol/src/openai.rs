@@ -29,12 +29,6 @@ impl MessageContent {
     }
 }
 
-impl Default for MessageContent {
-    fn default() -> Self {
-        MessageContent::Text(String::new())
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Cow<'static, str>,
@@ -217,8 +211,6 @@ impl ChatCompletionResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

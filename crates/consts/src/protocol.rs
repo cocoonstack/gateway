@@ -27,16 +27,12 @@ pub enum Protocol {
     Tts,
     /// speech-to-text
     Stt,
-    /// other audio work (sound effects, isolation, alignment, cloning)
-    Audio,
     /// video generation (async task type)
     Video,
     /// web search
     Search,
     /// realtime bidirectional streaming (served on the WebSocket surface)
     Realtime,
-    /// request body passed through as-is
-    Passthrough,
     /// Baidu Ernie chat
     Ernie,
     /// MiniMax v1 chat (sender_type/reply/base_resp shape)
@@ -55,6 +51,8 @@ pub enum Protocol {
     Moderations,
     /// document rerank (Cohere/Jina-compatible shape)
     Rerank,
+    /// System One typed decisions (TypeSafe Jev via OpenRouter)
+    Decisions,
 }
 
 impl Protocol {
@@ -68,11 +66,9 @@ impl Protocol {
         Protocol::Image,
         Protocol::Tts,
         Protocol::Stt,
-        Protocol::Audio,
         Protocol::Video,
         Protocol::Search,
         Protocol::Realtime,
-        Protocol::Passthrough,
         Protocol::Ernie,
         Protocol::MinimaxV1,
         Protocol::AwsAnthropic,
@@ -82,6 +78,7 @@ impl Protocol {
         Protocol::Dashscope,
         Protocol::Moderations,
         Protocol::Rerank,
+        Protocol::Decisions,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -95,11 +92,9 @@ impl Protocol {
             Protocol::Image => "image",
             Protocol::Tts => "tts",
             Protocol::Stt => "stt",
-            Protocol::Audio => "audio",
             Protocol::Video => "video",
             Protocol::Search => "search",
             Protocol::Realtime => "realtime",
-            Protocol::Passthrough => "passthrough",
             Protocol::Ernie => "ernie",
             Protocol::MinimaxV1 => "minimax-v1",
             Protocol::AwsAnthropic => "aws-anthropic",
@@ -109,6 +104,7 @@ impl Protocol {
             Protocol::Dashscope => "dashscope",
             Protocol::Moderations => "moderations",
             Protocol::Rerank => "rerank",
+            Protocol::Decisions => "decisions",
         }
     }
 
@@ -139,7 +135,7 @@ mod tests {
         for &p in Protocol::ALL {
             assert_eq!(Protocol::from_wire(p.as_str()), Some(p));
         }
-        assert_eq!(Protocol::ALL.len(), 23);
+        assert_eq!(Protocol::ALL.len(), 22);
         assert!(Protocol::from_wire("nope").is_none());
     }
 }

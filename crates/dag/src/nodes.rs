@@ -1,5 +1,7 @@
 //! The default node set for the online chat pipeline.
 
+use std::io::{self, Write};
+
 use gw_consts::{ErrCode, Protocol};
 use gw_models::{GResult, GatewayError};
 use gw_state::admission;
@@ -7,17 +9,13 @@ use gw_state::admission;
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
 
-/// Completion tokens reserved when the caller sets no max_tokens; settle
-/// corrects to actuals, so the estimate only needs to be monotone.
+/// Completion tokens reserved without a client max_tokens; settle corrects to actuals.
 const DEFAULT_COMPLETION_RESERVE: i64 = 256;
-/// Cap on the reservation regardless of a caller's `max_tokens`, so a hostile
-/// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
+/// Reservation cap, so a hostile `max_tokens` cannot overflow the estimate or the counter.
 const MAX_RESERVE: i64 = 1_000_000;
 
-/// preprocess/model_quota: per-(AK, model) daily token cap (AK override, else
-/// tenant default, else unmetered); over-quota degrades to the tenant's
-/// fallback model, so it runs before resolve_model. Soft check-then-consume:
-/// the reserved AK daily quota hard-caps spend.
+/// preprocess/model_quota: soft per-(AK, model) daily cap (AK override, else tenant default);
+/// over it degrades to the tenant fallback model, so it runs before resolve_model.
 pub struct ModelQuotaGate;
 
 #[async_trait::async_trait]
@@ -109,8 +107,7 @@ impl DagNode for ResolveModel {
     }
 }
 
-/// preprocess/tenant_entitlement: per-tenant model allowlist. Runs before the
-/// cache so an unentitled model can't be served from another tenant's entry.
+/// preprocess/tenant_entitlement: per-tenant model allowlist, ahead of the cache.
 pub struct TenantEntitlement;
 
 #[async_trait::async_trait]
@@ -134,9 +131,8 @@ impl DagNode for TenantEntitlement {
     }
 }
 
-/// preprocess/variant_select: weighted split of a public model across its
-/// variants, sticky per user id, else per conversation (its first user turn);
-/// after entitlement (on the public name), before the cache; a degraded request is left alone.
+/// preprocess/variant_select: weighted split of a public model, sticky per user (else per first
+/// user turn); after entitlement, before the cache; a degraded request is left alone.
 pub struct VariantSelect;
 
 #[async_trait::async_trait]
@@ -182,8 +178,7 @@ impl DagNode for VariantSelect {
     }
 }
 
-/// preprocess/cache_lookup: request-level TTL cache. On a hit the outcome is
-/// produced directly and the downstream nodes all short-circuit.
+/// preprocess/cache_lookup: request-level TTL cache; a hit short-circuits every later node.
 pub struct CacheLookup;
 
 #[async_trait::async_trait]
@@ -216,8 +211,8 @@ impl DagNode for CacheLookup {
     }
 }
 
-/// Cache key: sha256 of surface + model + messages + typed + passthrough params;
-/// not keyed by tenant (entitlement gates first, a split would only shrink hits).
+/// Cache key: sha256 of config generation, wire flags, beta header, model, messages, typed and
+/// raw params; not keyed by tenant (entitlement gates first, a split would only shrink hits).
 fn cache_key_of(ctx: &DagContext) -> Option<String> {
     use sha2::{Digest, Sha256};
     let param = ctx.request.model_param_v2.as_ref()?;
@@ -226,6 +221,9 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     h.update(ctx.cfg.generation().to_le_bytes());
     h.update(b"native-anthropic-wire-v1");
     h.update([u8::from(ctx.request.preserve_anthropic_wire)]);
+    if let Some(beta) = &ctx.request.anthropic_beta {
+        h.update(beta.as_bytes());
+    }
     h.update(param.model_name.as_bytes());
     // serialize straight into the hasher — no throwaway buffers for a multi-KB history
     serde_json::to_writer(&mut h, &ctx.request.message).ok()?;
@@ -239,14 +237,30 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     Some(hex::encode(h.finalize()))
 }
 
-/// Cheap admission estimate: ~chars/4 prompt heuristic + requested max_tokens,
-/// saturating and capped so caller-controlled input can't wrap the counters.
+struct PromptBytes(usize);
+
+impl Write for PromptBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Admission estimate: ~bytes/4 prompt plus the requested max_tokens, saturating and capped.
 fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
-    let prompt: usize = req.message.iter().map(|m| m.content.len()).sum();
-    let max_out = req
-        .model_param_v2
-        .as_ref()
-        .and_then(|p| p.typed.as_ref())
+    let typed = req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref());
+    let prompt = if let Some(gw_models::TypedParams::Decisions(p)) = typed {
+        let mut bytes = PromptBytes(0);
+        let _ = serde_json::to_writer(&mut bytes, &p.fields);
+        bytes.0
+    } else {
+        req.message.iter().map(|m| m.content.len()).sum()
+    };
+    let max_out = typed
         .and_then(|t| match t {
             gw_models::TypedParams::Chat(c) => c.max_tokens,
             _ => None,
@@ -258,8 +272,7 @@ fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
         .min(MAX_RESERVE)
 }
 
-/// preprocess/quota_check: AK daily-quota admission — reserves the estimate
-/// atomically; billing settles to actuals, a failed pipeline refunds.
+/// preprocess/quota_check: reserve the estimate against the AK daily quota; billing settles it.
 pub struct QuotaCheck;
 
 #[async_trait::async_trait]
@@ -270,12 +283,12 @@ impl DagNode for QuotaCheck {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = reserve_estimate(&ctx.request);
         let at = gw_state::epoch_secs();
-        admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
+        let reserved = admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
             .map_err(quota_denied)?;
-        ctx.quota_reserved = Some(est);
+        ctx.quota_reserved = Some(reserved);
         ctx.quota_at = at;
-        ctx.decide("quota_check", format!("reserved {est}"));
+        ctx.decide("quota_check", format!("reserved {reserved}"));
         Ok(())
     }
 }
@@ -407,6 +420,7 @@ impl DagNode for AkTpmLimit {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = ctx
             .quota_reserved
+            .filter(|&reserved| reserved > 0)
             .unwrap_or_else(|| reserve_estimate(&ctx.request));
         ctx.tpm_reserved = admission::reserve_tpm(ctx.state.governance.as_ref(), &ctx.ak, est)
             .await
@@ -415,8 +429,7 @@ impl DagNode for AkTpmLimit {
     }
 }
 
-/// model_access/budget: the tenant's daily token and cost budgets (soft caps)
-/// for this key and its effective end user. No-op without a configured cap.
+/// model_access/budget: the tenant's token and cost budgets (soft caps) for the key and user.
 pub struct BudgetGate;
 
 #[async_trait::async_trait]
@@ -433,9 +446,8 @@ impl DagNode for BudgetGate {
     }
 }
 
-/// model_access/call_engine: engine dispatch + one failover on an upstream 5xx
-/// (a PTU → paygo spill sets `ptu_spillover`). Availability samples record only
-/// the client-visible terminal outcome, attributed to the requested public name.
+/// model_access/call_engine: dispatch with one failover on an upstream 5xx or 401-403 refusal;
+/// availability records only the client-visible outcome, under the requested name.
 pub struct CallEngine;
 
 #[async_trait::async_trait]
@@ -524,7 +536,7 @@ impl DagNode for CallEngine {
     }
 }
 
-/// The call timer for the latency ranker; `None` when latency routing is off, so the default pays nothing.
+/// The latency ranker's call timer; `None` with latency routing off, so the default pays nothing.
 fn latency_clock(ctx: &DagContext) -> Option<std::time::Instant> {
     ctx.cfg
         .stability
@@ -572,8 +584,7 @@ async fn note_engine_outcome(
     }
 }
 
-/// Attach the requested model to a terminal engine-call error, for the
-/// contract's 424 `resource_name` extra. Error path only.
+/// Attach the requested model to a terminal engine-call error (the 424 `resource_name`).
 fn named(mut e: GatewayError, ctx: &DagContext) -> GatewayError {
     if e.resource.is_none() {
         e.resource = Some(requested_model(ctx.request.model_param_v2.as_ref()).to_owned());
@@ -699,8 +710,7 @@ pub enum StreamDelivery {
     None,
 }
 
-/// Token counts for one bill: vendor-reported sides plus the weighted billable
-/// sides, whose sum is always the platform total.
+/// One bill's counts: the vendor sides and the weighted sides that sum to the platform total.
 struct BillTokens {
     prompt: i64,
     completion: i64,
@@ -711,9 +721,7 @@ struct BillTokens {
 }
 
 impl BillTokens {
-    /// Prompt/completion-only counts with the model's weights applied — the
-    /// paths without a usage payload (estimates, malformed usage) must price
-    /// identically to the happy path or a cut stream changes effective pricing.
+    /// Weighted prompt/completion-only counts: estimate paths must price like the happy path.
     fn weighted(prompt: i64, completion: i64, rate: &gw_models::TokenRate) -> Self {
         let input = gw_models::TokenInput {
             prompt,
@@ -739,41 +747,7 @@ impl BillTokens {
     }
 }
 
-async fn bill_aborted_stream(
-    ctx: &mut DagContext,
-    delivered_completion: Option<i64>,
-) -> GResult<()> {
-    let response = &ctx
-        .outcome
-        .as_ref()
-        .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
-        .response;
-    let enc = crate::token_estimate::default_encoder();
-    let param = ctx.request.model_param_v2.as_ref();
-    let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
-        gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
-        _ => None,
-    });
-    let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-    let prompt = if response.prompt_tokens > 0 {
-        response.prompt_tokens
-    } else {
-        crate::token_estimate::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
-    };
-    let completion = delivered_completion
-        .unwrap_or_else(|| enc.encode_len(&response.message) as i64)
-        .max(0);
-    let rate =
-        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
-    ctx.decide(
-        "cost_calc",
-        format!("aborted stream, billed {prompt}+{completion}"),
-    );
-    bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
-}
-
-/// Close the deferred reserve/billing lifecycle after a buffered stream replay:
-/// a pre-delivery disconnect refunds, a partial delivery bills estimated tokens.
+/// Close a buffered stream's billing: refund before delivery, bill estimates after a partial one.
 pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
     if !ctx.billing_deferred {
         return Ok(());
@@ -813,6 +787,39 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
     }
 }
 
+async fn bill_aborted_stream(
+    ctx: &mut DagContext,
+    delivered_completion: Option<i64>,
+) -> GResult<()> {
+    let response = &ctx
+        .outcome
+        .as_ref()
+        .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?
+        .response;
+    let enc = crate::token_estimate::default_encoder();
+    let param = ctx.request.model_param_v2.as_ref();
+    let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
+        gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
+        _ => None,
+    });
+    let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+    let prompt = if response.prompt_tokens > 0 {
+        response.prompt_tokens
+    } else {
+        crate::token_estimate::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
+    };
+    let completion = delivered_completion
+        .unwrap_or_else(|| enc.encode_len(&response.message) as i64)
+        .max(0);
+    let rate =
+        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
+    ctx.decide(
+        "cost_calc",
+        format!("aborted stream, billed {prompt}+{completion}"),
+    );
+    bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
+}
+
 fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
     response.message.clear();
     response.completion_tokens = 0;
@@ -822,8 +829,7 @@ fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
     response.aborted = true;
 }
 
-/// Settle reserves and write the ledger through [`admission::settle_and_bill`];
-/// `estimated` marks an aborted stream's estimated counts.
+/// Settle reserves and write the ledger; `estimated` marks an aborted stream's estimated counts.
 async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> GResult<()> {
     let ptu_spillover = ctx
         .outcome
@@ -888,17 +894,9 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
             tpm_reserved,
             reserved_at: ctx.quota_at,
             model_quota_key,
+            budget_ak: &ctx.ak,
+            user_budget: ctx.user_budget,
         },
-    )
-    .await;
-    admission::consume_budgets(
-        ctx.state.as_ref(),
-        &ctx.cfg,
-        &ctx.ak,
-        ctx.effective_user_id(),
-        ctx.user_budget,
-        settled.total_tokens,
-        settled.cost_micros,
     )
     .await;
     ctx.decide(
@@ -1028,14 +1026,12 @@ fn model_provider(ctx: &DagContext) -> Option<&str> {
     ctx.cfg.find_model(name).and_then(|m| m.provider.as_deref())
 }
 
-/// The model name the request currently targets (post-fallback). Takes the
-/// param, not the whole context, so `bill` can call it across its ctx takes.
+/// The model the request targets now (post-fallback); takes the param so `bill` can call it.
 fn served_model(param: Option<&gw_models::ModelParamV2>) -> &str {
     param.map(|p| p.model_name.as_str()).unwrap_or_default()
 }
 
-/// The public name the caller requested (pre-fallback/variant), where
-/// availability attributes.
+/// The public name the caller requested (pre-fallback/variant), where availability attributes.
 fn requested_model(param: Option<&gw_models::ModelParamV2>) -> &str {
     param
         .map(|p| p.fallback_from.as_deref().unwrap_or(p.model_name.as_str()))

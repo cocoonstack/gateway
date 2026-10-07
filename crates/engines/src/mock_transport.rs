@@ -54,14 +54,18 @@ impl MockTransport {
         })
     }
 
-    fn ok_json(v: Value) -> GResult<UpstreamResponse> {
+    fn ok(body: UpstreamBody) -> GResult<UpstreamResponse> {
         Ok(UpstreamResponse {
             status: 200,
-            body: UpstreamBody::Json(bytes::Bytes::from(
-                serde_json::to_vec(&v).map_err(|e| GatewayError::internal(e.to_string()))?,
-            )),
+            body,
             headers: HeaderMap::new(),
         })
+    }
+
+    fn ok_json(v: Value) -> GResult<UpstreamResponse> {
+        Self::ok(UpstreamBody::Json(bytes::Bytes::from(
+            serde_json::to_vec(&v).map_err(|e| GatewayError::internal(e.to_string()))?,
+        )))
     }
 
     fn image_count(messages: &[Value]) -> usize {
@@ -98,11 +102,7 @@ impl MockTransport {
                         "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
                         "usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":pt+ct}}),
                 ];
-                return Ok(UpstreamResponse {
-                    status: 200,
-                    body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
-                    headers: HeaderMap::new(),
-                });
+                return Self::ok(UpstreamBody::Sse(Self::sse_bytes(&frames, true)));
             }
             return Self::ok_json(json!({
                 "id":"chatcmpl-mock","object":"chat.completion","created":MOCK_CREATED,"model":model,
@@ -126,11 +126,7 @@ impl MockTransport {
                     "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
                     "usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":pt+ct}}),
             ];
-            Ok(UpstreamResponse {
-                status: 200,
-                body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
-                headers: HeaderMap::new(),
-            })
+            Self::ok(UpstreamBody::Sse(Self::sse_bytes(&frames, true)))
         } else {
             Self::ok_json(json!({
                 "id": "chatcmpl-mock", "object": "chat.completion", "created": MOCK_CREATED,
@@ -206,11 +202,7 @@ impl MockTransport {
                     "usage":{"output_tokens":ot}}),
                 json!({"type":"message_stop"}),
             ];
-            return Ok(UpstreamResponse {
-                status: 200,
-                body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
-                headers: HeaderMap::new(),
-            });
+            return Self::ok(UpstreamBody::Sse(Self::sse_bytes(&frames, false)));
         }
 
         Self::ok_json(json!({
@@ -251,11 +243,7 @@ impl MockTransport {
                 frame(2, b, "null", ot),
                 frame(3, "", "stop", ot),
             );
-            return Ok(UpstreamResponse {
-                status: 200,
-                body: UpstreamBody::Sse(sse.into_bytes()),
-                headers: HeaderMap::new(),
-            });
+            return Self::ok(UpstreamBody::Sse(sse.into_bytes()));
         }
         Self::ok_json(json!({
             "output": {"choices": [{"finish_reason": "stop",
@@ -482,11 +470,7 @@ impl MockTransport {
                 json!({"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}],
                        "usageMetadata":{"promptTokenCount":pt,"candidatesTokenCount":ct,"totalTokenCount":pt+ct}}),
             ];
-            return Ok(UpstreamResponse {
-                status: 200,
-                body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
-                headers: HeaderMap::new(),
-            });
+            return Self::ok(UpstreamBody::Sse(Self::sse_bytes(&frames, false)));
         }
         Self::ok_json(json!({
             "candidates": [{"content": {"role": "model", "parts": [{"text": reply}]},
@@ -590,6 +574,54 @@ impl MockTransport {
         }))
     }
 
+    /// Decisions reply: a typed answer per question, the first choice option
+    /// picked, input billed at one micro-dollar a token in `usage.cost`.
+    fn decisions_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
+        let mut body = Self::parse(&req.body, "decisions")?;
+        let mut answers = serde_json::Map::new();
+        if let Value::Object(questions) = body["questions"].take() {
+            for (name, mut q) in questions {
+                let answer = match q["type"].as_str().unwrap_or_default() {
+                    "choice" => {
+                        let pick = q["criteria"]
+                            .as_object()
+                            .and_then(|c| c.keys().next())
+                            .map_or("", String::as_str);
+                        json!({"type": "choice", "choice": pick, "confidence": 1.0,
+                               "probabilities": {pick: 1.0}})
+                    }
+                    "score" => {
+                        let mut legend = serde_json::Map::new();
+                        let mut probabilities = serde_json::Map::new();
+                        if let Value::Array(criteria) = q["criteria"].take() {
+                            for (index, level) in criteria.into_iter().enumerate() {
+                                let key = index.to_string();
+                                legend.insert(key.clone(), level);
+                                probabilities
+                                    .insert(key, if index == 0 { 1.0 } else { 0.0 }.into());
+                            }
+                        }
+                        let mut answer = json!({"type": "score", "score": 0.0, "confidence": 1.0});
+                        answer["legend"] = legend.into();
+                        answer["probabilities"] = probabilities.into();
+                        answer
+                    }
+                    _ => json!({"type": "noul", "noul": 0.5}),
+                };
+                answers.insert(name, answer);
+            }
+        }
+        let input = Self::tokens(&String::from_utf8_lossy(&req.body));
+        let mut reply = json!({
+            "id": "gen-dec-mock",
+            "provider": "mock",
+            "usage": {"input_tokens": input, "output_tokens": 0, "cost": input as f64 / 1e6},
+        });
+        reply["model"] = body["model"].take();
+        reply["answers"] = answers.into();
+        Self::ok_json(reply)
+    }
+
     fn audio_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         if req.url.ends_with("/audio/transcriptions") {
             let language = Self::form_field(&req.body, "language");
@@ -601,12 +633,8 @@ impl MockTransport {
             return Self::ok_json(json!({"text": "[mock-stt] translated audio"}));
         }
         let body = Self::parse(&req.body, "audio")?;
-        if req.url.ends_with("/audio/speech") {
-            let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
-            Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
-        } else {
-            Self::ok_json(json!({"audio_b64": MOCK_B64, "kind": "audio-other"}))
-        }
+        let chars = body["input"].as_str().map(|s| s.len()).unwrap_or(0) as i64;
+        Self::ok_json(json!({"audio_b64": MOCK_B64, "characters": chars}))
     }
 
     /// Async hosts answer a handle on submit; a poll's state is spelled by the
@@ -625,11 +653,7 @@ impl MockTransport {
         };
         if req.url.contains("openai.com") {
             if req.url.ends_with("/content") {
-                return Ok(UpstreamResponse {
-                    status: 200,
-                    body: UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")),
-                    headers: HeaderMap::new(),
-                });
+                return Self::ok(UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")));
             }
             if req.method == "GET" {
                 let id = req.url.rsplit('/').next().unwrap_or_default();
@@ -708,11 +732,7 @@ impl MockTransport {
             }));
         }
         if req.url.contains("video-cdn") {
-            return Ok(UpstreamResponse {
-                status: 200,
-                body: UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")),
-                headers: HeaderMap::new(),
-            });
+            return Self::ok(UpstreamBody::Json(bytes::Bytes::from_static(b"MOCK-MP4")));
         }
         if req.url.contains("/query/video_generation") {
             let id = req.url.rsplit('=').next().unwrap_or_default();
@@ -735,7 +755,7 @@ impl MockTransport {
             } else if id.contains("failed") {
                 json!({"status": "failed", "error": "mock generation failed"})
             } else {
-                json!({"status": "done", "progress": 100,
+                json!({"status": "done", "progress": 100, "model": "mock-video",
                        "video": {"url": format!("mock://videos/{id}.mp4"), "duration": 2},
                        "usage": {"cost_in_usd_ticks": 1_600_000_000}})
             });
@@ -791,11 +811,6 @@ impl MockTransport {
             })
             .collect();
         Self::ok_json(json!({"query": q, "results": results}))
-    }
-
-    fn passthrough_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        Self::ok_json(json!({"ok": true, "protocol": req.protocol.as_str(), "echo": body}))
     }
 
     /// Legacy text-completions reply (the `.../completions` endpoint):
@@ -854,11 +869,7 @@ impl MockTransport {
                 json!({"type": "response.completed",
                     "response": {"model": model, "status": "completed", "usage": usage}}),
             ];
-            return Ok(UpstreamResponse {
-                status: 200,
-                body: UpstreamBody::Sse(Self::sse_bytes(&frames, true)),
-                headers: HeaderMap::new(),
-            });
+            return Self::ok(UpstreamBody::Sse(Self::sse_bytes(&frames, true)));
         }
         Self::ok_json(json!({
             "id": "resp_mock",
@@ -899,6 +910,9 @@ impl Transport for MockTransport {
         if req.protocol == Protocol::Search {
             return self.search_reply(&req);
         }
+        if req.protocol == Protocol::Decisions {
+            return self.decisions_reply(&req);
+        }
         let u = req.url.as_str();
         if u.contains("/model/") {
             self.bedrock_reply(&req)
@@ -927,8 +941,6 @@ impl Transport for MockTransport {
         } else if u.contains("/v1/completions") {
             // `/v1/chat/completions` does NOT contain `/v1/completions` — legacy endpoint only
             self.completions_reply(&req)
-        } else if u.contains("/passthrough") {
-            self.passthrough_reply(&req)
         } else {
             self.openai_reply(&req)
         }

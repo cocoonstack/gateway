@@ -18,7 +18,7 @@ access_keys:
     tokens_per_minute: 600   # optional TPM window
     expires_at_epoch_secs: 1767225600  # optional; expired keys 403
     banned: false            # optional; banned keys 403
-    model_quotas: {gpt-4o: 200000}     # optional per-model daily caps
+    model_quotas: {gpt-4o: 200000}     # optional per-model daily degrade thresholds
 ```
 
 ## Tenants
@@ -27,8 +27,11 @@ A tenant groups keys under shared governance: one pooled QPS bucket for all
 its keys, a model entitlement allowlist (unlisted models 403 and disappear
 from `GET /v1/models`), per-model daily-token quota defaults (each key metered
 separately against the same value; per-key `model_quotas` override), and an
-optional `fallback_model` — an over-quota request degrades to it instead of
-failing (the response echoes the requested model name; the ledger records both
+optional `fallback_model` — an over-quota request degrades to it (a
+typed-family request such as embeddings, rerank or decisions only when the
+fallback's protocol serves its surface); with no usable fallback the request
+is served by the model it named, so a per-model quota is a degrade trigger,
+not a cap (the response echoes the requested model name; the ledger records both
 requested and served; a model's own `fallback_models` chain for upstream
 failures is a separate mechanism, below). The per-key daily cap stays the hard backstop, and
 unconfigured (key, model) pairs never touch a counter.
@@ -73,7 +76,7 @@ models:
 | QPS | per access key | `access_keys[].qps` |
 | QPS | pooled per tenant | `tenants[].qps` |
 | Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
-| Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override |
+| Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override (degrade trigger, not a cap) |
 | Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
 | Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
 | Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
@@ -114,9 +117,12 @@ day; the TPM reserve settles only into the minute window that admitted it — a
 request that outlives its window leaves the next window's reservations alone. Charged price is the model's list price, or
 a tenant's `model_prices` override; when an account declares `cost_*_price` the
 ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
+A `protocol: decisions` model without a tenant override charges the vendor's
+reported `usage.cost` instead of the list price, and the cost budgets count
+that charge.
 Surfaces that meter no tokens bill per unit instead — TTS characters,
-transcription seconds, rerank search units, generated images, generated video
-seconds — at the model's `unit_price_micros` (see
+transcription seconds, rerank search units, web searches (one unit per query),
+generated images, generated video seconds — at the model's `unit_price_micros` (see
 [Configuration](configuration.md)); the unit count rides on the ledger row and
 the usage aggregates as `billed_units`. An async video bills when its poll first
 sees `done`: the submit row carries 0 units, the completion row (its
@@ -206,7 +212,9 @@ models:
 
 `security.dlp_redact` redacts emails and phone numbers from inbound content
 (chat messages, the Responses body, and the family typed params) and from the
-outbound message; `security.blocklist` rejects requests containing listed terms
+outbound message — it guards against accidental leaks and matches within each
+text field, so a value a client cuts across two content parts or spells out is
+not caught; `security.blocklist` rejects requests containing listed terms
 with a `content_filter` finish (not billed).
 
 ```yaml
@@ -258,8 +266,8 @@ fallback-model degrade), while the reserved per-key daily quota hard-caps spend.
 The daily cost budgets — `daily_cost_quota_micros` pooled over the tenant's
 keys, `key_daily_cost_quota_micros` per key, `user_daily_cost_quota_micros`
 per end user — are soft caps of the same kind over the ledger's charged
-`cost_micros` (list price or the tenant's `model_prices`, so unit-priced
-surfaces count too); they apply on every surface, realtime and batch included,
+`cost_micros` (list price, the tenant's `model_prices`, or a decisions reply's
+`usage.cost`, so unit-priced surfaces count too); they apply on every surface, realtime and batch included,
 and a response-cache hit, which bills nothing, counts nothing.
 The monthly counterparts — `monthly_cost_quota_micros`,
 `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` — meter the

@@ -49,6 +49,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 mod mcp;
 mod mcp_auth;
 
+/// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
+pub const TRACE_TARGET: &str = "gw::trace";
+
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
 const USER_BUDGET_PAGE_DEFAULT: usize = 200;
@@ -57,8 +60,6 @@ const CONTENT_PAGE_DEFAULT: usize = 200;
 const CONTENT_PAGE_MAX: usize = 1_000;
 const USAGE_SERIES_MAX_POINTS: i64 = 400;
 const STREAM_CHANNEL_CAP: usize = 64;
-/// Target of the per-request span; a layer exporting it is installed only with an OTLP collector.
-pub const TRACE_TARGET: &str = "gw::trace";
 const NO_OUTCOME: &str = "pipeline produced no outcome";
 const ADMIN_PAGE_MAX: usize = 10_000;
 const NO_CONFIG_STORE: &str = "config store not configured (set storage.postgres_url)";
@@ -88,22 +89,6 @@ impl std::ops::Deref for AppState {
     }
 }
 
-#[derive(Clone)]
-pub struct AppInner {
-    pub handler: OnlineHandler,
-    pub offline: OfflineHandler,
-    /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
-    pub mcp: reqwest::Client,
-    /// Upstream MCP credentials, OAuth tokens cached per server.
-    pub mcp_auth: Arc<mcp_auth::McpAuth>,
-    /// MCP session id → the `ak_id` of the key that opened it.
-    pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
-    /// Reloads config from its source; `None` = reload not wired (tests).
-    pub loader: Option<ConfigLoader>,
-    /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
-    pub config_store: Option<Arc<gw_state::PostgresConfigStore>>,
-}
-
 impl AppState {
     pub fn new(
         cfg: Arc<GatewayConfig>,
@@ -131,7 +116,6 @@ impl AppState {
         }))
     }
 
-    /// Attach the fleet config store (enables `PUT /admin/config`).
     pub fn with_config_store(mut self, store: Arc<gw_state::PostgresConfigStore>) -> Self {
         Arc::make_mut(&mut self.0).config_store = Some(store);
         self
@@ -147,23 +131,20 @@ impl AppState {
     }
 }
 
-/// The MCP proxy's client: no redirects, so a server or token endpoint cannot
-/// steer a credentialed request elsewhere.
-fn mcp_client() -> reqwest::Client {
-    #[allow(clippy::expect_used)]
-    // build fails only when TLS cannot initialize, where Client::new panics too
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("mcp client builds");
-    client
-}
-
-fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
-    moka::sync::Cache::builder()
-        .max_capacity(MCP_SESSION_CAP)
-        .time_to_live(MCP_SESSION_TTL)
-        .build()
+#[derive(Clone)]
+pub struct AppInner {
+    pub handler: OnlineHandler,
+    pub offline: OfflineHandler,
+    /// Client for the `/mcp/{server}` proxy; per-server timeouts apply per request.
+    pub mcp: reqwest::Client,
+    /// Upstream MCP credentials, OAuth tokens cached per server.
+    pub mcp_auth: Arc<mcp_auth::McpAuth>,
+    /// MCP session id → the `ak_id` of the key that opened it.
+    pub mcp_sessions: moka::sync::Cache<String, Arc<str>>,
+    /// Reloads config from its source; `None` = reload not wired (tests).
+    pub loader: Option<ConfigLoader>,
+    /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
+    pub config_store: Option<Arc<gw_state::PostgresConfigStore>>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -187,6 +168,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/moderations", post(moderations))
         .route("/v1/search", post(search))
         .route("/v1/rerank", post(rerank))
+        .route("/v1/decisions", post(decisions))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/batches", post(batches_submit))
         .route("/v1/batches/{id}", get(batches_get))
         .route("/v1/files", post(files_upload))
@@ -235,6 +218,25 @@ pub fn app(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(track_requests))
         .layer(axum::extract::DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
+}
+
+/// The MCP proxy's client: no redirects, so a server or token endpoint cannot
+/// steer a credentialed request elsewhere.
+fn mcp_client() -> reqwest::Client {
+    #[allow(clippy::expect_used)]
+    // build fails only when TLS cannot initialize, where Client::new panics too
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mcp client builds");
+    client
+}
+
+fn mcp_sessions() -> moka::sync::Cache<String, Arc<str>> {
+    moka::sync::Cache::builder()
+        .max_capacity(MCP_SESSION_CAP)
+        .time_to_live(MCP_SESSION_TTL)
+        .build()
 }
 
 /// Route fallback: the envelope's 404 instead of axum's bare one.
@@ -342,7 +344,7 @@ fn status_label(status: StatusCode) -> Cow<'static, str> {
     }
 }
 
-/// In-band realtime error event; never terminal, only a Close frame or disconnect ends the session.
+/// In-band realtime error event; the caller decides whether the session ends.
 fn rt_error(class: ErrClass, message: impl Into<Cow<'static, str>>) -> Value {
     let mut event = json!({"type":"error","error":{
         "type": class.openai_type(),
@@ -598,14 +600,13 @@ async fn realtime_gate(
         ));
     }
     let at = gw_state::epoch_secs();
-    admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
+    let reserved = admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at)
         .await
         .map_err(quota_exceeded)?;
     let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
-        Ok(reserved) => reserved,
+        Ok(tpm) => tpm,
         Err(denied) => {
-            gov.quota_settle(&ak.ak_id, -REALTIME_TURN_RESERVE, at)
-                .await;
+            gov.quota_settle(&ak.ak_id, -reserved, at).await;
             return Err((ErrClass::Throttling, denied));
         }
     };
@@ -614,7 +615,7 @@ async fn realtime_gate(
         ak,
         user,
         user_budget: Some(user_budget),
-        reserved: REALTIME_TURN_RESERVE,
+        reserved,
         tpm_reserved,
         at,
         request_id: gw_handler::new_request_id(),
@@ -656,7 +657,7 @@ async fn bill_realtime_turn(
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
         .map(|_| admission::model_quota_key(&ak.ak_id, &m.requested));
-    let settled = admission::settle_and_bill(
+    admission::settle_and_bill(
         state,
         cfg,
         admission::SettleInput {
@@ -686,17 +687,9 @@ async fn bill_realtime_turn(
             tpm_reserved: admit.tpm_reserved,
             reserved_at: admit.at,
             model_quota_key,
+            budget_ak: ak,
+            user_budget: admit.user_budget,
         },
-    )
-    .await;
-    admission::consume_budgets(
-        state,
-        cfg,
-        ak,
-        admit.user.as_str(),
-        admit.user_budget,
-        total,
-        settled.cost_micros,
     )
     .await;
     if !estimated {
@@ -840,24 +833,19 @@ async fn realtime_session(
 fn client_text_to_upstream(
     t: axum::extract::ws::Utf8Bytes,
 ) -> tokio_tungstenite::tungstenite::Message {
-    let b = bytes::Bytes::from(t);
-    match tokio_tungstenite::tungstenite::Utf8Bytes::try_from(b.clone()) {
-        Ok(u) => tokio_tungstenite::tungstenite::Message::Text(u),
-        Err(_) => {
-            tokio_tungstenite::tungstenite::Message::text(String::from_utf8_lossy(&b).into_owned())
-        }
-    }
+    tokio_tungstenite::tungstenite::Message::Text(
+        tokio_tungstenite::tungstenite::Utf8Bytes::try_from(bytes::Bytes::from(t))
+            .unwrap_or_default(),
+    )
 }
 
 /// The reverse direction of [`client_text_to_upstream`].
 fn upstream_text_to_client(
     t: tokio_tungstenite::tungstenite::Utf8Bytes,
 ) -> axum::extract::ws::Message {
-    let b = bytes::Bytes::from(t);
-    match axum::extract::ws::Utf8Bytes::try_from(b.clone()) {
-        Ok(u) => axum::extract::ws::Message::Text(u),
-        Err(_) => axum::extract::ws::Message::Text(String::from_utf8_lossy(&b).into_owned().into()),
-    }
+    axum::extract::ws::Message::Text(
+        axum::extract::ws::Utf8Bytes::try_from(bytes::Bytes::from(t)).unwrap_or_default(),
+    )
 }
 
 /// Bridge one realtime session to a real upstream: relay plus auth, gates and per-turn billing.
@@ -1125,22 +1113,17 @@ async fn realtime_bridge(
                             turn_ended = true;
                         }
                         // outbound DLP per frame: a span straddling deltas is beyond an unbuffered relay
-                        let n = if relay {
-                            gw_handler::plugins::dlp_redact_realtime_frame(
+                        let mut n = 0;
+                        if relay {
+                            n = gw_handler::plugins::dlp_redact_realtime_frame(
                                 s.handler.cfg().security_for(&ak.tenant),
                                 &mut v,
-                            )
-                        } else {
-                            0
-                        };
-                        if relay {
+                            );
                             let (text, opaque) = realtime_output_delta(&v);
-                            output_units = text.map_or(0, |text| {
-                                let tokens = gw_dag::token_estimate::default_encoder()
-                                    .encode_len(text);
-                                tokens as i64
-                            });
-                            output_units = output_units.saturating_add(opaque as i64);
+                            let encoder = gw_dag::token_estimate::default_encoder();
+                            output_units = text
+                                .map_or(0, |text| encoder.encode_len(text) as i64)
+                                .saturating_add(opaque as i64);
                         }
                         if n > 0 {
                             redacted = Some(v);
@@ -1625,8 +1608,7 @@ fn q_num<T: std::str::FromStr>(q: &HashMap<String, String>, key: &str, default: 
     q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Write one realtime security event (`user` already resolved). The shared sink
-/// for realtime blocklist/regex hits, moderation denials, and inbound DLP hits.
+/// Write one realtime security event (`user` already resolved).
 async fn write_rt_event(
     s: &AppState,
     ak: &AkInfo,
@@ -3116,6 +3098,7 @@ fn chat_request(body: ChatCompletionRequest) -> (Vec<ChatMsg>, ModelParamV2) {
                 parts: parts.map(Value::Array),
                 tool_calls: m.tool_calls.map(Value::Array),
                 tool_call_id: m.tool_call_id,
+                name: m.name,
                 reasoning_content: m.reasoning_content,
                 reasoning_details: m.reasoning_details.map(Value::Array),
             }
@@ -3331,6 +3314,7 @@ fn chat_stream_response(
         model: String,
         pending_finish: Option<Cow<'static, str>>,
         tool_index: usize,
+        tool_calls: bool,
     }
     impl SseEncodeState for St {
         fn queue(&mut self) -> &mut VecDeque<Event> {
@@ -3371,6 +3355,7 @@ fn chat_stream_response(
                         }
                     }
                     if let Some(tc) = c.tool_calls.take() {
+                        self.tool_calls = true;
                         let chunk = ChatCompletionChunk::tool_calls(
                             &self.id,
                             self.created,
@@ -3383,7 +3368,7 @@ fn chat_stream_response(
                     }
                     if let Some(fr) = c.finish_reason {
                         // held back until usage arrives so the final frame carries both
-                        self.pending_finish = Some(finish_openai(fr));
+                        self.pending_finish = Some(chat_finish(fr, self.tool_calls));
                     }
                     let Some((pt, ct, tt)) = c.usage_totals else {
                         return false;
@@ -3419,6 +3404,7 @@ fn chat_stream_response(
             model,
             pending_finish: None,
             tool_index: 0,
+            tool_calls: false,
         },
     )
 }
@@ -3652,8 +3638,15 @@ async fn messages(
     let content = match outcome.response.anthropic_content.take() {
         Some(Value::Array(blocks)) => blocks,
         _ => {
-            let mut blocks = Vec::new();
-            if !outcome.response.reasoning.is_empty() {
+            let mut blocks: Vec<Value> = outcome
+                .response
+                .reasoning_details
+                .take()
+                .into_iter()
+                .flatten()
+                .filter_map(gw_protocol::reasoning::detail_to_thinking_block)
+                .collect();
+            if blocks.is_empty() && !outcome.response.reasoning.is_empty() {
                 blocks.push(object([
                     ("type", "thinking".into()),
                     ("thinking", take(&mut outcome.response.reasoning).into()),
@@ -3763,8 +3756,8 @@ fn messages_stream_response(
             ));
         }
 
-        /// A text or (for a non-Anthropic model's reasoning prose) unsigned
-        /// thinking block; thinking precedes text, so opening text closes it.
+        /// A text or (for a non-Anthropic model's reasoning) thinking block;
+        /// thinking precedes text, so opening text closes it.
         fn open_block(&mut self, kind: BlockKind) -> usize {
             if let Some(idx) = *self.slot(kind) {
                 return idx;
@@ -3794,6 +3787,33 @@ fn messages_stream_response(
                 self.queue.push_back(Self::ev(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":idx}),
+                ));
+            }
+        }
+
+        fn apply_signed_detail(&mut self, detail: Value) {
+            let Some(Value::Object(mut block)) =
+                gw_protocol::reasoning::detail_to_thinking_block(detail)
+            else {
+                return;
+            };
+            self.ensure_message_start();
+            if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+                self.close_block(BlockKind::Thinking);
+                let idx = self.next_idx;
+                self.next_idx += 1;
+                let mut start = json!({"type":"content_block_start","index":idx});
+                start["content_block"] = Value::Object(block);
+                self.queue.push_back(Self::ev("content_block_start", start));
+                self.queue.push_back(Self::ev(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":idx}),
+                ));
+            } else if let Some(Value::String(signature)) = block.remove("signature") {
+                let idx = self.open_block(BlockKind::Thinking);
+                self.queue.push_back(Self::ev(
+                    "content_block_delta",
+                    block_delta(idx, "signature_delta", "signature", signature),
                 ));
             }
         }
@@ -3901,6 +3921,11 @@ fn messages_stream_response(
                             "content_block_delta",
                             block_delta(idx, "thinking_delta", "thinking", take(&mut c.reasoning)),
                         ));
+                    }
+                    if let Some(details) = c.reasoning_details.take() {
+                        for detail in details {
+                            self.apply_signed_detail(detail);
+                        }
                     }
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
@@ -4020,13 +4045,12 @@ async fn family_response(
     typed: TypedParams,
     user_id: Option<String>,
     surface: &'static str,
-    engine: &str,
     started: Instant,
 ) -> Response {
     match run_family(s, ak, model, mt, typed, vec![], user_id).await {
         Ok(mut ctx) => {
             log_access(surface, &ctx, started);
-            let response = response_v2_or_500(ctx.outcome.take(), engine);
+            let response = response_v2_or_500(ctx.outcome.take(), mt);
             terminal_response(&ctx, response).await
         }
         Err(resp) => resp,
@@ -4051,14 +4075,17 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
 
 /// The engine's native payload; a content block answers 400 with the block
 /// message (these surfaces have no in-band content_filter shape).
-fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
+fn response_v2_or_500(
+    outcome: Option<gw_engines::EngineOutcome>,
+    mt: gw_consts::Protocol,
+) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
         Some(o) => match o.response.response_v2 {
             Some(v) => (StatusCode::OK, Json(v)).into_response(),
-            None => error_response(500, format!("{engine} engine returned no payload")),
+            None => error_response(500, format!("{mt} engine returned no payload")),
         },
-        None => error_response(500, format!("{engine} engine returned no payload")),
+        None => error_response(500, format!("{mt} engine returned no payload")),
     }
 }
 
@@ -4175,7 +4202,7 @@ async fn responses(
         Err(e) => return gateway_error(e),
     };
     log_access("responses", &ctx, started);
-    let response = response_v2_or_500(ctx.outcome.take(), "responses");
+    let response = response_v2_or_500(ctx.outcome.take(), gw_consts::Protocol::Responses);
     terminal_response(&ctx, response).await
 }
 
@@ -4335,7 +4362,6 @@ async fn embeddings(
         typed,
         user_hint(hint, &body["user"]),
         "embeddings",
-        "embeddings",
         started,
     )
     .await
@@ -4367,7 +4393,6 @@ async fn images_generations(
         typed,
         user_hint(hint, &body["user"]),
         "images",
-        "image",
         started,
     )
     .await
@@ -4403,7 +4428,6 @@ async fn images_edits(
         typed,
         user_hint(hint, &body["user"]),
         "images_edits",
-        "image",
         started,
     )
     .await
@@ -4470,7 +4494,7 @@ async fn videos_generations(
                     return gateway_error(e);
                 }
             }
-            terminal_response(&ctx, response_v2_or_500(outcome, "video")).await
+            terminal_response(&ctx, response_v2_or_500(outcome, gw_consts::Protocol::Video)).await
         }
         .in_current_span(),
     )
@@ -4525,7 +4549,8 @@ async fn admit_video_job(
                 .map_err(gateway_error)?;
             if claimed {
                 let ak_id = gw_config::resolve_access_key_id(&job.ak);
-                let settled = admission::settle_and_bill(
+                let submitter = state.auth.get(&ak_id).await;
+                admission::settle_and_bill(
                     &state,
                     &cfg,
                     admission::SettleInput {
@@ -4555,18 +4580,9 @@ async fn admit_video_job(
                         tpm_reserved: None,
                         reserved_at: gw_state::epoch_secs(),
                         model_quota_key: None,
+                        budget_ak: submitter.as_deref().unwrap_or(&ak),
+                        user_budget: None,
                     },
-                )
-                .await;
-                let submitter = state.auth.get(&ak_id).await;
-                admission::consume_budgets(
-                    &state,
-                    &cfg,
-                    submitter.as_deref().unwrap_or(&ak),
-                    &job.user_id,
-                    None,
-                    settled.total_tokens,
-                    settled.cost_micros,
                 )
                 .await;
             }
@@ -4590,11 +4606,19 @@ async fn videos_get(
     Path(id): Path<String>,
 ) -> Response {
     match admit_video_job(&s, ak, &id).await {
-        Ok((_, _, poll)) => (
-            StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
-            Json(poll.body),
-        )
-            .into_response(),
+        Ok((job, _, mut poll)) => {
+            if job.model != job.served_model
+                && let Some(body) = poll.body.as_object_mut()
+                && body.contains_key("model")
+            {
+                body.insert("model".to_owned(), job.model.into());
+            }
+            (
+                StatusCode::from_u16(poll.status).unwrap_or(StatusCode::OK),
+                Json(poll.body),
+            )
+                .into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -4730,37 +4754,22 @@ async fn audio_transcribe(
         language: body["language"].as_str().map(str::to_owned),
         translate,
     });
-    let mut ctx = match run_family(
-        &s,
-        ak,
-        model,
-        gw_consts::Protocol::Stt,
-        typed,
-        vec![],
-        user_hint(hint, &body["user"]),
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
     let surface = if translate {
         "audio_translations"
     } else {
         "audio_transcriptions"
     };
-    log_access(surface, &ctx, started);
-    let outcome = ctx.outcome.take();
-    let response = match outcome {
-        Some(o) if o.block.block => error_response(400, o.response.message),
-        // the vendor body verbatim (text plus usage/segments/language when sent)
-        Some(o) => match o.response.response_v2 {
-            Some(body) => (StatusCode::OK, Json(body)).into_response(),
-            None => error_response(500, "stt engine returned no payload"),
-        },
-        None => error_response(500, "stt engine returned no outcome"),
-    };
-    terminal_response(&ctx, response).await
+    family_response(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::Stt,
+        typed,
+        user_hint(hint, &body["user"]),
+        surface,
+        started,
+    )
+    .await
 }
 
 /// POST /v1/moderations — OpenAI moderations shape; input may be a string or
@@ -4785,7 +4794,6 @@ async fn moderations(
         gw_consts::Protocol::Moderations,
         typed,
         user_hint(hint, &body["user"]),
-        "moderations",
         "moderations",
         started,
     )
@@ -4816,7 +4824,6 @@ async fn search(
         gw_consts::Protocol::Search,
         typed,
         user_hint(hint, &body["user"]),
-        "search",
         "search",
         started,
     )
@@ -4850,7 +4857,61 @@ async fn rerank(
         typed,
         user_hint(hint, &body["user"]),
         "rerank",
-        "rerank",
+        started,
+    )
+    .await
+}
+
+/// POST /v1/decisions — System One typed decisions (OpenRouter's Decisions API): `{model, state, questions}`.
+async fn decisions(
+    State(s): State<AppState>,
+    UserHint(hint): UserHint,
+    Authed(ak): Authed,
+    ApiJson(body): ApiJson<Value>,
+) -> Response {
+    decisions_response(&s, ak, hint, body, false, "decisions").await
+}
+
+/// POST /v1/systemone — the same decisions on the TypeSafe SDK's path.
+async fn systemone(
+    State(s): State<AppState>,
+    UserHint(hint): UserHint,
+    Authed(ak): Authed,
+    ApiJson(body): ApiJson<Value>,
+) -> Response {
+    decisions_response(&s, ak, hint, body, true, "systemone").await
+}
+
+async fn decisions_response(
+    s: &AppState,
+    ak: Arc<AkInfo>,
+    hint: Option<String>,
+    body: Value,
+    system_one: bool,
+    surface: &'static str,
+) -> Response {
+    let started = Instant::now();
+    let mut fields = match body {
+        Value::Object(fields) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let model = match fields.remove("model") {
+        Some(Value::String(m)) => m,
+        _ => String::new(),
+    };
+    if model.is_empty() || !fields.contains_key("state") || !fields.contains_key("questions") {
+        return error_response(400, "model, state, and questions are required");
+    }
+    let user_id = user_hint(hint, fields.get("user").unwrap_or(&Value::Null));
+    let typed = TypedParams::Decisions(gw_models::DecisionParams { system_one, fields });
+    family_response(
+        s,
+        ak,
+        model,
+        gw_consts::Protocol::Decisions,
+        typed,
+        user_id,
+        surface,
         started,
     )
     .await
@@ -4902,7 +4963,8 @@ async fn batches_submit(
             let Ok(mut req) = serde_json::from_str::<Value>(line) else {
                 return error_response(400, "input file line is not valid json");
             };
-            match batch_item(req["body"].take(), hint.as_deref()) {
+            let body = req.get_mut("body").map(Value::take).unwrap_or_default();
+            match batch_item(body, hint.as_deref()) {
                 Ok((item, line_model)) => {
                     if model.is_empty() {
                         model = line_model;
@@ -4912,7 +4974,7 @@ async fn batches_submit(
                 Err(e) => return error_response(400, e),
             }
         }
-    } else if let Some(items) = body["items"].as_array_mut() {
+    } else if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {
         for it in items {
             match batch_item(it.take(), hint.as_deref()) {
                 Ok((item, _)) => batch_items.push(item),

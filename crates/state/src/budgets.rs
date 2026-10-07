@@ -203,7 +203,7 @@ impl UserBudgetStore for PostgresUserBudgets {
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "user budget store unreachable; admission fails closed");
-                GatewayError::new(ErrCode::SYSTEM_ERROR, 503, "user budget store unavailable")
+                GatewayError::new(ErrCode::DB_READ, 503, "user budget store unavailable")
                     .with_source(e)
             })
     }

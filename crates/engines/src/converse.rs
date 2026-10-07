@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 /// Markers of the Bedrock ids whose family takes `reasoning_config`.
 const REASONING_CONFIG_MARKERS: [&str; 2] = ["openai.gpt-", "xai.grok-"];
+const IMAGE_BESIDE_TOOL_RESULT_MARKERS: [&str; 3] = ["openai.gpt-", "xai.grok-", "moonshotai.kimi"];
 
 /// Converse stream events as the Anthropic event sequence.
 #[derive(Debug)]
@@ -140,10 +141,30 @@ impl Events {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Claude,
+    Nova,
+    ImageBeside,
+    Other,
+}
+
 /// A Messages body as a Converse body; Claude-only knobs and passthrough extras ride in
 /// `additionalModelRequestFields`.
 pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let claude = claude_model(model);
+    let family = if claude {
+        Family::Claude
+    } else if model.contains("amazon.nova") {
+        Family::Nova
+    } else if IMAGE_BESIDE_TOOL_RESULT_MARKERS
+        .iter()
+        .any(|m| model.contains(m))
+    {
+        Family::ImageBeside
+    } else {
+        Family::Other
+    };
     let reasoning = reasoning_family(model);
     let mut out = Map::with_capacity(6);
     let mut documents = 0;
@@ -152,7 +173,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
             Value::String(text) => vec![object([("text", text.into())])],
             Value::Array(blocks) => blocks
                 .into_iter()
-                .flat_map(|b| content_block(b, &mut documents))
+                .flat_map(|b| content_block(b, &mut documents, family))
                 .collect(),
             _ => Vec::new(),
         };
@@ -163,7 +184,7 @@ pub(crate) fn request(mut body: Map<String, Value>, model: &str) -> Value {
     let messages: Vec<Value> = match body.remove("messages") {
         Some(Value::Array(messages)) => messages
             .into_iter()
-            .map(|m| message(m, &mut documents))
+            .map(|m| message(m, &mut documents, family))
             .collect(),
         _ => Vec::new(),
     };
@@ -302,12 +323,12 @@ fn block_event(kind: &str, index: u64, key: &str, payload: Value) -> Value {
     ])
 }
 
-fn message(mut m: Value, documents: &mut usize) -> Value {
+fn message(mut m: Value, documents: &mut usize, family: Family) -> Value {
     let content = match m["content"].take() {
         Value::String(text) => vec![object([("text", text.into())])],
         Value::Array(blocks) => blocks
             .into_iter()
-            .flat_map(|b| content_block(b, documents))
+            .flat_map(|b| content_block(b, documents, family))
             .collect(),
         _ => Vec::new(),
     };
@@ -326,9 +347,13 @@ fn carries_tool_block(message: &Value) -> bool {
 }
 
 /// One Messages content block as Converse blocks; a `cache_control` marker
-/// becomes a following `cachePoint`.
-fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
-    let cache_control = block.get_mut("cache_control").map(Value::take);
+/// becomes a following `cachePoint` for the families that cache.
+fn content_block(mut block: Value, documents: &mut usize, family: Family) -> Vec<Value> {
+    let cache_control = block
+        .get_mut("cache_control")
+        .map(Value::take)
+        .filter(|_| matches!(family, Family::Claude | Family::Nova));
+    let mut siblings = Vec::new();
     let mapped = match block["type"].as_str() {
         Some("text") => object([("text", block["text"].take())]),
         Some("image") => {
@@ -384,11 +409,17 @@ fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
                 Value::String(text) => vec![object([("text", text.into())])],
                 Value::Array(blocks) => blocks
                     .into_iter()
-                    .flat_map(|b| content_block(b, documents))
+                    .flat_map(|b| content_block(b, documents, family))
                     .filter(|b| b.get("cachePoint").is_none())
                     .collect(),
                 _ => Vec::new(),
             };
+            if family == Family::ImageBeside
+                && let Some(first) = content.iter().position(|b| b.get("image").is_some())
+            {
+                siblings = content.split_off(first);
+                content.extend(siblings.extract_if(.., |b| b.get("document").is_some()));
+            }
             if content.is_empty() {
                 content.push(json!({"json": {}}));
             }
@@ -415,8 +446,9 @@ fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
         _ => return Vec::new(),
     };
     let mut blocks = vec![mapped];
+    blocks.extend(siblings);
     if let Some(control) = cache_control {
-        blocks.push(cache_point(control));
+        blocks.push(cache_point(control, family == Family::Claude));
     }
     blocks
 }
@@ -424,7 +456,10 @@ fn content_block(mut block: Value, documents: &mut usize) -> Vec<Value> {
 /// `strict` reaches Bedrock only for Claude — the other families reject the
 /// field outright ("This model doesn't support the strict field").
 fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
-    let cache_control = tool.get_mut("cache_control").map(Value::take);
+    let cache_control = tool
+        .get_mut("cache_control")
+        .map(Value::take)
+        .filter(|_| claude);
     let mut spec = Map::with_capacity(4);
     spec.insert(
         "name".into(),
@@ -443,15 +478,15 @@ fn tool_spec(mut tool: Value, claude: bool) -> Vec<Value> {
     }
     let mut tools = vec![object([("toolSpec", Value::Object(spec))])];
     if let Some(control) = cache_control {
-        tools.push(cache_point(control));
+        tools.push(cache_point(control, true));
     }
     tools
 }
 
-fn cache_point(mut control: Value) -> Value {
+fn cache_point(mut control: Value, ttl: bool) -> Value {
     let mut point = Map::with_capacity(2);
     point.insert("type".into(), "default".into());
-    if let Some(ttl) = control.get_mut("ttl").filter(|ttl| !ttl.is_null()) {
+    if let Some(ttl) = control.get_mut("ttl").filter(|t| ttl && !t.is_null()) {
         point.insert("ttl".into(), ttl.take());
     }
     object([("cachePoint", Value::Object(point))])
@@ -544,6 +579,96 @@ fn stop_reason(converse: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_result_image_nests_only_where_bedrock_takes_it() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "shot"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+                    {"type": "text", "text": "after"},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "log"}}]}]}]}))
+            .unwrap()
+        };
+        let gpt = request(body(), "openai.gpt-6-luna");
+        let content = &gpt["messages"][0]["content"];
+        assert_eq!(
+            content[0]["toolResult"]["content"][0],
+            json!({"text": "shot"})
+        );
+        assert!(
+            content[0]["toolResult"]["content"][1]
+                .get("document")
+                .is_some(),
+            "{content}"
+        );
+        assert!(content[1].get("image").is_some(), "{content}");
+        assert_eq!(content[2], json!({"text": "after"}));
+        let kimi = request(body(), "us.moonshotai.kimi-k3");
+        assert!(kimi["messages"][0]["content"][1].get("image").is_some());
+        for model in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.meta.llama4-maverick-17b-instruct-v1:0",
+        ] {
+            let nested = request(body(), model);
+            assert!(
+                nested["messages"][0]["content"][0]["toolResult"]["content"][1]
+                    .get("image")
+                    .is_some(),
+                "{model}: {nested}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_error_status_reaches_every_family() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "broken", "is_error": true}]}]}))
+            .unwrap()
+        };
+        let claude = request(body(), "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        assert_eq!(
+            claude["messages"][0]["content"][0]["toolResult"]["status"],
+            "error"
+        );
+        for model in ["us.xai.grok-4.6", "us.meta.llama3-3-70b-instruct-v1:0"] {
+            let out = request(body(), model);
+            assert_eq!(
+                out["messages"][0]["content"][0]["toolResult"]["status"], "error",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_points_reach_only_the_families_that_cache() {
+        let body = || -> Map<String, Value> {
+            serde_json::from_value(json!({
+                "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}],
+                "tools": [{"name": "now", "input_schema": {"type": "object"},
+                           "cache_control": {"type": "ephemeral"}}]
+            }))
+            .unwrap()
+        };
+        let grok = request(body(), "us.xai.grok-4.6").to_string();
+        assert!(!grok.contains("cachePoint"), "{grok}");
+        let mut nova_body = body();
+        nova_body["system"][0]["cache_control"]["ttl"] = json!("1h");
+        let nova = request(nova_body, "us.amazon.nova-pro-v1:0");
+        assert_eq!(
+            nova["system"][1],
+            json!({"cachePoint": {"type": "default"}})
+        );
+        assert_eq!(
+            nova["messages"][0]["content"][1],
+            json!({"cachePoint": {"type": "default"}})
+        );
+        assert!(!nova["toolConfig"].to_string().contains("cachePoint"));
+    }
 
     #[test]
     fn messages_body_transcodes_to_converse() {

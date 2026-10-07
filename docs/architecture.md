@@ -4,7 +4,7 @@ Cargo workspace, 11 crates, strictly layered — lower layers never depend
 on higher ones:
 
 ```
-server → {views, task} → handler → {dag, engines} → {models, state} → {protocol, config} → consts
+server → {views, task} → handler → dag → {engines, state} → {models, protocol, config} → consts
 ```
 
 | Crate       | Layer | Role |
@@ -14,7 +14,7 @@ server → {views, task} → handler → {dag, engines} → {models, state} → 
 | `protocol`  | L1    | OpenAI / Anthropic wire types + cross-protocol conversions |
 | `config`    | L1    | YAML config loading (`conf/gateway.yaml`) |
 | `state`     | L2    | auth, account pool, quotas, rate limits, ledger, batch/file stores (in-process defaults; Postgres/Redis fleet backends) |
-| `engines`   | L3    | engine implementations behind the `Transport` seam, SSE + AWS EventStream decoding, usage extraction, SigV4 |
+| `engines`   | L2    | engine implementations behind the `Transport` seam, SSE + AWS EventStream decoding, usage extraction, SigV4 |
 | `dag`       | L3    | 4-layer pipeline executor + nodes |
 | `handler`   | L4    | online/offline orchestration, DLP/blocklist plugins |
 | `task`      | L5    | background tasks (quota reset, content purge, usage rollup, availability flush/alerts, webhook dispatch) |

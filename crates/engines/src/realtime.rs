@@ -133,14 +133,8 @@ pub fn realtime_audio_tokens(provider: &str, frame: &Value) -> (i64, i64) {
     }
     let u = &frame["response"]["usage"];
     (
-        u["input_token_details"]["audio_tokens"]
-            .as_i64()
-            .unwrap_or(0)
-            .max(0),
-        u["output_token_details"]["audio_tokens"]
-            .as_i64()
-            .unwrap_or(0)
-            .max(0),
+        crate::engine::tok(&u["input_token_details"]["audio_tokens"]),
+        crate::engine::tok(&u["output_token_details"]["audio_tokens"]),
     )
 }
 

@@ -285,12 +285,7 @@ impl ModelEngine for EmbeddingsEngine {
 
 /// The uniform family-engine tail: a summary message plus the native payload,
 /// finished at "stop".
-fn family_outcome(
-    message: String,
-    model: String,
-    v: serde_json::Value,
-    status: u16,
-) -> EngineOutcome {
+fn family_outcome(message: String, model: String, v: Value, status: u16) -> EngineOutcome {
     EngineOutcome::with_status(
         GatewayResponse {
             message,
@@ -345,23 +340,7 @@ impl ModelEngine for ImageEngine {
                 let (ext, content_type) = image_kind(&mask);
                 form.file("mask", &format!("mask.{ext}"), content_type, &mask);
             }
-            let (content_type, body) = form.finish();
-            let headers = vec![
-                ("content-type", content_type),
-                ("authorization", format!("Bearer {}", self.base.api_key())),
-            ];
-            let reply = self
-                .base
-                .send_bytes(
-                    &self
-                        .base
-                        .openai_url("mock://api.openai.com", "images/edits"),
-                    headers,
-                    body,
-                    false,
-                )
-                .await?;
-            let (status, v) = crate::base::parse_json_reply(reply)?;
+            let (status, v) = self.base.post_form("images/edits", form).await?;
             (status, v, true)
         } else {
             let mut body = json!({"model": model, "n": n});
@@ -409,7 +388,6 @@ fn decode_b64(payload: &str, what: &str) -> GResult<Vec<u8>> {
 pub enum AudioKind {
     Tts,
     Stt,
-    Other,
 }
 
 pub struct AudioEngine {
@@ -470,7 +448,7 @@ impl ModelEngine for AudioEngine {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         (status, object([("audio_b64", b64.into())]))
                     }
-                    body => crate::base::parse_json_reply(crate::transport::UpstreamResponse {
+                    body => parse_json_reply(crate::transport::UpstreamResponse {
                         status,
                         body,
                         headers: reply.headers,
@@ -497,31 +475,7 @@ impl ModelEngine for AudioEngine {
                 }
                 let (ext, content_type) = audio_kind(&audio);
                 form.file("file", &format!("audio.{ext}"), content_type, &audio);
-                let (content_type, body) = form.finish();
-                let headers = vec![
-                    ("content-type", content_type),
-                    ("authorization", format!("Bearer {}", self.base.api_key())),
-                ];
-                let reply = self
-                    .base
-                    .send_bytes(
-                        &self.base.openai_url("mock://api.openai.com", path),
-                        headers,
-                        body,
-                        false,
-                    )
-                    .await?;
-                crate::base::parse_json_reply(reply)?
-            }
-            AudioKind::Other => {
-                let mut b = json!({"model": model});
-                b["raw"] = self.base.take_raw();
-                self.base
-                    .round_trip(
-                        &self.base.openai_url("mock://api.openai.com", "audio/other"),
-                        b,
-                    )
-                    .await?
+                self.base.post_form(path, form).await?
             }
         };
         let message = match self.kind {
@@ -531,11 +485,11 @@ impl ModelEngine for AudioEngine {
                 v["audio_b64"].as_str().map(str::len).unwrap_or(0)
             ),
         };
-        // duration-priced transcription reports `usage.seconds` (or `duration`)
         let (input, output) = (
             crate::engine::tok(&v["usage"]["input_tokens"]),
             crate::engine::tok(&v["usage"]["output_tokens"]),
         );
+        // duration-priced transcription reports `usage.seconds` (or `duration`)
         if self.kind == AudioKind::Stt {
             units = whole_seconds(&v["usage"]["seconds"])
                 .or_else(|| whole_seconds(&v["duration"]))
@@ -624,8 +578,8 @@ pub struct VideoPoll {
     pub status: u16,
     pub body: Value,
     pub done: bool,
-    /// Billable units on `done`: the clip's whole seconds when the vendor
-    /// reports a duration, else the number of delivered videos.
+    /// Billable units on `done`: the clip's whole seconds when the vendor reports
+    /// a duration, else the delivered-video count where the dialect reports one.
     pub units: i64,
     pub vendor_cost: Option<i64>,
 }
@@ -1134,27 +1088,39 @@ fn rerank_tokens(v: &Value) -> i64 {
         .saturating_add(crate::engine::tok(&v["meta"]["tokens"]["output_tokens"]))
 }
 
-base_engine!(PassthroughEngine);
+base_engine!(DecisionsEngine);
 
 #[async_trait::async_trait]
-impl ModelEngine for PassthroughEngine {
-    /// Dedicated integration surfaces: request body passed through as-is,
-    /// placeholder protocol (byte-level alignment deferred).
+impl ModelEngine for DecisionsEngine {
+    /// System One decisions on OpenRouter: `{model, state, questions}` → typed
+    /// `answers`, the reply passed through whole; `usage.cost` is the charge.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
-        // the arbitrary vendor blob moves — json! would re-copy it whole
-        let mut body = json!({"model": model});
-        body["payload"] = self.base.take_raw();
-        let (status, v) = self
-            .base
-            .round_trip(&self.base.vendor_url("passthrough"), body)
-            .await?;
-        let message = if v["ok"].as_bool().unwrap_or(false) {
-            "ok"
-        } else {
-            "error"
+        let Some(TypedParams::Decisions(p)) = self.base.take_typed() else {
+            return Err(GatewayError::bad_request("decisions params are required"));
         };
-        Ok(family_outcome(message.to_owned(), model, v, status))
+        let base = self.base.base_url(VENDOR_SENTINEL);
+        let url = if p.system_one {
+            versioned_url(base, "systemone")
+        } else {
+            format!("{}/alpha/decisions", crate::base::unversioned(base))
+        };
+        let mut body = p.fields;
+        body.insert("model".to_owned(), model.as_str().into());
+        let (status, v) = self.base.round_trip(&url, Value::Object(body)).await?;
+        let usage = &v["usage"];
+        let (input, output) = (
+            crate::engine::tok(&usage["input_tokens"]),
+            crate::engine::tok(&usage["output_tokens"]),
+        );
+        let raw_usage = (!usage.is_null()).then(|| usage.clone());
+        let answers = v["answers"].as_object().map_or(0, Map::len);
+        let mut out = family_outcome(format!("{answers} answers"), model, v, status);
+        out.response.prompt_tokens = input;
+        out.response.completion_tokens = output;
+        out.response.total_tokens = input.saturating_add(output);
+        out.response.raw_usage = raw_usage;
+        Ok(out)
     }
 }
 
@@ -1228,7 +1194,7 @@ impl ResponsesEngine {
     fn build_body(&mut self) -> GResult<Value> {
         let mut body = match self.base.take_raw() {
             Value::Object(raw) => raw,
-            _ => serde_json::Map::new(),
+            _ => Map::new(),
         };
         if !self.base.request.preserve_responses_wire {
             self.cross_protocol_body(&mut body)?;
@@ -1248,7 +1214,7 @@ impl ResponsesEngine {
     }
 
     /// A Responses body from the chat/messages turns and the typed params.
-    fn cross_protocol_body(&mut self, body: &mut serde_json::Map<String, Value>) -> GResult<()> {
+    fn cross_protocol_body(&mut self, body: &mut Map<String, Value>) -> GResult<()> {
         let system = self.base.system_text();
         if !system.is_empty() {
             body.entry("instructions").or_insert(system.into());
@@ -1263,7 +1229,7 @@ impl ResponsesEngine {
             if m.role == gw_consts::role::TOOL {
                 input.push(function_call_output(
                     m.tool_call_id.unwrap_or_default().into(),
-                    m.content,
+                    tool_output(m.parts.unwrap_or_else(|| m.content.into())),
                 ));
                 continue;
             }
@@ -1273,9 +1239,20 @@ impl ResponsesEngine {
                 "user"
             };
             let mut calls = Vec::new();
+            let image = role == "user"
+                && m.parts
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| blocks.iter().any(is_image_part));
+            let mut items = Vec::new();
             if let Some(Value::Array(blocks)) = m.parts {
                 for mut block in blocks {
                     match block["type"].as_str() {
+                        Some("text") if image => items.push(object([
+                            ("type", "input_text".into()),
+                            ("text", block["text"].take()),
+                        ])),
+                        Some("image" | "image_url") if image => items.push(input_image(block)),
                         Some("tool_use") => calls.push(function_call(
                             block["id"].take(),
                             block["name"].take(),
@@ -1283,11 +1260,7 @@ impl ResponsesEngine {
                         )),
                         Some("tool_result") => input.push(function_call_output(
                             block["tool_use_id"].take(),
-                            match block["content"].take() {
-                                Value::String(s) => s,
-                                Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts),
-                                _ => String::new(),
-                            },
+                            tool_output(block["content"].take()),
                         )),
                         _ => {}
                     }
@@ -1311,7 +1284,12 @@ impl ResponsesEngine {
                     ));
                 }
             }
-            if !m.content.is_empty() {
+            if image {
+                input.push(object([
+                    ("role", role.into()),
+                    ("content", Value::Array(items)),
+                ]));
+            } else if !m.content.is_empty() {
                 input.push(object([
                     ("role", role.into()),
                     ("content", m.content.into()),
@@ -1321,7 +1299,7 @@ impl ResponsesEngine {
         }
         body.insert("input".to_owned(), Value::Array(input));
         body.insert("stream".to_owned(), self.base.request.stream.into());
-        if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
+        if let Some(TypedParams::Chat(p)) = self.base.take_typed() {
             if let Some(v) = p.max_tokens {
                 body.insert("max_output_tokens".to_owned(), v.into());
             }
@@ -1336,6 +1314,14 @@ impl ResponsesEngine {
                     "tools".to_owned(),
                     Value::Array(tools.into_iter().map(responses_tool).collect()),
                 );
+            }
+            if let Some(format) = p.response_format
+                && let Some(text) = body
+                    .entry("text")
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+            {
+                text.insert("format".to_owned(), responses_format(format));
             }
             if let Some(v) = p.tool_choice {
                 if let Some(parallel) = crate::openai_engine::parallel_tool_calls(&v) {
@@ -1394,19 +1380,11 @@ impl ResponsesEngine {
         Ok(EngineOutcome::from_pump(resp, status, r))
     }
 
-    /// Non-streaming Responses reply: full `output` array + `usage`.
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let mut v: Value = serde_json::from_slice(bytes)
+        let v: Value = serde_json::from_slice(bytes)
             .map_err(|e| crate::engine::unparsed_reply(status, "parse responses reply", e))?;
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
-        }
-        // the verbatim body must not leak the served variant either
-        if let Some(requested) = self.base.model_override()
-            && let Some(body) = v.as_object_mut()
-            && body.contains_key("model")
-        {
-            body.insert("model".to_owned(), requested.into());
         }
         let native = self.base.request.preserve_responses_wire;
         let (text, mut tool_calls) = responses_output(&v);
@@ -1490,6 +1468,40 @@ fn responses_output(v: &Value) -> (String, Vec<Value>) {
     (text, tool_calls)
 }
 
+fn input_image(block: Value) -> Value {
+    let mut item = Map::with_capacity(3);
+    item.insert("type".to_owned(), "input_image".into());
+    match gw_protocol::anthropic::image_to_image_url(block)
+        .get_mut("image_url")
+        .map(Value::take)
+    {
+        Some(Value::Object(mut url)) => {
+            item.insert(
+                "image_url".to_owned(),
+                url.remove("url").unwrap_or_default(),
+            );
+            if let Some(detail) = url.remove("detail") {
+                item.insert("detail".to_owned(), detail);
+            }
+        }
+        Some(url) => {
+            item.insert("image_url".to_owned(), url);
+        }
+        None => {}
+    }
+    Value::Object(item)
+}
+
+fn responses_format(mut format: Value) -> Value {
+    match format.get_mut("json_schema").map(Value::take) {
+        Some(Value::Object(mut schema)) => {
+            schema.insert("type".to_owned(), "json_schema".into());
+            Value::Object(schema)
+        }
+        _ => format,
+    }
+}
+
 /// A Chat- or Anthropic-shaped tool definition flattened into the Responses shape.
 fn responses_tool(mut tool: Value) -> Value {
     if let Some(Value::Object(mut f)) = tool.get_mut("function").map(Value::take) {
@@ -1524,12 +1536,38 @@ fn function_call(call_id: Value, name: Value, arguments: Value) -> Value {
     ])
 }
 
-fn function_call_output(call_id: Value, output: String) -> Value {
+fn function_call_output(call_id: Value, output: Value) -> Value {
     object([
         ("type", "function_call_output".into()),
         ("call_id", call_id),
-        ("output", output.into()),
+        ("output", output),
     ])
+}
+
+fn tool_output(content: Value) -> Value {
+    match content {
+        Value::Array(parts) if parts.iter().any(is_image_part) => {
+            Value::Array(parts.into_iter().filter_map(output_item).collect())
+        }
+        Value::Array(parts) => gw_protocol::anthropic::blocks_text(&parts).into(),
+        Value::String(s) => s.into(),
+        _ => Value::String(String::new()),
+    }
+}
+
+fn is_image_part(part: &Value) -> bool {
+    matches!(part["type"].as_str(), Some("image" | "image_url"))
+}
+
+fn output_item(mut part: Value) -> Option<Value> {
+    match part["type"].as_str() {
+        Some("text") => Some(object([
+            ("type", "input_text".into()),
+            ("text", part["text"].take()),
+        ])),
+        Some("image" | "image_url") => Some(input_image(part)),
+        _ => None,
+    }
 }
 
 /// A Responses `status`/`incomplete_details.reason` in the shared finish vocabulary.
@@ -2005,7 +2043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_and_search_and_passthrough() {
+    async fn video_and_search() {
         let mut v = VideoEngine::new(
             req(
                 Protocol::Video,
@@ -2034,9 +2072,6 @@ mod tests {
         );
         let out = s.run().await.unwrap();
         assert!(out.response.message.contains("result 1 for rust dag"));
-
-        let mut p = PassthroughEngine::new(req(Protocol::Passthrough, "e2b", None), t());
-        assert_eq!(p.run().await.unwrap().response.message, "ok");
     }
 
     #[tokio::test]
@@ -2112,6 +2147,114 @@ mod tests {
             function_call_to_tool_call(serde_json::json!({"type": "function_call",
                 "call_id": "c", "name": "now", "arguments": "{}"})),
             serde_json::json!({"id": "c", "type": "function", "function": {"name": "now", "arguments": "{}"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_cross_protocol_keeps_images_and_the_response_format() {
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.message = vec![
+            ChatMsg {
+                parts: Some(serde_json::json!([
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": "low"}},
+                ])),
+                ..ChatMsg::text("user", "what is this")
+            },
+            ChatMsg {
+                parts: Some(serde_json::json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}},
+                    {"type": "text", "text": "and this"},
+                ])),
+                ..ChatMsg::text("user", "and this")
+            },
+        ];
+        r.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(gw_models::ChatParams {
+            response_format: Some(serde_json::json!({"type": "json_schema", "json_schema": {
+                "name": "answer", "strict": true, "schema": {"type": "object"}}})),
+            ..Default::default()
+        }));
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["input"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "what is this"},
+                    {"type": "input_image", "image_url": "https://x/a.png", "detail": "low"},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64,QUJD"},
+                    {"type": "input_text", "text": "and this"},
+                ]},
+            ])
+        );
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"format": {"type": "json_schema", "name": "answer",
+                "strict": true, "schema": {"type": "object"}}})
+        );
+        let typed = TypedParams::Chat(gw_models::ChatParams {
+            response_format: Some(serde_json::json!({"type": "json_object"})),
+            ..Default::default()
+        });
+        let r = req(Protocol::Responses, "gpt-5-responses", Some(typed));
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"format": {"type": "json_object"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_result_screenshot_reaches_the_responses_wire() {
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.message = vec![ChatMsg {
+            parts: Some(
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "shot"}, {"type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}]),
+            ),
+            ..ChatMsg::text("user", "")
+        }];
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{"type": "function_call_output", "call_id": "toolu_1", "output": [
+                {"type": "input_text", "text": "shot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ]}])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_tool_message_screenshot_reaches_the_responses_wire() {
+        let mut r = req(Protocol::Responses, "gpt-5-responses", None);
+        r.message = vec![ChatMsg {
+            tool_call_id: Some("call_1".into()),
+            parts: Some(serde_json::json!([{"type": "text", "text": "shot"},
+                {"type": "image_url", "image_url": {"url": "https://x/s.png"}}])),
+            ..ChatMsg::text("tool", "shot")
+        }];
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["input"][0]["output"],
+            serde_json::json!([{"type": "input_text", "text": "shot"},
+                {"type": "input_image", "image_url": "https://x/s.png"}])
+        );
+    }
+
+    #[test]
+    fn a_response_format_joins_the_clients_text_object() {
+        let typed = TypedParams::Chat(gw_models::ChatParams {
+            response_format: Some(serde_json::json!({"type": "json_object"})),
+            ..Default::default()
+        });
+        let mut r = req(Protocol::Responses, "gpt-5-responses", Some(typed));
+        r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"text": {"verbosity": "low"}});
+        let body = ResponsesEngine::new(r, t()).build_body().unwrap();
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"verbosity": "low", "format": {"type": "json_object"}})
         );
     }
 
@@ -2412,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_reply_names_the_requested_model() {
+    fn responses_reply_keeps_the_vendor_model_for_the_cache() {
         let mut request = req(Protocol::Responses, "gpt-5-served", None);
         let param = request.model_param_v2.as_mut().unwrap();
         param.raw = json!({"input": "go"});
@@ -2424,7 +2567,10 @@ mod tests {
                 br#"{"id":"r","object":"response","model":"gpt-5-served-2026","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
             )
             .unwrap();
-        assert_eq!(out.response.response_v2.unwrap()["model"], "gpt-5-public");
+        assert_eq!(
+            out.response.response_v2.unwrap()["model"],
+            "gpt-5-served-2026"
+        );
     }
 
     #[tokio::test]

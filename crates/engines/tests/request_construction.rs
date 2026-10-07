@@ -756,6 +756,16 @@ async fn embed_request_shape_with_sigv4() {
     );
     assert_eq!(t.header("accept").as_deref(), Some("application/json"));
     assert!(auth.contains("SignedHeaders=") && auth.contains("Signature="));
+    assert!(b.get("output_dimension").is_none());
+
+    let t = RecordingTransport::new(r#"{"embeddings":{"float":[[0.5]]}}"#);
+    let mut req = chat_req(Protocol::AwsEmbed, "us.cohere.embed-v4:0");
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Embeddings(EmbeddingParams {
+        input: vec!["first".into()],
+        dimensions: Some(256),
+    }));
+    let _ = AwsEmbedEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(t.body_json()["output_dimension"], 256);
 }
 
 #[tokio::test]
@@ -2102,5 +2112,50 @@ async fn native_system_blocks_keep_the_clients_cache_control() {
         t.body_json()["system"],
         serde_json::json!([{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
         "the client's breakpoint and ttl survive; prompt_cache adds none on top"
+    );
+}
+
+#[tokio::test]
+async fn chat_system_parts_keep_their_cache_control_on_the_anthropic_wire() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.message[0].parts = Some(serde_json::json!([
+        {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]));
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["system"],
+        serde_json::json!([{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral", "ttl": "1h"}}])
+    );
+
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.message[0].parts = Some(serde_json::json!([{"type": "text", "text": "be brief"}]));
+    let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(t.body_json()["system"], "be brief");
+}
+
+#[tokio::test]
+async fn a_participant_name_reaches_the_openai_wire() {
+    let t = RecordingTransport::new(OPENAI_OK);
+    let mut req = chat_req(Protocol::OpenaiChat, "gpt-4.1-mini");
+    req.message[1].name = Some("alice".into());
+    OpenAiEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(t.body_json()["messages"][1]["name"], "alice");
+}
+
+#[tokio::test]
+async fn a_marked_chat_system_stays_plain_for_a_non_claude_converse_model() {
+    let t = RecordingTransport::new(
+        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
+    );
+    let mut req = chat_req(Protocol::AwsConverse, "us.xai.grok-4.6");
+    req.message[0].parts = Some(serde_json::json!([
+        {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}
+    ]));
+    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    assert_eq!(
+        t.body_json()["system"],
+        serde_json::json!([{"text": "be brief"}])
     );
 }

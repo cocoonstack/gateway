@@ -206,6 +206,8 @@ pub mod domain {
         /// the call id a role:"tool" result message refers back to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
         /// assistant reasoning prose replayed by the client (`reasoning_content`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reasoning_content: Option<String>,

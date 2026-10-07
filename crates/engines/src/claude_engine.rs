@@ -22,8 +22,17 @@ impl ClaudeEngine {
     fn build_body(&mut self) -> GResult<Map<String, Value>> {
         let system_text = self.base.system_text();
         let mut messages: Vec<Value> = Vec::new();
+        let (mut system_parts, mut marked) = (Vec::new(), false);
         for m in std::mem::take(&mut self.base.request.message) {
             if m.role == gw_consts::role::SYSTEM {
+                match m.parts {
+                    Some(Value::Array(parts)) => {
+                        marked |= parts.iter().any(|part| part.get("cache_control").is_some());
+                        system_parts.extend(parts);
+                    }
+                    _ if !m.content.is_empty() => system_parts.push(Value::String(m.content)),
+                    _ => {}
+                }
                 continue;
             }
             let content = match m.parts {
@@ -106,10 +115,22 @@ impl ClaudeEngine {
         let mut client_cap = false;
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
-        let mut native_system = None;
+        let mut native_system = marked.then(|| {
+            Value::Array(
+                system_parts
+                    .into_iter()
+                    .map(|part| match part {
+                        Value::String(text) => {
+                            object([("type", "text".into()), ("text", text.into())])
+                        }
+                        part => part,
+                    })
+                    .collect(),
+            )
+        });
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             // the native system-block array keeps the client's cache_control (and ttl)
-            native_system = p.system_blocks.filter(Value::is_array);
+            native_system = p.system_blocks.filter(Value::is_array).or(native_system);
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
                 client_cap = true;
@@ -279,11 +300,7 @@ impl ClaudeEngine {
             message: text,
             reasoning,
             reasoning_details: (!reasoning_details.is_empty()).then_some(reasoning_details),
-            tool_calls: if tool_use.is_empty() {
-                None
-            } else {
-                Some(Value::Array(tool_use))
-            },
+            tool_calls: (!tool_use.is_empty()).then_some(Value::Array(tool_use)),
             model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
             finish_reason: crate::engine::take_string(&mut v, "/stop_reason").unwrap_or_default(),
             stop_sequence: crate::engine::take_string(&mut v, "/stop_sequence"),

@@ -18,7 +18,7 @@ shared, what stays local, and what the LB needs to do.
 | Thinking-signature audit | in-process only | ⚠️ per-instance; a continuation landing on another instance finds no anchor and fails open (forwarded, not rejected) |
 | Monthly cost counters (`Governance`) | Redis (`storage.redis_url`) | ✅ when Redis is set (62-day keys); in-process they are swept at the daily reset |
 | Per-account latency (`stability.latency_routing`) | in-process only | ⚠️ per-instance; each instance ranks on its own samples, so a cold instance re-probes accounts the rest already measured |
-| MCP OAuth tokens, session binding, live-stream counts | in-process only | ⚠️ per-instance: up to N token fetches per server; a session id is bound on the instance that first saw it, so pin a key to one instance at the balancer to keep the binding fleet-wide |
+| MCP OAuth tokens, session binding, live-stream counts | in-process only | ⚠️ per-instance: up to N token fetches per server; a session id binds to the first key that presents it on each instance, so route `/mcp/` sticky by the `Mcp-Session-Id` header: every request after the initialize then reaches the one instance holding the binding |
 
 **A correct fleet = one Postgres (`storage.postgres_url`) + one Redis
 (`storage.redis_url`) shared by every instance.** Without them each instance
@@ -30,6 +30,9 @@ Use the sample [`deploy/nginx.conf`](../deploy/nginx.conf). The essentials:
 
 - **SSE**: `proxy_buffering off` and a long `proxy_read_timeout` — otherwise
   nginx buffers the whole stream or cuts long generations.
+- **MCP** (`/mcp/`): SSE like the rest, plus a hash on `Mcp-Session-Id` so
+  every request that carries a session id reaches the instance holding its
+  binding (the id-less initialize may land elsewhere).
 - **WebSocket** (`/v1/realtime`): the `Upgrade`/`Connection: upgrade` headers
   and a long read timeout. A WS connection pins to one instance for its life,
   so no session store is needed.

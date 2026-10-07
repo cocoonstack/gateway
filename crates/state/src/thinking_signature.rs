@@ -239,6 +239,8 @@ impl ThinkingSignatureAudit {
             });
         if matched {
             ReviewVerdict::Match
+        } else if entry.fingerprints.len() >= MAX_ANCHOR_FINGERPRINTS {
+            ReviewVerdict::Miss
         } else {
             ReviewVerdict::Mismatch
         }
@@ -383,7 +385,7 @@ pub struct ThinkingStreamCapture {
     context: AuditContext,
     disabled: bool,
     registered: bool,
-    blocks: BTreeMap<u64, CapturedBlock>,
+    blocks: BTreeMap<u64, (CapturedBlock, bool)>,
     captured_bytes: usize,
 }
 
@@ -409,9 +411,9 @@ impl ThinkingStreamCapture {
             Some("content_block_delta") => self.append_delta(event),
             Some("content_block_stop") => {
                 if let Some(index) = event.get("index").and_then(Value::as_u64)
-                    && let Some(block) = self.blocks.get_mut(&index)
+                    && let Some((_, complete)) = self.blocks.get_mut(&index)
                 {
-                    block.mark_complete();
+                    *complete = true;
                 }
             }
             Some("message_stop") => self.register(),
@@ -423,7 +425,7 @@ impl ThinkingStreamCapture {
     fn block_len(&self, index: u64) -> usize {
         self.blocks
             .get(&index)
-            .map_or(0, CapturedBlock::captured_len)
+            .map_or(0, |(block, _)| block.captured_len())
     }
 
     fn start_block(&mut self, event: &Value) {
@@ -450,15 +452,12 @@ impl ThinkingStreamCapture {
             Some("thinking") => CapturedBlock::Thinking {
                 thinking: bounded_string(block.get("thinking")).to_owned(),
                 signature: bounded_string(block.get("signature")).to_owned(),
-                complete: false,
             },
             Some("redacted_thinking") => CapturedBlock::RedactedThinking {
                 data: bounded_string(block.get("data")).to_owned(),
-                complete: false,
             },
             Some("tool_use") => CapturedBlock::ToolUse {
                 id: bounded_string(block.get("id")).to_owned(),
-                complete: false,
             },
             _ => return,
         };
@@ -476,7 +475,7 @@ impl ThinkingStreamCapture {
             return;
         }
         self.captured_bytes = next_bytes;
-        self.blocks.insert(index, captured);
+        self.blocks.insert(index, (captured, false));
     }
 
     fn append_delta(&mut self, event: &Value) {
@@ -491,10 +490,10 @@ impl ThinkingStreamCapture {
             self.blocks.get_mut(&index),
             delta.get("type").and_then(Value::as_str),
         ) {
-            (Some(CapturedBlock::Thinking { thinking, .. }), Some("thinking_delta")) => {
+            (Some((CapturedBlock::Thinking { thinking, .. }, _)), Some("thinking_delta")) => {
                 append_bounded(thinking, delta.get("thinking"))
             }
-            (Some(CapturedBlock::Thinking { signature, .. }), Some("signature_delta")) => {
+            (Some((CapturedBlock::Thinking { signature, .. }, _)), Some("signature_delta")) => {
                 replace_bounded(signature, delta.get("signature"))
             }
             _ => Some(()),
@@ -513,16 +512,15 @@ impl ThinkingStreamCapture {
     }
 
     fn register(&mut self) {
-        if self.disabled || self.blocks.values().any(|block| !block.is_complete()) {
+        if self.disabled || self.blocks.values().any(|(_, complete)| !complete) {
             return;
         }
         let mut sequence = ProtectedSequence::default();
-        for block in self.blocks.values() {
+        for (block, _) in self.blocks.values() {
             match block {
                 CapturedBlock::Thinking {
                     thinking,
                     signature,
-                    ..
                 } => {
                     sequence.has_opaque_proof |= !signature.is_empty();
                     sequence.blocks.push(ProtectedBlock::Thinking {
@@ -530,13 +528,13 @@ impl ThinkingStreamCapture {
                         signature,
                     });
                 }
-                CapturedBlock::RedactedThinking { data, .. } => {
+                CapturedBlock::RedactedThinking { data } => {
                     sequence.has_opaque_proof |= !data.is_empty();
                     sequence
                         .blocks
                         .push(ProtectedBlock::RedactedThinking { data });
                 }
-                CapturedBlock::ToolUse { id, .. } if !id.is_empty() => {
+                CapturedBlock::ToolUse { id } if !id.is_empty() => {
                     sequence.tool_ids.push(id);
                 }
                 CapturedBlock::ToolUse { .. } => {}
@@ -633,47 +631,20 @@ impl<'a> ProtectedSequence<'a> {
 
 #[derive(Debug)]
 enum CapturedBlock {
-    Thinking {
-        thinking: String,
-        signature: String,
-        complete: bool,
-    },
-    RedactedThinking {
-        data: String,
-        complete: bool,
-    },
-    ToolUse {
-        id: String,
-        complete: bool,
-    },
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
+    ToolUse { id: String },
 }
 
 impl CapturedBlock {
-    fn mark_complete(&mut self) {
-        match self {
-            Self::Thinking { complete, .. }
-            | Self::RedactedThinking { complete, .. }
-            | Self::ToolUse { complete, .. } => *complete = true,
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            Self::Thinking { complete, .. }
-            | Self::RedactedThinking { complete, .. }
-            | Self::ToolUse { complete, .. } => *complete,
-        }
-    }
-
     fn captured_len(&self) -> usize {
         match self {
             Self::Thinking {
                 thinking,
                 signature,
-                ..
             } => thinking.len().saturating_add(signature.len()),
-            Self::RedactedThinking { data, .. } => data.len(),
-            Self::ToolUse { id, .. } => id.len(),
+            Self::RedactedThinking { data } => data.len(),
+            Self::ToolUse { id } => id.len(),
         }
     }
 }
@@ -1031,6 +1002,15 @@ mod tests {
         assert_eq!(first, ReviewVerdict::Match);
         assert_eq!(second, ReviewVerdict::Match);
         assert_eq!(tampered, ReviewVerdict::Mismatch);
+
+        for later in ["sig-3", "sig-4", "sig-5"] {
+            remember(&audit, "key-a", "claude", "", later, "call_1");
+        }
+        let (_, evicted) = audit.review_request(
+            &continuation("claude", "", "sig-first", "call_1", "call_1"),
+            "key-a",
+        );
+        assert_eq!(evicted, ReviewVerdict::Miss);
     }
 
     #[test]

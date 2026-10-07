@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::transport::{Headers, SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
-/// The offline base of the generic vendor families (search, rerank, video, passthrough).
+/// The offline base of the generic vendor families (search, rerank, video).
 pub const VENDOR_SENTINEL: &str = "mock://api.vendor.com";
 
 pub(crate) struct Base {
@@ -79,7 +79,7 @@ impl Base {
     }
 
     /// `{base}/v1/{path}` for the generic vendor families (search, rerank,
-    /// video, passthrough) — the mock sentinel is theirs to share.
+    /// video) — the mock sentinel is theirs to share.
     pub fn vendor_url(&self, path: &str) -> String {
         self.openai_url(VENDOR_SENTINEL, path)
     }
@@ -210,6 +210,20 @@ impl Base {
         self.send_bytes(url, headers, bytes, stream).await
     }
 
+    pub async fn post_form(
+        &self,
+        path: &str,
+        form: crate::multipart::Form,
+    ) -> GResult<(u16, Value)> {
+        let (content_type, body) = form.finish();
+        let headers = vec![
+            ("content-type", content_type),
+            ("authorization", format!("Bearer {}", self.api_key())),
+        ];
+        let url = self.openai_url("mock://api.openai.com", path);
+        parse_json_reply(self.send_bytes(&url, headers, body, false).await?)
+    }
+
     /// Build and send an upstream POST from pre-serialized bytes — the SigV4
     /// engines sign the exact payload they send.
     pub async fn send_bytes(
@@ -302,16 +316,22 @@ pub(crate) fn merge_raw_extras_owned(body: &mut serde_json::Map<String, Value>, 
 
 /// `{base}/v1/{path}`, or `{base}/{path}` when the base already names its version (`/v2`, `/compatible-mode/v1`).
 pub fn versioned_url(base: &str, path: &str) -> String {
-    let versioned = base.rsplit('/').next().is_some_and(|segment| {
-        segment.len() > 1
-            && segment.starts_with('v')
-            && segment[1..].bytes().all(|b| b.is_ascii_digit())
-    });
-    if versioned {
-        format!("{base}/{path}")
-    } else {
+    if unversioned(base) == base {
         format!("{base}/v1/{path}")
+    } else {
+        format!("{base}/{path}")
     }
+}
+
+/// `base` without a trailing version segment (`/v1`, `/v4`).
+pub fn unversioned(base: &str) -> &str {
+    base.rsplit_once('/')
+        .filter(|(_, segment)| {
+            segment.len() > 1
+                && segment.starts_with('v')
+                && segment[1..].bytes().all(|b| b.is_ascii_digit())
+        })
+        .map_or(base, |(root, _)| root)
 }
 
 fn ensure_json_content_type(headers: &mut Headers) {

@@ -230,7 +230,7 @@ models:
 
 Bedrock serves `xai.grok-4.6` only through its `us.` and `global.` inference
 profiles. Converse returns the reasoning encrypted (a `redacted_thinking` block
-on `/v1/messages`, replayable in a tool loop), refuses `cachePoint`, and reports
+on `/v1/messages`, replayable in a tool loop), refuses `cachePoint` (the gateway sends none to it), and reports
 no cache reads — so leave `read_cache` off that model. The account's
 OpenAI-compatible endpoint is the fuller route: it takes `reasoning_effort`
 `none`…`max`, reports implicit cache reads as `cached_tokens`, and needs no

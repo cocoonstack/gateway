@@ -8,7 +8,7 @@ make test        # cargo test --workspace
 make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make fmt         # cargo fmt --all
 make deny        # cargo deny check (advisories + licenses)
-make release     # optimized gw-server binary (--locked)
+make release     # optimized `gw` binary (--locked)
 make docker      # build the container image
 make run         # cargo run -p gw-server
 ```
@@ -29,7 +29,7 @@ images for both components go to ghcr on the same tag
 Crates are strictly layered — lower layers never depend on higher ones:
 
 ```
-server → {views, task} → handler → {dag, engines} → {models, state} → {protocol, config} → consts
+server → {views, task} → handler → dag → {engines, state} → {models, protocol, config} → consts
 ```
 
 | Crate | Role |

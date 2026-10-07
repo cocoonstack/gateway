@@ -1735,6 +1735,7 @@ models:
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["model"], "vid-pub");
 
     let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
     let rows: Vec<&Value> = j["records"]
@@ -3519,11 +3520,26 @@ accounts: [{name: a, provider: openai, protocols: ["responses"]}]
 #[tokio::test]
 async fn batch_requires_items_or_file() {
     let app = app();
+    for body in [r#"{"model":"gpt-4o-mini"}"#, "[]", "5", r#""x""#] {
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/batches", Some("ak-demo-123"), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let upload = json!({"purpose": "batch", "file": "5\n[1]"}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/files", Some("ak-demo-123"), &upload))
+        .await
+        .unwrap();
+    let file_id = body_json(resp).await["id"].as_str().unwrap().to_owned();
     let resp = app
         .oneshot(post(
             "/v1/batches",
             Some("ak-demo-123"),
-            r#"{"model":"gpt-4o-mini"}"#,
+            &json!({"input_file_id": file_id}).to_string(),
         ))
         .await
         .unwrap();
@@ -6329,4 +6345,193 @@ accounts: [{name: openai, provider: openai, protocols: ["openai-chat"]}]
     let job = wait_batch(&app, "ak-slow", &id).await;
     assert_eq!(job["status"], "completed", "{job}");
     assert_eq!(job["results"].as_array().unwrap().len(), 2, "{job}");
+}
+
+#[tokio::test]
+async fn a_forced_tool_call_finishes_tool_calls_streamed_or_not() {
+    #[derive(Debug)]
+    struct NamedTool;
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for NamedTool {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let body = if request.stream {
+                gw_engines::transport::UpstreamBody::Sse(
+                    concat!(
+                        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                )
+            } else {
+                gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(
+                        &json!({"id":"c","choices":[{"index":0,"message":{"role":"assistant",
+                        "content":null,"tool_calls":[{"id":"call_1","type":"function",
+                        "function":{"name":"now","arguments":"{}"}}]},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}),
+                    )
+                    .unwrap()
+                    .into(),
+                )
+            };
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body,
+                headers: Default::default(),
+            })
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-tool, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-test, protocol: openai-chat}]
+accounts: [{name: openai, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(NamedTool)));
+    let request = |stream: bool| {
+        json!({"model":"gpt-test","stream":stream,
+            "tools":[{"type":"function","function":{"name":"now","parameters":{"type":"object"}}}],
+            "tool_choice":{"type":"function","function":{"name":"now"}},
+            "messages":[{"role":"user","content":"time?"}]})
+        .to_string()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-tool"),
+            &request(false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+    let resp = app
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-tool"),
+            &request(true),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let finishes: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|v| v["choices"][0]["finish_reason"].as_str().map(Value::from))
+        .collect();
+    assert_eq!(finishes, vec![Value::from("tool_calls")]);
+}
+
+#[tokio::test]
+async fn a_chat_wire_signature_reaches_the_messages_surface() {
+    #[derive(Debug)]
+    struct SignedReasoning;
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for SignedReasoning {
+        async fn send(
+            &self,
+            request: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let body = if request.stream {
+                gw_engines::transport::UpstreamBody::Sse(
+                    concat!(
+                        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"weigh\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"weigh\",\"format\":\"anthropic-claude-v1\",\"index\":0}]}}]}\n\n",
+                        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"signature\":\"sig-1\",\"format\":\"anthropic-claude-v1\",\"index\":0}]}}]}\n\n",
+                        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                )
+            } else {
+                gw_engines::transport::UpstreamBody::Json(
+                    serde_json::to_vec(&json!({"id":"c","choices":[{"index":0,"message":{"role":"assistant",
+                        "content":"ok","reasoning":"weigh","reasoning_details":[{"type":"reasoning.text",
+                        "text":"weigh","signature":"sig-1","format":"anthropic-claude-v1","index":0}]},
+                        "finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}))
+                    .unwrap()
+                    .into(),
+                )
+            };
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body,
+                headers: Default::default(),
+            })
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys: [{ak: ak-sig, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: claude-via-chat, protocol: openai-chat}]
+accounts: [{name: openai, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(SignedReasoning)));
+    let request = |stream: bool| {
+        json!({"model":"claude-via-chat","max_tokens":64,"stream":stream,
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "messages":[{"role":"user","content":"hi"}]})
+        .to_string()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/messages", Some("ak-sig"), &request(false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["content"][0],
+        json!({"type":"thinking","thinking":"weigh","signature":"sig-1"})
+    );
+    let resp = app
+        .oneshot(post("/v1/messages", Some("ak-sig"), &request(true)))
+        .await
+        .unwrap();
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        text.contains(r#"{"delta":{"signature":"sig-1","type":"signature_delta"},"index":0,"type":"content_block_delta"}"#),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn cache_key_distinguishes_the_anthropic_beta_header() {
+    let app = app();
+    let body =
+        r#"{"model":"cached-mini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    for beta in [None, Some("output-128k-2025-02-19")] {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-api-key", "ak-demo-123");
+        if let Some(beta) = beta {
+            req = req.header("anthropic-beta", beta);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app.oneshot(internal_get("/internal/ledger")).await.unwrap();
+    assert_eq!(body_json(resp).await["count"], 2);
 }

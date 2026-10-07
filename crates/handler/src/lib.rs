@@ -152,8 +152,8 @@ impl OnlineHandler {
                 .moderation(sec, inbound.as_deref().unwrap_or_default())
                 .await
             {
-                Moderation::Allow => {}
-                Moderation::Mask(spans) => {
+                Some(moderation::Verdict::Allow) => {}
+                Some(moderation::Verdict::Mask(spans)) => {
                     let masked = match plugins::apply_moderation_mask(&mut ctx.request, &spans) {
                         Ok(masked) => masked,
                         Err(protected) => {
@@ -173,7 +173,7 @@ impl OnlineHandler {
                         deferred.push(security_event(&ctx, "moderation", "mask", masked as i64));
                     }
                 }
-                Moderation::Degrade => {
+                Some(moderation::Verdict::Degrade) => {
                     if ctx.request.pins_reasoning_route() {
                         deferred.push(security_event(
                             &ctx,
@@ -216,12 +216,12 @@ impl OnlineHandler {
                         }
                     }
                 }
-                Moderation::Deny(reason) => {
+                Some(moderation::Verdict::Deny(reason)) => {
                     deferred.push(security_event(&ctx, "moderation", "block", 1));
                     deny_moderation(&mut ctx, "denied", reason, gw_consts::ErrCode::EMPTY_RESP);
                     return Ok(ctx);
                 }
-                Moderation::Unavailable => {
+                None => {
                     deny_moderation(
                         &mut ctx,
                         "moderator unavailable: denied",
@@ -259,8 +259,8 @@ impl OnlineHandler {
         let mut tried = 0;
         let mut throttled = 0;
         loop {
-            ctx.fallback_ahead = !ctx.request.replays_reasoning_output()
-                && next_fallback(&snap.cfg, &ctx, tried).is_some();
+            ctx.fallback_ahead = next_fallback(&snap.cfg, &ctx, tried).is_some()
+                && !ctx.request.replays_reasoning_output();
             // a panicking node must refund too; the refund reads only whole-written ctx fields
             let ran = std::panic::AssertUnwindSafe(gw_dag::run(&self.layers, &mut ctx))
                 .catch_unwind()
@@ -280,10 +280,9 @@ impl OnlineHandler {
                 )
                 .await;
             // signed thinking replays only against the model that produced it
-            if let Some((i, next)) = (is_upstream_fault(&e)
-                && !ctx.request.replays_reasoning_output())
-            .then(|| next_fallback(&snap.cfg, &ctx, tried))
-            .flatten()
+            if is_upstream_fault(&e)
+                && !ctx.request.replays_reasoning_output()
+                && let Some((i, next)) = next_fallback(&snap.cfg, &ctx, tried)
             {
                 tried = i + 1;
                 switch_model(&mut ctx, next, &e.message);
@@ -314,6 +313,15 @@ impl OnlineHandler {
             .and_then(|p| p.fallback_from.clone())
             && let Some(outcome) = ctx.outcome.as_mut()
         {
+            if let Some(body) = outcome
+                .response
+                .response_v2
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                && body.contains_key("model")
+            {
+                body.insert("model".to_owned(), requested.as_str().into());
+            }
             outcome.response.model = requested;
         }
 
@@ -398,32 +406,31 @@ impl OnlineHandler {
     /// Moderate raw text for the realtime surface, where `Degrade` denies: a live session cannot switch models.
     pub async fn moderate_rt(&self, sec: &gw_config::SecurityConf, text: &str) -> RtModeration {
         match self.moderation(sec, text).await {
-            Moderation::Allow => RtModeration::Allow,
-            Moderation::Mask(spans) => RtModeration::Mask(spans),
-            Moderation::Degrade => RtModeration::Deny(Cow::Borrowed(
+            Some(moderation::Verdict::Allow) => RtModeration::Allow,
+            Some(moderation::Verdict::Mask(spans)) => RtModeration::Mask(spans),
+            Some(moderation::Verdict::Degrade) => RtModeration::Deny(Cow::Borrowed(
                 "content requires degraded serving; not available on a live session",
             )),
-            Moderation::Deny(reason) => RtModeration::Deny(Cow::Owned(reason)),
-            Moderation::Unavailable => RtModeration::Deny(Cow::Borrowed(MODERATION_UNAVAILABLE)),
+            Some(moderation::Verdict::Deny(reason)) => RtModeration::Deny(Cow::Owned(reason)),
+            None => RtModeration::Deny(Cow::Borrowed(MODERATION_UNAVAILABLE)),
         }
     }
 
-    /// The one verdict resolution every surface shares, so the fail-open posture cannot drift.
-    async fn moderation(&self, sec: &gw_config::SecurityConf, text: &str) -> Moderation {
-        match self.moderator.review(text).await {
-            Ok(moderation::Verdict::Allow) => Moderation::Allow,
-            Ok(moderation::Verdict::Mask(spans)) => Moderation::Mask(spans),
-            Ok(moderation::Verdict::Degrade) => Moderation::Degrade,
-            Ok(moderation::Verdict::Deny(reason)) => Moderation::Deny(reason),
-            Err(e) => {
+    /// The one verdict resolution every surface shares, so the fail-open posture cannot drift;
+    /// `None` is a moderator error under a fail-closed posture.
+    async fn moderation(
+        &self,
+        sec: &gw_config::SecurityConf,
+        text: &str,
+    ) -> Option<moderation::Verdict> {
+        self.moderator.review(text).await.map_or_else(
+            |e| {
                 tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
-                if sec.moderation_fail_open {
-                    Moderation::Allow
-                } else {
-                    Moderation::Unavailable
-                }
-            }
-        }
+                sec.moderation_fail_open
+                    .then_some(moderation::Verdict::Allow)
+            },
+            Some,
+        )
     }
 
     fn push_policies(&self, cfg: &GatewayConfig) {
@@ -449,20 +456,11 @@ impl OnlineHandler {
     }
 }
 
-/// The realtime-surface subset of [`Moderation`]: no degrade mid-session.
+/// The realtime-surface subset of a moderator verdict: no degrade mid-session.
 pub enum RtModeration {
     Allow,
     Mask(Vec<std::ops::Range<usize>>),
     Deny(Cow<'static, str>),
-}
-
-/// One resolved moderator verdict; `Unavailable` is a moderator error under a fail-closed posture.
-enum Moderation {
-    Allow,
-    Mask(Vec<std::ops::Range<usize>>),
-    Degrade,
-    Deny(String),
-    Unavailable,
 }
 
 struct TerminalSubject {
@@ -578,13 +576,13 @@ async fn note_abuse(ctx: &DagContext) {
         .emit("abuse_suspend", String::from(&*ctx.ak.ak_id), summary);
 }
 
-/// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403
-/// refusal, or a 502/503 the gateway raised for a connection failure or an exhausted pool.
+/// Whether a pipeline error came from upstream: a vendor 5xx, 429 or 401-403 refusal,
+/// or a 5xx the gateway raised for a connection failure or an exhausted pool.
 fn is_upstream_fault(e: &GatewayError) -> bool {
     match e.original_status() {
         Some(status) => status >= 500 || matches!(status, 401..=403 | 429),
         None => {
-            e.http_status >= 502
+            (e.http_status >= 502 && e.code != gw_consts::ErrCode::DB_READ)
                 || (e.http_status == 429 && e.code == gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO)
         }
     }
@@ -2071,16 +2069,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_override_store_refuses_attributed_requests() {
-        #[derive(Debug)]
-        struct Down;
+        #[derive(Debug, Default)]
+        struct Down(std::sync::atomic::AtomicUsize);
         #[async_trait::async_trait]
         impl gw_state::UserBudgetStore for Down {
             async fn get(&self, _: &str, _: &str) -> GResult<Option<UserBudget>> {
-                Err(GatewayError::new(
-                    gw_consts::ErrCode::SYSTEM_ERROR,
-                    503,
-                    "down",
-                ))
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(GatewayError::new(gw_consts::ErrCode::DB_READ, 503, "down"))
             }
             async fn put(&self, _: &str, _: &str, _: UserBudget) -> GResult<()> {
                 unreachable!()
@@ -2092,10 +2087,11 @@ mod tests {
                 unreachable!()
             }
         }
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k2, owner: u1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat, fallback_models: [gpt-4o-mini]}, {name: gpt-4o-mini, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}, {ak: k2, owner: u1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let mut state = GatewayState::from_config(&cfg);
-        state.user_budgets = Arc::new(Down);
+        let down = Arc::new(Down::default());
+        state.user_budgets = down.clone();
         let h = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, Arc::new(state)),
             Arc::new(gw_engines::MockTransport),
@@ -2111,6 +2107,11 @@ mod tests {
             .err()
             .expect("a failed lookup fails closed");
         assert_eq!(err.http_status, 503);
+        assert_eq!(
+            down.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a store outage is not an upstream fault to fall back from"
+        );
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 
 ## Highlights
 
-- **OpenAI + Anthropic compatible surface** — `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/embeddings`, `/v1/images/{generations,edits}`, `/v1/videos/generations` + `/v1/videos/{id}`, `/v1/audio/{speech,transcriptions,translations}`, `/v1/moderations`, `/v1/search`, `/v1/rerank`, `/v1/batches` + `/v1/files`, `/v1/models`, `/v1/realtime` (WebSocket) — streaming and non-streaming
+- **OpenAI + Anthropic compatible surface** — `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/embeddings`, `/v1/images/{generations,edits}`, `/v1/videos/generations` + `/v1/videos/{id}`, `/v1/audio/{speech,transcriptions,translations}`, `/v1/moderations`, `/v1/search`, `/v1/rerank`, `/v1/decisions` + `/v1/systemone`, `/v1/batches` + `/v1/files`, `/v1/models`, `/v1/realtime` (WebSocket) — streaming and non-streaming
 - **Cross-protocol conversion** — serve Anthropic-style `/v1/messages` on OpenAI-protocol models and vice versa, including streaming event mapping
 - **MCP gateway** — `/mcp/{server}` proxies Model Context Protocol servers (Streamable HTTP) behind the same access keys: per-key server entitlement and tool allowlists, `tools/list` filtered to the allowlist, tool results reviewed by the tenant's moderator (mask or block), every tool call, denial and intervention audited, sessions bound to the key that opened them, server credentials kept in the gateway's environment as static bearers or OAuth 2.0 tokens the gateway fetches and refreshes itself (client-credentials or refresh-token grant) ([Security model](docs/security.md))
 - **Coding agents drop in** — Claude Code, Codex CLI, VS Code chat (Copilot), Cursor and opencode work with a base URL and an access key; the `anthropic-beta` header rides through to Anthropic-wire upstreams and each client's captured wire shape replays in the live matrix ([Examples](docs/examples.md#coding-agents))
@@ -42,13 +42,13 @@ curl -sN localhost:8080/v1/messages \
 
 # Your own config
 GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
-gw --version                       # --help lists the env vars; there are no other flags
+gw --version                       # --help names the config env vars; there are no other flags
 
 # Go live: give an account `endpoint` + `api_key_env` in the config — that's it.
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
 ```
 
-Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Performance](docs/performance.md) · [Security](docs/security.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
+Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Running a fleet](docs/multi-instance.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Performance](docs/performance.md) · [Security](docs/security.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
 
 ## Docker
 
@@ -61,8 +61,8 @@ docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
 
 The image binds `0.0.0.0` (`GW_HOST`) and ships a `/health` HEALTHCHECK.
 Published multi-arch (amd64 + arm64) to `ghcr.io/cocoonstack/gateway` on `v*`
-tags, alongside `ghcr.io/cocoonstack/gateway-control-plane` and control-plane
-binary tarballs (linux/darwin × amd64/arm64) on the GitHub Release.
+tags, alongside `ghcr.io/cocoonstack/gateway-control-plane`, and `gw` plus
+control-plane binary tarballs (linux/darwin × amd64/arm64) on the GitHub Release.
 
 ## Development
 

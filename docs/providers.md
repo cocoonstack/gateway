@@ -26,7 +26,7 @@ models:
 | `anthropic` | `https://api.anthropic.com` | anthropic-messages | `x-api-key` + `anthropic-version` (Claude Opus 5.5 live-verified: thinking is always on, so a chat-surface effort `none` sends no thinking and the model keeps its default effort; a forced `tool_choice` and a native `thinking` of `disabled` or `enabled` are the vendor's 400) |
 | `gemini` | `https://generativelanguage.googleapis.com` | gemini, realtime | `x-goog-api-key` (realtime = the Live API socket, live-verified: the bridge admits on `clientContent.turnComplete`, relays the binary frames, and settles `usageMetadata` — audio output tokens at their own weight) |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
-| `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` (its `reasoning_details` shape is the one this gateway emits, so signed Anthropic reasoning round-trips through tool loops; verified live on free and paid models; it normalizes reasoning tiers and sampling knobs for the model it routes to, so the gateway clamps nothing on an `openai/…` id and lets `max`, `minimal` and `temperature` ride through — the one thing it refuses itself is disabling reasoning on a model that always reasons) |
+| `openrouter` | `https://openrouter.ai/api` | openai-chat, decisions | `Bearer` (decisions = System One models such as TypeSafe Jev on `/v1/decisions` and `/v1/systemone`; its `reasoning_details` shape is the one this gateway emits, so signed Anthropic reasoning round-trips through tool loops; verified live on free and paid models; it normalizes reasoning tiers and sampling knobs for the model it routes to, so the gateway clamps nothing on an `openai/…` id and lets `max`, `minimal` and `temperature` ride through — the one thing it refuses itself is disabling reasoning on a model that always reasons) |
 | `moonshot` | `https://api.moonshot.cn` | openai-chat | `Bearer` (Kimi K2 thinking: `reasoning_content` in and out, `thinking: {type: disabled}` passes through; the vendor's `/anthropic` base also works as `kind: anthropic` + `endpoint`; the international site is `endpoint: https://api.moonshot.ai` — keys are site-specific and kimi-k3 is only there) |
 | `xai` | `https://api.x.ai` | openai-chat, responses, image, video, realtime | `Bearer` (Grok: `reasoning_effort` per model — grok-4.6 `low`–`xhigh`, grok-4.3 also `none`, others reject values they don't list; usage carries `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`, and the chat wire counts those reasoning tokens **outside** `completion_tokens` — it adds them into `total_tokens` instead, so the gateway bills them as output from that arithmetic (its Responses wire, OpenRouter and Bedrock all count them inside); every chat, Responses and image reply also carries `usage.cost_in_usd_ticks`, recorded as the vendor cost; xAI's own Anthropic-compatible surface is deprecated, so Anthropic clients reach Grok through this gateway's `/v1/messages` cross-protocol path; verified live: grok-4.3/4.6/4.20 chat + stream + effort tiers, `/v1/messages` both ways, grok-4.5 through `protocol: responses` natively and from the chat/messages surfaces incl. tool loops, grok-imagine-image-2.0 per-image units, and grok-voice-latest through `/v1/realtime` (`protocol: realtime`; xAI's `response.done` carries an empty `usage`, so the turn bills the delivered-output estimate — transcript tokens plus audio bytes/4 — as `estimated`, input unmetered: price the model per output unit accordingly); grok-imagine-video-1.5 through `/v1/videos/generations` + `GET /v1/videos/{id}` (`protocol: video`, unit price per generated second, vendor cost from `usage.cost_in_usd_ticks`); files/collections and vendor batches are not wired) |
 | `siliconflow` | `https://api.siliconflow.cn` | openai-chat, embeddings, rerank, tts, stt, image, video | `Bearer` (Qwen3 `enable_thinking`, DeepSeek/GLM/Kimi/MiniMax hosted models, bge/Qwen3 embeddings and rerankers, CosyVoice TTS, SenseVoice STT, Kolors images — all verified live) |
@@ -61,6 +61,21 @@ Jina reports `usage.total_tokens`, which bills as prompt tokens; Cohere bills
 by search units (`meta.billed_units.search_units`), priced by the model's
 `unit_price_micros`. Both verified live.
 
+### Decisions
+
+`/v1/decisions` and `/v1/systemone` serve System One models through the
+`openrouter` preset. The preset's default wire is openai-chat, so a decisions
+model names its protocol:
+
+```yaml
+models:
+  - {name: typesafe/jev-1.13, provider: openrouter, protocol: decisions}
+```
+
+The reply's `usage.cost` is the charge unless the tenant sets a `model_prices`
+override for the model. Verified live: both paths, with the preset endpoint
+and with `endpoint: https://openrouter.ai/api/v1`.
+
 ## Native (non-OpenAI) wire engines
 
 Some vendors are addressed in their own wire dialect rather than an
@@ -75,8 +90,8 @@ usage); the rest are marked non-streaming below and always answer buffered:
 | `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
 | `ernie` | Baidu Ernie (Wenxin) | `https://aip.baidubce.com` | a `bce-v3/…` key goes as `Bearer`, a legacy token as the `access_token` query param (non-streaming); Qianfan's OpenAI-compatible `https://qianfan.baidubce.com/v2` also works as `kind: openai` + `endpoint` |
 | `aws-anthropic` | Anthropic Claude on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id (`anthropic.claude-…`, `us.anthropic.claude-…`); the full Messages engine (system, tools, thinking dialects by generation, prompt-cache breakpoints, signed reasoning) on the InvokeModel wire — `anthropic_version` in the body, the client's `anthropic-beta` header as the `anthropic_beta` list, model and streaming in the path; streams via InvokeModelWithResponseStream (EventStream frames decoded into the same event sequence) |
-| `aws-converse` | any model on AWS Bedrock via the Converse API | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API key (see below); model name = the Bedrock model id or inference profile (`eu.amazon.nova-micro-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `mistral.pixtral-large-2502-v1:0`, `anthropic.claude-…`); the Messages engine transcoded to Converse — system, tools + tool results, images, thinking replay, prompt-cache points — and back (buffered and `converse-stream`); Claude reasoning knobs ride in `additionalModelRequestFields`, other passthrough extras too; on an `openai.gpt-<n>` or `xai.grok-<n>` id the requested effort becomes that family's `reasoning_config` enum instead — which takes `max` from every generation but never `minimal` — and Bedrock's own refusal of `temperature`/`topP` for those ids drops them from `inferenceConfig` (live: `us.`/`global.openai.gpt-6-astra`, `…gpt-5.6-luna`, and `us.xai.grok-4.6`, which rejects both knobs the same way, takes `none`…`max`, and returns its reasoning as `reasoningContent.redactedContent` — surfaced as a `redacted_thinking` block; Converse also rejects `cachePoint` on Grok and never reports a cache read, so price that route without a cache weight) |
-| `aws-embed` | Titan / Cohere embeddings on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API-key Bearer (see below); model name = the Bedrock model id; Titan `{inputText}` → `{embedding, inputTextTokenCount}` takes exactly one input per call (a batch is refused with 400; `dimensions` forwarded when the client sends it), Cohere `{texts, input_type: search_document}` → `{embeddings}` in one call; answered in the OpenAI `/v1/embeddings` list shape, usage from Bedrock's `x-amzn-bedrock-*-token-count` headers |
+| `aws-converse` | any model on AWS Bedrock via the Converse API | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API key (see below); model name = the Bedrock model id or inference profile (`eu.amazon.nova-micro-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `mistral.pixtral-large-2502-v1:0`, `anthropic.claude-…`); the Messages engine transcoded to Converse — system, tools + tool results, images, thinking replay, prompt-cache points (Claude takes them on system, messages and tools with their TTL, Nova on system and messages at the default TTL; other families get none; OpenAI GPT, Grok and Kimi ids refuse an image inside a tool result, so there its blocks from the first image on, documents aside, follow it as sibling blocks, while Llama 4 and the rest keep the image nested) — and back (buffered and `converse-stream`); Claude reasoning knobs ride in `additionalModelRequestFields`, other passthrough extras too; on an `openai.gpt-<n>` or `xai.grok-<n>` id the requested effort becomes that family's `reasoning_config` enum instead — which takes `max` from every generation but never `minimal` — and Bedrock's own refusal of `temperature`/`topP` for those ids drops them from `inferenceConfig` (live: `us.`/`global.openai.gpt-6-astra`, `…gpt-5.6-luna`, and `us.xai.grok-4.6`, which rejects both knobs the same way, takes `none`…`max`, and returns its reasoning as `reasoningContent.redactedContent` — surfaced as a `redacted_thinking` block; Converse also rejects `cachePoint` on Grok and never reports a cache read, so price that route without a cache weight) |
+| `aws-embed` | Titan / Cohere embeddings on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 or API-key Bearer (see below); model name = the Bedrock model id; Titan `{inputText}` → `{embedding, inputTextTokenCount}` takes exactly one input per call (a batch is refused with 400; `dimensions` forwarded when the client sends it), Cohere `{texts, input_type: search_document}` → `{embeddings}` (v4: `{embeddings: {float}}`, `dimensions` forwarded as `output_dimension`) in one call, also on a `us.`/`global.` inference profile; answered in the OpenAI `/v1/embeddings` list shape, usage from Bedrock's `x-amzn-bedrock-*-token-count` headers |
 | `aws-llama` | Meta Llama on AWS Bedrock | `https://bedrock-runtime.<region>.amazonaws.com` | SigV4 (see below); model name = the Bedrock model id or inference profile (`meta.llama3-8b-instruct-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`, `us.meta.llama4-scout-17b-instruct-v1:0`); the conversation is rendered into the Llama 3 (or Llama 4) chat template; usage from the token-count headers / invocation metrics, else the body counts |
 | `minimax-v1` | MiniMax legacy v1 (`abab*`) | `https://api.minimax.chat` | `Bearer` (non-streaming); kept for existing accounts — the vendor has retired it for new ones; new integrations should use MiniMax's OpenAI-/Anthropic-compatible endpoints |
 
@@ -84,8 +99,8 @@ usage); the rest are marked non-streaming below and always answer buffered:
 Brave Search API (`X-Subscription-Token`, live-verified; one unit per query),
 anything else the generic mock shape. Google's Custom Search JSON API is
 deliberately not wired — Google closed it to new customers (existing projects
-keep access until 2027-01-01), so no reachable configuration exists. The factory also dispatches `video`,
-generic `audio`, and `passthrough` protocols (kling-v1-6, grok-imagine-video,
+keep access until 2027-01-01), so no reachable configuration exists. The factory also dispatches the
+`video` protocol (kling-v1-6, grok-imagine-video,
 sora-2 and brave-search ship example accounts in the default config).
 `protocol: video`
 picks its wire from the account's provider label when it names a dialect,
@@ -176,8 +191,8 @@ each account's observed call latency — an exponentially weighted average of
 completed calls, kept per instance — so the fastest account of a tier takes
 the traffic while an account never or not recently (60 s) sampled ranks first
 and gets probed; equal ranks stay round-robin. The realtime surface keeps
-round-robin. On an upstream 5xx the failed account is excluded and another is tried
-once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
+round-robin. On an upstream 5xx or a 401/402/403 credential or billing refusal
+the failed account is excluded and another is tried once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
 an account into cooldown (`stability.failure_threshold` / `cooldown_seconds`),
 and it auto-recovers on expiry. A streaming response that already sent bytes to
 the client is never failed over, but a provider error that breaks such a stream

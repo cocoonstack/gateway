@@ -4,6 +4,9 @@ One YAML file configures the gateway. Resolution order:
 
 1. `GW_CONFIG=<path>` — explicit config file
 2. otherwise the embedded default (the repo's `conf/gateway.yaml`)
+3. with `storage.postgres_url` set, the Postgres config store's newest version
+   replaces the file at boot and on every reload; the file (or the embedded
+   default) only seeds an empty store
 
 `GW_HOST` / `GW_PORT` override `listen.host` / `listen.port` at runtime
 (the container image sets `GW_HOST=0.0.0.0`). `GW_CONTENT_KEY` (64 hex chars =
@@ -66,7 +69,7 @@ access_keys:
     tokens_per_minute: 600   # optional TPM window limit
     expires_at_epoch_secs: 1767225600  # optional expiry (403 after)
     banned: false            # optional; a banned key 403s but stays listed
-    model_quotas:            # optional per-model daily caps (override tenant defaults)
+    model_quotas:            # optional per-model daily degrade thresholds (override tenant defaults)
       gpt-4o: 200000
 ```
 
@@ -79,7 +82,7 @@ tenants:
     models: [gpt-4o, gpt-4o-mini]   # entitlement allowlist; absent = every model
     model_quotas:            # per-model daily-token defaults, applied per key
       gpt-4o: 100000
-    fallback_model: gpt-4o-mini     # over-quota requests degrade here instead of failing
+    fallback_model: gpt-4o-mini     # over-quota requests degrade here (a typed surface only to a model of its protocol); without one they stay on the requested model
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
     model_prices:            # optional per-model charged-price override for this tenant
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
@@ -118,10 +121,10 @@ outright when present (it is not merged field-by-field).
 ```yaml
 models:
   - name: gpt-4o                     # name clients request
-    protocol: openai-chat            # wire protocol (or set `provider:` instead)
+    protocol: openai-chat            # wire protocol (or set `provider:` instead; a video or search model must also set `provider:`)
     input_price_per_1k_micros: 2500  # billing rates (micros per 1k tokens)
     output_price_per_1k_micros: 10000
-    unit_price_micros: 0             # per non-token unit: TTS character, transcription second, rerank search unit
+    unit_price_micros: 0             # per non-token unit: TTS character, transcription second, rerank search unit, web search query
     qpm: 60                          # optional model-level rate limit
     cache_ttl_seconds: 60            # optional request-level response cache
     token_rate:                      # optional per-component billing weights
@@ -133,7 +136,7 @@ models:
     long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
     batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price; must be finite and in (0.0, 1.0]
     prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
-    fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / connection failure / vendor 429 (rejected at load when unknown, self or duplicate)
+    fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / 429 / 401-403 refusal / connection failure / no healthy account (rejected at load when unknown, self or duplicate)
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
       - {model: gpt-4o-next, weight: 10}
@@ -154,7 +157,8 @@ without token usage meter — a `tts` model's input characters, an `stt`
 model's audio seconds (the vendor's `usage.seconds` / `duration`, else the
 uploaded WAV/MP3's own play length; fractions rounded up), a `rerank`
 model's `search_units`, an `image` model's images, a `video` model's
-generated seconds — and adds to `cost_micros` next to any token cost;
+generated seconds, a `search` model's queries (one per call) — and adds to
+`cost_micros` next to any token cost;
 the count lands in the ledger's `billed_units` and the `/admin/usage`
 aggregates. An account's `cost_unit_price_micros` is the vendor side of the
 same unit, for margin. `prompt_cache` (anthropic-messages models)
@@ -164,7 +168,9 @@ cache-read rate; it is per model and off by default because a long one-shot
 prompt would pay the cache-write premium for nothing. A `/v1/messages` client
 that sends `system` as blocks with its own `cache_control` (including
 `ttl: 1h`) keeps them as sent; the gateway only marks the last system block
-when that block carries no breakpoint of its own. On an openai-chat model
+when that block carries no breakpoint of its own. A `/v1/chat/completions`
+system message whose content parts carry `cache_control` keeps them on an
+Anthropic-wire model the same way. On an openai-chat model
 the client's own breakpoints on system blocks, message blocks and
 `tool_result` ride through as OpenAI content parts, which OpenRouter honors
 for Anthropic models; a breakpoint on a tool definition does not (Gemini's
@@ -238,7 +244,9 @@ the charged `cost_micros` and margin is queryable per tenant/model via
 `GET /admin/usage`. A vendor that prices the call itself overrides those
 fields: OpenRouter's `usage.cost` in USD and xAI's `usage.cost_in_usd_ticks`
 (1e-10 USD a tick) are recorded as the exact vendor cost on every wire that
-carries them.
+carries them. On a `protocol: decisions` model the reported `usage.cost` is
+also the charged `cost_micros`, unless the tenant sets a `model_prices`
+override for the model.
 
 ### `security`, `stability`, `products`
 

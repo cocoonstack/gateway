@@ -237,15 +237,6 @@ pub fn apply_mask_slots<'a>(
     masker.hits
 }
 
-fn push_text(out: &mut String, s: &str) {
-    if !s.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(s);
-    }
-}
-
 /// Apply mask spans over [`inbound_text`]; `Err(n)` means n spans hit signed thinking and nothing changed.
 pub fn apply_moderation_mask(
     request: &mut GatewayRequest,
@@ -282,6 +273,222 @@ pub fn apply_mask_spans_frame(
 ) -> usize {
     let mut masker = SpanMasker::new(spans);
     gw_engines::realtime::visit_frame_text(frame, &mut |s| masker.apply(s))
+}
+
+/// The REST scan policy on a realtime frame; `collect_text` gathers the moderation text in the same walk.
+pub fn realtime_frame_scan(
+    sec: &SecurityConf,
+    frame: &mut serde_json::Value,
+    collect_text: bool,
+) -> (ScanOutcome, String, usize) {
+    let scan_rules = !sec.blocklist.is_empty() || !sec.regexes.is_empty();
+    // mask spans address pre-redaction offsets: no redaction while moderation text is collected
+    let redact = (sec.dlp_redact || sec.detect_secrets) && !collect_text;
+    let mut counts = ScanCounts::new(sec);
+    let mut text = String::new();
+    let redacted = if scan_rules || collect_text {
+        gw_engines::realtime::visit_frame_text(frame, &mut |s| {
+            if scan_rules {
+                counts.visit(s);
+            }
+            if collect_text {
+                push_text(&mut text, s);
+            }
+            if redact {
+                redact_in_place(s, sec.dlp_redact, sec.detect_secrets)
+            } else {
+                0
+            }
+        })
+    } else {
+        dlp_redact_realtime_frame(sec, frame)
+    };
+    (counts.outcome(), text, redacted)
+}
+
+/// DLP-redact a realtime frame in place; per-frame best effort, a span straddling deltas is missed.
+pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
+    if !sec.dlp_redact && !sec.detect_secrets {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    gw_engines::realtime::visit_frame_text(frame, &mut |s| redact_in_place(s, pii, secrets))
+}
+
+/// DLP hits inside signed thinking, which the handler rejects rather than rewrite.
+pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
+    if !sec.dlp_redact && !sec.detect_secrets {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut hits = 0;
+    for message in &mut request.message {
+        if message.role != gw_consts::role::AI {
+            continue;
+        }
+        for units in [message.parts.as_mut(), message.reasoning_details.as_mut()] {
+            let Some(blocks) = units.and_then(serde_json::Value::as_array_mut) else {
+                continue;
+            };
+            for block in blocks {
+                if block.as_object().is_some_and(is_signed_thinking_block) {
+                    hits += walk_part_value(block, &mut |text| redaction_hits(text, pii, secrets));
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// DLP inbound redaction: emails, 11-digit phone numbers, and credentials under `detect_secrets`.
+pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
+    if !sec.dlp_redact && !sec.detect_secrets {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    for_each_request_text(request, SignedThinking::Skip, &mut |s, _| {
+        redact_in_place(s, pii, secrets)
+    })
+}
+
+/// A retention copy of `text` with PII and secrets ALWAYS stripped, whatever the tenant's DLP flags.
+pub fn redact_retained(text: &str) -> String {
+    let mut s = text.to_owned();
+    redact_in_place(&mut s, true, true);
+    s
+}
+
+/// DLP probe of native SSE events before buffered replay; opaque deltas aside, nothing is rewritten.
+pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::StreamChunk]) -> usize {
+    if !sec.redacts_output() {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut fragments = EventFragments::default();
+    let mut scan = |text: &mut String| redaction_hits(text, pii, secrets);
+    let mut hits: usize = chunks
+        .iter_mut()
+        .filter_map(|chunk| chunk.native_event.as_mut())
+        .map(|event| walk_native_event(event, &mut fragments, &mut scan))
+        .sum();
+    if fragments.overflowed {
+        return hits.max(1);
+    }
+    hits += fragments
+        .values
+        .values()
+        .flat_map(|item| item.values())
+        .map(|text| redaction_hits(text, pii, secrets))
+        .sum::<usize>();
+    hits
+}
+
+/// Outbound DLP over one string: the error message a stream failure carries back.
+pub fn dlp_redact_text(sec: &SecurityConf, text: &mut String) -> usize {
+    if !sec.redacts_output() {
+        return 0;
+    }
+    redact_in_place(text, sec.dlp_redact, sec.detect_secrets)
+}
+
+/// Outbound DLP over `message` and the payloads the surfaces serialize verbatim.
+pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
+    if !sec.redacts_output() {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
+    let mut hits = redact_field(&mut response.message);
+    if !response.reasoning.is_empty() {
+        hits += redact_field(&mut response.reasoning);
+    }
+    if let Some(v) = &mut response.response_v2 {
+        hits += walk_json_strings(v, &mut redact_field);
+    }
+    if let Some(v) = &mut response.tool_calls {
+        hits += walk_json_strings(v, &mut redact_field);
+    }
+    // native units duplicate the normalized fields: count them only when those were clean
+    let mut native_hits = 0;
+    if let Some(details) = &mut response.reasoning_details {
+        native_hits += details
+            .iter_mut()
+            .map(|d| walk_part_text(d, SignedThinking::Skip, &mut |s, _| redact_field(s)))
+            .sum::<usize>();
+    }
+    if let Some(content) = &mut response.anthropic_content {
+        native_hits += walk_part_text(content, SignedThinking::Skip, &mut |s, _| redact_field(s));
+    }
+    if hits == 0 && native_hits > 0 {
+        hits = native_hits;
+    }
+    hits
+}
+
+/// Strip signed thinking the tenant cannot serve, so the client still gets the redacted turn.
+pub fn strip_unservable_thinking(
+    sec: &SecurityConf,
+    response: &mut GatewayResponse,
+    chunks: &[gw_models::StreamChunk],
+) -> usize {
+    let dlp = sec.redacts_output();
+    if !dlp && sec.blocklist.is_empty() && sec.regexes.is_empty() {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    let mut counts = ScanCounts::new(sec);
+    let mut hits = 0;
+    let mut visit = |text: &mut String| {
+        counts.visit(text);
+        if dlp {
+            hits += redaction_hits(text, pii, secrets);
+        }
+        0
+    };
+    let mut native = response
+        .anthropic_content
+        .as_mut()
+        .and_then(serde_json::Value::as_array_mut);
+    for block in native.iter_mut().flat_map(|blocks| blocks.iter_mut()) {
+        if block.as_object().is_some_and(is_signed_thinking_block) {
+            walk_signed_prose(block, &mut |text, _| visit(text));
+        }
+    }
+    let signed_reasoning = has_signed_unit(response.reasoning_details.as_deref())
+        || chunks
+            .iter()
+            .any(|chunk| has_signed_unit(chunk.reasoning_details.as_deref()));
+    if signed_reasoning {
+        visit(&mut response.reasoning);
+    }
+    let rules = counts.outcome();
+    if rules.block.is_some() {
+        hits += rules
+            .hits
+            .iter()
+            .filter(|h| h.action == Action::Block)
+            .map(|h| h.count as usize)
+            .sum::<usize>();
+    }
+    if hits > 0 {
+        if let Some(blocks) = native {
+            blocks.retain(|block| !block.as_object().is_some_and(is_signed_thinking_block));
+        }
+        if signed_reasoning {
+            response.reasoning.clear();
+            response.reasoning_details = None;
+        }
+    }
+    hits
+}
+
+fn push_text(out: &mut String, s: &str) {
+    if !s.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(s);
+    }
 }
 
 /// Case-insensitive blocklist test; ASCII matches without allocating, non-ASCII copies once.
@@ -334,6 +541,9 @@ fn for_each_message_text(
     f: &mut impl FnMut(&mut String, bool) -> usize,
 ) -> usize {
     let mut n = f(&mut msg.content, false);
+    if let Some(name) = &mut msg.name {
+        n += f(name, false);
+    }
     if let Some(parts) = &mut msg.parts {
         n += walk_part_text(parts, signed, f);
     }
@@ -349,7 +559,7 @@ fn for_each_message_text(
     n
 }
 
-/// The ONE tail field list all scans traverse; `raw` gets the media-aware walk.
+/// The ONE tail field list all scans traverse; a Responses `raw` gets the media-aware walk.
 fn for_each_param_text(
     param: &mut ModelParamV2,
     f: &mut impl FnMut(&mut String) -> usize,
@@ -392,6 +602,7 @@ fn for_each_typed_text(
         T::Search(p) => f(&mut p.query),
         T::Moderation(p) => p.input.iter_mut().map(&mut *f).sum(),
         T::Rerank(p) => f(&mut p.query) + p.documents.iter_mut().map(&mut *f).sum::<usize>(),
+        T::Decisions(p) => p.fields.values_mut().map(|v| walk_json_strings(v, f)).sum(),
         T::AudioStt(_) => 0,
     }
 }
@@ -516,89 +727,6 @@ fn walk_part_value(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) ->
     }
 }
 
-/// The REST scan policy on a realtime frame; `collect_text` gathers the moderation text in the same walk.
-pub fn realtime_frame_scan(
-    sec: &SecurityConf,
-    frame: &mut serde_json::Value,
-    collect_text: bool,
-) -> (ScanOutcome, String, usize) {
-    let scan_rules = !sec.blocklist.is_empty() || !sec.regexes.is_empty();
-    // mask spans address pre-redaction offsets: no redaction while moderation text is collected
-    let redact = (sec.dlp_redact || sec.detect_secrets) && !collect_text;
-    let mut counts = ScanCounts::new(sec);
-    let mut text = String::new();
-    let redacted = if scan_rules || collect_text {
-        gw_engines::realtime::visit_frame_text(frame, &mut |s| {
-            if scan_rules {
-                counts.visit(s);
-            }
-            if collect_text {
-                push_text(&mut text, s);
-            }
-            if redact {
-                redact_in_place(s, sec.dlp_redact, sec.detect_secrets)
-            } else {
-                0
-            }
-        })
-    } else {
-        dlp_redact_realtime_frame(sec, frame)
-    };
-    (counts.outcome(), text, redacted)
-}
-
-/// DLP-redact a realtime frame in place; per-frame best effort, a span straddling deltas is missed.
-pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
-    if !sec.dlp_redact && !sec.detect_secrets {
-        return 0;
-    }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    gw_engines::realtime::visit_frame_text(frame, &mut |s| redact_in_place(s, pii, secrets))
-}
-
-/// DLP hits inside signed thinking, which the handler rejects rather than rewrite.
-pub fn protected_thinking_dlp_hits(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
-    if !sec.dlp_redact && !sec.detect_secrets {
-        return 0;
-    }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    let mut hits = 0;
-    for message in &mut request.message {
-        if message.role != gw_consts::role::AI {
-            continue;
-        }
-        for units in [message.parts.as_mut(), message.reasoning_details.as_mut()] {
-            let Some(blocks) = units.and_then(serde_json::Value::as_array_mut) else {
-                continue;
-            };
-            for block in blocks {
-                if block.as_object().is_some_and(is_signed_thinking_block) {
-                    hits += walk_part_value(block, &mut |text| redaction_hits(text, pii, secrets));
-                }
-            }
-        }
-    }
-    hits
-}
-
-/// DLP inbound redaction: emails, 11-digit phone numbers, and credentials under `detect_secrets`.
-pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
-    if !sec.dlp_redact && !sec.detect_secrets {
-        return 0;
-    }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    for_each_request_text(request, SignedThinking::Skip, &mut |s, _| {
-        redact_in_place(s, pii, secrets)
-    })
-}
-
-/// A retention copy of `text` with PII and secrets ALWAYS stripped, whatever the tenant's DLP flags.
-pub fn redact_retained(text: &str) -> String {
-    let mut s = text.to_owned();
-    redact_in_place(&mut s, true, true);
-    s
-}
-
 fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
     let mut hits = 0;
     if pii && let Some((redacted, n)) = redact(s) {
@@ -639,31 +767,6 @@ fn redact_secrets(text: &str) -> Option<(String, usize)> {
         "[REDACTED_SECRET]"
     });
     (count > 0).then(|| (out.into_owned(), count))
-}
-
-/// DLP probe of native SSE events before buffered replay; opaque deltas aside, nothing is rewritten.
-pub fn native_event_dlp_hits(sec: &SecurityConf, chunks: &mut [gw_models::StreamChunk]) -> usize {
-    if !sec.redacts_output() {
-        return 0;
-    }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    let mut fragments = EventFragments::default();
-    let mut scan = |text: &mut String| redaction_hits(text, pii, secrets);
-    let mut hits: usize = chunks
-        .iter_mut()
-        .filter_map(|chunk| chunk.native_event.as_mut())
-        .map(|event| walk_native_event(event, &mut fragments, &mut scan))
-        .sum();
-    if fragments.overflowed {
-        return hits.max(1);
-    }
-    hits += fragments
-        .values
-        .values()
-        .flat_map(|item| item.values())
-        .map(|text| redaction_hits(text, pii, secrets))
-        .sum::<usize>();
-    hits
 }
 
 fn walk_native_event(
@@ -802,105 +905,6 @@ fn collect_delta_fragments(
         }
         _ => {}
     }
-}
-
-/// Outbound DLP over one string: the error message a stream failure carries back.
-pub fn dlp_redact_text(sec: &SecurityConf, text: &mut String) -> usize {
-    if !sec.redacts_output() {
-        return 0;
-    }
-    redact_in_place(text, sec.dlp_redact, sec.detect_secrets)
-}
-
-/// Outbound DLP over `message` and the payloads the surfaces serialize verbatim.
-pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
-    if !sec.redacts_output() {
-        return 0;
-    }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
-    let mut hits = redact_field(&mut response.message);
-    if !response.reasoning.is_empty() {
-        hits += redact_field(&mut response.reasoning);
-    }
-    if let Some(v) = &mut response.response_v2 {
-        hits += walk_json_strings(v, &mut redact_field);
-    }
-    if let Some(v) = &mut response.tool_calls {
-        hits += walk_json_strings(v, &mut redact_field);
-    }
-    // native units duplicate the normalized fields: count them only when those were clean
-    let mut native_hits = 0;
-    if let Some(details) = &mut response.reasoning_details {
-        native_hits += details
-            .iter_mut()
-            .map(|d| walk_part_text(d, SignedThinking::Skip, &mut |s, _| redact_field(s)))
-            .sum::<usize>();
-    }
-    if let Some(content) = &mut response.anthropic_content {
-        native_hits += walk_part_text(content, SignedThinking::Skip, &mut |s, _| redact_field(s));
-    }
-    if hits == 0 && native_hits > 0 {
-        hits = native_hits;
-    }
-    hits
-}
-
-/// Strip signed thinking the tenant cannot serve, so the client still gets the redacted turn.
-pub fn strip_unservable_thinking(
-    sec: &SecurityConf,
-    response: &mut GatewayResponse,
-    chunks: &[gw_models::StreamChunk],
-) -> usize {
-    let dlp = sec.redacts_output();
-    if !dlp && sec.blocklist.is_empty() && sec.regexes.is_empty() {
-        return 0;
-    }
-    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
-    let mut counts = ScanCounts::new(sec);
-    let mut hits = 0;
-    let mut visit = |text: &mut String| {
-        counts.visit(text);
-        if dlp {
-            hits += redaction_hits(text, pii, secrets);
-        }
-        0
-    };
-    let mut native = response
-        .anthropic_content
-        .as_mut()
-        .and_then(serde_json::Value::as_array_mut);
-    for block in native.iter_mut().flat_map(|blocks| blocks.iter_mut()) {
-        if block.as_object().is_some_and(is_signed_thinking_block) {
-            walk_signed_prose(block, &mut |text, _| visit(text));
-        }
-    }
-    let signed_reasoning = has_signed_unit(response.reasoning_details.as_deref())
-        || chunks
-            .iter()
-            .any(|chunk| has_signed_unit(chunk.reasoning_details.as_deref()));
-    if signed_reasoning {
-        visit(&mut response.reasoning);
-    }
-    let rules = counts.outcome();
-    if rules.block.is_some() {
-        hits += rules
-            .hits
-            .iter()
-            .filter(|h| h.action == Action::Block)
-            .map(|h| h.count as usize)
-            .sum::<usize>();
-    }
-    if hits > 0 {
-        if let Some(blocks) = native {
-            blocks.retain(|block| !block.as_object().is_some_and(is_signed_thinking_block));
-        }
-        if signed_reasoning {
-            response.reasoning.clear();
-            response.reasoning_details = None;
-        }
-    }
-    hits
 }
 
 fn has_signed_unit(units: Option<&[serde_json::Value]>) -> bool {
@@ -1894,6 +1898,31 @@ mod tests {
                 "flat extra prose under media-like keys must be scanned ({proto:?})"
             );
         }
+    }
+
+    #[test]
+    fn blocklist_scans_the_participant_name() {
+        let mut msg = ChatMsg::text("user", "hi");
+        msg.name = Some("forbiddenword".into());
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(security_check(&sec(), &mut req).block.is_some());
+    }
+
+    #[test]
+    fn blocklist_catches_a_term_split_across_text_parts() {
+        let mut msg = ChatMsg::text("user", "say forbiddenword");
+        msg.parts = Some(serde_json::json!([
+            {"type": "text", "text": "say forbi"},
+            {"type": "text", "text": "ddenword"},
+        ]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(security_check(&sec(), &mut req).block.is_some());
     }
 
     #[test]
