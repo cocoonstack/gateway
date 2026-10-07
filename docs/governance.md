@@ -18,7 +18,7 @@ access_keys:
     tokens_per_minute: 600   # optional TPM window
     expires_at_epoch_secs: 1767225600  # optional; expired keys 403
     banned: false            # optional; banned keys 403
-    model_quotas: {gpt-4o: 200000}     # optional per-model daily caps
+    model_quotas: {gpt-4o: 200000}     # optional per-model daily degrade thresholds
 ```
 
 ## Tenants
@@ -27,10 +27,11 @@ A tenant groups keys under shared governance: one pooled QPS bucket for all
 its keys, a model entitlement allowlist (unlisted models 403 and disappear
 from `GET /v1/models`), per-model daily-token quota defaults (each key metered
 separately against the same value; per-key `model_quotas` override), and an
-optional `fallback_model` — an over-quota request degrades to it instead of
-failing (a typed-family request such as embeddings, rerank or decisions only
-when the fallback's protocol serves its surface, else it is denied; the
-response echoes the requested model name; the ledger records both
+optional `fallback_model` — an over-quota request degrades to it (a
+typed-family request such as embeddings, rerank or decisions only when the
+fallback's protocol serves its surface); with no usable fallback the request
+is served by the model it named, so a per-model quota is a degrade trigger,
+not a cap (the response echoes the requested model name; the ledger records both
 requested and served; a model's own `fallback_models` chain for upstream
 failures is a separate mechanism, below). The per-key daily cap stays the hard backstop, and
 unconfigured (key, model) pairs never touch a counter.
@@ -75,7 +76,7 @@ models:
 | QPS | per access key | `access_keys[].qps` |
 | QPS | pooled per tenant | `tenants[].qps` |
 | Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
-| Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override |
+| Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override (degrade trigger, not a cap) |
 | Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
 | Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
 | Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
