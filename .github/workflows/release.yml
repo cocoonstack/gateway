@@ -58,7 +58,7 @@ jobs:
           npm run build
           mkdir -p ../../dist-web
           tar -czf "../../dist-web/control-plane-web-dist_${GITHUB_REF_NAME#v}.tar.gz" -C . dist
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           path: dist-gw
           merge-multiple: true
