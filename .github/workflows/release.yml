@@ -30,7 +30,7 @@ jobs:
           mkdir -p dist-gw
           tar -czf "dist-gw/gw_${GITHUB_REF_NAME#v}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" \
             -C target/release gw
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: gw-${{ matrix.os }}-${{ matrix.arch }}
           path: dist-gw/*.tar.gz
