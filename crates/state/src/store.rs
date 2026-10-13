@@ -584,7 +584,7 @@ impl Store for MemoryStore {
         #[cfg(test)]
         if self
             .ledger_failures
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 (remaining > 0).then(|| remaining - 1)
             })
             .is_ok()
