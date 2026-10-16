@@ -58,7 +58,6 @@ models:
   # gemini
   - {name: gemini-3.6-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
   - {name: gemini-3.7-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
-  - {name: gemini-2.5-flash, provider: gemini, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.25}}
   # deepseek
   - {name: deepseek-chat, provider: deepseek, input_price_per_1k_micros: 270, output_price_per_1k_micros: 1100, token_rate: {read_cache: 0.1}}
   - {name: deepseek-reasoner, provider: deepseek, input_price_per_1k_micros: 550, output_price_per_1k_micros: 2190, token_rate: {read_cache: 0.25}}
@@ -67,10 +66,10 @@ models:
   - {name: MiniMax-M2.7, provider: minimax-oai, input_price_per_1k_micros: 300, output_price_per_1k_micros: 1200}
   # qwen
   - {name: qwen-plus, provider: qwen-oai, input_price_per_1k_micros: 400, output_price_per_1k_micros: 1200, token_rate: {read_cache: 0.4}}
-  - {name: qwen3-max, provider: qwen-oai, input_price_per_1k_micros: 1200, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.2}}
-  - {name: qwen3-235b-a22b, provider: qwen-anth, input_price_per_1k_micros: 700, output_price_per_1k_micros: 2800}
+  - {name: qwen3.8-max, provider: qwen-oai, input_price_per_1k_micros: 1200, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.2}}
+  - {name: qwen3.7-plus, provider: qwen-anth, input_price_per_1k_micros: 700, output_price_per_1k_micros: 2800}
   # qianfan
-  - {name: ernie-x1.1, provider: qianfan, input_price_per_1k_micros: 300, output_price_per_1k_micros: 1200}
+  - {name: ernie-5.1, provider: qianfan, input_price_per_1k_micros: 300, output_price_per_1k_micros: 1200}
   - {name: ernie-4.5-turbo-128k, provider: qianfan, input_price_per_1k_micros: 100, output_price_per_1k_micros: 400}
   # moonshot
   - {name: kimi-k2.6, provider: moonshot, input_price_per_1k_micros: 600, output_price_per_1k_micros: 2500, token_rate: {read_cache: 0.15}}
@@ -97,7 +96,6 @@ models:
   - {name: "us.xai.grok-4.6", provider: aws, protocol: aws-converse, input_price_per_1k_micros: 2200, output_price_per_1k_micros: 6600, token_rate: {read_cache: 0.25}}
   - {name: "global.xai.grok-4.6", provider: aws-oai, protocol: openai-chat, input_price_per_1k_micros: 2000, output_price_per_1k_micros: 6000, token_rate: {read_cache: 0.25}}
   # async video dialects: sora bills per second, wan/hailuo per delivered video, dashscope per reported second
-  - {name: sora-2, provider: openai, protocol: video, unit_price_micros: 100000}
   - {name: Wan-AI/Wan2.2-T2V-A14B, provider: siliconflow, protocol: video, unit_price_micros: 500000}
   - {name: wan2.2-t2v-plus, provider: dashscope, protocol: video, unit_price_micros: 120000}
   - {name: MiniMax-Hailuo-02, provider: minimax, protocol: video, unit_price_micros: 300000}
@@ -112,11 +110,12 @@ models:
   - {name: gpt-4o-mini-tts, provider: openai, protocol: tts, unit_price_micros: 20}
   - {name: whisper-1, provider: openai, protocol: stt, unit_price_micros: 100}
   # dashscope legacy native wire
-  - {name: qwen-turbo, provider: dashscope-native, protocol: dashscope, input_price_per_1k_micros: 50, output_price_per_1k_micros: 200}
+  - {name: qwen-flash, provider: dashscope-native, protocol: dashscope, input_price_per_1k_micros: 50, output_price_per_1k_micros: 200}
   # gemini live (realtime bridge, gemini dialect)
   - {name: gemini-3.1-flash-live-preview, provider: gemini, protocol: realtime, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500}
   # web search
   - {name: brave-search, provider: brave, protocol: search, unit_price_micros: 5000}
+  - {name: cf-web-search, provider: cloudflare, protocol: search, unit_price_micros: 250}
   # rerank vendors
   - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
   - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
@@ -158,6 +157,11 @@ accounts:
     provider: brave
     endpoint: https://api.search.brave.com
     api_key_env: BRAVE_API_KEY
+    protocols: ["search"]
+  - name: cloudflare-search
+    provider: cloudflare
+    endpoint: https://api.cloudflare.com/client/v4/accounts/<account_id>
+    api_key_env: CLOUDFLARE_API_TOKEN
     protocols: ["search"]
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}

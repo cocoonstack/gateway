@@ -2134,31 +2134,39 @@ async fn sora_content_settles_once_without_a_prior_status_poll() {
 }
 
 #[tokio::test]
-async fn search_routes_brave_and_bills_one_unit() {
-    let app = app();
-    let resp = app
-        .clone()
-        .oneshot(post(
-            "/v1/search",
-            Some("ak-demo-123"),
-            r#"{"model":"brave-search","query":"api gateway","count":1}"#,
-        ))
-        .await
-        .unwrap();
-    let status = resp.status();
-    let j = body_json(resp).await;
-    assert_eq!(status, StatusCode::OK, "{j}");
-    assert_eq!(j["query"]["original"], "api gateway", "{j}");
-    assert_eq!(j["web"]["results"].as_array().map(Vec::len), Some(1), "{j}");
-    let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
-    let row = j["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["served_model"] == "brave-search")
-        .unwrap();
-    assert_eq!(row["billed_units"], 1);
-    assert_eq!(row["cost_micros"], 5000);
+async fn search_routes_each_dialect_and_bills_one_unit() {
+    for (model, results, cost) in [
+        ("brave-search", "/web/results", 5000),
+        ("cf-web-search", "/items", 250),
+    ] {
+        let app = app();
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/v1/search",
+                Some("ak-demo-123"),
+                &format!(r#"{{"model":"{model}","query":"api gateway","count":1}}"#),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let j = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "{model}: {j}");
+        assert_eq!(
+            j.pointer(results).and_then(Value::as_array).map(Vec::len),
+            Some(1),
+            "{model}: {j}"
+        );
+        let j = body_json(app.oneshot(internal_get("/internal/ledger")).await.unwrap()).await;
+        let row = j["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["served_model"] == model)
+            .unwrap();
+        assert_eq!(row["billed_units"], 1, "{model}");
+        assert_eq!(row["cost_micros"], cost, "{model}");
+    }
 }
 
 #[tokio::test]

@@ -167,6 +167,10 @@ models:
     protocol: search
     provider: brave
     unit_price_micros: 5000
+  - name: cf-web-search
+    protocol: search
+    provider: cloudflare
+    unit_price_micros: 250
   - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
     protocol: openai-chat
     provider: tencent
@@ -288,6 +292,10 @@ accounts:
     protocols: ["video"]
   - name: mock-search-1
     provider: brave
+    priority: 1
+    protocols: ["search"]
+  - name: mock-search-cf
+    provider: cloudflare
     priority: 1
     protocols: ["search"]
   - name: mock-responses-1 # OpenAI Responses API surface

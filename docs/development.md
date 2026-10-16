@@ -100,11 +100,11 @@ python3 scripts/live-matrix/live_matrix.py               # or: ... anthropic bed
 
 Last full run (2026-09-17, Linux x86_64): 182/205, every ledger row matching the
 oracle. The groups cover Anthropic, OpenAI (incl. gpt-realtime-mini through
-`/v1/realtime` and sora-2 video), Gemini, DeepSeek, MiniMax (incl. Hailuo
+`/v1/realtime`), Gemini, DeepSeek, MiniMax (incl. Hailuo
 video), Qwen/DashScope (incl. wan2.2-t2v-plus video), Qianfan, Moonshot,
 SiliconFlow (incl. Wan2.2 video), OpenRouter, Cohere/Jina rerank, xAI Grok
 (chat, Responses, image, video; the `grok` group serves the same models from
-OpenRouter and Bedrock), Kling video, Brave search, Bedrock (InvokeModel,
+OpenRouter and Bedrock), Kling video, Cloudflare web search, Bedrock (InvokeModel,
 Converse, Llama), a local Ollama through the generic OpenAI-compatible path,
 OpenAI moderations/TTS/STT, the DashScope legacy wire and the Gemini Live
 realtime dialect.

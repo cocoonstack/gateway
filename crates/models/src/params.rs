@@ -23,7 +23,7 @@ pub enum TypedParams {
     AudioStt(SttParams),
     /// Video generation (Sora / Wan / DashScope / Hailuo / Kling dialects + a generic shape).
     Video(VideoParams),
-    /// Web search (Brave dialect + a generic shape).
+    /// Web search (Brave and Cloudflare dialects + a generic shape).
     Search(SearchParams),
     /// content moderation (openai moderations shape)
     Moderation(ModerationParams),

@@ -97,7 +97,11 @@ usage); the rest are marked non-streaming below and always answer buffered:
 
 `protocol: search` routes web search: a `brave` provider account speaks the
 Brave Search API (`X-Subscription-Token`, live-verified; one unit per query),
-anything else the generic mock shape. Google's Custom Search JSON API is
+a `cloudflare` account the Cloudflare Web Search API (`POST {endpoint}/ai/websearch/`,
+`endpoint` = `https://api.cloudflare.com/client/v4/accounts/<account_id>`, an API
+token with Workers AI Read and AI Gateway Read as Bearer, the account's `default`
+AI Gateway, `count` capped at 10; live-verified; one unit per query), anything
+else the generic mock shape. Google's Custom Search JSON API is
 deliberately not wired — Google closed it to new customers (existing projects
 keep access until 2027-01-01), so no reachable configuration exists. The factory also dispatches the
 `video` protocol (kling-v1-6, grok-imagine-video,
@@ -109,8 +113,7 @@ else from its preset `kind` — `openai` → Sora,
 API (the account endpoint is the bare `https://dashscope-intl.aliyuncs.com`;
 some Wan models reject submit `parameters`, so the gateway forwards only what
 the caller sets), `minimax` → Hailuo, `kling` → Kling text2video, and
-anything else the generic `videos/generations` shape. Live-verified: sora-2
-(4 s billed from the `seconds` string, content download through the gateway), Wan2.2-T2V-A14B on
+anything else the generic `videos/generations` shape. Live-verified: Wan2.2-T2V-A14B on
 SiliconFlow and MiniMax-Hailuo-02 (one unit per delivered video, file content
 proxied through the gateway), and
 wan2.2-t2v-plus on DashScope intl (5 s from `usage.video_duration`).

@@ -663,7 +663,7 @@ def case_search(gw: Gateway, model: str) -> None:
         record(name, False, f"HTTP {st}: {txt[:200]}")
         return
     j = json.loads(txt)
-    results = (j.get("web") or {}).get("results") or j.get("results") or []
+    results = (j.get("web") or {}).get("results") or j.get("items") or j.get("results") or []
     count, row = gw.ledger()
     ok = (
         count == before + 1
@@ -1283,10 +1283,10 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(
             gw, "qwen-plus", "enable_thinking", stream=True, prompt=prime, expect_reasoning=True, enable_thinking=True
         )
-        case_chat(gw, "qwen3-max", stream=True)
+        case_chat(gw, "qwen3.8-max", stream=True)
         case_messages(
             gw,
-            "qwen3-235b-a22b",
+            "qwen3.7-plus",
             "anthropic-compat thinking",
             stream=True,
             thinking={"type": "enabled", "budget_tokens": 1024},
@@ -1296,8 +1296,8 @@ def run_group(gw: Gateway, group: str) -> None:
         case_prompt_cache(gw, "qwen-plus", words=400)
     elif group == "qianfan":
         case_chat(gw, "ernie-4.5-turbo-128k")
-        case_chat(gw, "ernie-x1.1", "reasoning", prompt=prime, expect_reasoning=True)
-        case_chat(gw, "ernie-x1.1", "reasoning", stream=True, prompt=prime, expect_reasoning=True)
+        case_chat(gw, "ernie-5.1", "reasoning", prompt=prime, expect_reasoning=True)
+        case_chat(gw, "ernie-5.1", "reasoning", stream=True, prompt=prime, expect_reasoning=True)
     elif group == "moonshot":
         # the org's RPM is 3: pace the calls
         case_chat(gw, "kimi-k2.6", prompt=prime, expect_reasoning=True)
@@ -1375,14 +1375,13 @@ def run_group(gw: Gateway, group: str) -> None:
         case_chat(gw, "global.xai.grok-4.6", "bedrock openai-compat", reasoning_effort="low")
         case_chat(gw, "global.xai.grok-4.6", "bedrock openai-compat", stream=True, reasoning_effort="low", prompt=prime)
     elif group == "video":
-        case_video(gw, "sora-2", {"duration": 4, "resolution": "720x1280"}, done="completed", units=4, content=True)
         case_video(gw, "Wan-AI/Wan2.2-T2V-A14B", {"resolution": "1280x720"}, done="Succeed", units=1)
         # parameters (size/duration) silently kill the task into UNKNOWN on intl — submit bare
         case_video(gw, "wan2.2-t2v-plus", {}, done="SUCCEEDED", units=5)
         case_video(gw, "MiniMax-Hailuo-02", {"duration": 6}, done="Success", units=1, content=True)
         case_video(gw, "kling-v2-6", {"duration": 5, "aspect_ratio": "16:9"}, done="succeed")
     elif group == "search":
-        case_search(gw, "brave-search")
+        case_search(gw, "cf-web-search")
     elif group == "openai-rt":
         case_realtime(gw, "gpt-realtime-mini")
     elif group == "openai-aux":
@@ -1390,7 +1389,7 @@ def run_group(gw: Gateway, group: str) -> None:
         case_tts(gw, "gpt-4o-mini-tts")
         case_stt(gw, "whisper-1")
     elif group == "dashscope-native":
-        case_chat(gw, "qwen-turbo")
+        case_chat(gw, "qwen-flash")
     elif group == "gemini-rt":
         case_realtime_gemini(gw, "gemini-3.1-flash-live-preview")
     elif group == "ollama":
