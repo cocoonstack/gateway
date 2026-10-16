@@ -117,6 +117,7 @@ models:
   - {name: gemini-3.1-flash-live-preview, provider: gemini, protocol: realtime, input_price_per_1k_micros: 300, output_price_per_1k_micros: 2500}
   # web search
   - {name: brave-search, provider: brave, protocol: search, unit_price_micros: 5000}
+  - {name: cf-web-search, provider: cloudflare, protocol: search, unit_price_micros: 250}
   # rerank vendors
   - {name: rerank-v3.5, protocol: rerank, provider: cohere, unit_price_micros: 2000}
   - {name: jina-reranker-v3, protocol: rerank, provider: jina, input_price_per_1k_micros: 20}
@@ -158,6 +159,11 @@ accounts:
     provider: brave
     endpoint: https://api.search.brave.com
     api_key_env: BRAVE_API_KEY
+    protocols: ["search"]
+  - name: cloudflare-search
+    provider: cloudflare
+    endpoint: https://api.cloudflare.com/client/v4/accounts/<account_id>
+    api_key_env: CLOUDFLARE_API_TOKEN
     protocols: ["search"]
   - {name: cohere, provider: cohere, endpoint: https://api.cohere.com, api_key_env: COHERE_API_KEY, protocols: ["rerank"], cost_unit_price_micros: 1000}
   - {name: jina, provider: jina, endpoint: https://api.jina.ai, api_key_env: JINA_API_KEY, protocols: ["rerank"]}

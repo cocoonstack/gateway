@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gw_consts::Protocol;
 use gw_models::{GResult, GatewayError};
+use gw_protocol::object;
 use serde_json::{Value, json};
 
 use crate::transport::{
@@ -799,6 +800,30 @@ impl MockTransport {
                 .collect();
             return Self::ok_json(json!({"query": {"original": q},
                                         "web": {"results": results}}));
+        }
+        if req.url.contains("/ai/websearch/") {
+            let body = Self::parse(&req.body, "websearch")?;
+            let q = body["query"].as_str().unwrap_or("");
+            let limit = body["limit"].as_i64().unwrap_or(3).clamp(1, 10);
+            let items = (0..limit)
+                .map(|i| {
+                    object([
+                        (
+                            "title",
+                            format!("cloudflare result {} for {q}", i + 1).into(),
+                        ),
+                        ("url", format!("mock://cloudflare/{}", i + 1).into()),
+                        ("description", format!("[mock-cloudflare] about {q}").into()),
+                    ])
+                })
+                .collect();
+            return Self::ok_json(object([
+                ("items", Value::Array(items)),
+                (
+                    "metadata",
+                    json!({"query": q, "requestId": "mock", "latencyMs": 0}),
+                ),
+            ]));
         }
         let body = Self::parse(&req.body, "search")?;
         let q = body["query"].as_str().unwrap_or("");

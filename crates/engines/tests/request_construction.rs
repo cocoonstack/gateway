@@ -1194,6 +1194,39 @@ async fn search_request_shape() {
 }
 
 #[tokio::test]
+async fn cloudflare_search_request_shape() {
+    let t = RecordingTransport::new(
+        r#"{"items":[{"title":"t","url":"https://u","description":"d"}],"metadata":{"query":"q","requestId":"r","latencyMs":1}}"#,
+    );
+    let mut req = typed_req(
+        Protocol::Search,
+        "cf-web-search",
+        TypedParams::Search(SearchParams {
+            query: "rust dag".into(),
+            count: 20,
+        }),
+    );
+    req.account = Some(Arc::new(gw_models::Account {
+        name: "cf-search".into(),
+        provider: "cloudflare".into(),
+        endpoint: "https://api.cloudflare.com/client/v4/accounts/acct".into(),
+        ..Default::default()
+    }));
+    let out = SearchEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(b["query"], "rust dag");
+    assert_eq!(b["limit"], 10, "{b}");
+    assert_eq!(b["options"]["gateway"]["id"], "default");
+    assert_eq!(
+        t.url(),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/websearch/"
+    );
+    assert_eq!(t.header("authorization").as_deref(), Some("Bearer mock"));
+    assert_eq!(out.response.message, "t");
+    assert_eq!(out.response.billed_units, 1);
+}
+
+#[tokio::test]
 async fn anthropic_chat_history_tool_round_trip() {
     let t = RecordingTransport::new(
         r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,

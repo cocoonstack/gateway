@@ -149,7 +149,7 @@ reconcile the write premium; the Responses surface reports the same two under
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}` (`count` defaults to 3, clamped to 1-20); a `brave` provider speaks the Brave Search API (the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
+| POST | `/v1/search` | web search as a routed backend: `{model, query, count?}` (`count` defaults to 3, clamped to 1-20); a `brave` provider speaks the Brave Search API, a `cloudflare` provider the Cloudflare Web Search API (`count` capped at 10; the vendor body passes through), each search bills one unit at the model's `unit_price_micros` |
 
 ## Decisions
 

@@ -14,6 +14,9 @@ use crate::engine::{EngineOutcome, ModelEngine, StreamChunk, reject_minimax_erro
 use crate::multipart::{Form, audio_kind, image_kind};
 use crate::transport::{Headers, SharedTransport, Transport, UpstreamBody, UpstreamRequest};
 
+const CLOUDFLARE_SEARCH_GATEWAY: &str = "default";
+const CLOUDFLARE_SEARCH_MAX_LIMIT: i64 = 10;
+
 /// Gemini `parts` from a unified message; remote image URLs cannot be inlined without a fetch and are skipped.
 fn gemini_parts(mut m: gw_models::ChatMsg) -> Vec<Value> {
     if let Some(Value::Array(parts)) = m.parts.take() {
@@ -946,7 +949,7 @@ base_engine!(SearchEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for SearchEngine {
-    /// Brave on its provider, else the generic shape.
+    /// Brave or Cloudflare on its provider, else the generic shape.
     async fn run(&mut self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {
@@ -982,6 +985,16 @@ impl ModelEngine for SearchEngine {
                     .await?;
                 let (status, v) = parse_json_reply(reply)?;
                 (status, v, "/web/results")
+            }
+            "cloudflare" => {
+                let body = json!({
+                    "query": query,
+                    "limit": count.clamp(1, CLOUDFLARE_SEARCH_MAX_LIMIT),
+                    "options": {"gateway": {"id": CLOUDFLARE_SEARCH_GATEWAY}},
+                });
+                let url = format!("{}/ai/websearch/", self.base.base_url(VENDOR_SENTINEL));
+                let (status, v) = self.base.round_trip(&url, body).await?;
+                (status, v, "/items")
             }
             _ => {
                 let body = json!({"query": query, "count": count});
