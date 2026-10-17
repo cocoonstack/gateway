@@ -313,14 +313,10 @@ struct LedgerSpool {
 impl LedgerSpool {
     fn new(path: &str) -> Self {
         let path = PathBuf::from(path);
-        let (replaying, replayed) = (
-            path.with_extension("replaying"),
-            path.with_extension("replayed"),
-        );
         Self {
+            replaying: path.with_extension("replaying"),
+            replayed: path.with_extension("replayed"),
             path,
-            replaying,
-            replayed,
             lock: Mutex::new(()),
         }
     }
@@ -356,8 +352,8 @@ impl LedgerSpool {
             let _held = self.lock.lock().await;
             run_blocking(move || {
                 if replaying.exists() {
-                    let saved = std::fs::read_to_string(&replayed).unwrap_or_default();
-                    return Ok(Some(saved.trim().parse().unwrap_or(0)));
+                    let text = std::fs::read_to_string(&replayed).unwrap_or_default();
+                    return Ok(Some(text.trim().parse().unwrap_or(0)));
                 }
                 if !path.exists() {
                     return Ok(None);
@@ -375,7 +371,7 @@ impl LedgerSpool {
                 return;
             }
         };
-        let mut replayed = 0;
+        let mut total = 0;
         loop {
             let replaying = self.replaying.clone();
             let (rows, next) = match run_blocking(move || read_spool_batch(&replaying, offset))
@@ -394,23 +390,25 @@ impl LedgerSpool {
                 tracing::warn!(error = %e, rows = rows.len(), "billing spool replay deferred");
                 return;
             }
-            replayed += rows.len();
+            total += rows.len();
             offset = next;
-            let saved = self.replayed.clone();
-            if let Err(e) = run_blocking(move || std::fs::write(saved, offset.to_string())).await {
+            let offset_file = self.replayed.clone();
+            if let Err(e) =
+                run_blocking(move || std::fs::write(offset_file, offset.to_string())).await
+            {
                 tracing::warn!(error = %e, "billing spool offset save failed");
             }
         }
-        let (replaying, saved) = (self.replaying.clone(), self.replayed.clone());
+        let (replaying, offset_file) = (self.replaying.clone(), self.replayed.clone());
         if let Err(e) = run_blocking(move || {
-            std::fs::remove_file(replaying).and_then(|()| remove_if_present(&saved))
+            std::fs::remove_file(replaying).and_then(|()| remove_if_present(&offset_file))
         })
         .await
         {
             tracing::error!(error = %e, path = %self.replaying.display(), "billing spool remove failed");
             return;
         }
-        tracing::info!(rows = replayed, "billing spool replayed");
+        tracing::info!(rows = total, "billing spool replayed");
     }
 }
 
