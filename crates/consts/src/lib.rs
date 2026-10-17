@@ -20,7 +20,6 @@ pub mod role {
     pub const MODEL: &str = "model";
     pub const SYSTEM: &str = "system";
     pub const TOOL: &str = "tool";
-    pub const STORAGE: &str = "storage";
 }
 
 /// Account tiers for PTU (provisioned) vs pay-as-you-go routing.

@@ -47,9 +47,6 @@ pub struct GatewayResponse {
     /// seconds, rerank search units); priced by the model's `unit_price_micros`.
     #[serde(default)]
     pub billed_units: i64,
-    /// sora2 async step marker.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub step: String,
 
     /// normalized usage view, filled by the CommonUsage post-processor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,13 +147,6 @@ mod tests {
         assert_eq!(r.message, "");
         assert_eq!(r.prompt_tokens, 0);
         assert!(r.common_usage.is_none());
-    }
-
-    #[test]
-    fn empty_step_is_omitted() {
-        let r = GatewayResponse::default();
-        let j = serde_json::to_value(&r).unwrap();
-        assert!(j.get("step").is_none());
     }
 
     #[test]
