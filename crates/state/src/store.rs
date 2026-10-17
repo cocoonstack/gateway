@@ -643,19 +643,7 @@ impl Store for MemoryStore {
             }
             ledger.rows.push(r.clone());
             if r.created_at_epoch_secs < watermark {
-                rollup
-                    .entry((
-                        bucket_floor(r.created_at_epoch_secs),
-                        r.tenant.clone(),
-                        r.user_id.clone(),
-                        r.model.clone(),
-                    ))
-                    .or_insert_with(|| UserUsageRow {
-                        user_id: r.user_id.clone(),
-                        model: r.model.clone(),
-                        ..Default::default()
-                    })
-                    .add_record(r);
+                roll_into(&mut rollup, r);
             }
         }
         Ok(())
@@ -783,19 +771,7 @@ impl Store for MemoryStore {
                 .iter()
                 .filter(|r| r.created_at_epoch_secs >= lo && r.created_at_epoch_secs < hi)
             {
-                fresh
-                    .entry((
-                        bucket_floor(r.created_at_epoch_secs),
-                        r.tenant.clone(),
-                        r.user_id.clone(),
-                        r.model.clone(),
-                    ))
-                    .or_insert_with(|| UserUsageRow {
-                        user_id: r.user_id.clone(),
-                        model: r.model.clone(),
-                        ..Default::default()
-                    })
-                    .add_record(r);
+                roll_into(&mut fresh, r);
             }
         }
         let written = fresh.len() as u64;
@@ -2808,6 +2784,25 @@ fn usage_of(r: &BillingRecord) -> UserUsageRow {
         vendor_cost_micros: r.vendor_cost_micros,
         billed_units: r.billed_units,
     }
+}
+
+fn roll_into(
+    buckets: &mut BTreeMap<(i64, String, String, String), UserUsageRow>,
+    r: &BillingRecord,
+) {
+    buckets
+        .entry((
+            bucket_floor(r.created_at_epoch_secs),
+            r.tenant.clone(),
+            r.user_id.clone(),
+            r.model.clone(),
+        ))
+        .or_insert_with(|| UserUsageRow {
+            user_id: r.user_id.clone(),
+            model: r.model.clone(),
+            ..Default::default()
+        })
+        .add_record(r);
 }
 
 /// Fold grouped usage rows into `map` by (user, model).
