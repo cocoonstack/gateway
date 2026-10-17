@@ -2850,6 +2850,79 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct GatedSearch(tokio::sync::Semaphore);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for GatedSearch {
+        async fn send(
+            &self,
+            _: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            self.0.acquire().await.unwrap().forget();
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
+                    br#"{"items":[{"title":"t","url":"https://u"}],"metadata":{"query":"q","requestId":"r","latencyMs":1}}"#,
+                )),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_unit_priced_call_holds_the_daily_cost_budget() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: web, protocol: search, provider: cloudflare, unit_price_micros: 250}]\naccounts: [{name: cf, provider: cloudflare, protocols: [search]}]\ntenants: [{name: t1, key_daily_cost_quota_micros: 250}]\naccess_keys: [{ak: s-ak, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let transport = Arc::new(GatedSearch(tokio::sync::Semaphore::new(0)));
+        let h = OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport.clone());
+        let ak = h.state().auth.get(&access_key_id("s-ak")).await.unwrap();
+        let search = || {
+            let mut param = ModelParamV2::with_name(Protocol::Search, "web");
+            param.typed = Some(gw_models::TypedParams::Search(
+                gw_models::params::SearchParams {
+                    query: "q".into(),
+                    count: 1,
+                },
+            ));
+            GatewayRequest {
+                is_online: true,
+                model_param_v2: Some(param),
+                ..Default::default()
+            }
+        };
+        let first = tokio::spawn({
+            let (h, ak) = (h.clone(), ak.clone());
+            async move { h.run(search(), ak).await }
+        });
+        let key = format!("cb:ak:{}", ak.ak_id);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while h.state().governance.quota_used(&key).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first call holds its unit price");
+
+        let second = h.run(search(), ak.clone()).await;
+
+        let err = second.err().expect("the in-flight hold leaves no budget");
+        assert!(
+            err.message.contains("daily cost budget exhausted"),
+            "{}",
+            err.message
+        );
+        transport.0.add_permits(1);
+        first.await.unwrap().unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(
+            (ledger.len(), ledger[0].cost_micros),
+            (1, 250),
+            "{ledger:?}"
+        );
+    }
+
+    #[derive(Debug)]
     struct PiiStream;
 
     #[async_trait::async_trait]

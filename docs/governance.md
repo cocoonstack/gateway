@@ -272,9 +272,11 @@ and `max_tokens` sides at the tenant's price), admitting while spent plus held
 is under the cap, so concurrent holds pass it by at most one hold; billing
 settles the hold to the charged amount and a failed call returns it. A call that
 costs more than it held still carries the total past the cap by the difference:
-a call without `max_tokens` holds 256 output tokens, and unit- or
-vendor-priced surfaces (images, video, decisions) hold no cost, so the cost caps
-only check them. Realtime turns and the monthly caps check before the call
+a call without `max_tokens` holds 256 output tokens. Units known at admission
+hold at the unit price (a search, `n` images, the characters of a speech
+request; one unit for transcription and rerank); video bills at its poll and
+vendor-priced decisions report their cost after the call, so for those the cost
+caps only check. Realtime turns and the monthly caps check before the call
 and accrue after it ("soft": concurrent turns can overshoot by one each).
 The per-(key, model) quota is soft the same way: it is a routing trigger (the
 fallback-model degrade), while the reserved per-key daily quota hard-caps spend.

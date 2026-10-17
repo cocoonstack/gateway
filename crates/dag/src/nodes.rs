@@ -263,6 +263,15 @@ fn reserve_parts(req: &gw_models::GatewayRequest) -> (i64, i64) {
     ((prompt as i64 / 4).clamp(1, MAX_RESERVE), max_out)
 }
 
+fn reserve_units(req: &gw_models::GatewayRequest) -> i64 {
+    match req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref()) {
+        Some(gw_models::TypedParams::Image(p)) => p.n.max(1),
+        Some(gw_models::TypedParams::AudioTts(p)) => p.input.chars().count() as i64,
+        Some(gw_models::TypedParams::Video(_)) => 0,
+        _ => 1,
+    }
+}
+
 /// preprocess/quota_check: reserve the estimate against the AK daily quota; billing settles it.
 pub struct QuotaCheck;
 
@@ -429,13 +438,19 @@ impl DagNode for BudgetGate {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let (prompt, max_out) = ctx.reserve_parts;
         let (cfg, request, tenant) = (&ctx.cfg, &ctx.request, &ctx.ak.tenant);
-        let est = || admission::BudgetSpend {
-            tokens: reserve_total((prompt, max_out)),
-            cost_micros: gw_models::cost_micros(
-                prompt,
-                max_out,
-                cfg.prices_for_tenant(tenant, served_model(request.model_param_v2.as_ref())),
-            ),
+        let est = || {
+            let served = served_model(request.model_param_v2.as_ref());
+            let units =
+                reserve_units(request).saturating_mul(cfg.unit_price_for_tenant(tenant, served));
+            admission::BudgetSpend {
+                tokens: reserve_total((prompt, max_out)),
+                cost_micros: gw_models::cost_micros(
+                    prompt,
+                    max_out,
+                    cfg.prices_for_tenant(tenant, served),
+                )
+                .saturating_add(units),
+            }
         };
         let (over, hold) = admission::reserve_budgets(
             &ctx.state,
@@ -1150,6 +1165,35 @@ mod tests {
         assert_eq!((t.prompt, t.completion), (100, 50));
         assert_eq!((t.billable_prompt, t.billable_completion), (50, 50));
         assert_eq!(t.total(), 100);
+    }
+
+    #[test]
+    fn reserve_units_counts_what_admission_already_knows() {
+        use gw_models::params::{ImageParams, TtsParams, VideoParams};
+        use gw_models::{GatewayRequest, ModelParamV2, TypedParams};
+        let units = |typed: TypedParams| {
+            let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, "m");
+            param.typed = Some(typed);
+            super::reserve_units(&GatewayRequest {
+                model_param_v2: Some(param),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            units(TypedParams::Image(ImageParams {
+                n: 3,
+                ..Default::default()
+            })),
+            3
+        );
+        assert_eq!(
+            units(TypedParams::AudioTts(TtsParams {
+                input: "héllo".into(),
+                ..Default::default()
+            })),
+            5
+        );
+        assert_eq!(units(TypedParams::Video(VideoParams::default())), 0);
     }
 
     #[test]
