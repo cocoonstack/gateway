@@ -90,7 +90,8 @@ when counts came from an aborted stream rather than a vendor usage payload).
 An aborted stream served by an OpenRouter account is billed from OpenRouter's
 record of the generation instead (`GET /api/v1/generation`, polled for about
 40 s with each lookup capped at 10 s; cancelled generations included), with cache
-reads at their weight and OpenRouter's cost as `vendor_cost_micros`; only when no
+reads at their weight (the record carries no cache-write count, so a cache write
+bills at the prompt weight) and OpenRouter's cost as `vendor_cost_micros`; only when no
 record arrives, or the gateway starts shutting down, does it fall back to the
 estimate. Shutdown waits for these settles before the final ledger flush, and the
 access log's `latency_ms` stops at the end of the stream, not of the lookup.
