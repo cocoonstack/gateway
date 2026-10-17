@@ -585,10 +585,17 @@ async fn realtime_gate(
     admission::check_model_qpm(gov, cfg, &m.served)
         .await
         .map_err(throttled)?;
-    let user_budget = admission::check_budgets(state, cfg, &ak, ak.attributed_user(hint))
-        .await
-        .map_err(|e| (ErrClass::ServiceUnavailable, e.message))?
-        .map_err(quota_exceeded)?;
+    let (user_budget, _) = admission::reserve_budgets(
+        state,
+        cfg,
+        &ak,
+        ak.attributed_user(hint),
+        admission::BudgetSpend::default,
+        gw_state::epoch_secs(),
+    )
+    .await
+    .map_err(|e| (ErrClass::ServiceUnavailable, e.message))?
+    .map_err(quota_exceeded)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak_id, &m.requested), limit)
@@ -689,6 +696,7 @@ async fn bill_realtime_turn(
             model_quota_key,
             budget_ak: ak,
             user_budget: admit.user_budget,
+            budget_hold: Default::default(),
         },
     )
     .await;
@@ -1225,7 +1233,9 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
             )
         })
         .unwrap_or_default();
-    let latency = started.elapsed();
+    let latency = ctx
+        .served_at
+        .map_or_else(|| started.elapsed(), |at| at.duration_since(started));
     let user_id = ctx.effective_user_id();
     let decisions = ctx.decisions_line();
     let ak_id = &*ctx.ak.ak_id;
@@ -1340,14 +1350,14 @@ fn user_hint(hint: Option<String>, field: &Value) -> Option<String> {
     hint.or_else(|| field.as_str().map(cap_user_hint))
 }
 
-/// Bound an attribution hint at `USER_HINT_MAX_BYTES`: it keys governance
-/// counters, so an unbounded value from any surface would grow the keyspace.
+/// Bound an attribution hint at `USER_HINT_MAX_BYTES` (it keys governance counters)
+/// and drop NUL, which Postgres TEXT refuses in every row the user lands in.
 fn cap_user_hint(s: &str) -> String {
     let mut end = s.len().min(USER_HINT_MAX_BYTES);
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    s[..end].to_owned()
+    s[..end].replace('\0', "")
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -4582,6 +4592,7 @@ async fn admit_video_job(
                         model_quota_key: None,
                         budget_ak: submitter.as_deref().unwrap_or(&ak),
                         user_budget: None,
+                        budget_hold: Default::default(),
                     },
                 )
                 .await;
@@ -6717,6 +6728,17 @@ mod tests {
         assert_eq!(
             records[0].cost_micros, 200_000,
             "settled at the admission price, not the reloaded one"
+        );
+    }
+
+    #[test]
+    fn user_hints_are_capped_and_drop_nul() {
+        assert_eq!(cap_user_hint("nul\0user"), "nuluser");
+        let long = "é".repeat(USER_HINT_MAX_BYTES);
+        assert!(cap_user_hint(&long).len() <= USER_HINT_MAX_BYTES);
+        assert_eq!(
+            user_hint(None, &serde_json::json!("\u{0}")),
+            Some(String::new())
         );
     }
 

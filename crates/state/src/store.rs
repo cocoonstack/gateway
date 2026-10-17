@@ -35,8 +35,8 @@ const ROLLUP_BUCKET_SECS: i64 = 60;
 const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 
 /// A minute is rolled only once closed for this long, so no in-flight write or
-/// trailing replica lands a row in a rolled minute — a rolled minute's source
-/// set can only shrink, which keeps the max-upsert sound.
+/// trailing replica lands a row in a rolled minute; a spool replay that does adds
+/// the row to the bucket in the same transaction, which keeps the max-upsert sound.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 /// In-process rollup retention: the monthly-budget window, then a bucket cap.
 const ROLLUP_RETENTION_SECS: i64 = 62 * 86_400;
@@ -60,7 +60,8 @@ const BATCH_ITEM_CHUNK: usize = 13_000;
 const PG_MAX_CONNECTIONS: u32 = 10;
 
 /// One billing entry (recorded locally only; no reporting upstream).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct BillingRecord {
     pub ak: String,
     pub product: String,
@@ -290,10 +291,10 @@ impl UserUsageRow {
         self.billed_units = self.billed_units.saturating_add(r.billed_units);
     }
 
-    /// Keep the larger of each counter. A bucket's source rows are append-only
-    /// and only ever shrink via ledger pruning, so per-column max always picks
-    /// the more complete snapshot — a recompute from a partially pruned ledger
-    /// can never shrink a bucket.
+    /// Keep the larger of each counter. A bucket's source rows only shrink via ledger
+    /// pruning, and a replayed late row is added to its bucket as it lands, so per-column
+    /// max always picks the more complete snapshot — a recompute from a partially pruned
+    /// ledger can never shrink a bucket.
     fn keep_max(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.max(o.requests);
         self.prompt_tokens = self.prompt_tokens.max(o.prompt_tokens);
@@ -359,6 +360,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         }
         Ok(())
     }
+    /// Insert late rows and atomically add the ones inserted to rollup buckets the watermark passed.
+    async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()>;
     /// Whether rows may batch off the request path; in-process backends stay synchronous.
     fn defers_ledger_writes(&self) -> bool {
         false
@@ -386,8 +389,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         until: i64,
         bucket_secs: i64,
     ) -> GResult<Vec<(i64, UserUsageRow)>>;
-    /// Recompute and upsert every rollup bucket in the trailing backfill window; buckets are never
-    /// deleted, so a missed tick self-heals. Returns the buckets written.
+    /// Recompute the trailing backfill window's rollup buckets (never deleted: a missed tick self-heals); returns those written.
     async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64>;
     /// Delete rolled billing rows past `ledger_max_rows`; returns rows deleted.
     async fn ledger_prune(&self) -> GResult<u64> {
@@ -576,11 +578,8 @@ impl MemoryStore {
     pub(crate) fn fail_next_ledger_writes(&self, count: usize) {
         self.ledger_failures.store(count, Ordering::Relaxed);
     }
-}
 
-#[async_trait::async_trait]
-impl Store for MemoryStore {
-    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+    fn injected_ledger_failure(&self) -> GResult<()> {
         #[cfg(test)]
         if self
             .ledger_failures
@@ -593,6 +592,14 @@ impl Store for MemoryStore {
                 "injected ledger write failure",
             ));
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for MemoryStore {
+    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+        self.injected_ledger_failure()?;
         // watermark first: rollup-then-records is the lock order advance uses
         let watermark = (self.ledger_max_rows > 0).then(|| rollup_watermark(&lock(&self.rollup)));
         let mut ledger = lock(&self.ledger);
@@ -621,6 +628,35 @@ impl Store for MemoryStore {
                     true
                 }
             });
+        }
+        Ok(())
+    }
+
+    async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()> {
+        self.injected_ledger_failure()?;
+        let mut rollup = lock(&self.rollup);
+        let watermark = rollup_watermark(&rollup);
+        let mut ledger = lock(&self.ledger);
+        for r in rows {
+            if !ledger.request_ids.insert(r.request_id.clone()) {
+                continue;
+            }
+            ledger.rows.push(r.clone());
+            if r.created_at_epoch_secs < watermark {
+                rollup
+                    .entry((
+                        bucket_floor(r.created_at_epoch_secs),
+                        r.tenant.clone(),
+                        r.user_id.clone(),
+                        r.model.clone(),
+                    ))
+                    .or_insert_with(|| UserUsageRow {
+                        user_id: r.user_id.clone(),
+                        model: r.model.clone(),
+                        ..Default::default()
+                    })
+                    .add_record(r);
+            }
         }
         Ok(())
     }
@@ -1378,13 +1414,55 @@ macro_rules! q_series_raw {
     };
 }
 
-macro_rules! q_rollup_insert {
+macro_rules! billing_insert {
+    ($rows:expr) => {{
+        // the QueryBuilder numbers placeholders per dialect, so no dialect_sql! here
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
+             account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
+             vendor_cost_micros, ptu_spillover, user_id, request_id,
+             created_at_epoch_secs, estimated, billed_units) ",
+        );
+        qb.push_values($rows, |mut v, r| {
+            v.push_bind(&r.ak)
+                .push_bind(&r.product)
+                .push_bind(&r.tenant)
+                .push_bind(&r.model)
+                .push_bind(&r.served_model)
+                .push_bind(&r.protocol)
+                .push_bind(&r.account)
+                .push_bind(r.prompt_tokens)
+                .push_bind(r.completion_tokens)
+                .push_bind(r.total_tokens)
+                .push_bind(r.cost_micros)
+                .push_bind(r.vendor_cost_micros)
+                .push_bind(r.ptu_spillover)
+                .push_bind(&r.user_id)
+                .push_bind(&r.request_id)
+                .push_bind(r.created_at_epoch_secs)
+                .push_bind(r.estimated)
+                .push_bind(r.billed_units);
+        });
+        qb.push(" ON CONFLICT (request_id) DO NOTHING");
+        qb
+    }};
+}
+
+macro_rules! rollup_select {
     ($d:ident) => {
         concat!(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests, \
              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, \
              billed_units) SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*), ",
-            usage_sums!($d),
+            usage_sums!($d)
+        )
+    };
+}
+
+macro_rules! q_rollup_insert {
+    ($d:ident) => {
+        concat!(
+            rollup_select!($d),
             " FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2 \
              GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET requests = ",
             sql_greatest!($d), "(usage_rollup.requests, excluded.requests), prompt_tokens = ",
@@ -1571,39 +1649,58 @@ macro_rules! sql_store_impl {
                 if rows.is_empty() {
                     return Ok(());
                 }
-                // the QueryBuilder numbers placeholders per dialect, so no dialect_sql! here
-                let mut qb = sqlx::QueryBuilder::new(
-                    "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
-                     account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
-                     vendor_cost_micros, ptu_spillover, user_id, request_id,
-                     created_at_epoch_secs, estimated, billed_units) ",
-                );
-                qb.push_values(rows, |mut v, r| {
-                    v.push_bind(&r.ak)
-                        .push_bind(&r.product)
-                        .push_bind(&r.tenant)
-                        .push_bind(&r.model)
-                        .push_bind(&r.served_model)
-                        .push_bind(&r.protocol)
-                        .push_bind(&r.account)
-                        .push_bind(r.prompt_tokens)
-                        .push_bind(r.completion_tokens)
-                        .push_bind(r.total_tokens)
-                        .push_bind(r.cost_micros)
-                        .push_bind(r.vendor_cost_micros)
-                        .push_bind(r.ptu_spillover)
-                        .push_bind(&r.user_id)
-                        .push_bind(&r.request_id)
-                        .push_bind(r.created_at_epoch_secs)
-                        .push_bind(r.estimated)
-                        .push_bind(r.billed_units);
-                });
-                qb.push(" ON CONFLICT (request_id) DO NOTHING")
+                billing_insert!(rows)
                     .build()
                     .execute(&self.pool)
                     .await
                     .map_err(|e| crate::sqlx_err("insert billing record", e))?;
                 Ok(())
+            }
+
+            async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()> {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| crate::sqlx_err("begin replay", e))?;
+                let mut insert = billing_insert!(rows);
+                let inserted: Vec<String> = insert
+                    .push(" RETURNING request_id")
+                    .build_query_scalar()
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| crate::sqlx_err("replay billing records", e))?;
+                if !inserted.is_empty() {
+                    let mut add = sqlx::QueryBuilder::new(concat!(
+                        rollup_select!($dialect),
+                        " FROM billing WHERE created_at_epoch_secs < (",
+                    ));
+                    add.push(ROLLUP_WATERMARK_SQL).push(") AND request_id IN (");
+                    let mut ids = add.separated(", ");
+                    for id in &inserted {
+                        ids.push_bind(id);
+                    }
+                    add.push(
+                        ") GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET \
+                         requests = usage_rollup.requests + excluded.requests, \
+                         prompt_tokens = usage_rollup.prompt_tokens + excluded.prompt_tokens, \
+                         completion_tokens = usage_rollup.completion_tokens + excluded.completion_tokens, \
+                         total_tokens = usage_rollup.total_tokens + excluded.total_tokens, \
+                         cost_micros = usage_rollup.cost_micros + excluded.cost_micros, \
+                         vendor_cost_micros = usage_rollup.vendor_cost_micros + excluded.vendor_cost_micros, \
+                         billed_units = usage_rollup.billed_units + excluded.billed_units",
+                    )
+                    .build()
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| crate::sqlx_err("roll up replayed records", e))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| crate::sqlx_err("commit replay", e))
             }
 
             fn defers_ledger_writes(&self) -> bool {
@@ -3466,6 +3563,69 @@ mod tests {
         exercise_rollup(&store, "").await;
     }
 
+    async fn exercise_replay(store: &dyn Store, ns: &str, prune: impl AsyncFnOnce(&str)) {
+        let tenant = format!("rp{ns}");
+        let billed = |at: i64| BillingRecord {
+            tenant: tenant.clone(),
+            user_id: "late".into(),
+            created_at_epoch_secs: at,
+            ..record("m1")
+        };
+        let rolled = billed(400);
+        store.ledger_add(&rolled).await.unwrap();
+        store.usage_rollup_advance(1_500).await.unwrap();
+        prune(&rolled.request_id).await;
+        let late = billed(410);
+        store
+            .ledger_replay_batch(std::slice::from_ref(&late))
+            .await
+            .unwrap();
+        store
+            .ledger_replay_batch(std::slice::from_ref(&late))
+            .await
+            .unwrap();
+        store.usage_rollup_advance(1_500).await.unwrap();
+        let usage = store
+            .usage_by_user(Some(&tenant), Some("late"), 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            usage
+                .iter()
+                .map(|u| (u.requests, u.cost_micros))
+                .collect::<Vec<_>>(),
+            vec![(2, 2 * rolled.cost_micros)],
+            "{usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_replay_adds_late_rows_to_a_pruned_bucket() {
+        let store = MemoryStore::default();
+        exercise_replay(&store, "", async |id: &str| {
+            let mut ledger = lock(&store.ledger);
+            ledger.rows.retain(|r| r.request_id != id);
+            ledger.request_ids.remove(id);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_replay_adds_late_rows_to_a_pruned_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("replay.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_replay(&store, "", async |id: &str| {
+            sqlx::query("DELETE FROM billing WHERE request_id = ?1")
+                .bind(id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn rollup_survives_ledger_prune() {
         let store = MemoryStore::with_ledger_cap(1);
@@ -3838,6 +3998,14 @@ mod tests {
         let store = PostgresStore::connect(&own_url).await.expect("pg connect");
         let ns = format!("-{nonce}");
         exercise_rollup(&store, &ns).await;
+        exercise_replay(&store, &ns, async |id: &str| {
+            sqlx::query("DELETE FROM billing WHERE request_id = $1")
+                .bind(id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        })
+        .await;
         exercise_erase(&store, &ns).await;
         exercise_content_list(&store, &ns).await;
         exercise_terminal_idempotence(&store, &ns).await;

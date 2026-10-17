@@ -325,6 +325,11 @@ fn apply_sse_event(
     if resp.model.is_empty() {
         resp.model = crate::engine::take_string(&mut v, "/model").unwrap_or_default();
     }
+    if resp.upstream_id.is_empty()
+        && let Some(id) = crate::engine::take_string(&mut v, "/id")
+    {
+        resp.upstream_id = id;
+    }
     let mut tool_calls = None;
     if let Some(delta) = v
         .get_mut("choices")

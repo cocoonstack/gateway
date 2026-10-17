@@ -240,7 +240,11 @@ impl Write for PromptBytes {
 }
 
 /// Admission estimate: ~bytes/4 prompt plus the requested max_tokens, saturating and capped.
-fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
+fn reserve_total((prompt, max_out): (i64, i64)) -> i64 {
+    prompt.saturating_add(max_out).min(MAX_RESERVE)
+}
+
+fn reserve_parts(req: &gw_models::GatewayRequest) -> (i64, i64) {
     let typed = req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref());
     let prompt = if let Some(gw_models::TypedParams::Decisions(p)) = typed {
         let mut bytes = PromptBytes(0);
@@ -256,9 +260,16 @@ fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
         })
         .unwrap_or(DEFAULT_COMPLETION_RESERVE)
         .clamp(0, MAX_RESERVE);
-    ((prompt as i64 / 4).max(1))
-        .saturating_add(max_out)
-        .min(MAX_RESERVE)
+    ((prompt as i64 / 4).clamp(1, MAX_RESERVE), max_out)
+}
+
+fn reserve_units(req: &gw_models::GatewayRequest) -> i64 {
+    match req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref()) {
+        Some(gw_models::TypedParams::Image(p)) => p.n.clamp(1, MAX_RESERVE),
+        Some(gw_models::TypedParams::AudioTts(p)) => p.input.chars().count() as i64,
+        Some(gw_models::TypedParams::Video(_)) => 0,
+        _ => 1,
+    }
 }
 
 /// preprocess/quota_check: reserve the estimate against the AK daily quota; billing settles it.
@@ -270,7 +281,8 @@ impl DagNode for QuotaCheck {
         "quota_check"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let est = reserve_estimate(&ctx.request);
+        ctx.reserve_parts = reserve_parts(&ctx.request);
+        let est = reserve_total(ctx.reserve_parts);
         let at = gw_state::epoch_secs();
         let reserved = admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
@@ -407,10 +419,7 @@ impl DagNode for AkTpmLimit {
         "ak_tpm"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let est = ctx
-            .quota_reserved
-            .filter(|&reserved| reserved > 0)
-            .unwrap_or_else(|| reserve_estimate(&ctx.request));
+        let est = reserve_total(ctx.reserve_parts);
         ctx.tpm_reserved = admission::reserve_tpm(ctx.state.governance.as_ref(), &ctx.ak, est)
             .await
             .map_err(key_limit_denied)?;
@@ -418,7 +427,7 @@ impl DagNode for AkTpmLimit {
     }
 }
 
-/// model_access/budget: the tenant's token and cost budgets (soft caps) for the key and user.
+/// model_access/budget: hold the estimate against the day budgets, check the month ones.
 pub struct BudgetGate;
 
 #[async_trait::async_trait]
@@ -427,10 +436,34 @@ impl DagNode for BudgetGate {
         "budget"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let over = admission::check_budgets(&ctx.state, &ctx.cfg, &ctx.ak, ctx.effective_user_id())
-            .await?
-            .map_err(quota_denied)?;
+        let (prompt, max_out) = ctx.reserve_parts;
+        let (cfg, request, tenant) = (&ctx.cfg, &ctx.request, &ctx.ak.tenant);
+        let est = || {
+            let served = served_model(request.model_param_v2.as_ref());
+            let units =
+                reserve_units(request).saturating_mul(cfg.unit_price_for_tenant(tenant, served));
+            admission::BudgetSpend {
+                tokens: reserve_total((prompt, max_out)),
+                cost_micros: gw_models::cost_micros(
+                    prompt,
+                    max_out,
+                    cfg.prices_for_tenant(tenant, served),
+                )
+                .saturating_add(units),
+            }
+        };
+        let (over, hold) = admission::reserve_budgets(
+            &ctx.state,
+            &ctx.cfg,
+            &ctx.ak,
+            ctx.effective_user_id(),
+            est,
+            ctx.quota_at,
+        )
+        .await?
+        .map_err(quota_denied)?;
         ctx.user_budget = Some(over);
+        ctx.budget_hold = hold;
         Ok(())
     }
 }
@@ -658,37 +691,7 @@ impl DagNode for CostCalc {
         if resp.aborted && resp.completion_tokens == 0 {
             return bill_aborted_stream(ctx, None).await;
         }
-        let rate =
-            gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
-        // saturating sums so a malformed usage subtree can't overflow the totals
-        let mut tokens = match &resp.common_usage {
-            Some(u) => {
-                let ti = gw_models::TokenInput {
-                    prompt: u.platform_input,
-                    audio_prompt: u.audio_input,
-                    read_cache: u.read_cache,
-                    write_cache: u.write_cache,
-                    write_cache_1h: u.write_cache_1h,
-                    completion: u.completion,
-                    audio_completion: u.audio_output,
-                    reasoning: u.reason,
-                };
-                BillTokens {
-                    prompt: u.prompt_total(),
-                    completion: u.completion_total(),
-                    billable_prompt: gw_models::weighted_prompt(&ti, &rate),
-                    billable_completion: gw_models::weighted_completion(&ti, &rate),
-                    units: 0,
-                }
-            }
-            // total-only vendors (MiniMax v1): meter the total as completion, not zero
-            None if resp.prompt_tokens == 0 && resp.completion_tokens == 0 => {
-                BillTokens::weighted(0, resp.total_tokens, &rate)
-            }
-            None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
-        };
-        tokens.units = resp.billed_units;
-        bill(ctx, tokens, false).await
+        bill(ctx, usage_tokens(ctx)?, false).await
     }
 }
 
@@ -736,7 +739,7 @@ impl BillTokens {
     }
 }
 
-/// Close a buffered stream's billing: refund before delivery, bill estimates after a partial one.
+/// Close a buffered stream's billing: refund before delivery, else bill its usage or an estimate.
 pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
     if !ctx.billing_deferred {
         return Ok(());
@@ -753,19 +756,16 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
                 .outcome
                 .as_mut()
                 .ok_or_else(|| GatewayError::internal("stream delivery without an outcome"))?;
-            blank_stream_response(&mut outcome.response);
-            bill_aborted_stream(ctx, Some(completion)).await
+            if outcome.response.completion_tokens == 0 {
+                blank_stream_response(&mut outcome.response);
+                return bill_aborted_stream(ctx, Some(completion)).await;
+            }
+            outcome.response.message.clear();
+            outcome.response.aborted = true;
+            bill(ctx, usage_tokens(ctx)?, false).await
         }
         StreamDelivery::None => {
-            ctx.state
-                .governance
-                .refund_reserves(
-                    &ctx.ak.ak_id,
-                    ctx.quota_reserved.take().unwrap_or(0),
-                    ctx.tpm_reserved.take(),
-                    ctx.quota_at,
-                )
-                .await;
+            ctx.refund_reserves().await;
             if let Some(outcome) = ctx.outcome.as_mut() {
                 outcome.response.prompt_tokens = 0;
                 blank_stream_response(&mut outcome.response);
@@ -780,6 +780,38 @@ async fn bill_aborted_stream(
     ctx: &mut DagContext,
     delivered_completion: Option<i64>,
 ) -> GResult<()> {
+    ctx.served_at = Some(std::time::Instant::now());
+    let mut settle = None;
+    let usage = match (ctx.request.account.as_deref(), ctx.outcome.as_ref()) {
+        (Some(account), Some(outcome))
+            if gw_engines::generation::records_generation(
+                account,
+                &outcome.response.upstream_id,
+            ) =>
+        {
+            let guard = settle.insert(ctx.state.begin_settle());
+            gw_engines::generation::recorded_usage(
+                ctx.transport.as_ref(),
+                account,
+                &outcome.response.upstream_id,
+                guard.closing(),
+            )
+            .await
+        }
+        _ => None,
+    };
+    if let (Some(usage), Some(outcome)) = (usage, ctx.outcome.as_mut()) {
+        let common = gw_engines::extract_common_usage(&usage, false);
+        if let Some(u) = &common {
+            let r = &mut outcome.response;
+            (r.prompt_tokens, r.completion_tokens) = (u.prompt_total(), u.completion_total());
+            r.total_tokens = r.prompt_tokens.saturating_add(r.completion_tokens);
+        }
+        outcome.response.common_usage = common;
+        outcome.response.raw_usage = Some(usage);
+        ctx.decide("cost_calc", "aborted stream, billed the provider's record");
+        return bill(ctx, usage_tokens(ctx)?, false).await;
+    }
     let response = &ctx
         .outcome
         .as_ref()
@@ -818,6 +850,45 @@ fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
     response.aborted = true;
 }
 
+fn usage_tokens(ctx: &DagContext) -> GResult<BillTokens> {
+    let resp = &ctx
+        .outcome
+        .as_ref()
+        .ok_or_else(|| GatewayError::internal("billing without an engine outcome"))?
+        .response;
+    let rate =
+        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
+    // saturating sums so a malformed usage subtree can't overflow the totals
+    let mut tokens = match &resp.common_usage {
+        Some(u) => {
+            let ti = gw_models::TokenInput {
+                prompt: u.platform_input,
+                audio_prompt: u.audio_input,
+                read_cache: u.read_cache,
+                write_cache: u.write_cache,
+                write_cache_1h: u.write_cache_1h,
+                completion: u.completion,
+                audio_completion: u.audio_output,
+                reasoning: u.reason,
+            };
+            BillTokens {
+                prompt: u.prompt_total(),
+                completion: u.completion_total(),
+                billable_prompt: gw_models::weighted_prompt(&ti, &rate),
+                billable_completion: gw_models::weighted_completion(&ti, &rate),
+                units: 0,
+            }
+        }
+        // total-only vendors (MiniMax v1): meter the total as completion, not zero
+        None if resp.prompt_tokens == 0 && resp.completion_tokens == 0 => {
+            BillTokens::weighted(0, resp.total_tokens, &rate)
+        }
+        None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
+    };
+    tokens.units = resp.billed_units;
+    Ok(tokens)
+}
+
 /// Settle reserves and write the ledger; `estimated` marks an aborted stream's estimated counts.
 async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> GResult<()> {
     let ptu_spillover = ctx
@@ -848,10 +919,11 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         served_conf.and_then(|m| m.batch_discount).unwrap_or(1.0)
     };
     // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
-    let (reserved, tpm_reserved, model_quota_key) = (
+    let (reserved, tpm_reserved, model_quota_key, budget_hold) = (
         ctx.quota_reserved.take().unwrap_or(0),
         ctx.tpm_reserved.take(),
         ctx.model_quota_key.take(),
+        std::mem::take(&mut ctx.budget_hold),
     );
     let settled = admission::settle_and_bill(
         ctx.state.as_ref(),
@@ -885,6 +957,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
             model_quota_key,
             budget_ak: &ctx.ak,
             user_budget: ctx.user_budget,
+            budget_hold,
         },
     )
     .await;
@@ -892,7 +965,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         "cost_calc",
         format!(
             "tokens={} cost_micros={}",
-            settled.total_tokens, settled.cost_micros
+            settled.tokens, settled.cost_micros
         ),
     );
     Ok(())
@@ -1095,7 +1168,43 @@ mod tests {
     }
 
     #[test]
-    fn reserve_estimate_saturates_on_hostile_max_tokens() {
+    fn reserve_units_counts_what_admission_already_knows() {
+        use gw_models::params::{ImageParams, TtsParams, VideoParams};
+        use gw_models::{GatewayRequest, ModelParamV2, TypedParams};
+        let units = |typed: TypedParams| {
+            let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, "m");
+            param.typed = Some(typed);
+            super::reserve_units(&GatewayRequest {
+                model_param_v2: Some(param),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            units(TypedParams::Image(ImageParams {
+                n: 3,
+                ..Default::default()
+            })),
+            3
+        );
+        assert_eq!(
+            units(TypedParams::AudioTts(TtsParams {
+                input: "héllo".into(),
+                ..Default::default()
+            })),
+            5
+        );
+        assert_eq!(units(TypedParams::Video(VideoParams::default())), 0);
+        assert_eq!(
+            units(TypedParams::Image(ImageParams {
+                n: i64::MAX,
+                ..Default::default()
+            })),
+            super::MAX_RESERVE
+        );
+    }
+
+    #[test]
+    fn reserve_total_saturates_on_hostile_max_tokens() {
         use gw_models::params::ChatParams;
         use gw_models::{ChatMsg, GatewayRequest, ModelParamV2, TypedParams};
         let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, "m");
@@ -1108,7 +1217,7 @@ mod tests {
             model_param_v2: Some(param),
             ..Default::default()
         };
-        let est = super::reserve_estimate(&req);
+        let est = super::reserve_total(super::reserve_parts(&req));
         assert!(est > 0 && est <= super::MAX_RESERVE);
     }
 }

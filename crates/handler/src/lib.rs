@@ -270,15 +270,7 @@ impl OnlineHandler {
                 break;
             };
             // a failed pipeline refunds its reservations whole, on the reserve's day bucket
-            ctx.state
-                .governance
-                .refund_reserves(
-                    &ctx.ak.ak_id,
-                    ctx.quota_reserved.take().unwrap_or(0),
-                    ctx.tpm_reserved.take(),
-                    ctx.quota_at,
-                )
-                .await;
+            ctx.refund_reserves().await;
             // signed thinking replays only against the model that produced it
             if is_upstream_fault(&e)
                 && !ctx.request.replays_reasoning_output()
@@ -2717,6 +2709,224 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Default)]
+    struct RecordedGenerationStream {
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for RecordedGenerationStream {
+        async fn send(
+            &self,
+            req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            use gw_engines::transport::{UpstreamBody, UpstreamResponse};
+            if req.method == "GET" {
+                assert!(
+                    req.url.ends_with("/v1/generation?id=gen-test-1"),
+                    "{}",
+                    req.url
+                );
+                let first = self
+                    .lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0;
+                let (status, body) = if first {
+                    (404, r#"{"error":{"code":404}}"#)
+                } else {
+                    (
+                        200,
+                        r#"{"data":{"cancelled":true,"native_tokens_prompt":120,"native_tokens_completion":80,"native_tokens_cached":100,"native_tokens_reasoning":0,"total_cost":0.0005}}"#,
+                    )
+                };
+                return Ok(UpstreamResponse {
+                    status,
+                    body: UpstreamBody::Json(bytes::Bytes::from_static(body.as_bytes())),
+                    headers: Default::default(),
+                });
+            }
+            let frames: Vec<Result<bytes::Bytes, gw_engines::transport::StreamFault>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"id\":\"gen-test-1\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                )),
+                Err(gw_engines::transport::StreamFault {
+                    timeout: false,
+                    message: "connection reset".to_owned(),
+                }),
+            ];
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    async fn openrouter_handler() -> (
+        OnlineHandler,
+        Arc<RecordedGenerationStream>,
+        Arc<gw_state::AkInfo>,
+    ) {
+        let yaml = "listen: {host: h, port: 1}\nproviders: [{name: openrouter, kind: openrouter, api_key_env: PATH}]\nmodels: [{name: m, provider: openrouter, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}]\ntenants: [{name: t1}]\naccess_keys: [{ak: or-ak, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let transport = Arc::new(RecordedGenerationStream::default());
+        let h = OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport.clone());
+        let ak = h.state().auth.get(&access_key_id("or-ak")).await.unwrap();
+        (h, transport, ak)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_openrouter_stream_bills_the_recorded_generation() {
+        let (h, transport, ak) = openrouter_handler().await;
+
+        let ctx = h
+            .run(drained_stream_req("m", "count to a thousand"), ak)
+            .await
+            .unwrap();
+
+        assert!(ctx.served_at.is_some());
+        let response = ctx.outcome.expect("outcome").response;
+        assert!(response.aborted);
+        assert_eq!(
+            (
+                response.prompt_tokens,
+                response.completion_tokens,
+                response.total_tokens
+            ),
+            (120, 80, 200),
+            "the access log and metrics read the record too"
+        );
+        assert_eq!(
+            transport.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        let row = &ledger[0];
+        assert!(!row.estimated, "{row:?}");
+        assert_eq!(
+            (row.prompt_tokens, row.completion_tokens),
+            (120, 80),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.cost_micros,
+            20 + 10 + 160,
+            "uncached at full price, cached at 0.1: {row:?}"
+        );
+        assert_eq!(row.vendor_cost_micros, 500, "{row:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_bills_a_pending_aborted_stream_before_the_flush_returns() {
+        let (h, transport, ak) = openrouter_handler().await;
+        let state = h.state();
+        let running = tokio::spawn({
+            let h = h.clone();
+            async move {
+                h.run(drained_stream_req("m", "count to a thousand"), ak)
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            gw_state::admission::flush_billing(&state),
+        )
+        .await
+        .expect("the flush waits only for the cancelled lookup");
+
+        let (_, ledger) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger.len(), 1, "billed before the flush returned");
+        assert!(ledger[0].estimated, "{:?}", ledger[0]);
+        assert_eq!(
+            transport.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        running.await.unwrap().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct GatedSearch(tokio::sync::Semaphore);
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for GatedSearch {
+        async fn send(
+            &self,
+            _: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            self.0.acquire().await.unwrap().forget();
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
+                    br#"{"items":[{"title":"t","url":"https://u"}],"metadata":{"query":"q","requestId":"r","latencyMs":1}}"#,
+                )),
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_unit_priced_call_holds_the_daily_cost_budget() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: web, protocol: search, provider: cloudflare, unit_price_micros: 250}]\naccounts: [{name: cf, provider: cloudflare, protocols: [search]}]\ntenants: [{name: t1, key_daily_cost_quota_micros: 250}]\naccess_keys: [{ak: s-ak, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let transport = Arc::new(GatedSearch(tokio::sync::Semaphore::new(0)));
+        let h = OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport.clone());
+        let ak = h.state().auth.get(&access_key_id("s-ak")).await.unwrap();
+        let search = || {
+            let mut param = ModelParamV2::with_name(Protocol::Search, "web");
+            param.typed = Some(gw_models::TypedParams::Search(
+                gw_models::params::SearchParams {
+                    query: "q".into(),
+                    count: 1,
+                },
+            ));
+            GatewayRequest {
+                is_online: true,
+                model_param_v2: Some(param),
+                ..Default::default()
+            }
+        };
+        let first = tokio::spawn({
+            let (h, ak) = (h.clone(), ak.clone());
+            async move { h.run(search(), ak).await }
+        });
+        let key = format!("cb:ak:{}", ak.ak_id);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while h.state().governance.quota_used(&key).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first call holds its unit price");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.run(search(), ak.clone()),
+        )
+        .await
+        .expect("a denial returns without waiting on the upstream");
+
+        let err = second.err().expect("the in-flight hold leaves no budget");
+        assert!(
+            err.message.contains("daily cost budget exhausted"),
+            "{}",
+            err.message
+        );
+        transport.0.add_permits(1);
+        first.await.unwrap().unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(
+            (ledger.len(), ledger[0].cost_micros),
+            (1, 250),
+            "{ledger:?}"
+        );
+    }
+
     #[derive(Debug)]
     struct PiiStream;
 
@@ -2732,7 +2942,7 @@ mod tests {
                     "data: {\"choices\":[{\"delta\":{\"content\":\"reach me at jane@corp.com now\"}}]}\n\n",
                 )),
                 Ok(bytes::Bytes::from(
-                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n",
                 )),
                 Ok(bytes::Bytes::from("data: [DONE]\n\n")),
             ];
@@ -2777,7 +2987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dlp_partial_replay_bills_only_delivered_text() {
+    async fn dlp_partial_replay_bills_the_upstream_usage() {
         let h = OnlineHandler::new(handler().config.clone(), Arc::new(PiiStream));
         let mut request = chat_req("gpt-4o", "hello");
         request.stream = true;
@@ -2793,9 +3003,13 @@ mod tests {
             .unwrap();
         let (_, ledger) = h.state().store.ledger_snapshot(10).await.unwrap();
         assert_eq!(ledger.len(), 1);
-        assert!(ledger[0].estimated);
-        assert!(ledger[0].completion_tokens > 0);
-        assert!(ctx.outcome.as_ref().unwrap().response.aborted);
+        assert!(!ledger[0].estimated, "{:?}", ledger[0]);
+        assert_eq!(
+            (ledger[0].prompt_tokens, ledger[0].completion_tokens),
+            (5, 7)
+        );
+        let response = &ctx.outcome.as_ref().unwrap().response;
+        assert!(response.aborted && response.message.is_empty());
     }
 
     #[tokio::test]

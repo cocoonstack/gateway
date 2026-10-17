@@ -81,10 +81,10 @@ models:
 | QPS | pooled per tenant | `tenants[].qps` |
 | Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
 | Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override (over it: the tenant `fallback_model`, else refused) |
-| Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
-| Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
-| Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
-| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (soft), per-user override via `/admin/tenants/{tenant}/users/{user}/budget` |
+| Daily tokens | per end user | `tenants[].user_daily_token_quota` (held) |
+| Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; held) |
+| Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (held) |
+| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (held), per-user override via `/admin/tenants/{tenant}/users/{user}/budget` |
 | Monthly cost | pooled per tenant / per key / per end user | `tenants[].monthly_cost_quota_micros`, `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` (UTC calendar month; soft; `monthly_cost_rollover` carries the unspent remainder); the per-user cap takes a per-user override |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |
@@ -142,8 +142,9 @@ tokens and 1-hour cache writes take their own `token_rate` weights, a
 scales what `/v1/batches` items cost.
 
 A streaming response that breaks after delivery has begun (client disconnect or
-upstream failure) is billed for what was delivered: the vendor's usage frame
-never arrives, so the token count is estimated from the request and the
+upstream failure) never sees the vendor's usage frame. On an OpenRouter account
+it is billed from OpenRouter's record of the generation, which counts what the
+model generated; elsewhere the token count is estimated from the request and the
 delivered text. A disconnect *before* any bytes are sent bills nothing.
 
 ## MCP tool access
@@ -234,8 +235,9 @@ deltas), so **whenever a tenant redacts output — `dlp_redact` or
 replayed** rather than forwarded token-by-token — DLP trades
 incremental delivery for a guarantee that no unmasked text reaches the client.
 Billing is settled after that replay: a disconnect before the first redacted
-chunk refunds the reservation, while a partial replay bills only an estimate of
-the delivered text.
+chunk refunds the reservation, while a partial replay bills the upstream's usage
+frame (what the model generated), or an estimate of the delivered text when the
+upstream sent none.
 Turn both `dlp_redact` and `detect_secrets` off to keep incremental delivery;
 note the embedded demo config ships with `dlp_redact` on.
 
@@ -262,15 +264,25 @@ REST, realtime (the `x-gw-user` hint is captured at WS connect), and batch
 (each item's `user`, or the submitter's `x-gw-user`, is persisted with the item
 so a fleet drainer still attributes and budgets it). `GET /admin/usage/users?user=&since=&until=`
 returns per-(user, model) cost over a billing period (add `format=csv` for
-export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap —
-enforced with a hard `400 service_quota_exceeded_exception` once exceeded;
-"soft" means check-then-consume, so concurrent in-flight turns can overshoot it
-by one before the counter accrues.
+export). `TenantConf.user_daily_token_quota` sets a per-user daily cap —
+enforced with a hard `400 service_quota_exceeded_exception` once exceeded.
+On the REST pipeline every daily budget holds the call's estimate at admission
+(the token estimate for the token cap; for the cost caps that estimate's prompt
+and `max_tokens` sides at the tenant's price), admitting while spent plus held
+is under the cap, so concurrent holds pass it by at most one hold; billing
+settles the hold to the charged amount and a failed call returns it. A call that
+costs more than it held still carries the total past the cap by the difference:
+a call without `max_tokens` holds 256 output tokens. Units known at admission
+hold at the unit price (a search, `n` images, the characters of a speech
+request; one unit for transcription and rerank); video bills at its poll and
+vendor-priced decisions report their cost after the call, so for those the cost
+caps only check. Realtime turns and the monthly caps check before the call
+and accrue after it ("soft": concurrent turns can overshoot by one each).
 The per-(key, model) quota is soft the same way: it is a routing trigger (the
 fallback-model degrade), while the reserved per-key daily quota hard-caps spend.
 The daily cost budgets — `daily_cost_quota_micros` pooled over the tenant's
 keys, `key_daily_cost_quota_micros` per key, `user_daily_cost_quota_micros`
-per end user — are soft caps of the same kind over the ledger's charged
+per end user — are caps of the same kind over the ledger's charged
 `cost_micros` (list price, the tenant's `model_prices`, or a decisions reply's
 `usage.cost`, so unit-priced surfaces count too); they apply on every surface, realtime and batch included,
 and a response-cache hit, which bills nothing, counts nothing.

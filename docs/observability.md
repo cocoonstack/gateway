@@ -87,9 +87,26 @@ the unit-priced surfaces; also summed in `/admin/usage`), charged
 `cost_micros` and `vendor_cost_micros`,
 `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag (set
 when counts came from an aborted stream rather than a vendor usage payload).
+An aborted stream served by an OpenRouter account is billed from OpenRouter's
+record of the generation instead (`GET /api/v1/generation`, polled for about
+40 s with each lookup capped at 10 s; cancelled generations included), with cache
+reads at their weight (the record carries no cache-write count, so a cache write
+bills at the prompt weight) and OpenRouter's cost as `vendor_cost_micros`; only when no
+record arrives, or the gateway starts shutting down, does it fall back to the
+estimate. Shutdown waits for these settles before the final ledger flush, and the
+access log's `latency_ms` stops at the end of the stream, not of the lookup.
 Writes are idempotent by `request_id`; a transient store failure is held in a
 bounded repair queue and retried with backoff — eight attempts, about 13 s —
 before the batch is dropped and counted in `gateway_ledger_write_failures_total`.
+With `storage.ledger_spool_path` set, the batch instead goes to that local
+JSON-lines file after three attempts (about 0.3 s; the directory is created on
+first use, and a spool that cannot be written falls back to the remaining
+retries), and a replay every 30 s inserts it in batches once the store accepts
+writes again; in the same transaction it adds the rows it inserted to any usage
+rollup bucket the watermark already passed, so a late row counts even after its
+bucket's other rows were pruned, and a repeated replay adds nothing
+(`billing spool replayed` in the log). The spool path is per-instance local
+disk; replicas must not share one file.
 A full queue applies backpressure to settlement until the repair worker makes
 room, so overload alone never discards an accepted row.
 Per-user usage additionally rolls into durable minute buckets every minute, so

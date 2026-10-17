@@ -35,9 +35,16 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
         limit: i64,
         at_epoch_secs: i64,
     ) -> Option<i64>;
+    /// [`Self::quota_reserve`] over every hold at once, all or none: `Err(i)` = `holds[i]` is at its cap, `Ok(false)` = admitted unrecorded.
+    async fn quota_reserve_all(
+        &self,
+        holds: &[(&str, i64, i64)],
+        at_epoch_secs: i64,
+    ) -> Result<bool, usize>;
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
     /// bucket the paired reserve used (`at_epoch_secs`).
     async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
+    async fn quota_settle_all(&self, deltas: &[(&str, i64)], at_epoch_secs: i64) -> Vec<i64>;
     /// Tokens spent today under `key`.
     async fn quota_used(&self, key: &str) -> i64;
     /// Add to `key`'s spent tokens; returns the day's new total.
@@ -105,8 +112,25 @@ impl Governance for MemoryGovernance {
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> Option<i64> {
         self.quota.reserve(key, amount, limit).then_some(amount)
     }
+    async fn quota_reserve_all(&self, holds: &[(&str, i64, i64)], _at: i64) -> Result<bool, usize> {
+        for (i, &(key, amount, limit)) in holds.iter().enumerate() {
+            if !self.quota.reserve(key, amount, limit) {
+                for &(key, amount, _) in &holds[..i] {
+                    self.quota.settle(key, -amount);
+                }
+                return Err(i);
+            }
+        }
+        Ok(true)
+    }
     async fn quota_settle(&self, key: &str, delta: i64, _at: i64) {
         self.quota.settle(key, delta);
+    }
+    async fn quota_settle_all(&self, deltas: &[(&str, i64)], _at: i64) -> Vec<i64> {
+        deltas
+            .iter()
+            .map(|&(key, delta)| self.quota.settle(key, delta))
+            .collect()
     }
     async fn quota_used(&self, key: &str) -> i64 {
         self.quota.used(key)
@@ -216,6 +240,30 @@ impl RedisGovernance {
         }
     }
 
+    async fn incr_all(&self, incrs: &[(String, i64)]) -> redis::RedisResult<Vec<i64>> {
+        if incrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for (key, by) in incrs {
+            pipe.cmd("INCRBY").arg(key).arg(*by);
+        }
+        let mut conn = self.conn.clone();
+        let totals: Vec<i64> = pipe.query_async(&mut conn).await?;
+        let mut arm = redis::pipe();
+        let mut fresh = false;
+        for ((key, by), total) in incrs.iter().zip(&totals) {
+            if total == by {
+                arm.cmd("PEXPIRE").arg(key).arg(QUOTA_TTL_MS).ignore();
+                fresh = true;
+            }
+        }
+        if fresh {
+            arm.query_async::<()>(&mut conn).await?;
+        }
+        Ok(totals)
+    }
+
     /// Increment `key` and set its TTL on first use; returns the post-increment
     /// count. A failed round-trip returns 0 so limits fail open rather than
     /// wedging the gateway on a Redis blip.
@@ -275,6 +323,34 @@ impl Governance for RedisGovernance {
                 }
             })
     }
+    async fn quota_reserve_all(&self, holds: &[(&str, i64, i64)], at: i64) -> Result<bool, usize> {
+        let incrs: Vec<_> = holds
+            .iter()
+            .map(|&(key, amount, _)| (quota_key_at(key, at), amount))
+            .collect();
+        let totals = match self.incr_all(&incrs).await {
+            Ok(totals) => totals,
+            Err(e) => {
+                tracing::warn!(error = %e, "redis budget reserve failed; admitting");
+                return Ok(false);
+            }
+        };
+        let Some(i) = holds
+            .iter()
+            .zip(&totals)
+            .position(|(&(_, amount, limit), &v)| v - amount >= limit)
+        else {
+            return Ok(true);
+        };
+        let mut undo = redis::pipe();
+        for (key, amount) in &incrs {
+            undo.cmd("DECRBY").arg(key).arg(*amount).ignore();
+        }
+        if let Err(e) = undo.query_async::<()>(&mut self.conn.clone()).await {
+            tracing::warn!(error = %e, "redis budget rollback failed");
+        }
+        Err(i)
+    }
     async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
             return;
@@ -287,6 +363,32 @@ impl Governance for RedisGovernance {
             None,
         )
         .await;
+    }
+    async fn quota_settle_all(&self, deltas: &[(&str, i64)], at: i64) -> Vec<i64> {
+        let incrs: Vec<_> = deltas
+            .iter()
+            .map(|&(key, delta)| (quota_key_at(key, at), delta))
+            .collect();
+        let mut totals = match self.incr_all(&incrs).await {
+            Ok(totals) => totals,
+            Err(e) => {
+                tracing::warn!(error = %e, "redis budget settle failed");
+                return vec![0; deltas.len()];
+            }
+        };
+        let mut floor = redis::pipe();
+        let mut floored = false;
+        for ((key, _), total) in incrs.iter().zip(totals.iter_mut()) {
+            if *total < 0 {
+                floor.cmd("SET").arg(key).arg(0).arg("KEEPTTL").ignore();
+                *total = 0;
+                floored = true;
+            }
+        }
+        if floored && let Err(e) = floor.query_async::<()>(&mut self.conn.clone()).await {
+            tracing::warn!(error = %e, "redis budget floor failed");
+        }
+        totals
     }
     async fn quota_consume(&self, key: &str, tokens: i64) -> i64 {
         self.incr_window(
@@ -404,6 +506,75 @@ mod tests {
         assert!((1..=60).contains(&ttl), "ttl armed on first use: {ttl}");
         let _: i64 = redis::cmd("DEL")
             .arg(counter_key(&key))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    async fn exercise_reserve_all(g: &dyn Governance, ns: &str) {
+        let (a, b, c) = (format!("ra{ns}"), format!("rb{ns}"), format!("rc{ns}"));
+        let now = crate::epoch_secs();
+        let pair = [(a.as_str(), 60, 100), (b.as_str(), 30, 50)];
+        assert_eq!(g.quota_reserve_all(&pair, now).await, Ok(true));
+        assert_eq!(g.quota_reserve_all(&pair, now).await, Ok(true));
+        assert_eq!((g.quota_used(&a).await, g.quota_used(&b).await), (120, 60));
+        assert_eq!(
+            g.quota_reserve_all(&[(a.as_str(), 1, 100), (b.as_str(), 1, 50)], now)
+                .await,
+            Err(0)
+        );
+        assert_eq!(
+            g.quota_reserve_all(&[(c.as_str(), 5, 100), (b.as_str(), 1, 50)], now)
+                .await,
+            Err(1)
+        );
+        assert_eq!(
+            (
+                g.quota_used(&a).await,
+                g.quota_used(&b).await,
+                g.quota_used(&c).await
+            ),
+            (120, 60, 0)
+        );
+        assert_eq!(
+            g.quota_settle_all(&[(a.as_str(), -200), (b.as_str(), -10)], now)
+                .await,
+            vec![0, 50]
+        );
+        assert_eq!(g.quota_settle_all(&[(b.as_str(), 0)], now).await, vec![50]);
+        assert_eq!(g.quota_reserve_all(&[], now).await, Ok(true));
+        assert!(g.quota_settle_all(&[], now).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_reserve_all_holds_all_or_none() {
+        exercise_reserve_all(&MemoryGovernance::default(), "").await;
+    }
+
+    #[tokio::test]
+    async fn redis_reserve_all_holds_all_or_none() {
+        let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
+            return;
+        };
+        let g = RedisGovernance::connect(&url).await.expect("redis connect");
+        let ns = format!("-{}", std::process::id());
+        exercise_reserve_all(&g, &ns).await;
+        let now = crate::epoch_secs();
+        let keys: Vec<_> = ["ra", "rb", "rc"]
+            .iter()
+            .map(|k| quota_key_at(&format!("{k}{ns}"), now))
+            .collect();
+        let mut conn = g.conn.clone();
+        for key in &keys {
+            let ttl: i64 = redis::cmd("PTTL")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert!(ttl > 0, "{key} ttl {ttl}");
+        }
+        let _: i64 = redis::cmd("DEL")
+            .arg(&keys)
             .query_async(&mut conn)
             .await
             .unwrap();

@@ -14,6 +14,7 @@ pub mod engine;
 pub mod eventstream;
 pub mod factory;
 pub mod families;
+pub mod generation;
 pub mod http_transport;
 pub mod mock_transport;
 pub mod multipart;

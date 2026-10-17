@@ -389,9 +389,11 @@ impl QuotaStore {
         reserve_on(&mut slot_mut(&self.used, key, || 0), amount, limit)
     }
 
-    /// Apply the settle delta (actual - reserved); never below zero.
-    pub fn settle(&self, key: &str, delta: i64) {
-        settle_on(&mut slot_mut(&self.used, key, || 0), delta);
+    /// Apply the settle delta (actual - reserved); never below zero. Returns the new total.
+    pub fn settle(&self, key: &str, delta: i64) -> i64 {
+        let mut e = slot_mut(&self.used, key, || 0);
+        settle_on(&mut e, delta);
+        *e
     }
 
     pub fn reset_all(&self) {
@@ -865,7 +867,8 @@ impl GatewayState {
                 }
             }
         }
-        state.billing = admission::BillingLedger::repairing(state.store.clone());
+        state.billing =
+            admission::BillingLedger::repairing(state.store.clone(), &st.ledger_spool_path);
         Ok(state)
     }
 
@@ -889,6 +892,10 @@ impl GatewayState {
             latency: prev.latency.clone(),
             streams: prev.streams.clone(),
         })
+    }
+
+    pub fn begin_settle(&self) -> admission::SettleGuard {
+        self.billing.begin_settle()
     }
 }
 
@@ -1075,11 +1082,16 @@ fn settle_on(counter: &mut i64, delta: i64) {
 
 #[cfg(test)]
 pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let db = format!("gwtest_{nonce}");
+    let db = format!(
+        "gwtest_{nonce}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let admin = sqlx::PgPool::connect(url).await.expect("pg admin");
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
         .execute(&admin)
