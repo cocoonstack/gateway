@@ -312,9 +312,6 @@ impl Governance for RedisGovernance {
                  return 0",
             )
         });
-        if holds.is_empty() {
-            return Ok(true);
-        }
         let mut invocation = SCRIPT.prepare_invoke();
         invocation.arg(QUOTA_TTL_MS);
         for &(key, amount, limit) in holds {
@@ -358,9 +355,6 @@ impl Governance for RedisGovernance {
                  return out",
             )
         });
-        if deltas.is_empty() {
-            return Vec::new();
-        }
         let mut invocation = SCRIPT.prepare_invoke();
         invocation.arg(QUOTA_TTL_MS);
         for &(key, delta) in deltas {

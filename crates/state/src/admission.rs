@@ -73,6 +73,9 @@ pub struct BudgetHold {
 impl BudgetHold {
     /// Return every held amount, for a call that never reached billing.
     pub async fn refund(self, gov: &dyn Governance) {
+        if self.held.is_empty() {
+            return;
+        }
         let refunds: Vec<_> = self
             .held
             .iter()
@@ -516,7 +519,16 @@ pub async fn reserve_budgets(
 ) -> GResult<Result<(UserBudget, BudgetHold), String>> {
     let over = user_budget(state, ak, user).await?;
     let gov = state.governance.as_ref();
-    let budgets = budgets(gov, cfg, ak, user, over).await;
+    let mut budgets = budgets(gov, cfg, ak, user, over).await;
+    if budgets.is_empty() {
+        return Ok(Ok((
+            over,
+            BudgetHold {
+                held: Vec::new(),
+                at,
+            },
+        )));
+    }
     let est = if budgets.iter().any(|b| b.window == Window::Day) {
         est()
     } else {
@@ -534,7 +546,13 @@ pub async fn reserve_budgets(
         .map(|&(i, amount)| (budgets[i].key.as_str(), amount, budgets[i].limit))
         .collect();
     let (reserved, checked) = tokio::join!(
-        gov.quota_reserve_all(&hold_args, at),
+        async {
+            if hold_args.is_empty() {
+                Ok(true)
+            } else {
+                gov.quota_reserve_all(&hold_args, at).await
+            }
+        },
         futures::future::join_all(budgets.iter().map(|b| async move {
             match b.window {
                 Window::Day if est.of(b.scope) > 0 => true,
@@ -554,7 +572,7 @@ pub async fn reserve_budgets(
         let held = if reserved == Ok(true) {
             holds
                 .iter()
-                .map(|&(i, amount)| (budgets[i].key.clone(), amount))
+                .map(|&(i, amount)| (std::mem::take(&mut budgets[i].key), amount))
                 .collect()
         } else {
             Vec::new()
@@ -811,7 +829,13 @@ async fn consume_budgets(
         .map(|&(_, key, delta)| (key, delta))
         .collect();
     let (settled, accrued) = tokio::join!(
-        gov.quota_settle_all(&deltas, hold.at),
+        async {
+            if deltas.is_empty() {
+                Vec::new()
+            } else {
+                gov.quota_settle_all(&deltas, hold.at).await
+            }
+        },
         futures::future::join_all(accrues.iter().map(|&i| {
             let b = &budgets[i];
             let amount = spent.of(b.scope);
