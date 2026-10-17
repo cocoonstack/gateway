@@ -154,6 +154,7 @@ impl BillingLedger {
             // detached: replays the spool for the life of the process
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(LEDGER_REPLAY_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
                     spool.replay(&replay_store).await;
@@ -190,11 +191,9 @@ impl BillingLedger {
             }
         });
         Self {
-            store,
             queue: Some(queue),
             deferred,
-            settles: TaskTracker::new(),
-            closing: CancellationToken::new(),
+            ..Self::direct(store)
         }
     }
 
@@ -332,7 +331,7 @@ impl LedgerSpool {
         }
         let path = self.path.clone();
         let _held = self.lock.lock().await;
-        blocking(move || {
+        run_blocking(move || {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -348,7 +347,7 @@ impl LedgerSpool {
         let claimed = {
             let (path, replaying) = (self.path.clone(), self.replaying.clone());
             let _held = self.lock.lock().await;
-            blocking(move || {
+            run_blocking(move || {
                 if replaying.exists() {
                     return Ok(true);
                 }
@@ -367,10 +366,12 @@ impl LedgerSpool {
                 return;
             }
         }
-        let (mut offset, mut replayed, mut since) = (0, 0, i64::MAX);
+        let (mut offset, mut replayed, mut since) = (0, 0, None);
         loop {
             let replaying = self.replaying.clone();
-            let (rows, next) = match blocking(move || read_spool_batch(&replaying, offset)).await {
+            let (rows, next) = match run_blocking(move || read_spool_batch(&replaying, offset))
+                .await
+            {
                 Ok(batch) => batch,
                 Err(e) => {
                     tracing::error!(error = %e, path = %self.replaying.display(), "billing spool read failed");
@@ -388,17 +389,18 @@ impl LedgerSpool {
             since = rows
                 .iter()
                 .map(|r| r.created_at_epoch_secs)
-                .fold(since, i64::min);
+                .chain(since)
+                .min();
             offset = next;
         }
-        if replayed > 0
+        if since.is_some()
             && let Err(e) = store.usage_rollup_since(since, crate::epoch_secs()).await
         {
             tracing::warn!(error = %e, rows = replayed, "billing spool rollup deferred");
             return;
         }
         let replaying = self.replaying.clone();
-        if let Err(e) = blocking(move || std::fs::remove_file(replaying)).await {
+        if let Err(e) = run_blocking(move || std::fs::remove_file(replaying)).await {
             tracing::error!(error = %e, path = %self.replaying.display(), "billing spool remove failed");
             return;
         }
@@ -508,7 +510,7 @@ pub async fn flush_billing(state: &GatewayState) {
     }
 }
 
-/// Hold the estimate `est` yields against the day budgets, admitting while spent plus held is under each cap; month budgets and a zero estimate only check.
+/// Hold the call's estimate against each day budget while spent plus held stays under its cap; month budgets only check.
 pub async fn reserve_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,
@@ -945,7 +947,7 @@ fn read_spool_batch(path: &Path, offset: u64) -> std::io::Result<(Vec<BillingRec
     Ok((rows, next))
 }
 
-async fn blocking<T, F>(f: F) -> std::io::Result<T>
+async fn run_blocking<T, F>(f: F) -> std::io::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
@@ -1339,6 +1341,14 @@ mod tests {
         assert_eq!(previous_month((2026, 9)), (2026, 8));
     }
 
+    async fn daily_fixture() -> (Arc<GatewayConfig>, Arc<GatewayState>, Arc<AkInfo>) {
+        let yaml = "listen: {host: h, port: 1}\ntenants: [{name: t1, key_daily_cost_quota_micros: 100}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 1000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let ak = state.auth.get(&access_key_id("k1")).await.unwrap();
+        (cfg, state, ak)
+    }
+
     async fn monthly_fixture(
         rollover: bool,
     ) -> (Arc<GatewayConfig>, Arc<GatewayState>, Arc<AkInfo>) {
@@ -1397,10 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn daily_budgets_hold_in_flight_calls_until_they_settle() {
-        let yaml = "listen: {host: h, port: 1}\ntenants: [{name: t1, key_daily_cost_quota_micros: 100}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 1000}]";
-        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
-        let state = Arc::new(GatewayState::from_config(&cfg));
-        let ak = state.auth.get(&access_key_id("k1")).await.unwrap();
+        let (cfg, state, ak) = daily_fixture().await;
         let gov = state.governance.as_ref();
         let key = format!("cb:ak:{}", ak.ak_id);
         let est = BudgetSpend {
@@ -1439,11 +1446,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_settle_that_matches_its_hold_still_alerts_at_the_cap() {
-        let yaml = "listen: {host: h, port: 1}\ntenants: [{name: t1, key_daily_cost_quota_micros: 100}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 1000}]";
-        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
-        let state = Arc::new(GatewayState::from_config(&cfg));
+        let (cfg, state, ak) = daily_fixture().await;
         let mut alerts = state.alerts.take_receiver().unwrap();
-        let ak = state.auth.get(&access_key_id("k1")).await.unwrap();
         let spend = BudgetSpend {
             tokens: 1,
             cost_micros: 100,

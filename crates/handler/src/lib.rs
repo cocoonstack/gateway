@@ -2763,14 +2763,23 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn an_aborted_openrouter_stream_bills_the_recorded_generation() {
+    async fn openrouter_handler() -> (
+        OnlineHandler,
+        Arc<RecordedGenerationStream>,
+        Arc<gw_state::AkInfo>,
+    ) {
         let yaml = "listen: {host: h, port: 1}\nproviders: [{name: openrouter, kind: openrouter, api_key_env: PATH}]\nmodels: [{name: m, provider: openrouter, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 2000, token_rate: {read_cache: 0.1}}]\ntenants: [{name: t1}]\naccess_keys: [{ak: or-ak, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let transport = Arc::new(RecordedGenerationStream::default());
         let h = OnlineHandler::new(gw_state::SharedConfig::new(cfg, state), transport.clone());
         let ak = h.state().auth.get(&access_key_id("or-ak")).await.unwrap();
+        (h, transport, ak)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_openrouter_stream_bills_the_recorded_generation() {
+        let (h, transport, ak) = openrouter_handler().await;
 
         let ctx = h
             .run(drained_stream_req("m", "count to a thousand"), ak)
@@ -2810,17 +2819,10 @@ mod tests {
         assert_eq!(row.vendor_cost_micros, 500, "{row:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_bills_a_pending_aborted_stream_before_the_flush_returns() {
-        let yaml = "listen: {host: h, port: 1}\nproviders: [{name: openrouter, kind: openrouter, api_key_env: PATH}]\nmodels: [{name: m, provider: openrouter, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 2000}]\ntenants: [{name: t1}]\naccess_keys: [{ak: or-ak, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
-        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
-        let state = Arc::new(GatewayState::from_config(&cfg));
-        let transport = Arc::new(RecordedGenerationStream::default());
-        let h = OnlineHandler::new(
-            gw_state::SharedConfig::new(cfg, state.clone()),
-            transport.clone(),
-        );
-        let ak = h.state().auth.get(&access_key_id("or-ak")).await.unwrap();
+        let (h, transport, ak) = openrouter_handler().await;
+        let state = h.state();
         let running = tokio::spawn({
             let h = h.clone();
             async move {

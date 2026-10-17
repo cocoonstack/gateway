@@ -1350,14 +1350,14 @@ fn user_hint(hint: Option<String>, field: &Value) -> Option<String> {
     hint.or_else(|| field.as_str().map(cap_user_hint))
 }
 
-/// Bound an attribution hint at `USER_HINT_MAX_BYTES`: it keys governance
-/// counters, so an unbounded value from any surface would grow the keyspace.
+/// Bound an attribution hint at `USER_HINT_MAX_BYTES` (it keys governance counters)
+/// and drop NUL, which Postgres TEXT refuses in every row the user lands in.
 fn cap_user_hint(s: &str) -> String {
     let mut end = s.len().min(USER_HINT_MAX_BYTES);
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    s[..end].to_owned()
+    s[..end].replace('\0', "")
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -6728,6 +6728,17 @@ mod tests {
         assert_eq!(
             records[0].cost_micros, 200_000,
             "settled at the admission price, not the reloaded one"
+        );
+    }
+
+    #[test]
+    fn user_hints_are_capped_and_drop_nul() {
+        assert_eq!(cap_user_hint("nul\0user"), "nuluser");
+        let long = "é".repeat(USER_HINT_MAX_BYTES);
+        assert!(cap_user_hint(&long).len() <= USER_HINT_MAX_BYTES);
+        assert_eq!(
+            user_hint(None, &serde_json::json!("\u{0}")),
+            Some(String::new())
         );
     }
 

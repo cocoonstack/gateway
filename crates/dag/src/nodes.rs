@@ -240,8 +240,7 @@ impl Write for PromptBytes {
 }
 
 /// Admission estimate: ~bytes/4 prompt plus the requested max_tokens, saturating and capped.
-fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
-    let (prompt, max_out) = reserve_parts(req);
+fn reserve_total((prompt, max_out): (i64, i64)) -> i64 {
     prompt.saturating_add(max_out).min(MAX_RESERVE)
 }
 
@@ -274,8 +273,7 @@ impl DagNode for QuotaCheck {
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         ctx.reserve_parts = reserve_parts(&ctx.request);
-        let (prompt, max_out) = ctx.reserve_parts;
-        let est = prompt.saturating_add(max_out).min(MAX_RESERVE);
+        let est = reserve_total(ctx.reserve_parts);
         let at = gw_state::epoch_secs();
         let reserved = admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
@@ -412,10 +410,7 @@ impl DagNode for AkTpmLimit {
         "ak_tpm"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let est = ctx
-            .quota_reserved
-            .filter(|&reserved| reserved > 0)
-            .unwrap_or_else(|| reserve_estimate(&ctx.request));
+        let est = reserve_total(ctx.reserve_parts);
         ctx.tpm_reserved = admission::reserve_tpm(ctx.state.governance.as_ref(), &ctx.ak, est)
             .await
             .map_err(key_limit_denied)?;
@@ -423,7 +418,7 @@ impl DagNode for AkTpmLimit {
     }
 }
 
-/// model_access/budget: holds the call's estimate against the daily budgets (tenant, key, user) and checks the monthly ones.
+/// model_access/budget: hold the estimate against the day budgets, check the month ones.
 pub struct BudgetGate;
 
 #[async_trait::async_trait]
@@ -435,7 +430,7 @@ impl DagNode for BudgetGate {
         let (prompt, max_out) = ctx.reserve_parts;
         let (cfg, request, tenant) = (&ctx.cfg, &ctx.request, &ctx.ak.tenant);
         let est = || admission::BudgetSpend {
-            tokens: prompt.saturating_add(max_out).min(MAX_RESERVE),
+            tokens: reserve_total((prompt, max_out)),
             cost_micros: gw_models::cost_micros(
                 prompt,
                 max_out,
@@ -770,25 +765,27 @@ async fn bill_aborted_stream(
     ctx: &mut DagContext,
     delivered_completion: Option<i64>,
 ) -> GResult<()> {
-    let settle = ctx.state.begin_settle();
     ctx.served_at = Some(std::time::Instant::now());
+    let mut settle = None;
     let usage = match (ctx.request.account.as_deref(), ctx.outcome.as_ref()) {
-        (Some(account), Some(outcome)) => {
+        (Some(account), Some(outcome))
+            if gw_engines::generation::records_generation(
+                account,
+                &outcome.response.upstream_id,
+            ) =>
+        {
+            let guard = settle.insert(ctx.state.begin_settle());
             gw_engines::generation::recorded_usage(
                 ctx.transport.as_ref(),
                 account,
                 &outcome.response.upstream_id,
-                settle.closing(),
+                guard.closing(),
             )
             .await
         }
         _ => None,
     };
-    if let Some(usage) = usage {
-        let outcome = ctx
-            .outcome
-            .as_mut()
-            .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?;
+    if let (Some(usage), Some(outcome)) = (usage, ctx.outcome.as_mut()) {
         let common = gw_engines::extract_common_usage(&usage, false);
         if let Some(u) = &common {
             let r = &mut outcome.response;
@@ -842,7 +839,7 @@ async fn bill_usage(ctx: &mut DagContext) -> GResult<()> {
     let resp = &ctx
         .outcome
         .as_ref()
-        .ok_or_else(|| GatewayError::internal("cost_calc without an engine outcome"))?
+        .ok_or_else(|| GatewayError::internal("billing without an engine outcome"))?
         .response;
     let rate =
         gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
@@ -1156,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_estimate_saturates_on_hostile_max_tokens() {
+    fn reserve_total_saturates_on_hostile_max_tokens() {
         use gw_models::params::ChatParams;
         use gw_models::{ChatMsg, GatewayRequest, ModelParamV2, TypedParams};
         let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, "m");
@@ -1169,7 +1166,7 @@ mod tests {
             model_param_v2: Some(param),
             ..Default::default()
         };
-        let est = super::reserve_estimate(&req);
+        let est = super::reserve_total(super::reserve_parts(&req));
         assert!(est > 0 && est <= super::MAX_RESERVE);
     }
 }

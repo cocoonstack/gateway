@@ -3,11 +3,11 @@
 use std::time::Duration;
 
 use gw_consts::Protocol;
-use gw_models::{Account, GResult, GatewayError};
+use gw_models::{Account, GResult};
 use serde_json::{Value, json};
 
-use crate::base::versioned_url;
-use crate::transport::{Transport, UpstreamBody, UpstreamRequest};
+use crate::base::{parse_json_reply, versioned_url};
+use crate::transport::{Transport, UpstreamRequest};
 
 const OPENROUTER_KIND: &str = "openrouter";
 /// Waits before each lookup of an abandoned stream's recorded usage; OpenRouter records one in about 5 s.
@@ -25,14 +25,16 @@ pub async fn recorded_usage(
     id: &str,
     closing: impl Future<Output = ()>,
 ) -> Option<Value> {
-    if !records_generation(account, id) {
-        return None;
-    }
+    let key = account.api_key()?;
     tokio::pin!(closing);
     for delay in LOOKUP_DELAYS {
         let lookup = async {
             tokio::time::sleep(delay).await;
-            tokio::time::timeout(LOOKUP_TIMEOUT, openrouter_usage(transport, account, id)).await
+            tokio::time::timeout(
+                LOOKUP_TIMEOUT,
+                openrouter_usage(transport, account, id, &key),
+            )
+            .await
         };
         tokio::select! {
             () = &mut closing => {
@@ -54,10 +56,9 @@ pub async fn recorded_usage(
     None
 }
 
-fn records_generation(account: &Account, id: &str) -> bool {
+pub fn records_generation(account: &Account, id: &str) -> bool {
     account.wire_kind() == OPENROUTER_KIND
         && !account.endpoint.is_empty()
-        && !account.api_key_env.is_empty()
         && !id.is_empty()
         && id
             .bytes()
@@ -69,10 +70,8 @@ async fn openrouter_usage(
     transport: &dyn Transport,
     account: &Account,
     id: &str,
+    key: &str,
 ) -> GResult<Option<Value>> {
-    let Some(key) = account.api_key() else {
-        return Ok(None);
-    };
     let resp = transport
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
@@ -89,22 +88,8 @@ async fn openrouter_usage(
     if resp.status == 404 {
         return Ok(None);
     }
-    let UpstreamBody::Json(body) = resp.body else {
-        return Err(lookup_failed("generation lookup returned no JSON body"));
-    };
-    if resp.status != 200 {
-        return Err(lookup_failed(format!(
-            "generation lookup returned {}",
-            resp.status
-        )));
-    }
-    let doc: Value = serde_json::from_slice(&body)
-        .map_err(|e| lookup_failed(format!("generation lookup body: {e}")))?;
+    let (_, doc) = parse_json_reply(resp)?;
     Ok(generation_usage(&doc["data"]))
-}
-
-fn lookup_failed(message: impl Into<String>) -> GatewayError {
-    GatewayError::new(gw_consts::ErrCode::FED_RESP_RPC_FAILED, 502, message)
 }
 
 /// Map `/generation` data to chat-wire usage, reasoning inside completion as in `completion_tokens`.
@@ -125,7 +110,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::transport::UpstreamResponse;
+    use crate::transport::{UpstreamBody, UpstreamResponse};
 
     #[derive(Debug)]
     struct Canned(u16, &'static str, Mutex<Vec<String>>);
@@ -162,7 +147,7 @@ mod tests {
             r#"{"data":{"cancelled":true,"native_tokens_prompt":11,"native_tokens_completion":73,"native_tokens_cached":4,"native_tokens_reasoning":73,"total_cost":9.09e-05}}"#,
             Mutex::default(),
         );
-        let usage = openrouter_usage(&t, &openrouter(), "gen-1792232109-kUA52UZsI2")
+        let usage = openrouter_usage(&t, &openrouter(), "gen-1792232109-kUA52UZsI2", "k")
             .await
             .unwrap()
             .unwrap();
@@ -187,7 +172,7 @@ mod tests {
     async fn an_unrecorded_generation_yields_nothing() {
         let missing = Canned(404, r#"{"error":{"code":404}}"#, Mutex::default());
         assert!(
-            openrouter_usage(&missing, &openrouter(), "gen-1")
+            openrouter_usage(&missing, &openrouter(), "gen-1", "k")
                 .await
                 .unwrap()
                 .is_none()
@@ -198,7 +183,7 @@ mod tests {
             Mutex::default(),
         );
         assert!(
-            openrouter_usage(&pending, &openrouter(), "gen-1")
+            openrouter_usage(&pending, &openrouter(), "gen-1", "k")
                 .await
                 .unwrap()
                 .is_none()

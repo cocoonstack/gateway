@@ -4,7 +4,6 @@
 //! [`SqliteStore`] (`storage.sqlite_path`, one durable node), and
 //! [`PostgresStore`] (`storage.postgres_url`, shared across a fleet).
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -389,11 +388,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         bucket_secs: i64,
     ) -> GResult<Vec<(i64, UserUsageRow)>>;
     async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64> {
-        self.usage_rollup_since(i64::MAX, now_epoch_secs).await
+        self.usage_rollup_since(None, now_epoch_secs).await
     }
     /// Recompute and upsert every rollup bucket in the trailing backfill window, or back to `since`
     /// for rows billed late; buckets are never deleted, so a missed tick self-heals. Returns the buckets written.
-    async fn usage_rollup_since(&self, since_epoch_secs: i64, now_epoch_secs: i64) -> GResult<u64>;
+    async fn usage_rollup_since(&self, since: Option<i64>, now_epoch_secs: i64) -> GResult<u64>;
     /// Delete rolled billing rows past `ledger_max_rows`; returns rows deleted.
     async fn ledger_prune(&self) -> GResult<u64> {
         Ok(0)
@@ -544,7 +543,7 @@ pub struct MemoryStore {
     #[cfg(test)]
     ledger_failures: AtomicUsize,
     /// Minute buckets keyed by (minute, tenant, user, model); see
-    /// [`Store::usage_rollup_advance`].
+    /// [`Store::usage_rollup_since`].
     rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
     rollup_max_buckets: Option<usize>,
     sec_events: Mutex<Vec<SecurityEvent>>,
@@ -740,13 +739,10 @@ impl Store for MemoryStore {
         Ok(map.into_iter().collect())
     }
 
-    async fn usage_rollup_since(&self, since: i64, now: i64) -> GResult<u64> {
+    async fn usage_rollup_since(&self, since: Option<i64>, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut rollup = lock(&self.rollup);
-        let watermark = rollup_watermark(&rollup);
-        let lo = (hi - ROLLUP_BACKFILL_SECS)
-            .min(watermark)
-            .min(bucket_floor(since));
+        let lo = rollup_floor(hi, rollup_watermark(&rollup), since);
         let mut fresh = BTreeMap::new();
         {
             let ledger = lock(&self.ledger);
@@ -1586,21 +1582,21 @@ macro_rules! sql_store_impl {
                      created_at_epoch_secs, estimated, billed_units) ",
                 );
                 qb.push_values(rows, |mut v, r| {
-                    v.push_bind(nul_free(&r.ak))
-                        .push_bind(nul_free(&r.product))
-                        .push_bind(nul_free(&r.tenant))
-                        .push_bind(nul_free(&r.model))
-                        .push_bind(nul_free(&r.served_model))
-                        .push_bind(nul_free(&r.protocol))
-                        .push_bind(nul_free(&r.account))
+                    v.push_bind(&r.ak)
+                        .push_bind(&r.product)
+                        .push_bind(&r.tenant)
+                        .push_bind(&r.model)
+                        .push_bind(&r.served_model)
+                        .push_bind(&r.protocol)
+                        .push_bind(&r.account)
                         .push_bind(r.prompt_tokens)
                         .push_bind(r.completion_tokens)
                         .push_bind(r.total_tokens)
                         .push_bind(r.cost_micros)
                         .push_bind(r.vendor_cost_micros)
                         .push_bind(r.ptu_spillover)
-                        .push_bind(nul_free(&r.user_id))
-                        .push_bind(nul_free(&r.request_id))
+                        .push_bind(&r.user_id)
+                        .push_bind(&r.request_id)
                         .push_bind(r.created_at_epoch_secs)
                         .push_bind(r.estimated)
                         .push_bind(r.billed_units);
@@ -1913,18 +1909,14 @@ macro_rules! sql_store_impl {
 }
 
 sql_store_impl!(SqliteStore, sqlite, {
-    async fn usage_rollup_since(&self, since: i64, now: i64) -> GResult<u64> {
+    async fn usage_rollup_since(&self, since: Option<i64>, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(dialect_sql!(sqlite, q_rollup_insert!(sqlite)))
-            .bind(
-                (hi - ROLLUP_BACKFILL_SECS)
-                    .min(watermark)
-                    .min(bucket_floor(since)),
-            )
+            .bind(rollup_floor(hi, watermark, since))
             .bind(hi)
             .execute(&self.pool)
             .await
@@ -2228,14 +2220,14 @@ impl PostgresStore {
 }
 
 sql_store_impl!(PostgresStore, postgres, {
-    async fn usage_rollup_since(&self, since: i64, now: i64) -> GResult<u64> {
+    async fn usage_rollup_since(&self, since: Option<i64>, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| crate::sqlx_err("begin rollup", e))?;
-        if since == i64::MAX {
+        if since.is_none() {
             let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
                 .bind(ROLLUP_LOCK_KEY)
                 .fetch_one(&mut *tx)
@@ -2256,11 +2248,7 @@ sql_store_impl!(PostgresStore, postgres, {
             .await
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(dialect_sql!(postgres, q_rollup_insert!(postgres)))
-            .bind(
-                (hi - ROLLUP_BACKFILL_SECS)
-                    .min(watermark)
-                    .min(bucket_floor(since)),
-            )
+            .bind(rollup_floor(hi, watermark, since))
             .bind(hi)
             .execute(&mut *tx)
             .await
@@ -2780,12 +2768,9 @@ where
     )
 }
 
-fn nul_free(s: &str) -> Cow<'_, str> {
-    if s.contains('\0') {
-        Cow::Owned(s.replace('\0', ""))
-    } else {
-        Cow::Borrowed(s)
-    }
+fn rollup_floor(hi: i64, watermark: i64, since: Option<i64>) -> i64 {
+    let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
+    since.map_or(lo, |since| lo.min(bucket_floor(since)))
 }
 
 fn bucket_floor(ts: i64) -> i64 {
@@ -3498,7 +3483,7 @@ mod tests {
             ),
             "a row billed below the watermark misses the trailing rollup"
         );
-        store.usage_rollup_since(100, 1_500).await.unwrap();
+        store.usage_rollup_since(Some(100), 1_500).await.unwrap();
         assert!(
             billed_late(
                 store
@@ -3508,22 +3493,6 @@ mod tests {
             ),
             "a rollup since its billing time counts the late row"
         );
-    }
-
-    async fn exercise_nul_text(store: &dyn Store) {
-        let mut r = record("m1");
-        r.user_id = "nul\0user".into();
-        r.request_id = format!("{}\0", r.request_id);
-        store
-            .ledger_add_batch(&[r.clone(), record("m1")])
-            .await
-            .unwrap();
-        let (_, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
-        let stored = rows
-            .iter()
-            .find(|row| row.request_id == r.request_id.replace('\0', ""))
-            .unwrap();
-        assert_eq!(stored.user_id, "nuluser");
     }
 
     #[tokio::test]
@@ -3538,7 +3507,6 @@ mod tests {
             .await
             .unwrap();
         exercise_rollup(&store, "").await;
-        exercise_nul_text(&store).await;
     }
 
     #[tokio::test]
@@ -3913,7 +3881,6 @@ mod tests {
         let store = PostgresStore::connect(&own_url).await.expect("pg connect");
         let ns = format!("-{nonce}");
         exercise_rollup(&store, &ns).await;
-        exercise_nul_text(&store).await;
         exercise_erase(&store, &ns).await;
         exercise_content_list(&store, &ns).await;
         exercise_terminal_idempotence(&store, &ns).await;
