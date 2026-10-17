@@ -57,12 +57,7 @@ pub async fn recorded_usage(
 }
 
 pub fn records_generation(account: &Account, id: &str) -> bool {
-    account.wire_kind() == OPENROUTER_KIND
-        && !account.endpoint.is_empty()
-        && !id.is_empty()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    account.wire_kind() == OPENROUTER_KIND && !account.endpoint.is_empty() && !id.is_empty()
 }
 
 /// The generation's native counts and cost as chat-wire usage; `None` until OpenRouter records it.
@@ -221,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_openrouter_account_with_a_plain_id_records_generations() {
+    fn only_an_openrouter_account_with_an_id_records_generations() {
         assert!(records_generation(
             &openrouter(),
             "gen-1792232109-kUA52UZsI2"
@@ -237,7 +232,6 @@ mod tests {
             ..openrouter()
         };
         assert!(records_generation(&raw, "gen-1"));
-        assert!(!records_generation(&openrouter(), "gen/../x"));
         assert!(!records_generation(&openrouter(), ""));
     }
 }

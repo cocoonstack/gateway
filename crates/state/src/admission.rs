@@ -105,12 +105,6 @@ pub struct SettleInput<'a> {
     pub budget_hold: BudgetHold,
 }
 
-/// What a settled request cost, for the decision trail.
-pub struct Settled {
-    pub total_tokens: i64,
-    pub cost_micros: i64,
-}
-
 /// A settle in progress: shutdown waits for it to drop and fires `closing` so it bills without waiting.
 pub struct SettleGuard {
     _tracked: TaskTrackerToken,
@@ -713,12 +707,12 @@ pub async fn settle_and_bill(
     state: &GatewayState,
     cfg: &GatewayConfig,
     s: SettleInput<'_>,
-) -> Settled {
+) -> BudgetSpend {
     let gov = state.governance.as_ref();
     let total = clamp_tokens(s.billing.total);
     let record = billing_record(cfg, &s.billing);
-    let settled = Settled {
-        total_tokens: record.total_tokens,
+    let settled = BudgetSpend {
+        tokens: record.total_tokens,
         cost_micros: record.cost_micros,
     };
     let settle_daily = gov.quota_settle(s.billing.ak, total - s.reserved, s.reserved_at);
@@ -741,10 +735,7 @@ pub async fn settle_and_bill(
         s.billing.user_id,
         s.user_budget,
         s.budget_hold,
-        BudgetSpend {
-            tokens: settled.total_tokens,
-            cost_micros: settled.cost_micros,
-        },
+        settled,
     );
     let write_ledger = state.billing.write(record);
     tokio::join!(

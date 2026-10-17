@@ -950,7 +950,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         "cost_calc",
         format!(
             "tokens={} cost_micros={}",
-            settled.total_tokens, settled.cost_micros
+            settled.tokens, settled.cost_micros
         ),
     );
     Ok(())
