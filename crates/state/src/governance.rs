@@ -240,6 +240,30 @@ impl RedisGovernance {
         }
     }
 
+    async fn incr_all(&self, incrs: &[(String, i64)]) -> redis::RedisResult<Vec<i64>> {
+        if incrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for (key, by) in incrs {
+            pipe.cmd("INCRBY").arg(key).arg(*by);
+        }
+        let mut conn = self.conn.clone();
+        let totals: Vec<i64> = pipe.query_async(&mut conn).await?;
+        let mut arm = redis::pipe();
+        let mut fresh = false;
+        for ((key, by), total) in incrs.iter().zip(&totals) {
+            if total == by {
+                arm.cmd("PEXPIRE").arg(key).arg(QUOTA_TTL_MS).ignore();
+                fresh = true;
+            }
+        }
+        if fresh {
+            arm.query_async::<()>(&mut conn).await?;
+        }
+        Ok(totals)
+    }
+
     /// Increment `key` and set its TTL on first use; returns the post-increment
     /// count. A failed round-trip returns 0 so limits fail open rather than
     /// wedging the gateway on a Redis blip.
@@ -300,36 +324,32 @@ impl Governance for RedisGovernance {
             })
     }
     async fn quota_reserve_all(&self, holds: &[(&str, i64, i64)], at: i64) -> Result<bool, usize> {
-        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
-            redis::Script::new(
-                "for i = 1, #KEYS do
-                   local amount = tonumber(ARGV[2 * i])
-                   local v = redis.call('INCRBY', KEYS[i], amount)
-                   if v == amount then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
-                   if v - amount >= tonumber(ARGV[2 * i + 1]) then
-                     for j = 1, i do redis.call('DECRBY', KEYS[j], ARGV[2 * j]) end
-                     return i
-                   end
-                 end
-                 return 0",
-            )
-        });
-        let mut invocation = SCRIPT.prepare_invoke();
-        invocation.arg(QUOTA_TTL_MS);
-        for &(key, amount, limit) in holds {
-            invocation.key(quota_key_at(key, at)).arg(amount).arg(limit);
-        }
-        match invocation
-            .invoke_async::<usize>(&mut self.conn.clone())
-            .await
-        {
-            Ok(0) => Ok(true),
-            Ok(i) => Err(i - 1),
+        let incrs: Vec<_> = holds
+            .iter()
+            .map(|&(key, amount, _)| (quota_key_at(key, at), amount))
+            .collect();
+        let totals = match self.incr_all(&incrs).await {
+            Ok(totals) => totals,
             Err(e) => {
                 tracing::warn!(error = %e, "redis budget reserve failed; admitting");
-                Ok(false)
+                return Ok(false);
             }
+        };
+        let Some(i) = holds
+            .iter()
+            .zip(&totals)
+            .position(|(&(_, amount, limit), &v)| v - amount >= limit)
+        else {
+            return Ok(true);
+        };
+        let mut undo = redis::pipe();
+        for (key, amount) in &incrs {
+            undo.cmd("DECRBY").arg(key).arg(*amount).ignore();
         }
+        if let Err(e) = undo.query_async::<()>(&mut self.conn.clone()).await {
+            tracing::warn!(error = %e, "redis budget rollback failed");
+        }
+        Err(i)
     }
     async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
@@ -345,30 +365,30 @@ impl Governance for RedisGovernance {
         .await;
     }
     async fn quota_settle_all(&self, deltas: &[(&str, i64)], at: i64) -> Vec<i64> {
-        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
-            redis::Script::new(
-                "local out = {}
-                 for i = 1, #KEYS do
-                   local v = redis.call('INCRBY', KEYS[i], ARGV[i + 1])
-                   if v == tonumber(ARGV[i + 1]) then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
-                   if v < 0 then redis.call('SET', KEYS[i], 0, 'KEEPTTL'); v = 0 end
-                   out[i] = v
-                 end
-                 return out",
-            )
-        });
-        let mut invocation = SCRIPT.prepare_invoke();
-        invocation.arg(QUOTA_TTL_MS);
-        for &(key, delta) in deltas {
-            invocation.key(quota_key_at(key, at)).arg(delta);
-        }
-        invocation
-            .invoke_async(&mut self.conn.clone())
-            .await
-            .unwrap_or_else(|e| {
+        let incrs: Vec<_> = deltas
+            .iter()
+            .map(|&(key, delta)| (quota_key_at(key, at), delta))
+            .collect();
+        let mut totals = match self.incr_all(&incrs).await {
+            Ok(totals) => totals,
+            Err(e) => {
                 tracing::warn!(error = %e, "redis budget settle failed");
-                vec![0; deltas.len()]
-            })
+                return vec![0; deltas.len()];
+            }
+        };
+        let mut floor = redis::pipe();
+        let mut floored = false;
+        for ((key, _), total) in incrs.iter().zip(totals.iter_mut()) {
+            if *total < 0 {
+                floor.cmd("SET").arg(key).arg(0).arg("KEEPTTL").ignore();
+                *total = 0;
+                floored = true;
+            }
+        }
+        if floored && let Err(e) = floor.query_async::<()>(&mut self.conn.clone()).await {
+            tracing::warn!(error = %e, "redis budget floor failed");
+        }
+        totals
     }
     async fn quota_consume(&self, key: &str, tokens: i64) -> i64 {
         self.incr_window(
