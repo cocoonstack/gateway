@@ -4,6 +4,9 @@
 //! two admission paths cannot drift. Denials carry the user-facing message;
 //! callers wrap it in their own wire shape.
 
+use std::io::Write;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +23,9 @@ const LEDGER_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const LEDGER_RETRY_MAX: Duration = Duration::from_secs(30);
 // a store that refuses writes must drain the queue rather than wedge it
 const LEDGER_RETRY_ATTEMPTS: usize = 8;
+// with a spool, rows leave the queue sooner, so an outage does not back up into requests
+const LEDGER_SPOOL_AFTER_ATTEMPTS: usize = 3;
+const LEDGER_REPLAY_INTERVAL: Duration = Duration::from_secs(30);
 // a month's counter must outlive the next month's rollover read
 const MONTH_COUNTER_TTL: Duration = Duration::from_secs(62 * 86_400);
 
@@ -77,10 +83,23 @@ impl BillingLedger {
         }
     }
 
-    pub(crate) fn repairing(store: Arc<dyn Store>) -> Self {
+    /// A batching writer; with `spool_path`, rows the store keeps refusing wait there instead of being dropped.
+    pub(crate) fn repairing(store: Arc<dyn Store>, spool_path: &str) -> Self {
         let (queue, mut pending) = mpsc::channel::<LedgerWrite>(LEDGER_QUEUE_CAPACITY);
         let deferred = store.defers_ledger_writes();
         let worker_store = store.clone();
+        let spool = (!spool_path.is_empty()).then(|| Arc::new(LedgerSpool::new(spool_path)));
+        if let Some(spool) = spool.clone() {
+            let replay_store = store.clone();
+            // detached: replays the spool for the life of the process
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(LEDGER_REPLAY_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    spool.replay(&replay_store).await;
+                }
+            });
+        }
         // the bounded worker owns accepted rows through caller cancellation
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(LEDGER_BATCH_MAX);
@@ -96,7 +115,7 @@ impl BillingLedger {
                     next.take(&mut batch, &mut row_acks, &mut ack);
                 }
                 let unacked = (batch.len() - row_acks.len()) as u64;
-                let committed = Self::commit(&worker_store, &mut batch).await;
+                let committed = Self::commit(&worker_store, spool.as_deref(), &mut batch).await;
                 if !committed {
                     dropped += unacked;
                 }
@@ -175,20 +194,37 @@ impl BillingLedger {
         rx.await.unwrap_or(false)
     }
 
-    async fn commit(store: &Arc<dyn Store>, batch: &mut Vec<BillingRecord>) -> bool {
+    async fn commit(
+        store: &Arc<dyn Store>,
+        spool: Option<&LedgerSpool>,
+        batch: &mut Vec<BillingRecord>,
+    ) -> bool {
         if batch.is_empty() {
             return true;
         }
+        let attempts = if spool.is_some() {
+            LEDGER_SPOOL_AFTER_ATTEMPTS
+        } else {
+            LEDGER_RETRY_ATTEMPTS
+        };
         let mut delay = LEDGER_RETRY_INITIAL;
         let mut committed = false;
-        for attempt in 1..=LEDGER_RETRY_ATTEMPTS {
+        for attempt in 1..=attempts {
             let Err(e) = store.ledger_add_batch(batch).await else {
                 committed = true;
                 break;
             };
             metrics::counter!("gateway_ledger_write_failures_total").increment(batch.len() as u64);
-            if attempt == LEDGER_RETRY_ATTEMPTS {
-                tracing::error!(error = %e, rows = batch.len(), "billing ledger retries exhausted; rows dropped");
+            if attempt == attempts {
+                committed = match spool {
+                    Some(spool) => spool.append(batch).await,
+                    None => false,
+                };
+                if committed {
+                    tracing::warn!(error = %e, rows = batch.len(), "billing ledger write failed; rows spooled for replay");
+                } else {
+                    tracing::error!(error = %e, rows = batch.len(), "billing ledger retries exhausted; rows dropped");
+                }
                 break;
             }
             tracing::error!(error = %e, rows = batch.len(), "billing ledger write failed; retrying");
@@ -197,6 +233,111 @@ impl BillingLedger {
         }
         batch.clear();
         committed
+    }
+}
+
+/// Ledger rows the store refused, appended to a local JSON-lines file and replayed in order.
+#[derive(Debug)]
+struct LedgerSpool {
+    path: PathBuf,
+    replaying: PathBuf,
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl LedgerSpool {
+    fn new(path: &str) -> Self {
+        let path = PathBuf::from(path);
+        let replaying = path.with_extension("replaying");
+        Self {
+            path,
+            replaying,
+            lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    async fn append(&self, rows: &[BillingRecord]) -> bool {
+        let mut lines = Vec::new();
+        for r in rows {
+            if let Err(e) = serde_json::to_writer(&mut lines, r) {
+                tracing::error!(error = %e, request_id = r.request_id, "spool billing row");
+                return false;
+            }
+            lines.push(b'\n');
+        }
+        let path = self.path.clone();
+        let _held = self.lock.lock().await;
+        let written = blocking(move || {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)?;
+            let len = f.metadata()?.len();
+            let mut last = *b"\n";
+            if len > 0 {
+                f.read_exact_at(&mut last, len - 1)?;
+            }
+            // a crash mid-append leaves a torn row; the next row starts on its own line
+            if last[0] != b'\n' {
+                f.write_all(b"\n")?;
+            }
+            f.write_all(&lines)?;
+            f.sync_data()
+        })
+        .await;
+        if let Err(e) = &written {
+            tracing::error!(error = %e, path = %self.path.display(), "billing spool write failed");
+        }
+        written.is_ok()
+    }
+
+    /// `request_id` uniqueness makes a re-insert of an already accepted batch a no-op.
+    async fn replay(&self, store: &Arc<dyn Store>) {
+        let (path, replaying) = (self.path.clone(), self.replaying.clone());
+        let read = {
+            let _held = self.lock.lock().await;
+            blocking(move || {
+                if !replaying.exists() {
+                    if !path.exists() {
+                        return Ok(None);
+                    }
+                    std::fs::rename(&path, &replaying)?;
+                }
+                std::fs::read(&replaying).map(Some)
+            })
+            .await
+        };
+        let bytes = match read {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(error = %e, path = %self.replaying.display(), "billing spool read failed");
+                return;
+            }
+        };
+        let rows: Vec<BillingRecord> = bytes
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| {
+                serde_json::from_str(&String::from_utf8_lossy(line))
+                    .inspect_err(
+                        |e| tracing::error!(error = %e, "skipping a torn billing spool line"),
+                    )
+                    .ok()
+            })
+            .collect();
+        for chunk in rows.chunks(LEDGER_BATCH_MAX) {
+            if let Err(e) = store.ledger_add_batch(chunk).await {
+                tracing::warn!(error = %e, rows = rows.len(), "billing spool replay deferred");
+                return;
+            }
+        }
+        let replaying = self.replaying.clone();
+        if let Err(e) = blocking(move || std::fs::remove_file(replaying)).await {
+            tracing::error!(error = %e, path = %self.replaying.display(), "billing spool remove failed");
+            return;
+        }
+        tracing::info!(rows = rows.len(), "billing spool replayed");
     }
 }
 
@@ -682,6 +823,16 @@ fn month_prefix((y, m): (i64, u32)) -> String {
     format!("m:{y}{m:02}:")
 }
 
+async fn blocking<T, F>(f: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 #[cfg(test)]
 mod tests {
     use gw_config::access_key_id;
@@ -744,7 +895,7 @@ mod tests {
     async fn billing_ledger_repairs_failed_writes() {
         let store = Arc::new(crate::MemoryStore::default());
         store.fail_next_ledger_writes(2);
-        let ledger = BillingLedger::repairing(store.clone());
+        let ledger = BillingLedger::repairing(store.clone(), "");
         let record = record("req-repair");
         ledger.write(record.clone()).await;
         let (count, rows) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -767,7 +918,7 @@ mod tests {
         let store = Arc::new(crate::MemoryStore::default());
         let ledger = BillingLedger {
             deferred: true,
-            ..BillingLedger::repairing(store.clone())
+            ..BillingLedger::repairing(store.clone(), "")
         };
         let mut row = record("req-attributed");
         row.user_id = "user-42".into();
@@ -785,7 +936,7 @@ mod tests {
         store.fail_next_ledger_writes(LEDGER_RETRY_ATTEMPTS);
         let ledger = BillingLedger {
             deferred: true,
-            ..BillingLedger::repairing(store.clone())
+            ..BillingLedger::repairing(store.clone(), "")
         };
         let mut row = record("req-fallback");
         row.user_id = "user-42".into();
@@ -801,7 +952,7 @@ mod tests {
     async fn canceled_attributed_write_is_reported_as_dropped() {
         let store = Arc::new(crate::MemoryStore::default());
         store.fail_next_ledger_writes(LEDGER_RETRY_ATTEMPTS);
-        let ledger = BillingLedger::repairing(store);
+        let ledger = BillingLedger::repairing(store, "");
         let (tx, rx) = oneshot::channel();
         drop(rx);
 
@@ -820,7 +971,7 @@ mod tests {
     async fn billing_ledger_backpressures_at_capacity_then_repairs_every_row() {
         let store = Arc::new(crate::MemoryStore::default());
         store.fail_next_ledger_writes(usize::MAX);
-        let ledger = BillingLedger::repairing(store.clone());
+        let ledger = BillingLedger::repairing(store.clone(), "");
         let queue = ledger.queue.as_ref().unwrap();
 
         ledger.write(record("req-0")).await;
@@ -868,7 +1019,7 @@ mod tests {
     async fn flush_returns_only_after_queued_rows_commit() {
         let store = Arc::new(crate::MemoryStore::default());
         store.fail_next_ledger_writes(1);
-        let ledger = BillingLedger::repairing(store.clone());
+        let ledger = BillingLedger::repairing(store.clone(), "");
         ledger.write(record("req-flush")).await;
         ledger.flush().await;
         let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
@@ -880,7 +1031,7 @@ mod tests {
     async fn billing_ledger_drains_a_store_that_never_accepts() {
         let store = Arc::new(crate::MemoryStore::default());
         store.fail_next_ledger_writes(usize::MAX);
-        let ledger = BillingLedger::repairing(store.clone());
+        let ledger = BillingLedger::repairing(store.clone(), "");
 
         tokio::time::timeout(Duration::from_secs(3_600), async {
             for i in 0..=LEDGER_QUEUE_CAPACITY {
@@ -903,6 +1054,65 @@ mod tests {
             ledger.flush().await > 0,
             "flush reports the rows the exhausted retries dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn rows_the_store_keeps_refusing_are_spooled_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger-spool.jsonl");
+        let store = Arc::new(crate::MemoryStore::default());
+        store.fail_next_ledger_writes(usize::MAX);
+        let ledger = BillingLedger::repairing(store.clone(), path.to_str().unwrap());
+
+        ledger.write(record("req-spooled")).await;
+
+        assert_eq!(
+            ledger.flush().await,
+            0,
+            "a spooled row is not a dropped row"
+        );
+        let spooled = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(spooled.lines().count(), 1);
+        assert!(spooled.contains("req-spooled"));
+    }
+
+    #[tokio::test]
+    async fn spool_replays_into_the_store_once_it_accepts_and_retries_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = LedgerSpool::new(dir.path().join("ledger-spool.jsonl").to_str().unwrap());
+        let store = Arc::new(crate::MemoryStore::default());
+        let as_store: Arc<dyn Store> = store.clone();
+        assert!(spool.append(&[record("req-a"), record("req-b")]).await);
+
+        store.fail_next_ledger_writes(1);
+        spool.replay(&as_store).await;
+        assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 0);
+        assert!(spool.replaying.exists(), "a refused replay keeps its rows");
+        assert!(spool.append(&[record("req-c")]).await);
+
+        spool.replay(&as_store).await;
+        spool.replay(&as_store).await;
+        let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        let mut ids: Vec<_> = rows.iter().map(|r| r.request_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!((count, ids), (3, vec!["req-a", "req-b", "req-c"]));
+        assert!(!spool.replaying.exists() && !spool.path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_torn_spool_row_never_swallows_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = LedgerSpool::new(dir.path().join("ledger-spool.jsonl").to_str().unwrap());
+        std::fs::write(&spool.path, b"{\"ak\":\"torn").unwrap();
+        assert!(spool.append(&[record("req-after-crash")]).await);
+        let store = Arc::new(crate::MemoryStore::default());
+        let as_store: Arc<dyn Store> = store.clone();
+
+        spool.replay(&as_store).await;
+
+        let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rows[0].request_id, "req-after-crash");
     }
 
     #[test]

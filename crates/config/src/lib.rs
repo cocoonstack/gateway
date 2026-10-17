@@ -580,6 +580,9 @@ pub struct StorageConf {
     /// Prune rolled billing records beyond this many; 0 = unlimited.
     #[serde(default)]
     pub ledger_max_rows: u64,
+    /// Local file holding ledger rows the store refuses until they replay; empty drops them after the retries.
+    #[serde(default)]
+    pub ledger_spool_path: String,
     /// Postgres pool size for the store and key-table pools; 0 = their built-in defaults.
     #[serde(default)]
     pub postgres_max_connections: u32,

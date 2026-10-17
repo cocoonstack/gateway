@@ -60,7 +60,7 @@ const BATCH_ITEM_CHUNK: usize = 13_000;
 const PG_MAX_CONNECTIONS: u32 = 10;
 
 /// One billing entry (recorded locally only; no reporting upstream).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BillingRecord {
     pub ak: String,
     pub product: String,

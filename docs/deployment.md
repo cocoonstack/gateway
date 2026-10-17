@@ -70,6 +70,7 @@ storage:
   redis_url: "redis://redis:6379"      # shared rate limits + quotas + account health
   ledger_max_rows: 1000000             # prune oldest billing rows past the cap
   postgres_max_connections: 10         # store and key-store connection-pool size
+  ledger_spool_path: /var/lib/gw/ledger-spool.jsonl  # keep billing rows through a store outage
   # sqlite_path: /var/lib/gw/store.db  # single-node alternative to postgres_url
 ```
 

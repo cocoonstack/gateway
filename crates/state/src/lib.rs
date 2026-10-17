@@ -865,7 +865,8 @@ impl GatewayState {
                 }
             }
         }
-        state.billing = admission::BillingLedger::repairing(state.store.clone());
+        state.billing =
+            admission::BillingLedger::repairing(state.store.clone(), &st.ledger_spool_path);
         Ok(state)
     }
 
