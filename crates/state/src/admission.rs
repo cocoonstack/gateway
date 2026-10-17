@@ -306,16 +306,21 @@ impl BillingLedger {
 struct LedgerSpool {
     path: PathBuf,
     replaying: PathBuf,
+    replayed: PathBuf,
     lock: Mutex<()>,
 }
 
 impl LedgerSpool {
     fn new(path: &str) -> Self {
         let path = PathBuf::from(path);
-        let replaying = path.with_extension("replaying");
+        let (replaying, replayed) = (
+            path.with_extension("replaying"),
+            path.with_extension("replayed"),
+        );
         Self {
             path,
             replaying,
+            replayed,
             lock: Mutex::new(()),
         }
     }
@@ -340,31 +345,37 @@ impl LedgerSpool {
         .await
     }
 
-    /// `request_id` uniqueness makes a re-insert of an already accepted batch a no-op.
+    /// Resumes after the last batch it saved; `request_id` uniqueness covers one committed but not saved.
     async fn replay(&self, store: &Arc<dyn Store>) {
         let claimed = {
-            let (path, replaying) = (self.path.clone(), self.replaying.clone());
+            let (path, replaying, replayed) = (
+                self.path.clone(),
+                self.replaying.clone(),
+                self.replayed.clone(),
+            );
             let _held = self.lock.lock().await;
             run_blocking(move || {
                 if replaying.exists() {
-                    return Ok(true);
+                    let saved = std::fs::read_to_string(&replayed).unwrap_or_default();
+                    return Ok(Some(saved.trim().parse().unwrap_or(0)));
                 }
                 if !path.exists() {
-                    return Ok(false);
+                    return Ok(None);
                 }
-                std::fs::rename(&path, &replaying).map(|()| true)
+                remove_if_present(&replayed)?;
+                std::fs::rename(&path, &replaying).map(|()| Some(0))
             })
             .await
         };
-        match claimed {
-            Ok(true) => {}
-            Ok(false) => return,
+        let mut offset = match claimed {
+            Ok(Some(offset)) => offset,
+            Ok(None) => return,
             Err(e) => {
                 tracing::error!(error = %e, path = %self.path.display(), "billing spool claim failed");
                 return;
             }
-        }
-        let (mut offset, mut replayed) = (0, 0);
+        };
+        let mut replayed = 0;
         loop {
             let replaying = self.replaying.clone();
             let (rows, next) = match run_blocking(move || read_spool_batch(&replaying, offset))
@@ -385,9 +396,17 @@ impl LedgerSpool {
             }
             replayed += rows.len();
             offset = next;
+            let saved = self.replayed.clone();
+            if let Err(e) = run_blocking(move || std::fs::write(saved, offset.to_string())).await {
+                tracing::warn!(error = %e, "billing spool offset save failed");
+            }
         }
-        let replaying = self.replaying.clone();
-        if let Err(e) = run_blocking(move || std::fs::remove_file(replaying)).await {
+        let (replaying, saved) = (self.replaying.clone(), self.replayed.clone());
+        if let Err(e) = run_blocking(move || {
+            std::fs::remove_file(replaying).and_then(|()| remove_if_present(&saved))
+        })
+        .await
+        {
             tracing::error!(error = %e, path = %self.replaying.display(), "billing spool remove failed");
             return;
         }
@@ -981,6 +1000,13 @@ fn read_spool_batch(path: &Path, offset: u64) -> std::io::Result<(Vec<BillingRec
     Ok((rows, next))
 }
 
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 async fn run_blocking<T, F>(f: F) -> std::io::Result<T>
 where
     T: Send + 'static,
@@ -1341,6 +1367,28 @@ mod tests {
             "{usage:?}"
         );
         assert!(!spool.replaying.exists());
+    }
+
+    #[tokio::test]
+    async fn replay_resumes_after_the_last_saved_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = LedgerSpool::new(dir.path().join("ledger-spool.jsonl").to_str().unwrap());
+        let mut lines = Vec::new();
+        for id in ["req-committed", "req-pending"] {
+            serde_json::to_writer(&mut lines, &record(id)).unwrap();
+            lines.push(b'\n');
+        }
+        let committed = lines.iter().position(|&b| b == b'\n').unwrap() + 1;
+        std::fs::write(&spool.replaying, &lines).unwrap();
+        std::fs::write(&spool.replayed, committed.to_string()).unwrap();
+        let store = Arc::new(crate::MemoryStore::default());
+        let as_store: Arc<dyn Store> = store.clone();
+
+        spool.replay(&as_store).await;
+
+        let (count, rows) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!((count, rows[0].request_id.as_str()), (1, "req-pending"));
+        assert!(!spool.replaying.exists() && !spool.replayed.exists());
     }
 
     #[tokio::test]

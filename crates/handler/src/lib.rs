@@ -2904,7 +2904,12 @@ mod tests {
         .await
         .expect("the first call holds its unit price");
 
-        let second = h.run(search(), ak.clone()).await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.run(search(), ak.clone()),
+        )
+        .await
+        .expect("a denial returns without waiting on the upstream");
 
         let err = second.err().expect("the in-flight hold leaves no budget");
         assert!(

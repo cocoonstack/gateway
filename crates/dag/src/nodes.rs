@@ -265,7 +265,7 @@ fn reserve_parts(req: &gw_models::GatewayRequest) -> (i64, i64) {
 
 fn reserve_units(req: &gw_models::GatewayRequest) -> i64 {
     match req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref()) {
-        Some(gw_models::TypedParams::Image(p)) => p.n.max(1),
+        Some(gw_models::TypedParams::Image(p)) => p.n.clamp(1, MAX_RESERVE),
         Some(gw_models::TypedParams::AudioTts(p)) => p.input.chars().count() as i64,
         Some(gw_models::TypedParams::Video(_)) => 0,
         _ => 1,
@@ -1194,6 +1194,13 @@ mod tests {
             5
         );
         assert_eq!(units(TypedParams::Video(VideoParams::default())), 0);
+        assert_eq!(
+            units(TypedParams::Image(ImageParams {
+                n: i64::MAX,
+                ..Default::default()
+            })),
+            super::MAX_RESERVE
+        );
     }
 
     #[test]

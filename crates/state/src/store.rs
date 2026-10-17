@@ -35,8 +35,8 @@ const ROLLUP_BUCKET_SECS: i64 = 60;
 const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 
 /// A minute is rolled only once closed for this long, so no in-flight write or
-/// trailing replica lands a row in a rolled minute — a rolled minute's source
-/// set can only shrink, which keeps the max-upsert sound.
+/// trailing replica lands a row in a rolled minute; a spool replay that does adds
+/// the row to the bucket in the same transaction, which keeps the max-upsert sound.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 /// In-process rollup retention: the monthly-budget window, then a bucket cap.
 const ROLLUP_RETENTION_SECS: i64 = 62 * 86_400;
@@ -291,10 +291,10 @@ impl UserUsageRow {
         self.billed_units = self.billed_units.saturating_add(r.billed_units);
     }
 
-    /// Keep the larger of each counter. A bucket's source rows are append-only
-    /// and only ever shrink via ledger pruning, so per-column max always picks
-    /// the more complete snapshot — a recompute from a partially pruned ledger
-    /// can never shrink a bucket.
+    /// Keep the larger of each counter. A bucket's source rows only shrink via ledger
+    /// pruning, and a replayed late row is added to its bucket as it lands, so per-column
+    /// max always picks the more complete snapshot — a recompute from a partially pruned
+    /// ledger can never shrink a bucket.
     fn keep_max(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.max(o.requests);
         self.prompt_tokens = self.prompt_tokens.max(o.prompt_tokens);
@@ -1448,13 +1448,21 @@ macro_rules! billing_insert {
     }};
 }
 
-macro_rules! q_rollup_insert {
+macro_rules! rollup_select {
     ($d:ident) => {
         concat!(
             "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests, \
              prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, \
              billed_units) SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*), ",
-            usage_sums!($d),
+            usage_sums!($d)
+        )
+    };
+}
+
+macro_rules! q_rollup_insert {
+    ($d:ident) => {
+        concat!(
+            rollup_select!($d),
             " FROM billing WHERE created_at_epoch_secs >= ?1 AND created_at_epoch_secs < ?2 \
              GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET requests = ",
             sql_greatest!($d), "(usage_rollup.requests, excluded.requests), prompt_tokens = ",
@@ -1667,10 +1675,7 @@ macro_rules! sql_store_impl {
                     .map_err(|e| crate::sqlx_err("replay billing records", e))?;
                 if !inserted.is_empty() {
                     let mut add = sqlx::QueryBuilder::new(concat!(
-                        "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests, \
-                         prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, \
-                         billed_units) SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*), ",
-                        usage_sums!($dialect),
+                        rollup_select!($dialect),
                         " FROM billing WHERE created_at_epoch_secs < (",
                     ));
                     add.push(ROLLUP_WATERMARK_SQL).push(") AND request_id IN (");
