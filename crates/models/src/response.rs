@@ -62,6 +62,9 @@ pub struct GatewayResponse {
     /// raw usage sub-tree from the vendor body/last SSE frame.
     #[serde(skip)]
     pub raw_usage: Option<Value>,
+    /// The vendor's id for this generation (OpenRouter `gen-…`), for a post-hoc usage lookup.
+    #[serde(skip)]
+    pub upstream_id: String,
 }
 
 impl GatewayResponse {

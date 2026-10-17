@@ -13,6 +13,13 @@ use crate::executor::{DagNode, Layer};
 const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// Reservation cap, so a hostile `max_tokens` cannot overflow the estimate or the counter.
 const MAX_RESERVE: i64 = 1_000_000;
+/// Waits before each lookup of an abandoned stream's recorded usage; OpenRouter records one in about 5 s.
+const GENERATION_LOOKUP_DELAYS: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(20),
+];
 
 /// preprocess/model_quota: per-(AK, model) daily cap (AK override, else tenant default);
 /// over it degrades to the tenant fallback model or denies, so it runs before resolve_model.
@@ -682,37 +689,7 @@ impl DagNode for CostCalc {
         if resp.aborted && resp.completion_tokens == 0 {
             return bill_aborted_stream(ctx, None).await;
         }
-        let rate =
-            gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
-        // saturating sums so a malformed usage subtree can't overflow the totals
-        let mut tokens = match &resp.common_usage {
-            Some(u) => {
-                let ti = gw_models::TokenInput {
-                    prompt: u.platform_input,
-                    audio_prompt: u.audio_input,
-                    read_cache: u.read_cache,
-                    write_cache: u.write_cache,
-                    write_cache_1h: u.write_cache_1h,
-                    completion: u.completion,
-                    audio_completion: u.audio_output,
-                    reasoning: u.reason,
-                };
-                BillTokens {
-                    prompt: u.prompt_total(),
-                    completion: u.completion_total(),
-                    billable_prompt: gw_models::weighted_prompt(&ti, &rate),
-                    billable_completion: gw_models::weighted_completion(&ti, &rate),
-                    units: 0,
-                }
-            }
-            // total-only vendors (MiniMax v1): meter the total as completion, not zero
-            None if resp.prompt_tokens == 0 && resp.completion_tokens == 0 => {
-                BillTokens::weighted(0, resp.total_tokens, &rate)
-            }
-            None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
-        };
-        tokens.units = resp.billed_units;
-        bill(ctx, tokens, false).await
+        bill_usage(ctx).await
     }
 }
 
@@ -760,7 +737,7 @@ impl BillTokens {
     }
 }
 
-/// Close a buffered stream's billing: refund before delivery, bill estimates after a partial one.
+/// Close a buffered stream's billing: refund before delivery; after a partial one bill the upstream's usage, or estimate without it.
 pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
     if !ctx.billing_deferred {
         return Ok(());
@@ -777,8 +754,13 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
                 .outcome
                 .as_mut()
                 .ok_or_else(|| GatewayError::internal("stream delivery without an outcome"))?;
-            blank_stream_response(&mut outcome.response);
-            bill_aborted_stream(ctx, Some(completion)).await
+            if outcome.response.completion_tokens == 0 {
+                blank_stream_response(&mut outcome.response);
+                return bill_aborted_stream(ctx, Some(completion)).await;
+            }
+            outcome.response.message.clear();
+            outcome.response.aborted = true;
+            bill_usage(ctx).await
         }
         StreamDelivery::None => {
             let gov = ctx.state.governance.as_ref();
@@ -804,6 +786,22 @@ async fn bill_aborted_stream(
     ctx: &mut DagContext,
     delivered_completion: Option<i64>,
 ) -> GResult<()> {
+    if let Some(usage) = recorded_usage(ctx).await {
+        let outcome = ctx
+            .outcome
+            .as_mut()
+            .ok_or_else(|| GatewayError::internal("aborted stream without an outcome"))?;
+        let common = gw_engines::extract_common_usage(&usage, false);
+        if let Some(u) = &common {
+            let r = &mut outcome.response;
+            (r.prompt_tokens, r.completion_tokens) = (u.prompt_total(), u.completion_total());
+            r.total_tokens = r.prompt_tokens.saturating_add(r.completion_tokens);
+        }
+        outcome.response.common_usage = common;
+        outcome.response.raw_usage = Some(usage);
+        ctx.decide("cost_calc", "aborted stream, billed the provider's record");
+        return bill_usage(ctx).await;
+    }
     let response = &ctx
         .outcome
         .as_ref()
@@ -833,6 +831,28 @@ async fn bill_aborted_stream(
     bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
 }
 
+/// OpenRouter's record of an abandoned stream's usage, polled until it lands.
+async fn recorded_usage(ctx: &DagContext) -> Option<serde_json::Value> {
+    let account = ctx.request.account.as_deref()?;
+    let id = ctx.outcome.as_ref()?.response.upstream_id.as_str();
+    if !gw_engines::generation::records_generation(account, id) {
+        return None;
+    }
+    for delay in GENERATION_LOOKUP_DELAYS {
+        tokio::time::sleep(delay).await;
+        match gw_engines::generation::openrouter_usage(ctx.transport.as_ref(), account, id).await {
+            Ok(Some(usage)) => return Some(usage),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, id, "generation usage lookup failed"),
+        }
+    }
+    tracing::warn!(
+        id,
+        "no recorded usage for an aborted stream; billing the estimate"
+    );
+    None
+}
+
 fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
     response.message.clear();
     response.completion_tokens = 0;
@@ -840,6 +860,45 @@ fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
     response.common_usage = None;
     response.raw_usage = None;
     response.aborted = true;
+}
+
+async fn bill_usage(ctx: &mut DagContext) -> GResult<()> {
+    let resp = &ctx
+        .outcome
+        .as_ref()
+        .ok_or_else(|| GatewayError::internal("cost_calc without an engine outcome"))?
+        .response;
+    let rate =
+        gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
+    // saturating sums so a malformed usage subtree can't overflow the totals
+    let mut tokens = match &resp.common_usage {
+        Some(u) => {
+            let ti = gw_models::TokenInput {
+                prompt: u.platform_input,
+                audio_prompt: u.audio_input,
+                read_cache: u.read_cache,
+                write_cache: u.write_cache,
+                write_cache_1h: u.write_cache_1h,
+                completion: u.completion,
+                audio_completion: u.audio_output,
+                reasoning: u.reason,
+            };
+            BillTokens {
+                prompt: u.prompt_total(),
+                completion: u.completion_total(),
+                billable_prompt: gw_models::weighted_prompt(&ti, &rate),
+                billable_completion: gw_models::weighted_completion(&ti, &rate),
+                units: 0,
+            }
+        }
+        // total-only vendors (MiniMax v1): meter the total as completion, not zero
+        None if resp.prompt_tokens == 0 && resp.completion_tokens == 0 => {
+            BillTokens::weighted(0, resp.total_tokens, &rate)
+        }
+        None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
+    };
+    tokens.units = resp.billed_units;
+    bill(ctx, tokens, false).await
 }
 
 /// Settle reserves and write the ledger; `estimated` marks an aborted stream's estimated counts.

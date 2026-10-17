@@ -62,7 +62,8 @@ default, so the whole pipeline is testable offline:
 - **`TokenEncoder`** — prompt token estimation capability (tiktoken
   cl100k_base BPE default, zero-dependency heuristic fallback). `cost_calc`
   uses it to bill an aborted stream from the delivered text when the vendor's
-  usage frame never arrives; token-aware PTU sizing is not ported yet.
+  usage frame never arrives and the account keeps no generation record
+  (OpenRouter does: `engines::generation`); token-aware PTU sizing is not ported yet.
 - **`Store`** — durable records (billing ledger, uploaded files, batch
   jobs). `MemoryStore` by default; `SqliteStore` when `storage.sqlite_path`
   is configured; `PostgresStore` when `storage.postgres_url` is — shared

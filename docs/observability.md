@@ -87,6 +87,11 @@ the unit-priced surfaces; also summed in `/admin/usage`), charged
 `cost_micros` and `vendor_cost_micros`,
 `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag (set
 when counts came from an aborted stream rather than a vendor usage payload).
+An aborted stream served by an OpenRouter account is billed from OpenRouter's
+record of the generation instead (`GET /api/v1/generation`, polled for about
+40 s; cancelled generations included), with cache reads at their weight and
+OpenRouter's cost as `vendor_cost_micros`; only when no record arrives does it
+fall back to the estimate.
 Writes are idempotent by `request_id`; a transient store failure is held in a
 bounded repair queue and retried with backoff — eight attempts, about 13 s —
 before the batch is dropped and counted in `gateway_ledger_write_failures_total`.
