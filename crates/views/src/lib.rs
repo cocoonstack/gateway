@@ -1350,8 +1350,7 @@ fn user_hint(hint: Option<String>, field: &Value) -> Option<String> {
     hint.or_else(|| field.as_str().map(cap_user_hint))
 }
 
-/// Bound an attribution hint at `USER_HINT_MAX_BYTES` (it keys governance counters)
-/// and drop NUL, which Postgres TEXT refuses in every row the user lands in.
+/// Cap an attribution hint at `USER_HINT_MAX_BYTES` and drop NUL, which Postgres TEXT refuses.
 fn cap_user_hint(s: &str) -> String {
     let mut end = s.len().min(USER_HINT_MAX_BYTES);
     while !s.is_char_boundary(end) {
@@ -3782,10 +3781,9 @@ fn messages_stream_response(
                 BlockKind::Text => json!({"type":"text","text":""}),
                 BlockKind::Thinking => json!({"type":"thinking","thinking":"","signature":""}),
             };
-            self.queue.push_back(Self::ev(
-                "content_block_start",
-                json!({"type":"content_block_start","index":idx,"content_block":content_block}),
-            ));
+            let mut start = json!({"type":"content_block_start","index":idx});
+            start["content_block"] = content_block;
+            self.queue.push_back(Self::ev("content_block_start", start));
             idx
         }
 
@@ -4259,8 +4257,7 @@ fn responses_stream_response(
                 }) => {
                     let err = *err;
                     self.ensure_created();
-                    // carry both documented shapes: the docs put code/message at the top
-                    // level, the vendor nests them, and a client models only one
+                    // both shapes, since clients model one: the docs put code/message on top, the vendor nests them
                     self.queue.push_back(
                         Event::default().event("error").data(
                             json!({
@@ -4314,14 +4311,14 @@ fn responses_stream_response(
                     };
                     if !self.native {
                         self.seq += 1;
+                        let mut done = json!({"type":"response.completed","response":{
+                            "model": self.model, "status": self.status,
+                        }});
+                        done["response"]["usage"] = responses_usage(pt, ct, tt, c.common_usage);
                         self.queue.push_back(
-                            Event::default().event("response.completed").data(
-                                json!({"type":"response.completed","response":{
-                                    "model": self.model, "status": self.status,
-                                    "usage": responses_usage(pt, ct, tt, c.common_usage),
-                                }})
-                                .to_string(),
-                            ),
+                            Event::default()
+                                .event("response.completed")
+                                .data(done.to_string()),
                         );
                     }
                     self.queue.push_back(Event::default().data("[DONE]"));

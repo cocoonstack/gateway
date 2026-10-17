@@ -935,7 +935,6 @@ impl SharedConfig {
     pub async fn reload(&self, cfg: GatewayConfig) -> gw_models::GResult<()> {
         let _serialized = self.reload_lock.lock().await;
         let prev = self.inner.load();
-        // cfg.generation keys the preserved cache so it can't serve a pre-reload entry
         let state = GatewayState::reload_from(&cfg, &prev.state).await?;
         self.inner.store(Arc::new(Snapshot {
             cfg: Arc::new(cfg),
