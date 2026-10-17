@@ -42,8 +42,6 @@ const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 const ROLLUP_RETENTION_SECS: i64 = 62 * 86_400;
 const ROLLUP_MAX_BUCKETS: usize = 1_000_000;
 
-/// Postgres advisory-lock key serializing the fleet's rollup: one replica
-/// advances per tick (the upsert is idempotent; the lock only avoids repeated scans).
 const ROLLUP_LOCK_KEY: i64 = 0x6777_726f_6c6c;
 
 /// One minute past the newest rolled bucket — where the raw ledger tail
@@ -360,7 +358,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         }
         Ok(())
     }
-    /// Insert late rows and atomically add the ones inserted to rollup buckets the watermark passed.
+    /// Insert late rows and atomically roll up requests not already counted before pruning.
     async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()>;
     /// Whether rows may batch off the request path; in-process backends stay synchronous.
     fn defers_ledger_writes(&self) -> bool {
@@ -1170,6 +1168,7 @@ impl SqliteStore {
                 billed_units INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
+            "CREATE TABLE IF NOT EXISTS billing_pruned (request_id TEXT PRIMARY KEY)",
             "CREATE TABLE IF NOT EXISTS erasures (
                 tenant TEXT NOT NULL, user_id TEXT NOT NULL,
                 erased_at_epoch_millis INTEGER NOT NULL,
@@ -1448,6 +1447,25 @@ macro_rules! billing_insert {
     }};
 }
 
+macro_rules! lock_rollup {
+    (sqlite, $tx:ident) => {};
+    (postgres, $tx:ident) => {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ROLLUP_LOCK_KEY)
+            .execute(&mut *$tx)
+            .await
+            .map_err(|e| crate::sqlx_err("acquire rollup lock", e))?;
+    };
+}
+
+macro_rules! prunable_billing {
+    () => {
+        " FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?1
+         AND created_at_epoch_secs <
+          (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)"
+    };
+}
+
 macro_rules! rollup_select {
     ($d:ident) => {
         concat!(
@@ -1666,6 +1684,7 @@ macro_rules! sql_store_impl {
                     .begin()
                     .await
                     .map_err(|e| crate::sqlx_err("begin replay", e))?;
+                lock_rollup!($dialect, tx);
                 let mut insert = billing_insert!(rows);
                 let inserted: Vec<String> = insert
                     .push(" RETURNING request_id")
@@ -1684,7 +1703,8 @@ macro_rules! sql_store_impl {
                         ids.push_bind(id);
                     }
                     add.push(
-                        ") GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET \
+                        ") AND NOT EXISTS (SELECT 1 FROM billing_pruned p WHERE p.request_id = billing.request_id) \
+                         GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET \
                          requests = usage_rollup.requests + excluded.requests, \
                          prompt_tokens = usage_rollup.prompt_tokens + excluded.prompt_tokens, \
                          completion_tokens = usage_rollup.completion_tokens + excluded.completion_tokens, \
@@ -1705,23 +1725,6 @@ macro_rules! sql_store_impl {
 
             fn defers_ledger_writes(&self) -> bool {
                 true
-            }
-
-            async fn ledger_prune(&self) -> GResult<u64> {
-                if self.ledger_max_rows == 0 {
-                    return Ok(0);
-                }
-                let done = sqlx::query(dialect_sql!(
-                    $dialect,
-                    "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?
-                     AND created_at_epoch_secs <
-                      (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)"
-                ))
-                .bind(self.ledger_max_rows as i64)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("prune billing records", e))?;
-                Ok(done.rows_affected())
             }
 
             async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
@@ -2003,6 +2006,35 @@ macro_rules! sql_store_impl {
 }
 
 sql_store_impl!(SqliteStore, sqlite, {
+    async fn ledger_prune(&self) -> GResult<u64> {
+        if self.ledger_max_rows == 0 {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin prune", e))?;
+        sqlx::query(concat!(
+            "INSERT INTO billing_pruned SELECT request_id",
+            prunable_billing!(),
+            " ON CONFLICT (request_id) DO NOTHING"
+        ))
+        .bind(self.ledger_max_rows as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| crate::sqlx_err("retain pruned billing ids", e))?;
+        let done = sqlx::query(concat!("DELETE", prunable_billing!()))
+            .bind(self.ledger_max_rows as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit prune", e))?;
+        Ok(done.rows_affected())
+    }
+
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
@@ -2223,6 +2255,7 @@ impl PostgresStore {
                 billed_units BIGINT NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS billing_created_idx ON billing (created_at_epoch_secs)",
             "CREATE UNIQUE INDEX IF NOT EXISTS billing_request_uidx ON billing (request_id)",
+            "CREATE TABLE IF NOT EXISTS billing_pruned (request_id TEXT PRIMARY KEY)",
             "CREATE TABLE IF NOT EXISTS usage_rollup (
                 minute_epoch BIGINT NOT NULL, tenant TEXT NOT NULL, user_id TEXT NOT NULL,
                 model TEXT NOT NULL, requests BIGINT NOT NULL,
@@ -2314,6 +2347,36 @@ impl PostgresStore {
 }
 
 sql_store_impl!(PostgresStore, postgres, {
+    async fn ledger_prune(&self) -> GResult<u64> {
+        if self.ledger_max_rows == 0 {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin prune", e))?;
+        lock_rollup!(postgres, tx);
+        let count: i64 = sqlx::query_scalar(dialect_sql!(
+            postgres,
+            concat!(
+                "WITH pruned AS (DELETE",
+                prunable_billing!(),
+                " RETURNING request_id),
+             retained AS (INSERT INTO billing_pruned SELECT request_id FROM pruned
+             ON CONFLICT (request_id) DO NOTHING) SELECT COUNT(*) FROM pruned"
+            )
+        ))
+        .bind(self.ledger_max_rows as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit prune", e))?;
+        Ok(count as u64)
+    }
+
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut tx = self
@@ -3624,6 +3687,135 @@ mod tests {
                 .unwrap();
         })
         .await;
+    }
+
+    async fn replay_after_prune_is_idempotent(store: &dyn Store) {
+        for (user, replay) in [("normal", false), ("replay", true)] {
+            let late = BillingRecord {
+                user_id: user.into(),
+                created_at_epoch_secs: 400,
+                ..record("late")
+            };
+            if !replay {
+                store.ledger_add(&late).await.unwrap();
+            }
+            let newer = |at| BillingRecord {
+                created_at_epoch_secs: at,
+                ..record("newer")
+            };
+            store.ledger_add(&newer(7_000)).await.unwrap();
+            store.usage_rollup_advance(10_000).await.unwrap();
+            if replay {
+                store
+                    .ledger_replay_batch(std::slice::from_ref(&late))
+                    .await
+                    .unwrap();
+            }
+            store.ledger_add(&newer(8_000)).await.unwrap();
+            store.usage_rollup_advance(10_000).await.unwrap();
+            assert!(store.ledger_prune().await.unwrap() > 0);
+            assert!(
+                store
+                    .ledger_snapshot(usize::MAX)
+                    .await
+                    .unwrap()
+                    .1
+                    .iter()
+                    .all(|r| r.request_id != late.request_id)
+            );
+            for _ in 0..2 {
+                store
+                    .ledger_replay_batch(std::slice::from_ref(&late))
+                    .await
+                    .unwrap();
+                store.ledger_add(&newer(9_000)).await.unwrap();
+                store.usage_rollup_advance(10_000).await.unwrap();
+                assert!(store.ledger_prune().await.unwrap() > 0);
+                let usage = store
+                    .usage_by_user(None, Some(user), 0, 1_000)
+                    .await
+                    .unwrap();
+                assert_eq!(usage.len(), 1);
+                assert_eq!(
+                    (usage[0].requests, usage[0].cost_micros),
+                    (1, late.cost_micros)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_replay_does_not_rebill_pruned_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open_with_cap(dir.path().join("replay.db").to_str().unwrap(), 1)
+            .await
+            .unwrap();
+        replay_after_prune_is_idempotent(&store).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_replay_does_not_rebill_pruned_records() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let (url, _) = crate::scratch_pg(&url).await;
+        let store = PostgresStore::connect_with_cap(&url, 1, 0).await.unwrap();
+        replay_after_prune_is_idempotent(&store).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_replay_waits_for_rollup_before_classifying_late_rows() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let (url, _) = crate::scratch_pg(&url).await;
+        let store = std::sync::Arc::new(PostgresStore::connect(&url).await.unwrap());
+        let billed = |at| BillingRecord {
+            created_at_epoch_secs: at,
+            ..record("late")
+        };
+        store.ledger_add(&billed(300)).await.unwrap();
+        store.usage_rollup_advance(420).await.unwrap();
+        store.ledger_add(&billed(390)).await.unwrap();
+        let mut rollup = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ROLLUP_LOCK_KEY)
+            .execute(&mut *rollup)
+            .await
+            .unwrap();
+        let replay_store = store.clone();
+        let late = billed(400);
+        let replay = tokio::spawn(async move {
+            replay_store.ledger_replay_batch(&[late]).await.unwrap();
+        });
+        crate::eventually("replay waiting for rollup", async || {
+            assert!(
+                !replay.is_finished(),
+                "replay bypassed the rollup transaction"
+            );
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                 AND objid::bigint = $1 AND NOT granted)",
+            )
+            .bind(ROLLUP_LOCK_KEY & 0xffff_ffff)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+        })
+        .await;
+        sqlx::query(dialect_sql!(postgres, q_rollup_insert!(postgres)))
+            .bind(360_i64)
+            .bind(2_940_i64)
+            .execute(&mut *rollup)
+            .await
+            .unwrap();
+        rollup.commit().await.unwrap();
+        replay.await.unwrap();
+        store.usage_rollup_advance(3_060).await.unwrap();
+        let usage = store.usage_by_user(None, None, 360, 420).await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].requests, 2);
     }
 
     #[tokio::test]

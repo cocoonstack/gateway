@@ -93,7 +93,8 @@ storage:
   warning until it returns ([Governance](governance.md#limits)).
 - `ledger_max_rows` is not a hard cap: pruning spares rows not yet folded
   into the usage rollup, so the table can briefly exceed the cap under
-  rollup lag.
+  rollup lag. Pruned request IDs remain as compact deduplication records for
+  late spool replay.
 - With Postgres + Redis, the batching billing writer shares the connection
   pool with request-path reads; at the default `postgres_max_connections: 10`
   a single-node bench showed the big-body lane going bimodal (p99 9 ms vs

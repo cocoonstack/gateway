@@ -1082,11 +1082,16 @@ fn settle_on(counter: &mut i64, delta: i64) {
 
 #[cfg(test)]
 pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let db = format!("gwtest_{nonce}");
+    let db = format!(
+        "gwtest_{nonce}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let admin = sqlx::PgPool::connect(url).await.expect("pg admin");
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
         .execute(&admin)
