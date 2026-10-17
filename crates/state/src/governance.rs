@@ -303,11 +303,13 @@ impl Governance for RedisGovernance {
         static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
             redis::Script::new(
                 "for i = 1, #KEYS do
-                   if tonumber(redis.call('GET', KEYS[i]) or '0') >= tonumber(ARGV[2 * i + 1]) then return i end
-                 end
-                 for i = 1, #KEYS do
                    local amount = tonumber(ARGV[2 * i])
-                   if redis.call('INCRBY', KEYS[i], amount) == amount then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
+                   local v = redis.call('INCRBY', KEYS[i], amount)
+                   if v == amount then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
+                   if v - amount >= tonumber(ARGV[2 * i + 1]) then
+                     for j = 1, i do redis.call('DECRBY', KEYS[j], ARGV[2 * j]) end
+                     return i
+                   end
                  end
                  return 0",
             )
@@ -348,8 +350,8 @@ impl Governance for RedisGovernance {
                 "local out = {}
                  for i = 1, #KEYS do
                    local v = redis.call('INCRBY', KEYS[i], ARGV[i + 1])
+                   if v == tonumber(ARGV[i + 1]) then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
                    if v < 0 then redis.call('SET', KEYS[i], 0, 'KEEPTTL'); v = 0 end
-                   if redis.call('PTTL', KEYS[i]) < 0 then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
                    out[i] = v
                  end
                  return out",
@@ -535,7 +537,27 @@ mod tests {
             return;
         };
         let g = RedisGovernance::connect(&url).await.expect("redis connect");
-        exercise_reserve_all(&g, &format!("-{}", std::process::id())).await;
+        let ns = format!("-{}", std::process::id());
+        exercise_reserve_all(&g, &ns).await;
+        let now = crate::epoch_secs();
+        let keys: Vec<_> = ["ra", "rb", "rc"]
+            .iter()
+            .map(|k| quota_key_at(&format!("{k}{ns}"), now))
+            .collect();
+        let mut conn = g.conn.clone();
+        for key in &keys {
+            let ttl: i64 = redis::cmd("PTTL")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert!(ttl > 0, "{key} ttl {ttl}");
+        }
+        let _: i64 = redis::cmd("DEL")
+            .arg(&keys)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
