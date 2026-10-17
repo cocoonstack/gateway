@@ -5,6 +5,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::ListenerExt as _;
 use gw_config::GatewayConfig;
 use gw_state::GatewayState;
 use gw_views::AppState;
@@ -194,7 +195,11 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!(error = %e, "TCP_NODELAY not set on an accepted connection");
+        }
+    });
     tracing::info!("gw listening on http://{addr}");
 
     // connect-info so the audit trail can root the source IP at the TCP peer
