@@ -796,8 +796,7 @@ pub fn month_prefixes() -> [String; 2] {
     [month_prefix(month), month_prefix(previous_month(month))]
 }
 
-/// Accrue usage under `over`, the override admission resolved (`None` resolves it now), settling
-/// what `hold` held; a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
+/// Accrue usage under `over` (`None` resolves it now) and settle `hold`; a scope at its cap alerts.
 async fn consume_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,

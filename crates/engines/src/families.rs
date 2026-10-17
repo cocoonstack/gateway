@@ -565,8 +565,7 @@ fn video_dialect(vendor: &str, wire: &str) -> VideoDialect {
 /// The vendor's async handle in a submit reply, whichever dialect answered;
 /// `None` for a synchronous reply that already carries the video.
 pub fn video_handle(v: &Value) -> Option<&str> {
-    // task ids before `request_id`: DashScope and Kling replies carry both, and
-    // their top-level request_id is the HTTP call's trace id, not the job
+    // task ids first: a DashScope or Kling request_id traces the HTTP call, not the job
     v["output"]["task_id"]
         .as_str()
         .or_else(|| v["data"]["task_id"].as_str())
