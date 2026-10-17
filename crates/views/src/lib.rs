@@ -585,10 +585,17 @@ async fn realtime_gate(
     admission::check_model_qpm(gov, cfg, &m.served)
         .await
         .map_err(throttled)?;
-    let user_budget = admission::check_budgets(state, cfg, &ak, ak.attributed_user(hint))
-        .await
-        .map_err(|e| (ErrClass::ServiceUnavailable, e.message))?
-        .map_err(quota_exceeded)?;
+    let (user_budget, _) = admission::reserve_budgets(
+        state,
+        cfg,
+        &ak,
+        ak.attributed_user(hint),
+        admission::BudgetSpend::default(),
+        gw_state::epoch_secs(),
+    )
+    .await
+    .map_err(|e| (ErrClass::ServiceUnavailable, e.message))?
+    .map_err(quota_exceeded)?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak_id, &m.requested), limit)
@@ -689,6 +696,7 @@ async fn bill_realtime_turn(
             model_quota_key,
             budget_ak: ak,
             user_budget: admit.user_budget,
+            budget_hold: Default::default(),
         },
     )
     .await;
@@ -4582,6 +4590,7 @@ async fn admit_video_job(
                         model_quota_key: None,
                         budget_ak: submitter.as_deref().unwrap_or(&ak),
                         user_budget: None,
+                        budget_hold: Default::default(),
                     },
                 )
                 .await;

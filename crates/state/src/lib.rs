@@ -389,9 +389,11 @@ impl QuotaStore {
         reserve_on(&mut slot_mut(&self.used, key, || 0), amount, limit)
     }
 
-    /// Apply the settle delta (actual - reserved); never below zero.
-    pub fn settle(&self, key: &str, delta: i64) {
-        settle_on(&mut slot_mut(&self.used, key, || 0), delta);
+    /// Apply the settle delta (actual - reserved); never below zero. Returns the new total.
+    pub fn settle(&self, key: &str, delta: i64) -> i64 {
+        let mut e = slot_mut(&self.used, key, || 0);
+        settle_on(&mut e, delta);
+        *e
     }
 
     pub fn reset_all(&self) {

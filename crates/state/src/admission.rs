@@ -44,6 +44,46 @@ pub struct TpmReserve {
     pub window: Option<i64>,
 }
 
+/// Tokens and cost a call charges the budgets: the admission estimate, or the settled actuals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BudgetSpend {
+    pub tokens: i64,
+    pub cost_micros: i64,
+}
+
+impl BudgetSpend {
+    fn of(self, scope: BudgetScope) -> i64 {
+        if scope.charges_cost() {
+            self.cost_micros
+        } else {
+            self.tokens
+        }
+    }
+}
+
+/// Day-budget amounts held at admission, so concurrent calls count before they settle.
+#[derive(Debug, Default)]
+pub struct BudgetHold {
+    held: Vec<(String, i64)>,
+    at: i64,
+}
+
+impl BudgetHold {
+    /// Return every held amount, for a call that never reached billing.
+    pub async fn refund(self, gov: &dyn Governance) {
+        let at = self.at;
+        futures::future::join_all(self.held.into_iter().map(|(key, amount)| async move {
+            gov.quota_settle(&key, -amount, at).await;
+        }))
+        .await;
+    }
+
+    fn take(&mut self, key: &str) -> Option<i64> {
+        let i = self.held.iter().position(|(k, _)| k == key)?;
+        Some(self.held.swap_remove(i).1)
+    }
+}
+
 /// One settled call: identity + reserves to close.
 pub struct SettleInput<'a> {
     pub billing: BillingInput<'a>,
@@ -59,6 +99,8 @@ pub struct SettleInput<'a> {
     /// The key whose budgets the call charges, and the user override admission resolved.
     pub budget_ak: &'a AkInfo,
     pub user_budget: Option<UserBudget>,
+    /// Day-budget amounts admission held; the settle charges the difference.
+    pub budget_hold: BudgetHold,
 }
 
 /// What a settled request cost, for the decision trail.
@@ -441,34 +483,52 @@ pub async fn flush_billing(state: &GatewayState) {
     }
 }
 
-/// Daily and monthly budgets (soft caps: check-then-consume, so concurrent
-/// turns can overshoot by one): admit while every configured scope is under its cap.
-/// Admitted yields the user's override for settlement; the outer error is a failed lookup.
-pub async fn check_budgets(
+/// Hold `est` against the day budgets, admitting while spent plus held is under each cap; month budgets and a zero `est` only check.
+pub async fn reserve_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
-) -> GResult<Result<UserBudget, String>> {
+    est: BudgetSpend,
+    at: i64,
+) -> GResult<Result<(UserBudget, BudgetHold), String>> {
     let over = user_budget(state, ak, user).await?;
     let gov = state.governance.as_ref();
     let budgets = budgets(gov, cfg, ak, user, over).await;
-    let under = futures::future::join_all(budgets.iter().map(|b| async move {
+    let admitted = futures::future::join_all(budgets.iter().map(|b| async move {
+        let amount = est.of(b.scope);
         match b.window {
-            Window::Day => gov.quota_check(&b.key, b.limit).await,
-            Window::Month => gov.counter_get(&b.key).await < b.limit,
+            Window::Day if amount > 0 => gov.quota_reserve(&b.key, amount, b.limit, at).await,
+            Window::Day => gov.quota_check(&b.key, b.limit).await.then_some(0),
+            Window::Month => (gov.counter_get(&b.key).await < b.limit).then_some(0),
         }
     }))
     .await;
-    if let Some((b, _)) = budgets.iter().zip(under).find(|(_, under)| !under) {
-        return Ok(Err(format!(
-            "{} {} budget exhausted for {}",
-            b.window.label(),
-            b.scope.unit(),
-            b.scope.subject(ak, user)
-        )));
+    let mut hold = BudgetHold {
+        held: Vec::new(),
+        at,
+    };
+    let mut denied = None;
+    for (b, admitted) in budgets.into_iter().zip(admitted) {
+        match admitted {
+            Some(held) if held > 0 => hold.held.push((b.key, held)),
+            Some(_) => {}
+            None if denied.is_none() => {
+                denied = Some(format!(
+                    "{} {} budget exhausted for {}",
+                    b.window.label(),
+                    b.scope.unit(),
+                    b.scope.subject(ak, user)
+                ));
+            }
+            None => {}
+        }
     }
-    Ok(Ok(over))
+    let Some(denied) = denied else {
+        return Ok(Ok((over, hold)));
+    };
+    hold.refund(gov).await;
+    Ok(Err(denied))
 }
 
 pub fn model_quota_key(ak_id: &str, model: &str) -> String {
@@ -647,8 +707,11 @@ pub async fn settle_and_bill(
         s.budget_ak,
         s.billing.user_id,
         s.user_budget,
-        settled.total_tokens,
-        settled.cost_micros,
+        s.budget_hold,
+        BudgetSpend {
+            tokens: settled.total_tokens,
+            cost_micros: settled.cost_micros,
+        },
     );
     let write_ledger = state.billing.write(record);
     tokio::join!(
@@ -667,18 +730,20 @@ pub fn month_prefixes() -> [String; 2] {
     [month_prefix(month), month_prefix(previous_month(month))]
 }
 
-/// Accrue usage under `over`, the override admission resolved (`None` resolves it now);
-/// a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
+/// Accrue usage under `over`, the override admission resolved (`None` resolves it now), settling
+/// what `hold` held; a scope reaching its cap raises a `budget_exhausted` alert (deduped by the bus).
 async fn consume_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
     over: Option<UserBudget>,
-    tokens: i64,
-    cost_micros: i64,
+    mut hold: BudgetHold,
+    spent: BudgetSpend,
 ) {
-    if tokens <= 0 && cost_micros <= 0 {
+    let gov = state.governance.as_ref();
+    if spent.tokens <= 0 && spent.cost_micros <= 0 {
+        hold.refund(gov).await;
         return;
     }
     let over = match over {
@@ -688,23 +753,28 @@ async fn consume_budgets(
             UserBudget::default()
         }),
     };
-    let gov = state.governance.as_ref();
     let budgets = budgets(gov, cfg, ak, user, over).await;
-    let used = futures::future::join_all(budgets.iter().map(|b| async move {
-        let amount = if b.scope.charges_cost() {
-            cost_micros
-        } else {
-            tokens
-        };
-        if amount <= 0 {
-            return None;
+    let at = hold.at;
+    let used = futures::future::join_all(budgets.iter().map(|b| {
+        let held = hold.take(&b.key);
+        async move {
+            let amount = spent.of(b.scope);
+            match (b.window, held) {
+                (Window::Day, Some(held)) if held == amount => None,
+                (Window::Day, Some(held)) => {
+                    Some(gov.quota_settle(&b.key, amount - held, at).await)
+                }
+                _ if amount <= 0 => None,
+                (Window::Day, None) => Some(gov.quota_consume(&b.key, amount).await),
+                (Window::Month, _) => {
+                    Some(gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await)
+                }
+            }
         }
-        Some(match b.window {
-            Window::Day => gov.quota_consume(&b.key, amount).await,
-            Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
-        })
     }))
     .await;
+    // a reload between admission and settle may have dropped a held budget
+    hold.refund(gov).await;
     for (b, used) in budgets.iter().zip(used) {
         if let Some(used) = used
             && used >= b.limit
@@ -1185,12 +1255,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daily_budgets_hold_in_flight_calls_until_they_settle() {
+        let yaml = "listen: {host: h, port: 1}\ntenants: [{name: t1, key_daily_cost_quota_micros: 100}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 1000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let ak = state.auth.get(&access_key_id("k1")).await.unwrap();
+        let gov = state.governance.as_ref();
+        let key = format!("cb:ak:{}", ak.ak_id);
+        let est = BudgetSpend {
+            tokens: 1,
+            cost_micros: 60,
+        };
+        let now = crate::epoch_secs();
+        let reserve = || reserve_budgets(&state, &cfg, &ak, "", est, now);
+
+        let (_, first) = reserve().await.unwrap().unwrap();
+        let (_, second) = reserve().await.unwrap().unwrap();
+        assert_eq!(gov.quota_used(&key).await, 120, "both calls are in flight");
+        let denied = reserve().await.unwrap().unwrap_err();
+        assert!(
+            denied.starts_with("daily cost budget exhausted for key:"),
+            "{denied}"
+        );
+        assert_eq!(gov.quota_used(&key).await, 120, "a denial holds nothing");
+
+        let spent = BudgetSpend {
+            tokens: 1,
+            cost_micros: 10,
+        };
+        consume_budgets(&state, &cfg, &ak, "", None, first, spent).await;
+        assert_eq!(gov.quota_used(&key).await, 70, "the settle charges actuals");
+        second.refund(gov).await;
+        assert_eq!(gov.quota_used(&key).await, 10, "a refund returns the hold");
+        let (_, third) = reserve().await.unwrap().unwrap();
+        consume_budgets(&state, &cfg, &ak, "", None, third, BudgetSpend::default()).await;
+        assert_eq!(
+            gov.quota_used(&key).await,
+            10,
+            "a zero-cost settle refunds the hold"
+        );
+    }
+
+    #[tokio::test]
     async fn monthly_budget_denies_at_the_cap_without_touching_daily_counters() {
         let (cfg, state, ak) = monthly_fixture(false).await;
         let gov = state.governance.as_ref();
-        check_budgets(&state, &cfg, &ak, "").await.unwrap().unwrap();
-        consume_budgets(&state, &cfg, &ak, "", None, 10, 3).await;
-        let err = check_budgets(&state, &cfg, &ak, "")
+        reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default(), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        consume_budgets(
+            &state,
+            &cfg,
+            &ak,
+            "",
+            None,
+            BudgetHold::default(),
+            BudgetSpend {
+                tokens: 10,
+                cost_micros: 3,
+            },
+        )
+        .await;
+        let err = reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default(), 0)
             .await
             .unwrap()
             .unwrap_err();
@@ -1201,7 +1328,10 @@ mod tests {
         assert_eq!(gov.quota_used(&format!("cb:ak:{}", ak.ak_id)).await, 0);
         gov.quota_reset_all().await;
         assert!(
-            check_budgets(&state, &cfg, &ak, "").await.unwrap().is_err(),
+            reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default(), 0)
+                .await
+                .unwrap()
+                .is_err(),
             "the daily reset leaves month counters alone"
         );
     }

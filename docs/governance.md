@@ -81,10 +81,10 @@ models:
 | QPS | pooled per tenant | `tenants[].qps` |
 | Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
 | Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override (over it: the tenant `fallback_model`, else refused) |
-| Daily tokens | per end user | `tenants[].user_daily_token_quota` (soft) |
-| Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; soft) |
-| Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (soft) |
-| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (soft), per-user override via `/admin/tenants/{tenant}/users/{user}/budget` |
+| Daily tokens | per end user | `tenants[].user_daily_token_quota` (held) |
+| Daily cost | pooled per tenant | `tenants[].daily_cost_quota_micros` (micro-dollars of charged price; held) |
+| Daily cost | per access key | `tenants[].key_daily_cost_quota_micros` (held) |
+| Daily cost | per end user | `tenants[].user_daily_cost_quota_micros` (held), per-user override via `/admin/tenants/{tenant}/users/{user}/budget` |
 | Monthly cost | pooled per tenant / per key / per end user | `tenants[].monthly_cost_quota_micros`, `key_monthly_cost_quota_micros`, `user_monthly_cost_quota_micros` (UTC calendar month; soft; `monthly_cost_rollover` carries the unspent remainder); the per-user cap takes a per-user override |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |
@@ -262,15 +262,21 @@ REST, realtime (the `x-gw-user` hint is captured at WS connect), and batch
 (each item's `user`, or the submitter's `x-gw-user`, is persisted with the item
 so a fleet drainer still attributes and budgets it). `GET /admin/usage/users?user=&since=&until=`
 returns per-(user, model) cost over a billing period (add `format=csv` for
-export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap —
-enforced with a hard `400 service_quota_exceeded_exception` once exceeded;
-"soft" means check-then-consume, so concurrent in-flight turns can overshoot it
-by one before the counter accrues.
+export). `TenantConf.user_daily_token_quota` sets a per-user daily cap —
+enforced with a hard `400 service_quota_exceeded_exception` once exceeded.
+On the REST pipeline every daily budget holds the call's estimate at admission
+(the token estimate for the token cap; for the cost caps that estimate's prompt
+and `max_tokens` sides at the tenant's price), admitting while spent plus held
+is under the cap, so concurrent calls overshoot by at most one; billing settles
+the hold to the charged amount and a failed call returns it. A call without
+`max_tokens` holds 256 output tokens, so a long completion can still carry one
+call past the cap. Realtime turns and the monthly caps check before the call
+and accrue after it ("soft": concurrent turns can overshoot by one each).
 The per-(key, model) quota is soft the same way: it is a routing trigger (the
 fallback-model degrade), while the reserved per-key daily quota hard-caps spend.
 The daily cost budgets — `daily_cost_quota_micros` pooled over the tenant's
 keys, `key_daily_cost_quota_micros` per key, `user_daily_cost_quota_micros`
-per end user — are soft caps of the same kind over the ledger's charged
+per end user — are caps of the same kind over the ledger's charged
 `cost_micros` (list price, the tenant's `model_prices`, or a decisions reply's
 `usage.cost`, so unit-priced surfaces count too); they apply on every surface, realtime and batch included,
 and a response-cache hit, which bills nothing, counts nothing.

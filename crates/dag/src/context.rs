@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gw_config::GatewayConfig;
 use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{GResult, GatewayError, GatewayRequest, ModelParamV2};
-use gw_state::admission::TpmReserve;
+use gw_state::admission::{BudgetHold, TpmReserve};
 use gw_state::{AkInfo, GatewayState, UserBudget};
 
 pub struct DagContext {
@@ -40,6 +40,8 @@ pub struct DagContext {
     pub tpm_reserved: Option<TpmReserve>,
     /// The user's budget override resolved at admission, charged at settlement.
     pub user_budget: Option<UserBudget>,
+    /// Day-budget amounts held at admission (same lifecycle as `quota_reserved`).
+    pub budget_hold: BudgetHold,
     /// Outbound DLP buffered this stream; billing waits for the view's delivery result.
     pub billing_deferred: bool,
 }
@@ -69,6 +71,7 @@ impl DagContext {
             quota_at: 0,
             tpm_reserved: None,
             user_budget: None,
+            budget_hold: BudgetHold::default(),
             billing_deferred: false,
         }
     }

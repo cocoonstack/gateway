@@ -241,6 +241,11 @@ impl Write for PromptBytes {
 
 /// Admission estimate: ~bytes/4 prompt plus the requested max_tokens, saturating and capped.
 fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
+    let (prompt, max_out) = reserve_parts(req);
+    prompt.saturating_add(max_out).min(MAX_RESERVE)
+}
+
+fn reserve_parts(req: &gw_models::GatewayRequest) -> (i64, i64) {
     let typed = req.model_param_v2.as_ref().and_then(|p| p.typed.as_ref());
     let prompt = if let Some(gw_models::TypedParams::Decisions(p)) = typed {
         let mut bytes = PromptBytes(0);
@@ -256,9 +261,7 @@ fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
         })
         .unwrap_or(DEFAULT_COMPLETION_RESERVE)
         .clamp(0, MAX_RESERVE);
-    ((prompt as i64 / 4).max(1))
-        .saturating_add(max_out)
-        .min(MAX_RESERVE)
+    ((prompt as i64 / 4).clamp(1, MAX_RESERVE), max_out)
 }
 
 /// preprocess/quota_check: reserve the estimate against the AK daily quota; billing settles it.
@@ -418,7 +421,7 @@ impl DagNode for AkTpmLimit {
     }
 }
 
-/// model_access/budget: the tenant's token and cost budgets (soft caps) for the key and user.
+/// model_access/budget: holds the call's estimate against the tenant's daily budgets for the key and user.
 pub struct BudgetGate;
 
 #[async_trait::async_trait]
@@ -427,10 +430,31 @@ impl DagNode for BudgetGate {
         "budget"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let over = admission::check_budgets(&ctx.state, &ctx.cfg, &ctx.ak, ctx.effective_user_id())
-            .await?
-            .map_err(quota_denied)?;
+        let (prompt, max_out) = reserve_parts(&ctx.request);
+        let served = served_model(ctx.request.model_param_v2.as_ref());
+        let est = admission::BudgetSpend {
+            tokens: ctx
+                .quota_reserved
+                .filter(|&reserved| reserved > 0)
+                .unwrap_or_else(|| prompt.saturating_add(max_out).min(MAX_RESERVE)),
+            cost_micros: gw_models::cost_micros(
+                prompt,
+                max_out,
+                ctx.cfg.prices_for_tenant(&ctx.ak.tenant, served),
+            ),
+        };
+        let (over, hold) = admission::reserve_budgets(
+            &ctx.state,
+            &ctx.cfg,
+            &ctx.ak,
+            ctx.effective_user_id(),
+            est,
+            ctx.quota_at,
+        )
+        .await?
+        .map_err(quota_denied)?;
         ctx.user_budget = Some(over);
+        ctx.budget_hold = hold;
         Ok(())
     }
 }
@@ -757,15 +781,15 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
             bill_aborted_stream(ctx, Some(completion)).await
         }
         StreamDelivery::None => {
-            ctx.state
-                .governance
-                .refund_reserves(
-                    &ctx.ak.ak_id,
-                    ctx.quota_reserved.take().unwrap_or(0),
-                    ctx.tpm_reserved.take(),
-                    ctx.quota_at,
-                )
-                .await;
+            let gov = ctx.state.governance.as_ref();
+            gov.refund_reserves(
+                &ctx.ak.ak_id,
+                ctx.quota_reserved.take().unwrap_or(0),
+                ctx.tpm_reserved.take(),
+                ctx.quota_at,
+            )
+            .await;
+            std::mem::take(&mut ctx.budget_hold).refund(gov).await;
             if let Some(outcome) = ctx.outcome.as_mut() {
                 outcome.response.prompt_tokens = 0;
                 blank_stream_response(&mut outcome.response);
@@ -848,10 +872,11 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
         served_conf.and_then(|m| m.batch_discount).unwrap_or(1.0)
     };
     // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
-    let (reserved, tpm_reserved, model_quota_key) = (
+    let (reserved, tpm_reserved, model_quota_key, budget_hold) = (
         ctx.quota_reserved.take().unwrap_or(0),
         ctx.tpm_reserved.take(),
         ctx.model_quota_key.take(),
+        std::mem::take(&mut ctx.budget_hold),
     );
     let settled = admission::settle_and_bill(
         ctx.state.as_ref(),
@@ -885,6 +910,7 @@ async fn bill(ctx: &mut DagContext, mut tokens: BillTokens, estimated: bool) -> 
             model_quota_key,
             budget_ak: &ctx.ak,
             user_budget: ctx.user_budget,
+            budget_hold,
         },
     )
     .await;

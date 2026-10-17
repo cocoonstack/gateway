@@ -270,15 +270,15 @@ impl OnlineHandler {
                 break;
             };
             // a failed pipeline refunds its reservations whole, on the reserve's day bucket
-            ctx.state
-                .governance
-                .refund_reserves(
-                    &ctx.ak.ak_id,
-                    ctx.quota_reserved.take().unwrap_or(0),
-                    ctx.tpm_reserved.take(),
-                    ctx.quota_at,
-                )
-                .await;
+            let gov = ctx.state.governance.as_ref();
+            gov.refund_reserves(
+                &ctx.ak.ak_id,
+                ctx.quota_reserved.take().unwrap_or(0),
+                ctx.tpm_reserved.take(),
+                ctx.quota_at,
+            )
+            .await;
+            std::mem::take(&mut ctx.budget_hold).refund(gov).await;
             // signed thinking replays only against the model that produced it
             if is_upstream_fault(&e)
                 && !ctx.request.replays_reasoning_output()

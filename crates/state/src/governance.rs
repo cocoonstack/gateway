@@ -36,8 +36,8 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
         at_epoch_secs: i64,
     ) -> Option<i64>;
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
-    /// bucket the paired reserve used (`at_epoch_secs`).
-    async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
+    /// bucket the paired reserve used (`at_epoch_secs`); returns the new total, or 0 for a zero delta.
+    async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64) -> i64;
     /// Tokens spent today under `key`.
     async fn quota_used(&self, key: &str) -> i64;
     /// Add to `key`'s spent tokens; returns the day's new total.
@@ -105,8 +105,8 @@ impl Governance for MemoryGovernance {
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> Option<i64> {
         self.quota.reserve(key, amount, limit).then_some(amount)
     }
-    async fn quota_settle(&self, key: &str, delta: i64, _at: i64) {
-        self.quota.settle(key, delta);
+    async fn quota_settle(&self, key: &str, delta: i64, _at: i64) -> i64 {
+        self.quota.settle(key, delta)
     }
     async fn quota_used(&self, key: &str) -> i64 {
         self.quota.used(key)
@@ -275,9 +275,9 @@ impl Governance for RedisGovernance {
                 }
             })
     }
-    async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
+    async fn quota_settle(&self, key: &str, delta: i64, at: i64) -> i64 {
         if delta == 0 {
-            return;
+            return 0;
         }
         settle_floored(
             &self.conn,
@@ -286,7 +286,7 @@ impl Governance for RedisGovernance {
             Duration::from_millis(QUOTA_TTL_MS as u64),
             None,
         )
-        .await;
+        .await
     }
     async fn quota_consume(&self, key: &str, tokens: i64) -> i64 {
         self.incr_window(
@@ -348,13 +348,14 @@ fn quota_key(key: &str) -> String {
 
 /// Apply a settle delta and floor at 0 atomically (a rollover between reserve
 /// and settle must not plant a negative); keeps an existing TTL, arms `window` otherwise.
+/// Returns the new total, 0 when the round-trip failed.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,
     delta: i64,
     window: Duration,
     id: Option<i64>,
-) {
+) -> i64 {
     static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
         redis::Script::new(
             "local id = tonumber(ARGV[3])
@@ -368,16 +369,17 @@ async fn settle_floored(
         )
     });
     let mut conn = conn.clone();
-    if let Err(e) = SCRIPT
+    SCRIPT
         .key(key)
         .arg(delta)
         .arg(window.as_millis() as i64)
         .arg(id.unwrap_or(-1))
         .invoke_async::<i64>(&mut conn)
         .await
-    {
-        tracing::warn!(error = %e, key, "redis settle failed");
-    }
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, key, "redis settle failed");
+            0
+        })
 }
 
 #[cfg(test)]
