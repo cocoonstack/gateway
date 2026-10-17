@@ -1090,7 +1090,7 @@ pub(crate) async fn scratch_pg(url: &str) -> (String, u128) {
     let db = format!(
         "gwtest_{nonce}_{}_{}",
         std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let admin = sqlx::PgPool::connect(url).await.expect("pg admin");
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
