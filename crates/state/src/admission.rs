@@ -534,16 +534,11 @@ pub async fn reserve_budgets(
     } else {
         BudgetSpend::default()
     };
-    let holds: Vec<(usize, i64)> = budgets
+    let holds = |b: &Budget| b.window == Window::Day && est.of(b.scope) > 0;
+    let hold_args: Vec<_> = budgets
         .iter()
-        .enumerate()
-        .filter(|(_, b)| b.window == Window::Day)
-        .map(|(i, b)| (i, est.of(b.scope)))
-        .filter(|&(_, amount)| amount > 0)
-        .collect();
-    let hold_args: Vec<_> = holds
-        .iter()
-        .map(|&(i, amount)| (budgets[i].key.as_str(), amount, budgets[i].limit))
+        .filter(|b| holds(b))
+        .map(|b| (b.key.as_str(), est.of(b.scope), b.limit))
         .collect();
     let (reserved, checked) = tokio::join!(
         async {
@@ -555,13 +550,16 @@ pub async fn reserve_budgets(
         },
         futures::future::join_all(budgets.iter().map(|b| async move {
             match b.window {
-                Window::Day if est.of(b.scope) > 0 => true,
+                _ if holds(b) => true,
                 Window::Day => gov.quota_check(&b.key, b.limit).await,
                 Window::Month => gov.counter_get(&b.key).await < b.limit,
             }
         })),
     );
-    let refused = reserved.err().map(|i| holds[i].0);
+    let refused = reserved
+        .err()
+        .and_then(|n| budgets.iter().enumerate().filter(|(_, b)| holds(b)).nth(n))
+        .map(|(i, _)| i);
     let Some(i) = checked
         .iter()
         .position(|ok| !ok)
@@ -570,9 +568,10 @@ pub async fn reserve_budgets(
         .min()
     else {
         let held = if reserved == Ok(true) {
-            holds
-                .iter()
-                .map(|&(i, amount)| (std::mem::take(&mut budgets[i].key), amount))
+            budgets
+                .iter_mut()
+                .filter(|b| holds(b))
+                .map(|b| (std::mem::take(&mut b.key), est.of(b.scope)))
                 .collect()
         } else {
             Vec::new()
@@ -815,19 +814,21 @@ async fn consume_budgets(
         }),
     };
     let budgets = budgets(gov, cfg, ak, user, over).await;
-    let (mut settles, mut accrues) = (Vec::new(), Vec::new());
+    if budgets.is_empty() {
+        return;
+    }
+    let (mut settles, mut deltas, mut accrues) = (Vec::new(), Vec::new(), Vec::new());
     for (i, b) in budgets.iter().enumerate() {
         let amount = spent.of(b.scope);
         match (b.window, hold.take(&b.key)) {
-            (Window::Day, Some(held)) => settles.push((i, b.key.as_str(), amount - held)),
+            (Window::Day, Some(held)) => {
+                settles.push(i);
+                deltas.push((b.key.as_str(), amount - held));
+            }
             _ if amount <= 0 => {}
             _ => accrues.push(i),
         }
     }
-    let deltas: Vec<_> = settles
-        .iter()
-        .map(|&(_, key, delta)| (key, delta))
-        .collect();
     let (settled, accrued) = tokio::join!(
         async {
             if deltas.is_empty() {
@@ -847,17 +848,13 @@ async fn consume_budgets(
             }
         })),
     );
-    let mut used = vec![None; budgets.len()];
-    for (&(i, _, _), total) in settles.iter().zip(settled) {
-        used[i] = Some(total);
-    }
-    for (&i, total) in accrues.iter().zip(accrued) {
-        used[i] = Some(total);
-    }
-    for (b, used) in budgets.iter().zip(used) {
-        if let Some(used) = used
-            && used >= b.limit
-        {
+    let totals = settles
+        .iter()
+        .zip(settled)
+        .chain(accrues.iter().zip(accrued));
+    for (&i, used) in totals {
+        let b = &budgets[i];
+        if used >= b.limit {
             state.alerts.emit(
                 "budget_exhausted",
                 b.scope.subject(ak, user),
