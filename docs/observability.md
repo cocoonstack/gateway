@@ -96,10 +96,12 @@ Writes are idempotent by `request_id`; a transient store failure is held in a
 bounded repair queue and retried with backoff — eight attempts, about 13 s —
 before the batch is dropped and counted in `gateway_ledger_write_failures_total`.
 With `storage.ledger_spool_path` set, the batch instead goes to that local
-JSON-lines file after three attempts (about 0.3 s), and a replay every 30 s
-inserts it once the store accepts writes again (`billing spool replayed` in the
-log). A row replayed more than 20 minutes after it was billed is in the ledger
-but not in the usage rollup that `GET /admin/usage/users` reads.
+JSON-lines file after three attempts (about 0.3 s; the directory is created on
+first use, and a spool that cannot be written falls back to the remaining
+retries), and a replay every 30 s inserts it in batches once the store accepts
+writes again, then re-rolls the usage rollup back to the oldest replayed row
+(`billing spool replayed` in the log). The spool path is per-instance local
+disk; replicas must not share one file.
 A full queue applies backpressure to settlement until the repair worker makes
 room, so overload alone never discards an accepted row.
 Per-user usage additionally rolls into durable minute buckets every minute, so
