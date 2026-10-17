@@ -73,11 +73,12 @@ pub struct BudgetHold {
 impl BudgetHold {
     /// Return every held amount, for a call that never reached billing.
     pub async fn refund(self, gov: &dyn Governance) {
-        let at = self.at;
-        futures::future::join_all(self.held.into_iter().map(|(key, amount)| async move {
-            gov.quota_settle(&key, -amount, at).await;
-        }))
-        .await;
+        let refunds: Vec<_> = self
+            .held
+            .iter()
+            .map(|(key, amount)| (key.as_str(), -amount))
+            .collect();
+        gov.quota_settle_all(&refunds, self.at).await;
     }
 
     fn take(&mut self, key: &str) -> Option<i64> {
@@ -521,41 +522,59 @@ pub async fn reserve_budgets(
     } else {
         BudgetSpend::default()
     };
-    let admitted = futures::future::join_all(budgets.iter().map(|b| async move {
-        let amount = est.of(b.scope);
-        match b.window {
-            Window::Day if amount > 0 => gov.quota_reserve(&b.key, amount, b.limit, at).await,
-            Window::Day => gov.quota_check(&b.key, b.limit).await.then_some(0),
-            Window::Month => (gov.counter_get(&b.key).await < b.limit).then_some(0),
-        }
-    }))
-    .await;
-    let mut hold = BudgetHold {
-        held: Vec::new(),
-        at,
-    };
-    let mut denied = None;
-    for (b, admitted) in budgets.into_iter().zip(admitted) {
-        match admitted {
-            Some(held) if held > 0 => hold.held.push((b.key, held)),
-            Some(_) => {}
-            None => {
-                denied.get_or_insert_with(|| {
-                    format!(
-                        "{} {} budget exhausted for {}",
-                        b.window.label(),
-                        b.scope.unit(),
-                        b.scope.subject(ak, user)
-                    )
-                });
+    let holds: Vec<(usize, i64)> = budgets
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.window == Window::Day)
+        .map(|(i, b)| (i, est.of(b.scope)))
+        .filter(|&(_, amount)| amount > 0)
+        .collect();
+    let hold_args: Vec<_> = holds
+        .iter()
+        .map(|&(i, amount)| (budgets[i].key.as_str(), amount, budgets[i].limit))
+        .collect();
+    let (reserved, checked) = tokio::join!(
+        gov.quota_reserve_all(&hold_args, at),
+        futures::future::join_all(budgets.iter().map(|b| async move {
+            match b.window {
+                Window::Day if est.of(b.scope) > 0 => true,
+                Window::Day => gov.quota_check(&b.key, b.limit).await,
+                Window::Month => gov.counter_get(&b.key).await < b.limit,
             }
-        }
-    }
-    let Some(denied) = denied else {
-        return Ok(Ok((over, hold)));
+        })),
+    );
+    let refused = reserved.err().map(|i| holds[i].0);
+    let Some(i) = checked
+        .iter()
+        .position(|ok| !ok)
+        .into_iter()
+        .chain(refused)
+        .min()
+    else {
+        let held = if reserved == Ok(true) {
+            holds
+                .iter()
+                .map(|&(i, amount)| (budgets[i].key.clone(), amount))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(Ok((over, BudgetHold { held, at })));
     };
-    hold.refund(gov).await;
-    Ok(Err(denied))
+    if reserved == Ok(true) {
+        let refunds: Vec<_> = hold_args
+            .iter()
+            .map(|&(key, amount, _)| (key, -amount))
+            .collect();
+        gov.quota_settle_all(&refunds, at).await;
+    }
+    let b = &budgets[i];
+    Ok(Err(format!(
+        "{} {} budget exhausted for {}",
+        b.window.label(),
+        b.scope.unit(),
+        b.scope.subject(ak, user)
+    )))
 }
 
 pub fn model_quota_key(ak_id: &str, model: &str) -> String {
@@ -778,25 +797,39 @@ async fn consume_budgets(
         }),
     };
     let budgets = budgets(gov, cfg, ak, user, over).await;
-    let at = hold.at;
-    let used = futures::future::join_all(budgets.iter().map(|b| {
-        let held = hold.take(&b.key);
-        async move {
+    let (mut settles, mut accrues) = (Vec::new(), Vec::new());
+    for (i, b) in budgets.iter().enumerate() {
+        let amount = spent.of(b.scope);
+        match (b.window, hold.take(&b.key)) {
+            (Window::Day, Some(held)) => settles.push((i, b.key.as_str(), amount - held)),
+            _ if amount <= 0 => {}
+            _ => accrues.push(i),
+        }
+    }
+    let deltas: Vec<_> = settles
+        .iter()
+        .map(|&(_, key, delta)| (key, delta))
+        .collect();
+    let (settled, accrued) = tokio::join!(
+        gov.quota_settle_all(&deltas, hold.at),
+        futures::future::join_all(accrues.iter().map(|&i| {
+            let b = &budgets[i];
             let amount = spent.of(b.scope);
-            match (b.window, held) {
-                (Window::Day, Some(held)) if held == amount => Some(gov.quota_used(&b.key).await),
-                (Window::Day, Some(held)) => {
-                    Some(gov.quota_settle(&b.key, amount - held, at).await)
-                }
-                _ if amount <= 0 => None,
-                (Window::Day, None) => Some(gov.quota_consume(&b.key, amount).await),
-                (Window::Month, _) => {
-                    Some(gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await)
+            async move {
+                match b.window {
+                    Window::Day => gov.quota_consume(&b.key, amount).await,
+                    Window::Month => gov.counter_add(&b.key, amount, MONTH_COUNTER_TTL).await,
                 }
             }
-        }
-    }))
-    .await;
+        })),
+    );
+    let mut used = vec![None; budgets.len()];
+    for (&(i, _, _), total) in settles.iter().zip(settled) {
+        used[i] = Some(total);
+    }
+    for (&i, total) in accrues.iter().zip(accrued) {
+        used[i] = Some(total);
+    }
     for (b, used) in budgets.iter().zip(used) {
         if let Some(used) = used
             && used >= b.limit

@@ -35,9 +35,16 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
         limit: i64,
         at_epoch_secs: i64,
     ) -> Option<i64>;
+    /// [`Self::quota_reserve`] over every hold at once, all or none: `Err(i)` = `holds[i]` is at its cap, `Ok(false)` = admitted unrecorded.
+    async fn quota_reserve_all(
+        &self,
+        holds: &[(&str, i64, i64)],
+        at_epoch_secs: i64,
+    ) -> Result<bool, usize>;
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
-    /// bucket the paired reserve used (`at_epoch_secs`); returns the new total, or 0 when nothing was applied.
-    async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64) -> i64;
+    /// bucket the paired reserve used (`at_epoch_secs`).
+    async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
+    async fn quota_settle_all(&self, deltas: &[(&str, i64)], at_epoch_secs: i64) -> Vec<i64>;
     /// Tokens spent today under `key`.
     async fn quota_used(&self, key: &str) -> i64;
     /// Add to `key`'s spent tokens; returns the day's new total.
@@ -105,11 +112,25 @@ impl Governance for MemoryGovernance {
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> Option<i64> {
         self.quota.reserve(key, amount, limit).then_some(amount)
     }
-    async fn quota_settle(&self, key: &str, delta: i64, _at: i64) -> i64 {
-        if delta == 0 {
-            return 0;
+    async fn quota_reserve_all(&self, holds: &[(&str, i64, i64)], _at: i64) -> Result<bool, usize> {
+        for (i, &(key, amount, limit)) in holds.iter().enumerate() {
+            if !self.quota.reserve(key, amount, limit) {
+                for &(key, amount, _) in &holds[..i] {
+                    self.quota.settle(key, -amount);
+                }
+                return Err(i);
+            }
         }
-        self.quota.settle(key, delta)
+        Ok(true)
+    }
+    async fn quota_settle(&self, key: &str, delta: i64, _at: i64) {
+        self.quota.settle(key, delta);
+    }
+    async fn quota_settle_all(&self, deltas: &[(&str, i64)], _at: i64) -> Vec<i64> {
+        deltas
+            .iter()
+            .map(|&(key, delta)| self.quota.settle(key, delta))
+            .collect()
     }
     async fn quota_used(&self, key: &str) -> i64 {
         self.quota.used(key)
@@ -278,9 +299,42 @@ impl Governance for RedisGovernance {
                 }
             })
     }
-    async fn quota_settle(&self, key: &str, delta: i64, at: i64) -> i64 {
+    async fn quota_reserve_all(&self, holds: &[(&str, i64, i64)], at: i64) -> Result<bool, usize> {
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "for i = 1, #KEYS do
+                   if tonumber(redis.call('GET', KEYS[i]) or '0') >= tonumber(ARGV[2 * i + 1]) then return i end
+                 end
+                 for i = 1, #KEYS do
+                   local amount = tonumber(ARGV[2 * i])
+                   if redis.call('INCRBY', KEYS[i], amount) == amount then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
+                 end
+                 return 0",
+            )
+        });
+        if holds.is_empty() {
+            return Ok(true);
+        }
+        let mut invocation = SCRIPT.prepare_invoke();
+        invocation.arg(QUOTA_TTL_MS);
+        for &(key, amount, limit) in holds {
+            invocation.key(quota_key_at(key, at)).arg(amount).arg(limit);
+        }
+        match invocation
+            .invoke_async::<usize>(&mut self.conn.clone())
+            .await
+        {
+            Ok(0) => Ok(true),
+            Ok(i) => Err(i - 1),
+            Err(e) => {
+                tracing::warn!(error = %e, "redis budget reserve failed; admitting");
+                Ok(false)
+            }
+        }
+    }
+    async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
-            return 0;
+            return;
         }
         settle_floored(
             &self.conn,
@@ -289,7 +343,36 @@ impl Governance for RedisGovernance {
             Duration::from_millis(QUOTA_TTL_MS as u64),
             None,
         )
-        .await
+        .await;
+    }
+    async fn quota_settle_all(&self, deltas: &[(&str, i64)], at: i64) -> Vec<i64> {
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "local out = {}
+                 for i = 1, #KEYS do
+                   local v = redis.call('INCRBY', KEYS[i], ARGV[i + 1])
+                   if v < 0 then redis.call('SET', KEYS[i], 0, 'KEEPTTL'); v = 0 end
+                   if redis.call('PTTL', KEYS[i]) < 0 then redis.call('PEXPIRE', KEYS[i], ARGV[1]) end
+                   out[i] = v
+                 end
+                 return out",
+            )
+        });
+        if deltas.is_empty() {
+            return Vec::new();
+        }
+        let mut invocation = SCRIPT.prepare_invoke();
+        invocation.arg(QUOTA_TTL_MS);
+        for &(key, delta) in deltas {
+            invocation.key(quota_key_at(key, at)).arg(delta);
+        }
+        invocation
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "redis budget settle failed");
+                vec![0; deltas.len()]
+            })
     }
     async fn quota_consume(&self, key: &str, tokens: i64) -> i64 {
         self.incr_window(
@@ -351,14 +434,13 @@ fn quota_key(key: &str) -> String {
 
 /// Apply a settle delta and floor at 0 atomically (a rollover between reserve
 /// and settle must not plant a negative); keeps an existing TTL, arms `window` otherwise.
-/// Returns the new total, or 0 when the window moved on or the round-trip failed.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,
     delta: i64,
     window: Duration,
     id: Option<i64>,
-) -> i64 {
+) {
     static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
         redis::Script::new(
             "local id = tonumber(ARGV[3])
@@ -372,17 +454,16 @@ async fn settle_floored(
         )
     });
     let mut conn = conn.clone();
-    SCRIPT
+    if let Err(e) = SCRIPT
         .key(key)
         .arg(delta)
         .arg(window.as_millis() as i64)
         .arg(id.unwrap_or(-1))
         .invoke_async::<i64>(&mut conn)
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, key, "redis settle failed");
-            0
-        })
+    {
+        tracing::warn!(error = %e, key, "redis settle failed");
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +493,55 @@ mod tests {
             .query_async(&mut conn)
             .await
             .unwrap();
+    }
+
+    async fn exercise_reserve_all(g: &dyn Governance, ns: &str) {
+        let (a, b, c) = (format!("ra{ns}"), format!("rb{ns}"), format!("rc{ns}"));
+        let now = crate::epoch_secs();
+        let pair = [(a.as_str(), 60, 100), (b.as_str(), 30, 50)];
+        assert_eq!(g.quota_reserve_all(&pair, now).await, Ok(true));
+        assert_eq!(g.quota_reserve_all(&pair, now).await, Ok(true));
+        assert_eq!((g.quota_used(&a).await, g.quota_used(&b).await), (120, 60));
+        assert_eq!(
+            g.quota_reserve_all(&[(a.as_str(), 1, 100), (b.as_str(), 1, 50)], now)
+                .await,
+            Err(0)
+        );
+        assert_eq!(
+            g.quota_reserve_all(&[(c.as_str(), 5, 100), (b.as_str(), 1, 50)], now)
+                .await,
+            Err(1)
+        );
+        assert_eq!(
+            (
+                g.quota_used(&a).await,
+                g.quota_used(&b).await,
+                g.quota_used(&c).await
+            ),
+            (120, 60, 0)
+        );
+        assert_eq!(
+            g.quota_settle_all(&[(a.as_str(), -200), (b.as_str(), -10)], now)
+                .await,
+            vec![0, 50]
+        );
+        assert_eq!(g.quota_settle_all(&[(b.as_str(), 0)], now).await, vec![50]);
+        assert_eq!(g.quota_reserve_all(&[], now).await, Ok(true));
+        assert!(g.quota_settle_all(&[], now).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_reserve_all_holds_all_or_none() {
+        exercise_reserve_all(&MemoryGovernance::default(), "").await;
+    }
+
+    #[tokio::test]
+    async fn redis_reserve_all_holds_all_or_none() {
+        let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
+            return;
+        };
+        let g = RedisGovernance::connect(&url).await.expect("redis connect");
+        exercise_reserve_all(&g, &format!("-{}", std::process::id())).await;
     }
 
     #[tokio::test]
