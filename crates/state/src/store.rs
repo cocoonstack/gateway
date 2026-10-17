@@ -360,6 +360,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         }
         Ok(())
     }
+    /// Insert late rows and atomically add the ones inserted to rollup buckets the watermark passed.
+    async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()>;
     /// Whether rows may batch off the request path; in-process backends stay synchronous.
     fn defers_ledger_writes(&self) -> bool {
         false
@@ -387,12 +389,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         until: i64,
         bucket_secs: i64,
     ) -> GResult<Vec<(i64, UserUsageRow)>>;
-    async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64> {
-        self.usage_rollup_since(None, now_epoch_secs).await
-    }
-    /// Recompute and upsert every rollup bucket in the trailing backfill window, or back to `since`
-    /// for rows billed late; buckets are never deleted, so a missed tick self-heals. Returns the buckets written.
-    async fn usage_rollup_since(&self, since: Option<i64>, now_epoch_secs: i64) -> GResult<u64>;
+    /// Recompute the trailing backfill window's rollup buckets (never deleted: a missed tick self-heals); returns those written.
+    async fn usage_rollup_advance(&self, now_epoch_secs: i64) -> GResult<u64>;
     /// Delete rolled billing rows past `ledger_max_rows`; returns rows deleted.
     async fn ledger_prune(&self) -> GResult<u64> {
         Ok(0)
@@ -543,7 +541,7 @@ pub struct MemoryStore {
     #[cfg(test)]
     ledger_failures: AtomicUsize,
     /// Minute buckets keyed by (minute, tenant, user, model); see
-    /// [`Store::usage_rollup_since`].
+    /// [`Store::usage_rollup_advance`].
     rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
     rollup_max_buckets: Option<usize>,
     sec_events: Mutex<Vec<SecurityEvent>>,
@@ -580,11 +578,8 @@ impl MemoryStore {
     pub(crate) fn fail_next_ledger_writes(&self, count: usize) {
         self.ledger_failures.store(count, Ordering::Relaxed);
     }
-}
 
-#[async_trait::async_trait]
-impl Store for MemoryStore {
-    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+    fn injected_ledger_failure(&self) -> GResult<()> {
         #[cfg(test)]
         if self
             .ledger_failures
@@ -597,6 +592,14 @@ impl Store for MemoryStore {
                 "injected ledger write failure",
             ));
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for MemoryStore {
+    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+        self.injected_ledger_failure()?;
         // watermark first: rollup-then-records is the lock order advance uses
         let watermark = (self.ledger_max_rows > 0).then(|| rollup_watermark(&lock(&self.rollup)));
         let mut ledger = lock(&self.ledger);
@@ -625,6 +628,35 @@ impl Store for MemoryStore {
                     true
                 }
             });
+        }
+        Ok(())
+    }
+
+    async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()> {
+        self.injected_ledger_failure()?;
+        let mut rollup = lock(&self.rollup);
+        let watermark = rollup_watermark(&rollup);
+        let mut ledger = lock(&self.ledger);
+        for r in rows {
+            if !ledger.request_ids.insert(r.request_id.clone()) {
+                continue;
+            }
+            ledger.rows.push(r.clone());
+            if r.created_at_epoch_secs < watermark {
+                rollup
+                    .entry((
+                        bucket_floor(r.created_at_epoch_secs),
+                        r.tenant.clone(),
+                        r.user_id.clone(),
+                        r.model.clone(),
+                    ))
+                    .or_insert_with(|| UserUsageRow {
+                        user_id: r.user_id.clone(),
+                        model: r.model.clone(),
+                        ..Default::default()
+                    })
+                    .add_record(r);
+            }
         }
         Ok(())
     }
@@ -739,10 +771,11 @@ impl Store for MemoryStore {
         Ok(map.into_iter().collect())
     }
 
-    async fn usage_rollup_since(&self, since: Option<i64>, now: i64) -> GResult<u64> {
+    async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut rollup = lock(&self.rollup);
-        let lo = rollup_floor(hi, rollup_watermark(&rollup), since);
+        let watermark = rollup_watermark(&rollup);
+        let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
         let mut fresh = BTreeMap::new();
         {
             let ledger = lock(&self.ledger);
@@ -1381,6 +1414,40 @@ macro_rules! q_series_raw {
     };
 }
 
+macro_rules! billing_insert {
+    ($rows:expr) => {{
+        // the QueryBuilder numbers placeholders per dialect, so no dialect_sql! here
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
+             account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
+             vendor_cost_micros, ptu_spillover, user_id, request_id,
+             created_at_epoch_secs, estimated, billed_units) ",
+        );
+        qb.push_values($rows, |mut v, r| {
+            v.push_bind(&r.ak)
+                .push_bind(&r.product)
+                .push_bind(&r.tenant)
+                .push_bind(&r.model)
+                .push_bind(&r.served_model)
+                .push_bind(&r.protocol)
+                .push_bind(&r.account)
+                .push_bind(r.prompt_tokens)
+                .push_bind(r.completion_tokens)
+                .push_bind(r.total_tokens)
+                .push_bind(r.cost_micros)
+                .push_bind(r.vendor_cost_micros)
+                .push_bind(r.ptu_spillover)
+                .push_bind(&r.user_id)
+                .push_bind(&r.request_id)
+                .push_bind(r.created_at_epoch_secs)
+                .push_bind(r.estimated)
+                .push_bind(r.billed_units);
+        });
+        qb.push(" ON CONFLICT (request_id) DO NOTHING");
+        qb
+    }};
+}
+
 macro_rules! q_rollup_insert {
     ($d:ident) => {
         concat!(
@@ -1574,39 +1641,61 @@ macro_rules! sql_store_impl {
                 if rows.is_empty() {
                     return Ok(());
                 }
-                // the QueryBuilder numbers placeholders per dialect, so no dialect_sql! here
-                let mut qb = sqlx::QueryBuilder::new(
-                    "INSERT INTO billing (ak, product, tenant, model, served_model, protocol,
-                     account, prompt_tokens, completion_tokens, total_tokens, cost_micros,
-                     vendor_cost_micros, ptu_spillover, user_id, request_id,
-                     created_at_epoch_secs, estimated, billed_units) ",
-                );
-                qb.push_values(rows, |mut v, r| {
-                    v.push_bind(&r.ak)
-                        .push_bind(&r.product)
-                        .push_bind(&r.tenant)
-                        .push_bind(&r.model)
-                        .push_bind(&r.served_model)
-                        .push_bind(&r.protocol)
-                        .push_bind(&r.account)
-                        .push_bind(r.prompt_tokens)
-                        .push_bind(r.completion_tokens)
-                        .push_bind(r.total_tokens)
-                        .push_bind(r.cost_micros)
-                        .push_bind(r.vendor_cost_micros)
-                        .push_bind(r.ptu_spillover)
-                        .push_bind(&r.user_id)
-                        .push_bind(&r.request_id)
-                        .push_bind(r.created_at_epoch_secs)
-                        .push_bind(r.estimated)
-                        .push_bind(r.billed_units);
-                });
-                qb.push(" ON CONFLICT (request_id) DO NOTHING")
+                billing_insert!(rows)
                     .build()
                     .execute(&self.pool)
                     .await
                     .map_err(|e| crate::sqlx_err("insert billing record", e))?;
                 Ok(())
+            }
+
+            async fn ledger_replay_batch(&self, rows: &[BillingRecord]) -> GResult<()> {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| crate::sqlx_err("begin replay", e))?;
+                let mut insert = billing_insert!(rows);
+                let inserted: Vec<String> = insert
+                    .push(" RETURNING request_id")
+                    .build_query_scalar()
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| crate::sqlx_err("replay billing records", e))?;
+                if !inserted.is_empty() {
+                    let mut add = sqlx::QueryBuilder::new(concat!(
+                        "INSERT INTO usage_rollup (minute_epoch, tenant, user_id, model, requests, \
+                         prompt_tokens, completion_tokens, total_tokens, cost_micros, vendor_cost_micros, \
+                         billed_units) SELECT (created_at_epoch_secs/60)*60, tenant, user_id, model, COUNT(*), ",
+                        usage_sums!($dialect),
+                        " FROM billing WHERE created_at_epoch_secs < (",
+                    ));
+                    add.push(ROLLUP_WATERMARK_SQL).push(") AND request_id IN (");
+                    let mut ids = add.separated(", ");
+                    for id in &inserted {
+                        ids.push_bind(id);
+                    }
+                    add.push(
+                        ") GROUP BY 1, 2, 3, 4 ON CONFLICT (minute_epoch, tenant, user_id, model) DO UPDATE SET \
+                         requests = usage_rollup.requests + excluded.requests, \
+                         prompt_tokens = usage_rollup.prompt_tokens + excluded.prompt_tokens, \
+                         completion_tokens = usage_rollup.completion_tokens + excluded.completion_tokens, \
+                         total_tokens = usage_rollup.total_tokens + excluded.total_tokens, \
+                         cost_micros = usage_rollup.cost_micros + excluded.cost_micros, \
+                         vendor_cost_micros = usage_rollup.vendor_cost_micros + excluded.vendor_cost_micros, \
+                         billed_units = usage_rollup.billed_units + excluded.billed_units",
+                    )
+                    .build()
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| crate::sqlx_err("roll up replayed records", e))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| crate::sqlx_err("commit replay", e))
             }
 
             fn defers_ledger_writes(&self) -> bool {
@@ -1909,14 +1998,14 @@ macro_rules! sql_store_impl {
 }
 
 sql_store_impl!(SqliteStore, sqlite, {
-    async fn usage_rollup_since(&self, since: Option<i64>, now: i64) -> GResult<u64> {
+    async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(dialect_sql!(sqlite, q_rollup_insert!(sqlite)))
-            .bind(rollup_floor(hi, watermark, since))
+            .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
             .bind(hi)
             .execute(&self.pool)
             .await
@@ -2220,35 +2309,27 @@ impl PostgresStore {
 }
 
 sql_store_impl!(PostgresStore, postgres, {
-    async fn usage_rollup_since(&self, since: Option<i64>, now: i64) -> GResult<u64> {
+    async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| crate::sqlx_err("begin rollup", e))?;
-        if since.is_none() {
-            let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-                .bind(ROLLUP_LOCK_KEY)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| crate::sqlx_err("acquire rollup lock", e))?;
-            if !locked {
-                return Ok(0);
-            }
-        } else {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(ROLLUP_LOCK_KEY)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| crate::sqlx_err("wait for rollup lock", e))?;
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(ROLLUP_LOCK_KEY)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("acquire rollup lock", e))?;
+        if !locked {
+            return Ok(0);
         }
         let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
         let r = sqlx::query(dialect_sql!(postgres, q_rollup_insert!(postgres)))
-            .bind(rollup_floor(hi, watermark, since))
+            .bind((hi - ROLLUP_BACKFILL_SECS).min(watermark))
             .bind(hi)
             .execute(&mut *tx)
             .await
@@ -2766,11 +2847,6 @@ where
             billed_units: row.get(7),
         },
     )
-}
-
-fn rollup_floor(hi: i64, watermark: i64, since: Option<i64>) -> i64 {
-    let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
-    since.map_or(lo, |since| lo.min(bucket_floor(since)))
 }
 
 fn bucket_floor(ts: i64) -> i64 {
@@ -3466,33 +3542,6 @@ mod tests {
             vec![(0, 2), (1_200, 1)],
             "rolled buckets and the raw tail group by bucket start"
         );
-
-        let mut late = record("m1");
-        late.tenant = tenant.clone();
-        late.user_id = "dave".into();
-        late.created_at_epoch_secs = 100;
-        store.ledger_add(&late).await.unwrap();
-        let billed_late = |rows: Vec<UserUsageRow>| rows.iter().any(|r| r.user_id == "dave");
-        store.usage_rollup_advance(1_500).await.unwrap();
-        assert!(
-            !billed_late(
-                store
-                    .usage_by_user(Some(&tenant), None, 0, 1_000)
-                    .await
-                    .unwrap()
-            ),
-            "a row billed below the watermark misses the trailing rollup"
-        );
-        store.usage_rollup_since(Some(100), 1_500).await.unwrap();
-        assert!(
-            billed_late(
-                store
-                    .usage_by_user(Some(&tenant), None, 0, 1_000)
-                    .await
-                    .unwrap()
-            ),
-            "a rollup since its billing time counts the late row"
-        );
     }
 
     #[tokio::test]
@@ -3507,6 +3556,69 @@ mod tests {
             .await
             .unwrap();
         exercise_rollup(&store, "").await;
+    }
+
+    async fn exercise_replay(store: &dyn Store, ns: &str, prune: impl AsyncFnOnce(&str)) {
+        let tenant = format!("rp{ns}");
+        let billed = |at: i64| BillingRecord {
+            tenant: tenant.clone(),
+            user_id: "late".into(),
+            created_at_epoch_secs: at,
+            ..record("m1")
+        };
+        let rolled = billed(400);
+        store.ledger_add(&rolled).await.unwrap();
+        store.usage_rollup_advance(1_500).await.unwrap();
+        prune(&rolled.request_id).await;
+        let late = billed(410);
+        store
+            .ledger_replay_batch(std::slice::from_ref(&late))
+            .await
+            .unwrap();
+        store
+            .ledger_replay_batch(std::slice::from_ref(&late))
+            .await
+            .unwrap();
+        store.usage_rollup_advance(1_500).await.unwrap();
+        let usage = store
+            .usage_by_user(Some(&tenant), Some("late"), 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            usage
+                .iter()
+                .map(|u| (u.requests, u.cost_micros))
+                .collect::<Vec<_>>(),
+            vec![(2, 2 * rolled.cost_micros)],
+            "{usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_replay_adds_late_rows_to_a_pruned_bucket() {
+        let store = MemoryStore::default();
+        exercise_replay(&store, "", async |id: &str| {
+            let mut ledger = lock(&store.ledger);
+            ledger.rows.retain(|r| r.request_id != id);
+            ledger.request_ids.remove(id);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_replay_adds_late_rows_to_a_pruned_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("replay.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_replay(&store, "", async |id: &str| {
+            sqlx::query("DELETE FROM billing WHERE request_id = ?1")
+                .bind(id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3881,6 +3993,14 @@ mod tests {
         let store = PostgresStore::connect(&own_url).await.expect("pg connect");
         let ns = format!("-{nonce}");
         exercise_rollup(&store, &ns).await;
+        exercise_replay(&store, &ns, async |id: &str| {
+            sqlx::query("DELETE FROM billing WHERE request_id = $1")
+                .bind(id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        })
+        .await;
         exercise_erase(&store, &ns).await;
         exercise_content_list(&store, &ns).await;
         exercise_terminal_idempotence(&store, &ns).await;

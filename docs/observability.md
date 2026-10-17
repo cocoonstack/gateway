@@ -102,7 +102,9 @@ With `storage.ledger_spool_path` set, the batch instead goes to that local
 JSON-lines file after three attempts (about 0.3 s; the directory is created on
 first use, and a spool that cannot be written falls back to the remaining
 retries), and a replay every 30 s inserts it in batches once the store accepts
-writes again, then re-rolls the usage rollup back to the oldest replayed row
+writes again; in the same transaction it adds the rows it inserted to any usage
+rollup bucket the watermark already passed, so a late row counts even after its
+bucket's other rows were pruned, and a repeated replay adds nothing
 (`billing spool replayed` in the log). The spool path is per-instance local
 disk; replicas must not share one file.
 A full queue applies backpressure to settlement until the repair worker makes

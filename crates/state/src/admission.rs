@@ -364,7 +364,7 @@ impl LedgerSpool {
                 return;
             }
         }
-        let (mut offset, mut replayed, mut since) = (0, 0, None);
+        let (mut offset, mut replayed) = (0, 0);
         loop {
             let replaying = self.replaying.clone();
             let (rows, next) = match run_blocking(move || read_spool_batch(&replaying, offset))
@@ -379,23 +379,12 @@ impl LedgerSpool {
             if next == offset {
                 break;
             }
-            if let Err(e) = store.ledger_add_batch(&rows).await {
+            if let Err(e) = store.ledger_replay_batch(&rows).await {
                 tracing::warn!(error = %e, rows = rows.len(), "billing spool replay deferred");
                 return;
             }
             replayed += rows.len();
-            since = rows
-                .iter()
-                .map(|r| r.created_at_epoch_secs)
-                .chain(since)
-                .min();
             offset = next;
-        }
-        if since.is_some()
-            && let Err(e) = store.usage_rollup_since(since, crate::epoch_secs()).await
-        {
-            tracing::warn!(error = %e, rows = replayed, "billing spool rollup deferred");
-            return;
         }
         let replaying = self.replaying.clone();
         if let Err(e) = run_blocking(move || std::fs::remove_file(replaying)).await {
