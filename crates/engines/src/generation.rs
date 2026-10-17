@@ -1,5 +1,7 @@
 //! Post-hoc usage of an OpenRouter generation, which OpenRouter records even for a cancelled stream.
 
+use std::time::Duration;
+
 use gw_consts::Protocol;
 use gw_models::{Account, GResult, GatewayError};
 use serde_json::{Value, json};
@@ -8,10 +10,52 @@ use crate::base::versioned_url;
 use crate::transport::{Transport, UpstreamBody, UpstreamRequest};
 
 const OPENROUTER_KIND: &str = "openrouter";
+/// Waits before each lookup of an abandoned stream's recorded usage; OpenRouter records one in about 5 s.
+const LOOKUP_DELAYS: [Duration; 4] = [
+    Duration::from_secs(3),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+];
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Whether `account` records generation `id` for a later [`openrouter_usage`] lookup.
-pub fn records_generation(account: &Account, id: &str) -> bool {
-    account.kind == OPENROUTER_KIND
+pub async fn recorded_usage(
+    transport: &dyn Transport,
+    account: &Account,
+    id: &str,
+    closing: impl Future<Output = ()>,
+) -> Option<Value> {
+    if !records_generation(account, id) {
+        return None;
+    }
+    tokio::pin!(closing);
+    for delay in LOOKUP_DELAYS {
+        let lookup = async {
+            tokio::time::sleep(delay).await;
+            tokio::time::timeout(LOOKUP_TIMEOUT, openrouter_usage(transport, account, id)).await
+        };
+        tokio::select! {
+            () = &mut closing => {
+                tracing::warn!(id, "shutting down before the generation record; billing the estimate");
+                return None;
+            }
+            found = lookup => match found {
+                Ok(Ok(Some(usage))) => return Some(usage),
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, id, "generation usage lookup failed"),
+                Err(_) => tracing::warn!(id, "generation usage lookup timed out"),
+            },
+        }
+    }
+    tracing::warn!(
+        id,
+        "no recorded usage for an aborted stream; billing the estimate"
+    );
+    None
+}
+
+fn records_generation(account: &Account, id: &str) -> bool {
+    account.wire_kind() == OPENROUTER_KIND
         && !account.endpoint.is_empty()
         && !account.api_key_env.is_empty()
         && !id.is_empty()
@@ -21,7 +65,7 @@ pub fn records_generation(account: &Account, id: &str) -> bool {
 }
 
 /// The generation's native counts and cost as chat-wire usage; `None` until OpenRouter records it.
-pub async fn openrouter_usage(
+async fn openrouter_usage(
     transport: &dyn Transport,
     account: &Account,
     id: &str,
@@ -33,10 +77,7 @@ pub async fn openrouter_usage(
         .send(UpstreamRequest {
             protocol: Protocol::OpenaiChat,
             method: "GET",
-            url: versioned_url(
-                account.endpoint.trim_end_matches('/'),
-                &format!("generation?id={id}"),
-            ),
+            url: versioned_url(account.base_url(""), &format!("generation?id={id}")),
             headers: vec![("authorization", format!("Bearer {key}"))],
             body: Vec::new(),
             stream: false,
@@ -164,6 +205,36 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Default)]
+    struct Silent(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Transport for Silent {
+        async fn send(&self, _: UpstreamRequest) -> GResult<UpstreamResponse> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_times_out_each_try() {
+        let t = Silent::default();
+        let usage = recorded_usage(&t, &openrouter(), "gen-1", std::future::pending()).await;
+        assert!(usage.is_none());
+        assert_eq!(
+            t.0.load(std::sync::atomic::Ordering::SeqCst),
+            LOOKUP_DELAYS.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closing_gateway_skips_the_lookup() {
+        let t = Silent::default();
+        let usage = recorded_usage(&t, &openrouter(), "gen-1", std::future::ready(())).await;
+        assert!(usage.is_none());
+        assert_eq!(t.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn only_an_openrouter_account_with_a_plain_id_records_generations() {
         assert!(records_generation(
@@ -175,6 +246,12 @@ mod tests {
             ..openrouter()
         };
         assert!(!records_generation(&other, "gen-1"));
+        let raw = Account {
+            kind: String::new(),
+            provider: OPENROUTER_KIND.into(),
+            ..openrouter()
+        };
+        assert!(records_generation(&raw, "gen-1"));
         assert!(!records_generation(&openrouter(), "gen/../x"));
         assert!(!records_generation(&openrouter(), ""));
     }

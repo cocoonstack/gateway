@@ -1233,7 +1233,9 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
             )
         })
         .unwrap_or_default();
-    let latency = started.elapsed();
+    let latency = ctx
+        .served_at
+        .map_or_else(|| started.elapsed(), |at| at.duration_since(started));
     let user_id = ctx.effective_user_id();
     let decisions = ctx.decisions_line();
     let ak_id = &*ctx.ak.ak_id;

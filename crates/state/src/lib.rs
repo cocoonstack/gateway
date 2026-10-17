@@ -893,6 +893,10 @@ impl GatewayState {
             streams: prev.streams.clone(),
         })
     }
+
+    pub fn begin_settle(&self) -> admission::SettleGuard {
+        self.billing.begin_settle()
+    }
 }
 
 /// A consistent (config, derived-state) pair. A request loads one snapshot and

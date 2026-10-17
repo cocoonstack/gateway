@@ -13,13 +13,6 @@ use crate::executor::{DagNode, Layer};
 const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// Reservation cap, so a hostile `max_tokens` cannot overflow the estimate or the counter.
 const MAX_RESERVE: i64 = 1_000_000;
-/// Waits before each lookup of an abandoned stream's recorded usage; OpenRouter records one in about 5 s.
-const GENERATION_LOOKUP_DELAYS: [std::time::Duration; 4] = [
-    std::time::Duration::from_secs(3),
-    std::time::Duration::from_secs(5),
-    std::time::Duration::from_secs(10),
-    std::time::Duration::from_secs(20),
-];
 
 /// preprocess/model_quota: per-(AK, model) daily cap (AK override, else tenant default);
 /// over it degrades to the tenant fallback model or denies, so it runs before resolve_model.
@@ -736,7 +729,7 @@ impl BillTokens {
     }
 }
 
-/// Close a buffered stream's billing: refund before delivery; after a partial one bill the upstream's usage, or estimate without it.
+/// Close a buffered stream's billing: refund before delivery, else bill its usage or an estimate.
 pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelivery) -> GResult<()> {
     if !ctx.billing_deferred {
         return Ok(());
@@ -777,7 +770,21 @@ async fn bill_aborted_stream(
     ctx: &mut DagContext,
     delivered_completion: Option<i64>,
 ) -> GResult<()> {
-    if let Some(usage) = recorded_usage(ctx).await {
+    let settle = ctx.state.begin_settle();
+    ctx.served_at = Some(std::time::Instant::now());
+    let usage = match (ctx.request.account.as_deref(), ctx.outcome.as_ref()) {
+        (Some(account), Some(outcome)) => {
+            gw_engines::generation::recorded_usage(
+                ctx.transport.as_ref(),
+                account,
+                &outcome.response.upstream_id,
+                settle.closing(),
+            )
+            .await
+        }
+        _ => None,
+    };
+    if let Some(usage) = usage {
         let outcome = ctx
             .outcome
             .as_mut()
@@ -820,28 +827,6 @@ async fn bill_aborted_stream(
         format!("aborted stream, billed {prompt}+{completion}"),
     );
     bill(ctx, BillTokens::weighted(prompt, completion, &rate), true).await
-}
-
-/// OpenRouter's record of an abandoned stream's usage, polled until it lands.
-async fn recorded_usage(ctx: &DagContext) -> Option<serde_json::Value> {
-    let account = ctx.request.account.as_deref()?;
-    let id = ctx.outcome.as_ref()?.response.upstream_id.as_str();
-    if !gw_engines::generation::records_generation(account, id) {
-        return None;
-    }
-    for delay in GENERATION_LOOKUP_DELAYS {
-        tokio::time::sleep(delay).await;
-        match gw_engines::generation::openrouter_usage(ctx.transport.as_ref(), account, id).await {
-            Ok(Some(usage)) => return Some(usage),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, id, "generation usage lookup failed"),
-        }
-    }
-    tracing::warn!(
-        id,
-        "no recorded usage for an aborted stream; billing the estimate"
-    );
-    None
 }
 
 fn blank_stream_response(response: &mut gw_models::GatewayResponse) {

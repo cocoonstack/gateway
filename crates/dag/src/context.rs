@@ -45,6 +45,7 @@ pub struct DagContext {
     pub budget_hold: BudgetHold,
     /// Outbound DLP buffered this stream; billing waits for the view's delivery result.
     pub billing_deferred: bool,
+    pub served_at: Option<std::time::Instant>,
 }
 
 impl DagContext {
@@ -75,6 +76,7 @@ impl DagContext {
             user_budget: None,
             budget_hold: BudgetHold::default(),
             billing_deferred: false,
+            served_at: None,
         }
     }
 

@@ -13,6 +13,8 @@ use std::time::Duration;
 use gw_config::{GatewayConfig, TenantConf};
 use gw_models::GResult;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 
 use crate::store::{BillingInput, BillingRecord, Store, billing_record};
 use crate::{AkInfo, GatewayState, Governance, UserBudget, clamp_tokens};
@@ -109,11 +111,25 @@ pub struct Settled {
     pub cost_micros: i64,
 }
 
+/// A settle in progress: shutdown waits for it to drop and fires `closing` so it bills without waiting.
+pub struct SettleGuard {
+    _tracked: TaskTrackerToken,
+    closing: CancellationToken,
+}
+
+impl SettleGuard {
+    pub fn closing(&self) -> WaitForCancellationFuture<'_> {
+        self.closing.cancelled()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BillingLedger {
     store: Arc<dyn Store>,
     queue: Option<mpsc::Sender<LedgerWrite>>,
     deferred: bool,
+    settles: TaskTracker,
+    closing: CancellationToken,
 }
 
 impl BillingLedger {
@@ -122,6 +138,8 @@ impl BillingLedger {
             store,
             queue: None,
             deferred: false,
+            settles: TaskTracker::new(),
+            closing: CancellationToken::new(),
         }
     }
 
@@ -175,6 +193,15 @@ impl BillingLedger {
             store,
             queue: Some(queue),
             deferred,
+            settles: TaskTracker::new(),
+            closing: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn begin_settle(&self) -> SettleGuard {
+        SettleGuard {
+            _tracked: self.settles.token(),
+            closing: self.closing.clone(),
         }
     }
 
@@ -379,7 +406,6 @@ impl LedgerSpool {
     }
 }
 
-/// One budget: its window, governance counter and cap.
 struct Budget {
     scope: BudgetScope,
     window: Window,
@@ -471,8 +497,11 @@ impl LedgerWrite {
     }
 }
 
-/// Commit billing rows the batching writer still holds, before the process exits.
+/// Finish in-flight settles, then commit the rows the batching writer holds, before the process exits.
 pub async fn flush_billing(state: &GatewayState) {
+    state.billing.closing.cancel();
+    state.billing.settles.close();
+    state.billing.settles.wait().await;
     let dropped = state.billing.flush().await;
     if dropped > 0 {
         tracing::error!(rows = dropped, "billing rows dropped before shutdown");
