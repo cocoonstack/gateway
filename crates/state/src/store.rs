@@ -684,7 +684,6 @@ impl Store for MemoryStore {
                     model: r.model.clone(),
                     ..Default::default()
                 });
-            // saturating: a hostile record can carry i64::MAX counts (usage is floored, not capped)
             e.requests += 1;
             e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
             e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
