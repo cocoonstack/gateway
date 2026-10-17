@@ -3782,10 +3782,9 @@ fn messages_stream_response(
                 BlockKind::Text => json!({"type":"text","text":""}),
                 BlockKind::Thinking => json!({"type":"thinking","thinking":"","signature":""}),
             };
-            self.queue.push_back(Self::ev(
-                "content_block_start",
-                json!({"type":"content_block_start","index":idx,"content_block":content_block}),
-            ));
+            let mut start = json!({"type":"content_block_start","index":idx});
+            start["content_block"] = content_block;
+            self.queue.push_back(Self::ev("content_block_start", start));
             idx
         }
 
@@ -4314,14 +4313,14 @@ fn responses_stream_response(
                     };
                     if !self.native {
                         self.seq += 1;
+                        let mut done = json!({"type":"response.completed","response":{
+                            "model": self.model, "status": self.status,
+                        }});
+                        done["response"]["usage"] = responses_usage(pt, ct, tt, c.common_usage);
                         self.queue.push_back(
-                            Event::default().event("response.completed").data(
-                                json!({"type":"response.completed","response":{
-                                    "model": self.model, "status": self.status,
-                                    "usage": responses_usage(pt, ct, tt, c.common_usage),
-                                }})
-                                .to_string(),
-                            ),
+                            Event::default()
+                                .event("response.completed")
+                                .data(done.to_string()),
                         );
                     }
                     self.queue.push_back(Event::default().data("[DONE]"));

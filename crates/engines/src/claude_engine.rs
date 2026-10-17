@@ -661,17 +661,18 @@ pub fn anthropic_native_chunks(
         .filter(|usage| usage.is_object())
         .cloned()
         .unwrap_or_else(|| json!({"input_tokens":response.prompt_tokens,"output_tokens":0}));
-    let mut events = vec![json!({
+    let mut message_start = json!({
         "type":"message_start",
         "message":{
             "type":"message",
             "role":"assistant",
             "model":stream_model,
             "content":[],
-            "stop_reason":null,
-            "usage":start_usage
+            "stop_reason":null
         }
-    })];
+    });
+    message_start["message"]["usage"] = start_usage;
+    let mut events = vec![message_start];
     if let Value::Array(blocks) = content {
         for (index, mut start) in blocks.into_iter().enumerate() {
             let mut deltas = Vec::new();
