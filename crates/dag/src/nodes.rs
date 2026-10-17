@@ -430,7 +430,7 @@ impl DagNode for AkTpmLimit {
     }
 }
 
-/// model_access/budget: holds the call's estimate against the tenant's daily budgets for the key and user.
+/// model_access/budget: holds the call's estimate against the daily budgets (tenant, key, user) and checks the monthly ones.
 pub struct BudgetGate;
 
 #[async_trait::async_trait]
@@ -440,16 +440,13 @@ impl DagNode for BudgetGate {
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let (prompt, max_out) = ctx.reserve_parts;
-        let served = served_model(ctx.request.model_param_v2.as_ref());
-        let est = admission::BudgetSpend {
-            tokens: ctx
-                .quota_reserved
-                .filter(|&reserved| reserved > 0)
-                .unwrap_or_else(|| prompt.saturating_add(max_out).min(MAX_RESERVE)),
+        let (cfg, request, tenant) = (&ctx.cfg, &ctx.request, &ctx.ak.tenant);
+        let est = || admission::BudgetSpend {
+            tokens: prompt.saturating_add(max_out).min(MAX_RESERVE),
             cost_micros: gw_models::cost_micros(
                 prompt,
                 max_out,
-                ctx.cfg.prices_for_tenant(&ctx.ak.tenant, served),
+                cfg.prices_for_tenant(tenant, served_model(request.model_param_v2.as_ref())),
             ),
         };
         let (over, hold) = admission::reserve_budgets(
@@ -765,15 +762,7 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
             bill_usage(ctx).await
         }
         StreamDelivery::None => {
-            let gov = ctx.state.governance.as_ref();
-            gov.refund_reserves(
-                &ctx.ak.ak_id,
-                ctx.quota_reserved.take().unwrap_or(0),
-                ctx.tpm_reserved.take(),
-                ctx.quota_at,
-            )
-            .await;
-            std::mem::take(&mut ctx.budget_hold).refund(gov).await;
+            ctx.refund_reserves().await;
             if let Some(outcome) = ctx.outcome.as_mut() {
                 outcome.response.prompt_tokens = 0;
                 blank_stream_response(&mut outcome.response);

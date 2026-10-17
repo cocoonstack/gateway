@@ -479,18 +479,23 @@ pub async fn flush_billing(state: &GatewayState) {
     }
 }
 
-/// Hold `est` against the day budgets, admitting while spent plus held is under each cap; month budgets and a zero `est` only check.
+/// Hold the estimate `est` yields against the day budgets, admitting while spent plus held is under each cap; month budgets and a zero estimate only check.
 pub async fn reserve_budgets(
     state: &GatewayState,
     cfg: &GatewayConfig,
     ak: &AkInfo,
     user: &str,
-    est: BudgetSpend,
+    est: impl FnOnce() -> BudgetSpend,
     at: i64,
 ) -> GResult<Result<(UserBudget, BudgetHold), String>> {
     let over = user_budget(state, ak, user).await?;
     let gov = state.governance.as_ref();
     let budgets = budgets(gov, cfg, ak, user, over).await;
+    let est = if budgets.iter().any(|b| b.window == Window::Day) {
+        est()
+    } else {
+        BudgetSpend::default()
+    };
     let admitted = futures::future::join_all(budgets.iter().map(|b| async move {
         let amount = est.of(b.scope);
         match b.window {
@@ -509,15 +514,16 @@ pub async fn reserve_budgets(
         match admitted {
             Some(held) if held > 0 => hold.held.push((b.key, held)),
             Some(_) => {}
-            None if denied.is_none() => {
-                denied = Some(format!(
-                    "{} {} budget exhausted for {}",
-                    b.window.label(),
-                    b.scope.unit(),
-                    b.scope.subject(ak, user)
-                ));
+            None => {
+                denied.get_or_insert_with(|| {
+                    format!(
+                        "{} {} budget exhausted for {}",
+                        b.window.label(),
+                        b.scope.unit(),
+                        b.scope.subject(ak, user)
+                    )
+                });
             }
-            None => {}
         }
     }
     let Some(denied) = denied else {
@@ -756,7 +762,7 @@ async fn consume_budgets(
         async move {
             let amount = spent.of(b.scope);
             match (b.window, held) {
-                (Window::Day, Some(held)) if held == amount => None,
+                (Window::Day, Some(held)) if held == amount => Some(gov.quota_used(&b.key).await),
                 (Window::Day, Some(held)) => {
                     Some(gov.quota_settle(&b.key, amount - held, at).await)
                 }
@@ -769,8 +775,6 @@ async fn consume_budgets(
         }
     }))
     .await;
-    // a reload between admission and settle may have dropped a held budget
-    hold.refund(gov).await;
     for (b, used) in budgets.iter().zip(used) {
         if let Some(used) = used
             && used >= b.limit
@@ -1375,7 +1379,7 @@ mod tests {
             cost_micros: 60,
         };
         let now = crate::epoch_secs();
-        let reserve = || reserve_budgets(&state, &cfg, &ak, "", est, now);
+        let reserve = || reserve_budgets(&state, &cfg, &ak, "", || est, now);
 
         let (_, first) = reserve().await.unwrap().unwrap();
         let (_, second) = reserve().await.unwrap().unwrap();
@@ -1405,10 +1409,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_settle_that_matches_its_hold_still_alerts_at_the_cap() {
+        let yaml = "listen: {host: h, port: 1}\ntenants: [{name: t1, key_daily_cost_quota_micros: 100}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 1, daily_token_quota: 1000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let mut alerts = state.alerts.take_receiver().unwrap();
+        let ak = state.auth.get(&access_key_id("k1")).await.unwrap();
+        let spend = BudgetSpend {
+            tokens: 1,
+            cost_micros: 100,
+        };
+        let (_, hold) = reserve_budgets(&state, &cfg, &ak, "", || spend, crate::epoch_secs())
+            .await
+            .unwrap()
+            .unwrap();
+
+        consume_budgets(&state, &cfg, &ak, "", None, hold, spend).await;
+
+        let alert = alerts.try_recv().expect("budget_exhausted alert");
+        assert_eq!(alert.kind, "budget_exhausted");
+    }
+
+    #[tokio::test]
+    async fn without_a_day_budget_admission_never_prices_the_estimate() {
+        let (cfg, state, ak) = monthly_fixture(false).await;
+        reserve_budgets(&state, &cfg, &ak, "", || unreachable!("no day budget"), 0)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn monthly_budget_denies_at_the_cap_without_touching_daily_counters() {
         let (cfg, state, ak) = monthly_fixture(false).await;
         let gov = state.governance.as_ref();
-        reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default(), 0)
+        reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default, 0)
             .await
             .unwrap()
             .unwrap();
@@ -1425,7 +1460,7 @@ mod tests {
             },
         )
         .await;
-        let err = reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default(), 0)
+        let err = reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default, 0)
             .await
             .unwrap()
             .unwrap_err();
@@ -1436,7 +1471,7 @@ mod tests {
         assert_eq!(gov.quota_used(&format!("cb:ak:{}", ak.ak_id)).await, 0);
         gov.quota_reset_all().await;
         assert!(
-            reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default(), 0)
+            reserve_budgets(&state, &cfg, &ak, "", BudgetSpend::default, 0)
                 .await
                 .unwrap()
                 .is_err(),

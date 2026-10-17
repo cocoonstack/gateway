@@ -36,7 +36,7 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
         at_epoch_secs: i64,
     ) -> Option<i64>;
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
-    /// bucket the paired reserve used (`at_epoch_secs`); returns the new total, or 0 for a zero delta.
+    /// bucket the paired reserve used (`at_epoch_secs`); returns the new total, or 0 when nothing was applied.
     async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64) -> i64;
     /// Tokens spent today under `key`.
     async fn quota_used(&self, key: &str) -> i64;
@@ -106,6 +106,9 @@ impl Governance for MemoryGovernance {
         self.quota.reserve(key, amount, limit).then_some(amount)
     }
     async fn quota_settle(&self, key: &str, delta: i64, _at: i64) -> i64 {
+        if delta == 0 {
+            return 0;
+        }
         self.quota.settle(key, delta)
     }
     async fn quota_used(&self, key: &str) -> i64 {
@@ -348,7 +351,7 @@ fn quota_key(key: &str) -> String {
 
 /// Apply a settle delta and floor at 0 atomically (a rollover between reserve
 /// and settle must not plant a negative); keeps an existing TTL, arms `window` otherwise.
-/// Returns the new total, 0 when the round-trip failed.
+/// Returns the new total, or 0 when the window moved on or the round-trip failed.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,

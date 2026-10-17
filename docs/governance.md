@@ -269,10 +269,12 @@ enforced with a hard `400 service_quota_exceeded_exception` once exceeded.
 On the REST pipeline every daily budget holds the call's estimate at admission
 (the token estimate for the token cap; for the cost caps that estimate's prompt
 and `max_tokens` sides at the tenant's price), admitting while spent plus held
-is under the cap, so concurrent calls overshoot by at most one; billing settles
-the hold to the charged amount and a failed call returns it. A call without
-`max_tokens` holds 256 output tokens, so a long completion can still carry one
-call past the cap. Realtime turns and the monthly caps check before the call
+is under the cap, so concurrent holds pass it by at most one hold; billing
+settles the hold to the charged amount and a failed call returns it. A call that
+costs more than it held still carries the total past the cap by the difference:
+a call without `max_tokens` holds 256 output tokens, and unit- or
+vendor-priced surfaces (images, video, decisions) hold no cost, so the cost caps
+only check them. Realtime turns and the monthly caps check before the call
 and accrue after it ("soft": concurrent turns can overshoot by one each).
 The per-(key, model) quota is soft the same way: it is a routing trigger (the
 fallback-model degrade), while the reserved per-key daily quota hard-caps spend.

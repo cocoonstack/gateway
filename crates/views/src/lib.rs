@@ -590,7 +590,7 @@ async fn realtime_gate(
         cfg,
         &ak,
         ak.attributed_user(hint),
-        admission::BudgetSpend::default(),
+        admission::BudgetSpend::default,
         gw_state::epoch_secs(),
     )
     .await

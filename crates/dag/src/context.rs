@@ -90,6 +90,19 @@ impl DagContext {
             .ok_or_else(|| GatewayError::internal("model param missing after resolve_model"))
     }
 
+    pub async fn refund_reserves(&mut self) {
+        let gov = self.state.governance.as_ref();
+        tokio::join!(
+            gov.refund_reserves(
+                &self.ak.ak_id,
+                self.quota_reserved.take().unwrap_or(0),
+                self.tpm_reserved.take(),
+                self.quota_at,
+            ),
+            std::mem::take(&mut self.budget_hold).refund(gov),
+        );
+    }
+
     /// The effective end user: the key's `owner`, else request metadata, else `""`.
     pub fn effective_user_id(&self) -> &str {
         self.ak
