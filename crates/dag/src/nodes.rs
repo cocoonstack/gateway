@@ -691,7 +691,7 @@ impl DagNode for CostCalc {
         if resp.aborted && resp.completion_tokens == 0 {
             return bill_aborted_stream(ctx, None).await;
         }
-        bill_usage(ctx).await
+        bill(ctx, usage_tokens(ctx)?, false).await
     }
 }
 
@@ -762,7 +762,7 @@ pub async fn settle_deferred_stream(ctx: &mut DagContext, delivery: StreamDelive
             }
             outcome.response.message.clear();
             outcome.response.aborted = true;
-            bill_usage(ctx).await
+            bill(ctx, usage_tokens(ctx)?, false).await
         }
         StreamDelivery::None => {
             ctx.refund_reserves().await;
@@ -810,7 +810,7 @@ async fn bill_aborted_stream(
         outcome.response.common_usage = common;
         outcome.response.raw_usage = Some(usage);
         ctx.decide("cost_calc", "aborted stream, billed the provider's record");
-        return bill_usage(ctx).await;
+        return bill(ctx, usage_tokens(ctx)?, false).await;
     }
     let response = &ctx
         .outcome
@@ -850,7 +850,7 @@ fn blank_stream_response(response: &mut gw_models::GatewayResponse) {
     response.aborted = true;
 }
 
-async fn bill_usage(ctx: &mut DagContext) -> GResult<()> {
+fn usage_tokens(ctx: &DagContext) -> GResult<BillTokens> {
     let resp = &ctx
         .outcome
         .as_ref()
@@ -886,7 +886,7 @@ async fn bill_usage(ctx: &mut DagContext) -> GResult<()> {
         None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
     };
     tokens.units = resp.billed_units;
-    bill(ctx, tokens, false).await
+    Ok(tokens)
 }
 
 /// Settle reserves and write the ledger; `estimated` marks an aborted stream's estimated counts.
