@@ -280,7 +280,9 @@ impl DagNode for QuotaCheck {
         "quota_check"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let est = reserve_estimate(&ctx.request);
+        ctx.reserve_parts = reserve_parts(&ctx.request);
+        let (prompt, max_out) = ctx.reserve_parts;
+        let est = prompt.saturating_add(max_out).min(MAX_RESERVE);
         let at = gw_state::epoch_secs();
         let reserved = admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
@@ -437,7 +439,7 @@ impl DagNode for BudgetGate {
         "budget"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let (prompt, max_out) = reserve_parts(&ctx.request);
+        let (prompt, max_out) = ctx.reserve_parts;
         let served = served_model(ctx.request.model_param_v2.as_ref());
         let est = admission::BudgetSpend {
             tokens: ctx

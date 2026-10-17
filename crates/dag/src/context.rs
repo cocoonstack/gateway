@@ -28,6 +28,7 @@ pub struct DagContext {
     /// A fallback model retries this attempt's upstream fault, so its failure is not the outcome.
     pub fallback_ahead: bool,
     pub(crate) request_limits_admitted: bool,
+    pub(crate) reserve_parts: (i64, i64),
     /// This request's cache key (computed by cache_lookup, reused by cache_store).
     pub cache_key: Option<String>,
     /// Governance key for the (AK, model) daily counter; set only when a cap is configured.
@@ -65,6 +66,7 @@ impl DagContext {
             cache_hit: false,
             fallback_ahead: false,
             request_limits_admitted: false,
+            reserve_parts: (0, 0),
             cache_key: None,
             model_quota_key: None,
             quota_reserved: None,
