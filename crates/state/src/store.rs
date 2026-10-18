@@ -2789,12 +2789,8 @@ fn roll_into(
             r.user_id.clone(),
             r.model.clone(),
         ))
-        .or_insert_with(|| UserUsageRow {
-            user_id: r.user_id.clone(),
-            model: r.model.clone(),
-            ..Default::default()
-        })
-        .add_record(r);
+        .and_modify(|e| e.add_record(r))
+        .or_insert_with(|| usage_of(r));
 }
 
 /// Fold grouped usage rows into `map` by (user, model).
