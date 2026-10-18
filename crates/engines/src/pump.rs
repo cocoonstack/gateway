@@ -128,9 +128,6 @@ where
                         }
                     }
                 }
-                if out.aborted {
-                    break;
-                }
             }
             out.streamed_live = sent_any;
         }

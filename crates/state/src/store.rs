@@ -34,9 +34,7 @@ const ROLLUP_BUCKET_SECS: i64 = 60;
 /// watermark trails it), so late rows and missed ticks self-heal.
 const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 
-/// A minute is rolled only once closed for this long, so no in-flight write or
-/// trailing replica lands a row in a rolled minute; a spool replay that does adds
-/// the row to the bucket in the same transaction, which keeps the max-upsert sound.
+/// A minute rolls once closed this long, past in-flight writes; a late spool row joins its bucket on replay.
 const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
 /// In-process rollup retention: the monthly-budget window, then a bucket cap.
 const ROLLUP_RETENTION_SECS: i64 = 62 * 86_400;
@@ -291,10 +289,7 @@ impl UserUsageRow {
         self.billed_units = self.billed_units.saturating_add(r.billed_units);
     }
 
-    /// Keep the larger of each counter. A bucket's source rows only shrink via ledger
-    /// pruning, and a replayed late row is added to its bucket as it lands, so per-column
-    /// max always picks the more complete snapshot — a recompute from a partially pruned
-    /// ledger can never shrink a bucket.
+    /// Keep the larger of each counter: pruning only shrinks a bucket's sources, so a recompute never shrinks it.
     fn keep_max(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.max(o.requests);
         self.prompt_tokens = self.prompt_tokens.max(o.prompt_tokens);
@@ -614,8 +609,7 @@ impl Store for MemoryStore {
                 .fetch_add(1, Ordering::Relaxed)
                 .is_multiple_of(LEDGER_PRUNE_EVERY)
         {
-            // spare unrolled rows (the cap yields to billing integrity); a full scan, since
-            // completion order can wedge a young row ahead of prunable ones
+            // spare unrolled rows; a full scan, since completion order can wedge a young row first
             let low_water = self.ledger_max_rows - self.ledger_max_rows / 10;
             let mut excess = ledger.rows.len() - low_water;
             let MemoryLedger { rows, request_ids } = &mut *ledger;
@@ -643,19 +637,7 @@ impl Store for MemoryStore {
             }
             ledger.rows.push(r.clone());
             if r.created_at_epoch_secs < watermark {
-                rollup
-                    .entry((
-                        bucket_floor(r.created_at_epoch_secs),
-                        r.tenant.clone(),
-                        r.user_id.clone(),
-                        r.model.clone(),
-                    ))
-                    .or_insert_with(|| UserUsageRow {
-                        user_id: r.user_id.clone(),
-                        model: r.model.clone(),
-                        ..Default::default()
-                    })
-                    .add_record(r);
+                roll_into(&mut rollup, r);
             }
         }
         Ok(())
@@ -684,7 +666,6 @@ impl Store for MemoryStore {
                     model: r.model.clone(),
                     ..Default::default()
                 });
-            // saturating: a hostile record can carry i64::MAX counts (usage is floored, not capped)
             e.requests += 1;
             e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
             e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
@@ -784,19 +765,7 @@ impl Store for MemoryStore {
                 .iter()
                 .filter(|r| r.created_at_epoch_secs >= lo && r.created_at_epoch_secs < hi)
             {
-                fresh
-                    .entry((
-                        bucket_floor(r.created_at_epoch_secs),
-                        r.tenant.clone(),
-                        r.user_id.clone(),
-                        r.model.clone(),
-                    ))
-                    .or_insert_with(|| UserUsageRow {
-                        user_id: r.user_id.clone(),
-                        model: r.model.clone(),
-                        ..Default::default()
-                    })
-                    .add_record(r);
+                roll_into(&mut fresh, r);
             }
         }
         let written = fresh.len() as u64;
@@ -2281,8 +2250,7 @@ impl PostgresStore {
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS finish_reason TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batch_results ADD COLUMN IF NOT EXISTS tool_calls TEXT NOT NULL DEFAULT ''",
-            // pre-upgrade results predate user_id; backfill it from the items rows so erasure
-            // reaches history (idempotent)
+            // backfill pre-upgrade results' user_id from the items rows so erasure reaches history
             "UPDATE batch_results r SET user_id = i.user_id FROM batch_items i
              WHERE r.batch_id = i.batch_id AND r.idx = i.idx
                AND r.user_id = '' AND i.user_id <> ''",
@@ -2522,8 +2490,7 @@ sql_store_impl!(PostgresStore, postgres, {
     }
 
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
-        // lock the row, THEN aggregate: a single UPDATE's subquery reads the statement-start
-        // snapshot and would miss a result committing while it waits for the lock
+        // lock, then aggregate: an UPDATE's subquery snapshot misses results committed during the wait
         let mut tx = self
             .pool
             .begin()
@@ -2809,6 +2776,21 @@ fn usage_of(r: &BillingRecord) -> UserUsageRow {
         vendor_cost_micros: r.vendor_cost_micros,
         billed_units: r.billed_units,
     }
+}
+
+fn roll_into(
+    buckets: &mut BTreeMap<(i64, String, String, String), UserUsageRow>,
+    r: &BillingRecord,
+) {
+    buckets
+        .entry((
+            bucket_floor(r.created_at_epoch_secs),
+            r.tenant.clone(),
+            r.user_id.clone(),
+            r.model.clone(),
+        ))
+        .and_modify(|e| e.add_record(r))
+        .or_insert_with(|| usage_of(r));
 }
 
 /// Fold grouped usage rows into `map` by (user, model).

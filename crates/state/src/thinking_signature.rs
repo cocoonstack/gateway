@@ -174,8 +174,7 @@ impl ThinkingSignatureAudit {
             }
         }
 
-        // thinking disabled: the client must strip the replayed blocks and the upstream
-        // arbitrates; enabled: a known anchor missing its blocks is still a Mismatch
+        // thinking off: the upstream arbitrates stripped blocks; on: a known anchor without them mismatches
         if sequence.blocks.is_empty() && !request.reasoning_engaged() {
             return (Some(context), ReviewVerdict::Miss);
         }

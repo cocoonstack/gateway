@@ -858,7 +858,6 @@ fn usage_tokens(ctx: &DagContext) -> GResult<BillTokens> {
         .response;
     let rate =
         gw_state::model_token_rate(&ctx.cfg, served_model(ctx.request.model_param_v2.as_ref()));
-    // saturating sums so a malformed usage subtree can't overflow the totals
     let mut tokens = match &resp.common_usage {
         Some(u) => {
             let ti = gw_models::TokenInput {

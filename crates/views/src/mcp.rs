@@ -522,7 +522,9 @@ fn jsonrpc_error(id: Value, code: i64, message: String) -> Response {
 }
 
 fn jsonrpc_error_value(id: Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+    let mut error = json!({"jsonrpc": "2.0", "error": {"code": code, "message": message}});
+    error["id"] = id;
+    error
 }
 
 #[cfg(test)]

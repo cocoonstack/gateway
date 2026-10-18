@@ -639,8 +639,7 @@ pub struct TenantConf {
     /// Default per-model daily token caps, metered per key.
     #[serde(default)]
     pub model_quotas: HashMap<String, i64>,
-    /// Where an over-quota request degrades to instead of hard-failing;
-    /// None = pass through unmetered (the per-AK daily cap still backstops).
+    /// Where an over-quota request degrades to; None = the request is refused.
     #[serde(default)]
     pub fallback_model: Option<String>,
     /// Env var holding this tenant's scoped admin token; empty = none.
@@ -1238,8 +1237,7 @@ impl GatewayConfig {
         Ok(())
     }
 
-    /// Config generation (a stable hash of the source document); mixed into
-    /// cache keys so a reload to a different config can't serve a stale entry.
+    /// Config generation: a stable hash of the source document.
     pub fn generation(&self) -> u64 {
         self.generation
     }

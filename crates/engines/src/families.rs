@@ -565,8 +565,7 @@ fn video_dialect(vendor: &str, wire: &str) -> VideoDialect {
 /// The vendor's async handle in a submit reply, whichever dialect answered;
 /// `None` for a synchronous reply that already carries the video.
 pub fn video_handle(v: &Value) -> Option<&str> {
-    // task ids before `request_id`: DashScope and Kling replies carry both, and
-    // their top-level request_id is the HTTP call's trace id, not the job
+    // task ids first: a DashScope or Kling request_id traces the HTTP call, not the job
     v["output"]["task_id"]
         .as_str()
         .or_else(|| v["data"]["task_id"].as_str())
@@ -738,14 +737,8 @@ fn video_outcome(model: &str, v: Value, status: u16) -> EngineOutcome {
         .or_else(|| v["video_url"].as_str())
         .unwrap_or_default()
         .to_owned();
-    let step = v["status"]
-        .as_str()
-        .or_else(|| v["output"]["task_status"].as_str())
-        .unwrap_or_default()
-        .to_owned();
     let units = whole_seconds(&v["video"]["duration"]).unwrap_or(0);
     let mut out = family_outcome(message, model.to_owned(), v, status);
-    out.response.step = step;
     out.response.billed_units = units;
     out
 }
@@ -2070,7 +2063,6 @@ mod tests {
         );
         let out = v.run().await.unwrap();
         assert_eq!(out.response.message, "mock://videos/out.mp4");
-        assert_eq!(out.response.step, "succeeded");
 
         let mut s = SearchEngine::new(
             req(

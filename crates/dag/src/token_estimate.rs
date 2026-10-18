@@ -115,10 +115,6 @@ pub fn estimate_prompt_tokens(
     let mut num = 0usize;
 
     for msg in messages {
-        // storage-role messages are internal bookkeeping, not sent upstream.
-        if msg.role == gw_consts::role::STORAGE {
-            continue;
-        }
         num += per_msg;
         num += enc.encode_len(&message_text(msg));
         num += enc.encode_len(&msg.role);

@@ -55,6 +55,12 @@ speed sit orders of magnitude below that; the gateway is not the ceiling.
   `ak-bench`'s 10⁹ daily-token quota mid-run and every further request was a
   clean `service_quota_exceeded_exception` — reserve-then-settle admission
   does not overshoot at 40k requests/s.
+- Streams on a pooled connection: until 2026-10-18 the listener left Nagle on,
+  so on Linux every streamed response on a keep-alive connection ended ~44 ms
+  late, waiting on the client's delayed ACK (one stream at a time: 22
+  requests/s). With `TCP_NODELAY` on every accepted connection the same probe
+  runs ~7,000 streams/s at p50 0.12 ms, and 64 concurrent streams ~53k/s; the
+  macOS table above never showed the stall.
 - Resources: the gateway used ~8 cores at 256 concurrency. Memory grows only
   in the in-memory store, which keeps every ledger row (~1 KB per request);
   point `storage` at SQLite/Postgres for anything longer than a benchmark.
