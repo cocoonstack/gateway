@@ -31,8 +31,10 @@ models:
 | `xai` | `https://api.x.ai` | openai-chat, responses, image, video, realtime | `Bearer` (Grok: `reasoning_effort` per model — grok-4.6 `low`–`xhigh`, grok-4.3 also `none`, others reject values they don't list; usage carries `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`, and the chat wire counts those reasoning tokens **outside** `completion_tokens` — it adds them into `total_tokens` instead, so the gateway bills them as output from that arithmetic (its Responses wire, OpenRouter and Bedrock all count them inside); every chat, Responses and image reply also carries `usage.cost_in_usd_ticks`, recorded as the vendor cost; xAI's own Anthropic-compatible surface is deprecated, so Anthropic clients reach Grok through this gateway's `/v1/messages` cross-protocol path; verified live: grok-4.3/4.6/4.20 chat + stream + effort tiers, `/v1/messages` both ways, grok-4.5 through `protocol: responses` natively and from the chat/messages surfaces incl. tool loops, grok-imagine-image-2.0 per-image units, and grok-voice-latest through `/v1/realtime` (`protocol: realtime`; xAI's `response.done` carries an empty `usage`, so the turn bills the delivered-output estimate — transcript tokens plus audio bytes/4 — as `estimated`, input unmetered: price the model per output unit accordingly); grok-imagine-video-1.5 through `/v1/videos/generations` + `GET /v1/videos/{id}` (`protocol: video`, unit price per generated second, vendor cost from `usage.cost_in_usd_ticks`); files/collections and vendor batches are not wired) |
 | `siliconflow` | `https://api.siliconflow.cn` | openai-chat, embeddings, rerank, tts, stt, image, video | `Bearer` (Qwen3 `enable_thinking`, DeepSeek/GLM/Kimi/MiniMax hosted models, bge/Qwen3 embeddings and rerankers, CosyVoice TTS, SenseVoice STT, Kolors images — all verified live) |
 
-Any other OpenAI-compatible vendor (Qwen, Ollama, vLLM, a relay) uses
-`kind: openai` with an `endpoint:` override:
+Any other OpenAI-compatible vendor (Qwen, Ollama, vLLM, Parasail, a relay) uses
+`kind: openai` with an `endpoint:` override. A streamed reply is read as SSE
+when its body opens with `data:`, whatever its `content-type` says (Parasail
+labels its streams `application/json`):
 
 ```yaml
 providers:
