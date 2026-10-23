@@ -195,43 +195,63 @@ impl Transport for HttpTransport {
                         || ct.starts_with("application/vnd.amazon.eventstream")
                 });
         let headers = std::mem::take(resp.headers_mut());
-        if is_sse {
-            use futures::TryStreamExt;
-            let stream = Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
-                timeout: e.is_timeout(),
-                message: e.without_url().to_string(),
-            }));
+        if !is_sse && !req.stream {
+            let bytes = resp.bytes().await.map_err(|e| {
+                let e = e.without_url();
+                // both stay 502 (failover-eligible); the code split keeps the external 408-vs-424 class
+                let what = if e.is_timeout() {
+                    "read upstream body timed out"
+                } else {
+                    "read upstream body failed"
+                };
+                GatewayError::new(upstream_fault_code(e.is_timeout()), 502, what).with_source(e)
+            })?;
             return Ok(UpstreamResponse {
                 status,
-                body: idle_capped(stream, timeout),
+                body: UpstreamBody::Json(bytes),
                 headers,
             });
         }
-        let read = resp.bytes();
-        let bytes = if req.stream {
-            tokio::time::timeout(timeout, read).await.map_err(|_| {
+        use futures::{StreamExt, TryStreamExt};
+        let mut stream: futures::stream::BoxStream<'static, _> =
+            Box::pin(resp.bytes_stream().map_err(|e| StreamFault {
+                timeout: e.is_timeout(),
+                message: e.without_url().to_string(),
+            }));
+        if !is_sse {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let late = |_| {
                 GatewayError::new(
                     gw_consts::ErrCode::FED_RESP_TIMEOUT,
                     502,
-                    format!("upstream body not read within {:?}", timeout),
+                    format!("upstream body not read within {timeout:?}"),
                 )
-            })?
-        } else {
-            read.await
-        };
-        let bytes = bytes.map_err(|e| {
-            let e = e.without_url();
-            // both stay 502 (failover-eligible); the code split keeps the external 408-vs-424 class
-            let what = if e.is_timeout() {
-                "read upstream body timed out"
-            } else {
-                "read upstream body failed"
             };
-            GatewayError::new(upstream_fault_code(e.is_timeout()), 502, what).with_source(e)
-        })?;
+            let head = tokio::time::timeout_at(deadline, stream.try_next())
+                .await
+                .map_err(late)?
+                .map_err(StreamFault::into_error)?
+                .unwrap_or_default();
+            if status >= 400 || !head.trim_ascii_start().starts_with(b"data:") {
+                let body = stream.try_fold(Vec::from(head), |mut body, b| async move {
+                    body.extend_from_slice(&b);
+                    Ok(body)
+                });
+                let body = tokio::time::timeout_at(deadline, body)
+                    .await
+                    .map_err(late)?
+                    .map_err(StreamFault::into_error)?;
+                return Ok(UpstreamResponse {
+                    status,
+                    body: UpstreamBody::Json(body.into()),
+                    headers,
+                });
+            }
+            stream = Box::pin(futures::stream::once(async { Ok(head) }).chain(stream));
+        }
         Ok(UpstreamResponse {
             status,
-            body: UpstreamBody::Json(bytes),
+            body: idle_capped(stream, timeout),
             headers,
         })
     }
@@ -394,6 +414,25 @@ mod tests {
         (format!("http://{addr}/v1/chat/completions"), hits)
     }
 
+    async fn serve_once(status: u16, content_type: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
     fn request(url: String) -> UpstreamRequest {
         UpstreamRequest {
             protocol: gw_consts::Protocol::OpenaiChat,
@@ -488,6 +527,32 @@ mod tests {
         let resp = t.send(req).await.unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stream_request_body_is_read_by_its_first_bytes() {
+        let sse = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+        for (status, body, want_sse) in [
+            (200, sse, true),
+            (200, "{\"ok\":true}", false),
+            (502, sse, false),
+        ] {
+            let mut req = request(serve_once(status, "application/json", body).await);
+            req.stream = true;
+            let t = HttpTransport::new(Duration::from_secs(5)).unwrap();
+            let resp = t.send(req).await.unwrap();
+            assert_eq!(
+                matches!(resp.body, UpstreamBody::SseStream(_)),
+                want_sse,
+                "{status} {body}"
+            );
+            let got = match resp.buffered().await.unwrap().body {
+                UpstreamBody::Json(b) => b.to_vec(),
+                UpstreamBody::Sse(b) => b,
+                UpstreamBody::SseStream(_) => unreachable!("buffered drains the stream"),
+            };
+            assert_eq!(got, body.as_bytes(), "{status}");
+        }
     }
 
     #[test]
