@@ -21,9 +21,10 @@ impl ClaudeEngine {
     /// The Messages body. On Bedrock the model rides in the invoke path and
     /// streaming in the URL, and the API version is a body field.
     fn build_body(&mut self) -> GResult<Map<String, Value>> {
-        let protocol = self.base.param()?.protocol;
+        let param = self.base.param()?;
+        let (protocol, served_as_named) = (param.protocol, param.fallback_from.is_none());
         let converse = protocol == gw_consts::Protocol::AwsConverse;
-        let in_place = self.base.request.preserve_anthropic_wire && !converse;
+        let in_place = self.base.request.preserve_anthropic_wire && !converse && served_as_named;
         let mut system_text = if in_place {
             String::new()
         } else {
@@ -119,12 +120,14 @@ impl ClaudeEngine {
         let mut client_cap = false;
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
-        let mut native_system = None;
+        let (mut native_system, mut top_system) = (None, None);
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             // the native system-block array keeps the client's cache_control (and ttl)
             native_system = p.system_blocks.filter(Value::is_array);
-            if in_place && let Some(system) = p.system {
-                system_text = system;
+            if in_place {
+                system_text = p.system.unwrap_or_default();
+            } else {
+                top_system = p.system;
             }
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
@@ -189,8 +192,15 @@ impl ClaudeEngine {
             self.base.output_cap = max_tokens;
         }
         let mut raw = self.base.take_raw();
+        let messages_long = marked && breakpoints(body.get("messages")).1;
         let folded = system_parts.into_iter().map(|part| match part {
             Value::String(text) => object([("type", "text".into()), ("text", text.into())]),
+            Value::Object(mut block) => {
+                if messages_long && block.get("cache_control").is_some_and(|c| !is_long_ttl(c)) {
+                    block.remove("cache_control");
+                }
+                Value::Object(block)
+            }
             part => part,
         });
         let system = match native_system {
@@ -198,7 +208,14 @@ impl ClaudeEngine {
                 blocks.extend(folded);
                 Some(Value::Array(blocks))
             }
-            _ if marked => Some(Value::Array(folded.collect())),
+            _ if marked => Some(Value::Array(
+                top_system
+                    .map(|text| content_blocks(Value::String(text)))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(folded)
+                    .collect(),
+            )),
             _ if system_text.is_empty() => None,
             _ => Some(Value::String(system_text)),
         };

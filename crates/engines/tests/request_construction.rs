@@ -1449,27 +1449,107 @@ async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
 }
 
 #[tokio::test]
-async fn native_system_turns_fold_into_the_system_prompt_on_converse() {
+async fn native_system_turns_fold_into_the_system_prompt_on_converse_or_a_swapped_model() {
+    let converse_ok = r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#;
+    for (protocol, model, requested, reply) in [
+        (
+            Protocol::AwsConverse,
+            "us.amazon.nova-lite-v1:0",
+            None,
+            converse_ok,
+        ),
+        (
+            Protocol::AnthropicMessages,
+            "claude-sonnet-4-6",
+            Some("claude-opus-5-5"),
+            CLAUDE_OK,
+        ),
+    ] {
+        let t = RecordingTransport::new(reply);
+        let mut req = native_system_turn_req(protocol, model);
+        req.model_param_v2.as_mut().unwrap().fallback_from = requested.map(str::to_owned);
+        ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        let roles: Vec<&str> = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"], "{b}");
+        let system: Vec<&str> = b["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(system, ["sys", "env block", "reminder"], "{b}");
+    }
+}
+
+#[tokio::test]
+async fn a_cache_marked_system_turn_keeps_the_top_level_system_text_on_converse() {
     let t = RecordingTransport::new(
         r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
     );
-    let req = native_system_turn_req(Protocol::AwsConverse, "us.amazon.nova-lite-v1:0");
+    let mut env = ChatMsg::text("system", "env block");
+    env.parts = Some(serde_json::json!([
+        {"type": "text", "text": "env block", "cache_control": {"type": "ephemeral"}}
+    ]));
+    let mut req = chat_req(Protocol::AwsConverse, "us.anthropic.claude-opus-5-5");
+    req.preserve_anthropic_wire = true;
+    req.message = vec![ChatMsg::text("user", "hi"), env];
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+        system: Some("sys".into()),
+        ..Default::default()
+    }));
     ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    let roles: Vec<&str> = b["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["role"].as_str().unwrap())
-        .collect();
-    assert_eq!(roles, ["user", "assistant", "user"], "{b}");
     let system: Vec<&str> = b["system"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|block| block["text"].as_str())
         .collect();
-    assert_eq!(system, ["sys", "env block", "reminder"], "{b}");
+    assert_eq!(system, ["sys", "env block"], "{b}");
+}
+
+#[tokio::test]
+async fn a_folded_system_turn_never_puts_a_5m_breakpoint_before_a_1h_one_on_converse() {
+    let t = RecordingTransport::new(
+        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
+    );
+    let mut user = ChatMsg::text("user", "remember ALPHA");
+    user.parts = Some(
+        serde_json::json!([{"type": "text", "text": "remember ALPHA",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
+    );
+    let mut rule = ChatMsg::text("system", "one word");
+    rule.parts = Some(serde_json::json!([{"type": "text", "text": "one word",
+        "cache_control": {"type": "ephemeral"}}]));
+    let mut req = chat_req(Protocol::AwsConverse, "global.anthropic.claude-opus-5-5");
+    req.preserve_anthropic_wire = true;
+    req.message = vec![
+        user,
+        rule,
+        ChatMsg::text("assistant", "noted"),
+        ChatMsg::text("user", "the word?"),
+    ];
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+        system: Some("terse".into()),
+        ..Default::default()
+    }));
+    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    let system: Vec<&str> = b["system"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert_eq!(system, ["terse", "one word"], "{b}");
+    assert!(!b["system"].to_string().contains("cachePoint"), "{b}");
+    assert!(b["messages"][0].to_string().contains("1h"), "{b}");
 }
 
 #[tokio::test]
