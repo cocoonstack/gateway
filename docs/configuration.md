@@ -162,31 +162,32 @@ generated seconds, a `search` model's queries (one per call) — and adds to
 `cost_micros` next to any token cost;
 the count lands in the ledger's `billed_units` and the `/admin/usage`
 aggregates. An account's `cost_unit_price_micros` is the vendor side of the
-same unit, for margin. `prompt_cache` (anthropic-messages models)
-marks the system prompt and the latest user turn as Anthropic prompt-cache
-breakpoints, so each turn of a conversation re-reads its prefix at the
-cache-read rate; it is per model and off by default because a long one-shot
-prompt would pay the cache-write premium for nothing. Client breakpoints win:
-the gateway marks the latest user turn only when the client put no breakpoint
-on a message block (`tool_result` content included) and sent no top-level
-`cache_control`, and the system prompt only when the client left it unmarked
-and no 1-hour breakpoint follows it. The turn goes first, and neither is added
-past Anthropic's four breakpoints. A
-`/v1/messages` client's breakpoints, `ttl: 1h` included, ride through as sent,
-and on `anthropic-messages` and `aws-anthropic` models its mid-conversation
-`role: "system"` messages stay in place with their `output_config` and
-`clear_at`; on `aws-converse` they join the end of `system`. On a `responses` model served by an OpenRouter account,
-`prompt_cache` on an `anthropic/*` model adds the top-level
-`cache_control: {type: ephemeral}` that OpenRouter needs to cache it, unless
-the client sent its own. A `/v1/chat/completions` system message whose
-content parts carry `cache_control` keeps them on an Anthropic-wire model the
-same way. On an openai-chat model
-the client's own breakpoints on system blocks, message blocks and
-`tool_result` ride through as OpenAI content parts, which OpenRouter honors
-for Anthropic models; a breakpoint on a tool definition does not (Gemini's
-compatible endpoint rejects the field), and a later breakpoint covers the
-tools anyway. `variants` splits a
-public name across other declared same-protocol models (one level):
+same unit, for margin. `prompt_cache` (anthropic-messages models) marks the
+system prompt and the latest user turn as Anthropic prompt-cache breakpoints,
+so each turn of a conversation re-reads its prefix at the cache-read rate; it
+is per model and off by default because a long one-shot prompt would pay the
+cache-write premium for nothing. Client breakpoints win: the gateway marks the
+latest user turn only when the client put no breakpoint on a message block
+(`tool_result` content included) and sent no top-level `cache_control`, and
+the system prompt only when the client left it unmarked and no 1-hour
+breakpoint follows it. The turn goes first, and neither is added past
+Anthropic's four breakpoints. A `/v1/messages` client's breakpoints, `ttl: 1h`
+included, ride through as sent. On `anthropic-messages` and `aws-anthropic`
+models its mid-conversation `role: "system"` messages stay in place with their
+`output_config` and `clear_at`; they join the end of `system` on
+`aws-converse`, and when a fallback or variant serves a pre-5 Claude model in
+place of the one the client named, since those models reject the turn. On a
+`responses` model served by an OpenRouter account, `prompt_cache` on an
+`anthropic/*` model adds the top-level `cache_control: {type: ephemeral}` that
+OpenRouter needs to cache it, unless the client sent its own. A
+`/v1/chat/completions` system message whose content parts carry
+`cache_control` keeps them on an Anthropic-wire model the same way. On an
+openai-chat model the client's own breakpoints on system blocks, message
+blocks and `tool_result` ride through as OpenAI content parts, which
+OpenRouter honors for Anthropic models; a breakpoint on a tool definition does
+not (Gemini's compatible endpoint rejects the field), and a later breakpoint
+covers the tools anyway. `variants` splits a public name across other declared
+same-protocol models (one level):
 entitlement and the per-(AK, model) daily counter judge the public name,
 billing prices the served variant, and the response echoes the requested
 name. Selection hashes the effective user, so a user sticks to one backend

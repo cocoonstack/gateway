@@ -1418,12 +1418,23 @@ fn native_system_turn_req(protocol: Protocol, model: &str) -> GatewayRequest {
 
 #[tokio::test]
 async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
-    for (protocol, model) in [
-        (Protocol::AnthropicMessages, "claude-opus-5-5"),
-        (Protocol::AwsAnthropic, "anthropic.claude-opus-5-5"),
+    for (protocol, model, requested) in [
+        (Protocol::AnthropicMessages, "claude-opus-5-5", None),
+        (Protocol::AwsAnthropic, "anthropic.claude-opus-5-5", None),
+        (
+            Protocol::AnthropicMessages,
+            "~anthropic/claude-opus-latest",
+            Some("claude-opus-5-5"),
+        ),
+        (
+            Protocol::AnthropicMessages,
+            "MiniMax-M2",
+            Some("claude-opus-5-5"),
+        ),
     ] {
         let t = RecordingTransport::new(CLAUDE_OK);
-        let req = native_system_turn_req(protocol, model);
+        let mut req = native_system_turn_req(protocol, model);
+        req.model_param_v2.as_mut().unwrap().fallback_from = requested.map(str::to_owned);
         ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
         assert_eq!(
@@ -1438,12 +1449,12 @@ async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
                     {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
                 ]},
             ]),
-            "{protocol:?}"
+            "{protocol:?} {model}"
         );
         assert_eq!(
             b["system"],
             serde_json::json!([{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]),
-            "{protocol:?}"
+            "{protocol:?} {model}"
         );
     }
 }

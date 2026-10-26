@@ -4,7 +4,9 @@
 
 use gw_models::{GResult, GatewayResponse};
 use gw_protocol::object;
-use gw_protocol::reasoning::{ThinkingDialect, is_thinking_block};
+use gw_protocol::reasoning::{
+    ThinkingDialect, anthropic_thinking_dialect, anthropic_thinks_by_default, is_thinking_block,
+};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -22,9 +24,11 @@ impl ClaudeEngine {
     /// streaming in the URL, and the API version is a body field.
     fn build_body(&mut self) -> GResult<Map<String, Value>> {
         let param = self.base.param()?;
-        let (protocol, served_as_named) = (param.protocol, param.fallback_from.is_none());
+        let protocol = param.protocol;
         let converse = protocol == gw_consts::Protocol::AwsConverse;
-        let in_place = self.base.request.preserve_anthropic_wire && !converse && served_as_named;
+        let in_place = self.base.request.preserve_anthropic_wire
+            && !converse
+            && (param.fallback_from.is_none() || !claude_before_5(&param.model_name));
         let mut system_text = if in_place {
             String::new()
         } else {
@@ -875,6 +879,11 @@ fn system_turn(m: gw_models::ChatMsg) -> Value {
         m.parts.unwrap_or(Value::String(m.content)),
     );
     Value::Object(turn)
+}
+
+fn claude_before_5(model: &str) -> bool {
+    model.contains("claude")
+        && !anthropic_thinks_by_default(anthropic_thinking_dialect(model), model)
 }
 
 fn place_breakpoints(body: &mut Map<String, Value>) {
