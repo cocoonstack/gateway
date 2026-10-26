@@ -53,6 +53,8 @@ pub struct InMessage {
     pub role: String,
     /// string or [{type:"text"|"image"|"tool_result"|...}] blocks
     pub content: Value,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -231,8 +231,9 @@ pub struct ModelConf {
     #[serde(default)]
     pub token_rate: Option<TokenRateConf>,
     /// Anthropic prompt caching: mark the system prompt and the latest user
-    /// turn as cache breakpoints, so a multi-turn conversation's prefix bills
-    /// at the cache-read rate. Pair with `token_rate`.
+    /// turn as cache breakpoints unless the client placed any (an `anthropic/*`
+    /// Responses model on OpenRouter gets the top-level `cache_control` instead),
+    /// so a conversation's prefix bills at the cache-read rate. Pair with `token_rate`.
     #[serde(default)]
     pub prompt_cache: bool,
     /// Models tried in order when this one fails upstream (5xx, 429, 401-403, connection

@@ -136,7 +136,7 @@ models:
       audio_completion: 8.33         #   audio output tokens (default = completion weight)
     long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
     batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price; must be finite and in (0.0, 1.0]
-    prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
+    prompt_cache: true               # prompt-cache breakpoints (Anthropic wires; anthropic/* on OpenRouter Responses)
     fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / 429 / 401-403 refusal / connection failure / no healthy account (rejected at load when unknown, self or duplicate)
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
@@ -166,12 +166,19 @@ same unit, for margin. `prompt_cache` (anthropic-messages models)
 marks the system prompt and the latest user turn as Anthropic prompt-cache
 breakpoints, so each turn of a conversation re-reads its prefix at the
 cache-read rate; it is per model and off by default because a long one-shot
-prompt would pay the cache-write premium for nothing. A `/v1/messages` client
-that sends `system` as blocks with its own `cache_control` (including
-`ttl: 1h`) keeps them as sent; the gateway only marks the last system block
-when that block carries no breakpoint of its own. A `/v1/chat/completions`
-system message whose content parts carry `cache_control` keeps them on an
-Anthropic-wire model the same way. On an openai-chat model
+prompt would pay the cache-write premium for nothing. Client breakpoints win:
+when the request already carries any `cache_control` (top-level, on a tool, a
+system block or a message block), the gateway adds none, so the request stays
+within Anthropic's four breakpoints and the client's TTL order. A
+`/v1/messages` client's breakpoints, `ttl: 1h` included, ride through as sent,
+and on `anthropic-messages` and `aws-anthropic` models its mid-conversation
+`role: "system"` messages stay in place with their `output_config` and
+`clear_at`; on `aws-converse` they join the end of `system`. On a `responses` model served by an OpenRouter account,
+`prompt_cache` on an `anthropic/*` model adds the top-level
+`cache_control: {type: ephemeral}` that OpenRouter needs to cache it, unless
+the client sent its own. A `/v1/chat/completions` system message whose
+content parts carry `cache_control` keeps them on an Anthropic-wire model the
+same way. On an openai-chat model
 the client's own breakpoints on system blocks, message blocks and
 `tool_result` ride through as OpenAI content parts, which OpenRouter honors
 for Anthropic models; a breakpoint on a tool definition does not (Gemini's

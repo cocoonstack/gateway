@@ -20,11 +20,22 @@ impl ClaudeEngine {
     /// The Messages body. On Bedrock the model rides in the invoke path and
     /// streaming in the URL, and the API version is a body field.
     fn build_body(&mut self) -> GResult<Map<String, Value>> {
-        let system_text = self.base.system_text();
+        let protocol = self.base.param()?.protocol;
+        let converse = protocol == gw_consts::Protocol::AwsConverse;
+        let in_place = self.base.request.preserve_anthropic_wire && !converse;
+        let mut system_text = if in_place {
+            String::new()
+        } else {
+            self.base.system_text()
+        };
         let mut messages: Vec<Value> = Vec::new();
         let (mut system_parts, mut marked) = (Vec::new(), false);
         for m in std::mem::take(&mut self.base.request.message) {
             if m.role == gw_consts::role::SYSTEM {
+                if in_place {
+                    messages.push(system_turn(m));
+                    continue;
+                }
                 match m.parts {
                     Some(Value::Array(parts)) => {
                         marked |= parts.iter().any(|part| part.get("cache_control").is_some());
@@ -77,22 +88,14 @@ impl ClaudeEngine {
             push_turn(&mut messages, role, content);
         }
 
-        let prompt_cache = self.base.request.prompt_cache;
-        if prompt_cache
-            && let Some(last) = messages.last_mut()
-            && last["role"] == "user"
-        {
-            last["content"] = Value::Array(cached_blocks(last["content"].take()));
-        }
         let param = self.base.param()?;
-        let converse = param.protocol == gw_consts::Protocol::AwsConverse;
         let anthropic_fields = !converse || crate::converse::claude_model(&param.model_name);
         let bedrock = matches!(
-            param.protocol,
+            protocol,
             gw_consts::Protocol::AwsAnthropic | gw_consts::Protocol::AwsConverse
         );
         let mut body = Map::new();
-        if param.protocol == gw_consts::Protocol::AwsAnthropic {
+        if protocol == gw_consts::Protocol::AwsAnthropic {
             body.insert("anthropic_version".into(), "bedrock-2023-05-31".into());
             if let Some(betas) = self.base.request.anthropic_beta.as_deref() {
                 body.insert(
@@ -115,22 +118,13 @@ impl ClaudeEngine {
         let mut client_cap = false;
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
-        let mut native_system = marked.then(|| {
-            Value::Array(
-                system_parts
-                    .into_iter()
-                    .map(|part| match part {
-                        Value::String(text) => {
-                            object([("type", "text".into()), ("text", text.into())])
-                        }
-                        part => part,
-                    })
-                    .collect(),
-            )
-        });
+        let mut native_system = None;
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             // the native system-block array keeps the client's cache_control (and ttl)
-            native_system = p.system_blocks.filter(Value::is_array).or(native_system);
+            native_system = p.system_blocks.filter(Value::is_array);
+            if in_place && let Some(system) = p.system {
+                system_text = system;
+            }
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
                 client_cap = true;
@@ -194,12 +188,18 @@ impl ClaudeEngine {
             self.base.output_cap = max_tokens;
         }
         let mut raw = self.base.take_raw();
+        let folded = system_parts.into_iter().map(|part| match part {
+            Value::String(text) => object([("type", "text".into()), ("text", text.into())]),
+            part => part,
+        });
         let system = match native_system {
-            Some(blocks) if prompt_cache => Some(Value::Array(cached_blocks(blocks))),
-            Some(blocks) => Some(blocks),
-            None if system_text.is_empty() => None,
-            None if prompt_cache => Some(Value::Array(cached_blocks(Value::String(system_text)))),
-            None => Some(Value::String(system_text)),
+            Some(Value::Array(mut blocks)) => {
+                blocks.extend(folded);
+                Some(Value::Array(blocks))
+            }
+            _ if marked => Some(Value::Array(folded.collect())),
+            _ if system_text.is_empty() => None,
+            _ => Some(Value::String(system_text)),
         };
         if let Some(system) = system {
             body.insert("system".into(), system);
@@ -227,6 +227,9 @@ impl ClaudeEngine {
             }
         }
         crate::base::merge_raw_extras_owned(&mut body, raw);
+        if self.base.request.prompt_cache && !has_breakpoint(&body) {
+            place_breakpoints(&mut body);
+        }
         Ok(body)
     }
 
@@ -846,16 +849,50 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     messages.push(Value::Object(msg));
 }
 
-/// Content as blocks with a prompt-cache breakpoint on the last one (a breakpoint
-/// caches everything before it); a client-placed breakpoint wins (it may carry a ttl).
-fn cached_blocks(content: Value) -> Vec<Value> {
-    let mut blocks = content_blocks(content);
-    if let Some(Value::Object(block)) = blocks.last_mut() {
-        block
-            .entry("cache_control")
-            .or_insert_with(|| json!({"type": "ephemeral"}));
+fn system_turn(m: gw_models::ChatMsg) -> Value {
+    let mut turn = m.extra;
+    turn.insert("role".into(), m.role.into());
+    turn.insert(
+        "content".into(),
+        m.parts.unwrap_or(Value::String(m.content)),
+    );
+    Value::Object(turn)
+}
+
+fn has_breakpoint(body: &Map<String, Value>) -> bool {
+    fn marked(blocks: Option<&Value>) -> bool {
+        blocks.and_then(Value::as_array).is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("cache_control").is_some() || marked(b.get("content")))
+        })
     }
-    blocks
+    body.contains_key("cache_control")
+        || ["tools", "system", "messages"]
+            .into_iter()
+            .any(|key| marked(body.get(key)))
+}
+
+fn place_breakpoints(body: &mut Map<String, Value>) {
+    if let Some(system) = body.get_mut("system") {
+        cache_last_block(system);
+    }
+    if let Some(Value::Array(turns)) = body.get_mut("messages")
+        && let Some(last) = turns.iter_mut().rfind(|t| t["role"] != "system")
+        && last["role"] == "user"
+    {
+        cache_last_block(&mut last["content"]);
+    }
+}
+
+/// Content as blocks with a prompt-cache breakpoint on the last one (a breakpoint
+/// caches everything before it).
+fn cache_last_block(content: &mut Value) {
+    let mut blocks = content_blocks(content.take());
+    if let Some(Value::Object(block)) = blocks.last_mut() {
+        block.insert("cache_control".into(), json!({"type": "ephemeral"}));
+    }
+    *content = Value::Array(blocks);
 }
 
 /// Tool definitions in the anthropic wire shape: OpenAI-shaped defs are
