@@ -249,11 +249,14 @@ captured from the real client and replays in the live matrix (`agents` group).
 **Claude Code** — the Anthropic wire, so the gateway model must speak it
 natively or by conversion. Claude Code sends a system-block array with
 `cache_control` points, its tool set, `thinking` (with `display: omitted`),
-`context_management`, and its user id in `metadata.user_id`; it enables beta
-features through the `anthropic-beta` header, which the gateway forwards to
-Anthropic-wire upstreams (the header for `kind: anthropic`, the
-`anthropic_beta` body list for `aws-anthropic`). Point it at the gateway with
-the access key as the API key:
+`context_management`, mid-conversation `role: "system"` messages (the
+request's last breakpoint often sits on one), and its user id in
+`metadata.user_id`; it enables beta features through the `anthropic-beta`
+header, which the gateway forwards to Anthropic-wire upstreams (the header for
+`kind: anthropic`, the `anthropic_beta` body list for `aws-anthropic` and for
+Claude on `aws-converse`, minus the advisor-tool, advanced-tool-use and
+prompt-caching-scope betas Bedrock rejects). Point it at the gateway with the
+access key as the API key:
 
 ```bash
 export ANTHROPIC_BASE_URL=https://gw.example.com
@@ -289,7 +292,10 @@ env_key = "GW_API_KEY"          # export GW_API_KEY=ak-...
 wire_api = "responses"
 ```
 
-Codex tries a WebSocket first and falls back to HTTPS on its own.
+Codex tries a WebSocket first and falls back to HTTPS on its own. An
+`anthropic/*` model on an OpenRouter Responses account caches nothing unless
+the request carries a top-level `cache_control`; set `prompt_cache: true` on
+that model and the gateway adds it.
 
 **VS Code chat (GitHub Copilot)** — *Chat: Manage Language Models* → *Add
 Models* → *Custom Endpoint*: pick the API type (Chat Completions, Responses

@@ -1380,7 +1380,338 @@ async fn anthropic_prompt_cache_marks_system_and_latest_user_turn() {
     assert_eq!(b["messages"][0]["content"], "hello");
 }
 
+fn native_system_turn_req(protocol: Protocol, model: &str) -> GatewayRequest {
+    let mut env = ChatMsg::text("system", "env block");
+    env.extra.insert(
+        "output_config".into(),
+        serde_json::json!({"effort": "medium"}),
+    );
+    let mut effort = ChatMsg::text("system", "");
+    effort.parts = Some(serde_json::json!([]));
+    effort.extra.insert(
+        "output_config".into(),
+        serde_json::json!({"effort": "high"}),
+    );
+    let mut reminder = ChatMsg::text("system", "reminder");
+    reminder.parts = Some(serde_json::json!([
+        {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
+    ]));
+    let mut req = chat_req(protocol, model);
+    req.message = vec![
+        ChatMsg::text("user", "hi"),
+        env,
+        ChatMsg::text("assistant", "ok"),
+        effort,
+        ChatMsg::text("user", "again"),
+        reminder,
+    ];
+    req.preserve_anthropic_wire = true;
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+        system: Some("sys".into()),
+        system_blocks: Some(serde_json::json!([
+            {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+        ])),
+        ..Default::default()
+    }));
+    req
+}
+
+#[tokio::test]
+async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
+    let am = Protocol::AnthropicMessages;
+    for (protocol, model, swapped) in [
+        (am, "claude-opus-5-5", false),
+        (Protocol::AwsAnthropic, "anthropic.claude-opus-5-5", false),
+        (am, "~anthropic/claude-opus-latest", true),
+        (am, "MiniMax-M2", true),
+        (am, "claude-sonnet-5", true),
+    ] {
+        let t = RecordingTransport::new(CLAUDE_OK);
+        let mut req = native_system_turn_req(protocol, model);
+        req.model_param_v2.as_mut().unwrap().fallback_from =
+            swapped.then(|| "claude-opus-5-5".into());
+        ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        let mut want = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "env block", "output_config": {"effort": "medium"}},
+            {"role": "assistant", "content": "ok"},
+            {"role": "system", "content": [], "output_config": {"effort": "high"}},
+            {"role": "user", "content": "again"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
+            ]},
+        ]);
+        if swapped {
+            let turns = want.as_array_mut().unwrap();
+            turns.retain(|turn| turn["content"] != serde_json::json!([]));
+            for turn in turns {
+                turn.as_object_mut().unwrap().remove("output_config");
+            }
+        }
+        assert_eq!(b["messages"], want, "{protocol:?} {model}");
+        assert_eq!(
+            b["system"],
+            serde_json::json!([{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]),
+            "{protocol:?} {model}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_system_turns_fold_into_the_system_prompt_on_converse_or_a_swapped_model() {
+    let am = Protocol::AnthropicMessages;
+    for (protocol, model, swapped) in [
+        (Protocol::AwsConverse, "us.amazon.nova-lite-v1:0", false),
+        (am, "claude-sonnet-4-6", true),
+        (am, "anthropic/claude-sonnet-4.6", true),
+        (am, "anthropic/claude-opus-4", true),
+    ] {
+        let reply = if protocol == Protocol::AwsConverse {
+            CONVERSE_OK
+        } else {
+            CLAUDE_OK
+        };
+        let t = RecordingTransport::new(reply);
+        let mut req = native_system_turn_req(protocol, model);
+        req.model_param_v2.as_mut().unwrap().fallback_from =
+            swapped.then(|| "claude-opus-5-5".into());
+        ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        let roles: Vec<&str> = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"], "{b}");
+        assert_eq!(system_texts(&b), ["sys", "env block", "reminder"], "{b}");
+    }
+}
+
+#[tokio::test]
+async fn a_cache_marked_system_turn_keeps_the_top_level_system_text_on_converse() {
+    let t = RecordingTransport::new(CONVERSE_OK);
+    let mut env = ChatMsg::text("system", "env block");
+    env.parts = Some(serde_json::json!([
+        {"type": "text", "text": "env block", "cache_control": {"type": "ephemeral"}}
+    ]));
+    let mut req = chat_req(Protocol::AwsConverse, "us.anthropic.claude-opus-5-5");
+    req.preserve_anthropic_wire = true;
+    req.message = vec![ChatMsg::text("user", "hi"), env];
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+        system: Some("sys".into()),
+        ..Default::default()
+    }));
+    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(system_texts(&b), ["sys", "env block"], "{b}");
+}
+
+#[tokio::test]
+async fn a_folded_system_turn_never_puts_a_5m_breakpoint_before_a_1h_one_on_converse() {
+    let t = RecordingTransport::new(CONVERSE_OK);
+    let mut user = ChatMsg::text("user", "remember ALPHA");
+    user.parts = Some(
+        serde_json::json!([{"type": "text", "text": "remember ALPHA",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
+    );
+    let mut rule = ChatMsg::text("system", "one word");
+    rule.parts = Some(serde_json::json!([{"type": "text", "text": "one word",
+        "cache_control": {"type": "ephemeral"}}]));
+    let mut req = chat_req(Protocol::AwsConverse, "global.anthropic.claude-opus-5-5");
+    req.preserve_anthropic_wire = true;
+    req.message = vec![
+        user,
+        rule,
+        ChatMsg::text("assistant", "noted"),
+        ChatMsg::text("user", "the word?"),
+    ];
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+        system: Some("terse".into()),
+        ..Default::default()
+    }));
+    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(system_texts(&b), ["terse", "one word"], "{b}");
+    assert!(!b["system"].to_string().contains("cachePoint"), "{b}");
+    assert!(b["messages"][0].to_string().contains("1h"), "{b}");
+}
+
+#[tokio::test]
+async fn prompt_cache_fills_only_the_breakpoints_the_client_left_out() {
+    let five = serde_json::json!({"type": "ephemeral"});
+    let hour = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    let text = |text: &str, control: Option<&Value>| {
+        let mut block = serde_json::json!({"type": "text", "text": text});
+        if let Some(control) = control {
+            block["cache_control"] = control.clone();
+        }
+        block
+    };
+    let tool = |name: &str| serde_json::json!({"name": name, "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}});
+    let tool_result = serde_json::json!({"type": "tool_result", "tool_use_id": "tu",
+        "content": [{"type": "text", "text": "r", "cache_control": {"type": "ephemeral"}}]});
+    let (f, h) = (Some(&five), Some(&hour));
+    let q = || vec![text("q", None)];
+    #[rustfmt::skip]
+    let cases = [
+        ("system only", Some(vec![text("sys", f)]), None, q(), None, 2, true, true),
+        ("system 1h", Some(vec![text("sys", h)]), None, q(), None, 2, true, true),
+        ("system and message", Some(vec![text("sys", f)]), None, vec![text("q", f)],
+            None, 2, true, true),
+        ("message only", None, None, vec![text("q", f)], None, 2, true, true),
+        ("message 1h", None, None, vec![text("q", h)], None, 1, true, false),
+        ("tool_result", None, None, vec![tool_result, text("q", None)], None, 2, false, true),
+        ("top-level", None, None, q(), f, 2, false, true),
+        ("top-level 1h", None, None, q(), h, 1, false, false),
+        ("four taken", Some(vec![text("a", f), text("b", f), text("c", f)]),
+            Some(vec![tool("t")]), q(), None, 4, false, true),
+        ("one slot left", None, Some(vec![tool("t1"), tool("t2"), tool("t3")]),
+            q(), None, 4, true, false),
+    ];
+    for (name, system, tools, last, top, total, user_marked, system_marked) in cases {
+        let t = RecordingTransport::new(CLAUDE_OK);
+        let mut turn = ChatMsg::text("user", "");
+        turn.parts = Some(Value::Array(last));
+        let mut req = chat_req(Protocol::AnthropicMessages, "claude-opus-5-5");
+        req.preserve_anthropic_wire = true;
+        req.prompt_cache = true;
+        req.message = vec![
+            ChatMsg::text("user", "hi"),
+            ChatMsg::text("assistant", "ok"),
+            turn,
+        ];
+        let param = req.model_param_v2.as_mut().unwrap();
+        if let Some(top) = top {
+            param.raw = serde_json::json!({"cache_control": top});
+        }
+        param.typed = Some(TypedParams::Chat(ChatParams {
+            system: Some("sys".into()),
+            system_blocks: system.map(Value::Array),
+            tools: tools.map(Value::Array),
+            ..Default::default()
+        }));
+        ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        let marked = |v: &Value| {
+            v.as_array()
+                .and_then(|blocks| blocks.last())
+                .is_some_and(|block| block.get("cache_control").is_some())
+        };
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            total,
+            "{name}: {b}"
+        );
+        assert_eq!(
+            marked(&b["messages"][2]["content"]),
+            user_marked,
+            "{name}: {b}"
+        );
+        assert_eq!(marked(&b["system"]), system_marked, "{name}: {b}");
+        let mut ttls = Vec::new();
+        for key in ["tools", "system", "messages"] {
+            collect_ttls(&b[key], &mut ttls);
+        }
+        assert!(
+            !ttls.windows(2).any(|w| w == ["5m", "1h"]),
+            "{name}: {ttls:?}"
+        );
+    }
+}
+
+fn system_texts(b: &Value) -> Vec<&str> {
+    b["system"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect()
+}
+
+fn collect_ttls(v: &Value, out: &mut Vec<&'static str>) {
+    for block in v.as_array().into_iter().flatten() {
+        if let Some(control) = block.get("cache_control") {
+            out.push(if control["ttl"] == "1h" { "1h" } else { "5m" });
+        }
+        collect_ttls(&block["content"], out);
+    }
+}
+
+#[tokio::test]
+async fn prompt_cache_marks_the_last_user_turn_ahead_of_a_trailing_system_turn() {
+    let t = RecordingTransport::new(CLAUDE_OK);
+    let mut req = chat_req(Protocol::AnthropicMessages, "claude-opus-5-5");
+    req.preserve_anthropic_wire = true;
+    req.prompt_cache = true;
+    req.message = vec![
+        ChatMsg::text("user", "hello"),
+        ChatMsg::text("system", "reminder"),
+    ];
+    req.model_param_v2.as_mut().unwrap().typed = Some(TypedParams::Chat(ChatParams {
+        system: Some("be brief".into()),
+        ..Default::default()
+    }));
+    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
+    let b = t.body_json();
+    assert_eq!(
+        b["system"],
+        serde_json::json!([{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}])
+    );
+    assert_eq!(
+        b["messages"],
+        serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+            ]},
+            {"role": "system", "content": "reminder"},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn openrouter_anthropic_responses_carry_a_top_level_cache_control() {
+    use gw_models::Account;
+
+    let ephemeral = serde_json::json!({"type": "ephemeral"});
+    let hour = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    let (e, own) = (Some(&ephemeral), Some(&hour));
+    #[rustfmt::skip]
+    let cases = [
+        ("anthropic/claude-opus-5.5", "openrouter", true, None, e),
+        ("~anthropic/claude-opus-latest", "openrouter", true, None, e),
+        ("anthropic/claude-opus-5.5", "openrouter", true, own, own),
+        ("anthropic/claude-opus-5.5", "openrouter", false, None, None),
+        ("openai/gpt-6-sol", "openrouter", true, None, None),
+        ("anthropic/claude-opus-5.5", "openai", true, None, None),
+    ];
+    for (model, kind, prompt_cache, client, want) in cases {
+        let t = RecordingTransport::new(RESPONSES_OK);
+        let mut req = GatewayRequest {
+            preserve_responses_wire: true,
+            prompt_cache,
+            account: Some(Arc::new(Account {
+                name: kind.into(),
+                kind: kind.into(),
+                ..Default::default()
+            })),
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::Responses, model)),
+            ..Default::default()
+        };
+        let mut raw = serde_json::json!({"input": [{"role": "user", "content": "hi"}]});
+        if let Some(client) = client {
+            raw["cache_control"] = client.clone();
+        }
+        req.model_param_v2.as_mut().unwrap().raw = raw;
+        ResponsesEngine::new(req, t.clone()).run().await.unwrap();
+        let b = t.body_json();
+        assert_eq!(b.get("cache_control"), want, "{model} {prompt_cache} {b}");
+    }
+}
+
 const RESPONSES_OK: &str = r#"{"id":"r","object":"response","model":"gpt-6-astra","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+const CONVERSE_OK: &str = r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#;
 const CLAUDE_OK: &str = r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
 const OPENAI_OK: &str = r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
 
@@ -2020,9 +2351,7 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
 
 #[tokio::test]
 async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
-    let t = RecordingTransport::new(
-        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
-    );
+    let t = RecordingTransport::new(CONVERSE_OK);
     let mut req = chat_req(Protocol::AwsConverse, "us.meta.llama3-3-70b-instruct-v1:0");
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
@@ -2131,6 +2460,7 @@ async fn native_system_blocks_keep_the_clients_cache_control() {
         r#"{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
     let mut req = chat_req(Protocol::AnthropicMessages, "claude-haiku-4-5");
+    req.message.retain(|m| m.role != "system");
     req.prompt_cache = true;
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
@@ -2179,9 +2509,7 @@ async fn a_participant_name_reaches_the_openai_wire() {
 
 #[tokio::test]
 async fn a_marked_chat_system_stays_plain_for_a_non_claude_converse_model() {
-    let t = RecordingTransport::new(
-        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
-    );
+    let t = RecordingTransport::new(CONVERSE_OK);
     let mut req = chat_req(Protocol::AwsConverse, "us.xai.grok-4.6");
     req.message[0].parts = Some(serde_json::json!([
         {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}

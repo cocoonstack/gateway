@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::base::{parse_json_reply, versioned_url};
 use crate::transport::{Transport, UpstreamRequest};
 
-const OPENROUTER_KIND: &str = "openrouter";
+pub(crate) const OPENROUTER_KIND: &str = "openrouter";
 /// Waits before each lookup of an abandoned stream's recorded usage; OpenRouter records one in about 5 s.
 const LOOKUP_DELAYS: [Duration; 4] = [
     Duration::from_secs(3),

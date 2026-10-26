@@ -13,6 +13,12 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 
 const DEFAULT_MAX_TOKENS: i64 = 1024;
 const THINKING_DEFAULT_MAX_TOKENS: i64 = 16384;
+const MAX_BREAKPOINTS: usize = 4;
+const BEDROCK_REJECTED_BETAS: [&str; 3] = [
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "prompt-caching-scope-2026-01-05",
+];
 
 base_engine!(ClaudeEngine);
 
@@ -20,11 +26,26 @@ impl ClaudeEngine {
     /// The Messages body. On Bedrock the model rides in the invoke path and
     /// streaming in the URL, and the API version is a body field.
     fn build_body(&mut self) -> GResult<Map<String, Value>> {
-        let system_text = self.base.system_text();
+        let param = self.base.param()?;
+        let protocol = param.protocol;
+        let converse = protocol == gw_consts::Protocol::AwsConverse;
+        let served_as_named = param.fallback_from.is_none();
+        let in_place = self.base.request.preserve_anthropic_wire
+            && !converse
+            && (served_as_named || !claude_before_5(&param.model_name));
+        let mut system_text = if in_place {
+            String::new()
+        } else {
+            self.base.system_text()
+        };
         let mut messages: Vec<Value> = Vec::new();
         let (mut system_parts, mut marked) = (Vec::new(), false);
         for m in std::mem::take(&mut self.base.request.message) {
             if m.role == gw_consts::role::SYSTEM {
+                if in_place {
+                    messages.extend(system_turn(m, served_as_named));
+                    continue;
+                }
                 match m.parts {
                     Some(Value::Array(parts)) => {
                         marked |= parts.iter().any(|part| part.get("cache_control").is_some());
@@ -77,32 +98,32 @@ impl ClaudeEngine {
             push_turn(&mut messages, role, content);
         }
 
-        let prompt_cache = self.base.request.prompt_cache;
-        if prompt_cache
-            && let Some(last) = messages.last_mut()
-            && last["role"] == "user"
-        {
-            last["content"] = Value::Array(cached_blocks(last["content"].take()));
-        }
         let param = self.base.param()?;
-        let converse = param.protocol == gw_consts::Protocol::AwsConverse;
         let anthropic_fields = !converse || crate::converse::claude_model(&param.model_name);
         let bedrock = matches!(
-            param.protocol,
+            protocol,
             gw_consts::Protocol::AwsAnthropic | gw_consts::Protocol::AwsConverse
         );
         let mut body = Map::new();
-        if param.protocol == gw_consts::Protocol::AwsAnthropic {
+        if protocol == gw_consts::Protocol::AwsAnthropic {
             body.insert("anthropic_version".into(), "bedrock-2023-05-31".into());
-            if let Some(betas) = self.base.request.anthropic_beta.as_deref() {
-                body.insert(
-                    "anthropic_beta".into(),
-                    Value::Array(betas.split(',').map(|b| Value::from(b.trim())).collect()),
-                );
-            }
         } else if !bedrock {
             body.insert("model".into(), param.model_name.clone().into());
             body.insert("stream".into(), self.base.request.stream.into());
+        }
+        if bedrock
+            && anthropic_fields
+            && let Some(betas) = self.base.request.anthropic_beta.as_deref()
+        {
+            let betas: Vec<Value> = betas
+                .split(',')
+                .map(str::trim)
+                .filter(|b| !BEDROCK_REJECTED_BETAS.contains(b))
+                .map(Value::from)
+                .collect();
+            if !betas.is_empty() {
+                body.insert("anthropic_beta".into(), Value::Array(betas));
+            }
         }
         body.insert("messages".into(), Value::Array(messages));
         let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
@@ -115,22 +136,15 @@ impl ClaudeEngine {
         let mut client_cap = false;
         // 4.7+ rejects the sampling knobs outright; 4.6 only once thinking is engaged
         let mut sampling_rejected = dialect == ThinkingDialect::AdaptiveSummarized;
-        let mut native_system = marked.then(|| {
-            Value::Array(
-                system_parts
-                    .into_iter()
-                    .map(|part| match part {
-                        Value::String(text) => {
-                            object([("type", "text".into()), ("text", text.into())])
-                        }
-                        part => part,
-                    })
-                    .collect(),
-            )
-        });
+        let (mut native_system, mut top_system) = (None, None);
         if let Some(gw_models::TypedParams::Chat(p)) = self.base.take_typed() {
             // the native system-block array keeps the client's cache_control (and ttl)
-            native_system = p.system_blocks.filter(Value::is_array).or(native_system);
+            native_system = p.system_blocks.filter(Value::is_array);
+            if in_place {
+                system_text = p.system.unwrap_or_default();
+            } else {
+                top_system = p.system;
+            }
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
                 client_cap = true;
@@ -194,12 +208,32 @@ impl ClaudeEngine {
             self.base.output_cap = max_tokens;
         }
         let mut raw = self.base.take_raw();
+        let messages_long = marked && breakpoints(body.get("messages")).1;
+        let folded = system_parts.into_iter().map(|part| match part {
+            Value::String(text) => object([("type", "text".into()), ("text", text.into())]),
+            Value::Object(mut block) => {
+                if messages_long && block.get("cache_control").is_some_and(|c| !is_long_ttl(c)) {
+                    block.remove("cache_control");
+                }
+                Value::Object(block)
+            }
+            part => part,
+        });
         let system = match native_system {
-            Some(blocks) if prompt_cache => Some(Value::Array(cached_blocks(blocks))),
-            Some(blocks) => Some(blocks),
-            None if system_text.is_empty() => None,
-            None if prompt_cache => Some(Value::Array(cached_blocks(Value::String(system_text)))),
-            None => Some(Value::String(system_text)),
+            Some(Value::Array(mut blocks)) => {
+                blocks.extend(folded);
+                Some(Value::Array(blocks))
+            }
+            _ if marked => Some(Value::Array(
+                top_system
+                    .map(|text| content_blocks(Value::String(text)))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(folded)
+                    .collect(),
+            )),
+            _ if system_text.is_empty() => None,
+            _ => Some(Value::String(system_text)),
         };
         if let Some(system) = system {
             body.insert("system".into(), system);
@@ -227,6 +261,9 @@ impl ClaudeEngine {
             }
         }
         crate::base::merge_raw_extras_owned(&mut body, raw);
+        if self.base.request.prompt_cache {
+            place_breakpoints(&mut body);
+        }
         Ok(body)
     }
 
@@ -846,16 +883,88 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     messages.push(Value::Object(msg));
 }
 
-/// Content as blocks with a prompt-cache breakpoint on the last one (a breakpoint
-/// caches everything before it); a client-placed breakpoint wins (it may carry a ttl).
-fn cached_blocks(content: Value) -> Vec<Value> {
-    let mut blocks = content_blocks(content);
-    if let Some(Value::Object(block)) = blocks.last_mut() {
-        block
-            .entry("cache_control")
-            .or_insert_with(|| json!({"type": "ephemeral"}));
+fn system_turn(m: gw_models::ChatMsg, served_as_named: bool) -> Option<Value> {
+    let mut turn = m.extra;
+    let content = m.parts.unwrap_or(Value::String(m.content));
+    let empty = match &content {
+        Value::String(text) => text.is_empty(),
+        Value::Array(blocks) => blocks.is_empty(),
+        _ => false,
+    };
+    if !served_as_named && turn.remove("output_config").is_some() && turn.is_empty() && empty {
+        return None;
     }
-    blocks
+    turn.insert("role".into(), m.role.into());
+    turn.insert("content".into(), content);
+    Some(Value::Object(turn))
+}
+
+fn claude_before_5(model: &str) -> bool {
+    model
+        .find("claude")
+        .and_then(|i| {
+            model[i..]
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+        })
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < 5)
+}
+
+fn place_breakpoints(body: &mut Map<String, Value>) {
+    let top = body.get("cache_control");
+    let top_long = top.is_some_and(is_long_ttl);
+    let (tool_marks, _) = breakpoints(body.get("tools"));
+    let (system_marks, _) = breakpoints(body.get("system"));
+    let (message_marks, messages_long) = breakpoints(body.get("messages"));
+    let mut slots = MAX_BREAKPOINTS
+        .saturating_sub(tool_marks + system_marks + message_marks + usize::from(top.is_some()));
+    if slots > 0
+        && message_marks == 0
+        && top.is_none()
+        && let Some(Value::Array(turns)) = body.get_mut("messages")
+        && let Some(last) = turns.iter_mut().rfind(|t| t["role"] != "system")
+        && last["role"] == "user"
+    {
+        cache_last_block(&mut last["content"]);
+        slots -= 1;
+    }
+    if slots > 0
+        && system_marks == 0
+        && !messages_long
+        && !top_long
+        && let Some(system) = body.get_mut("system")
+    {
+        cache_last_block(system);
+    }
+}
+
+fn breakpoints(blocks: Option<&Value>) -> (usize, bool) {
+    let (mut count, mut long) = (0, false);
+    for block in blocks.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(control) = block.get("cache_control") {
+            count += 1;
+            long |= is_long_ttl(control);
+        }
+        let (nested, nested_long) = breakpoints(block.get("content"));
+        count += nested;
+        long |= nested_long;
+    }
+    (count, long)
+}
+
+fn is_long_ttl(control: &Value) -> bool {
+    control["ttl"].as_str().is_some_and(|ttl| ttl != "5m")
+}
+
+/// Content as blocks with a prompt-cache breakpoint on the last one (a breakpoint
+/// caches everything before it).
+fn cache_last_block(content: &mut Value) {
+    let mut blocks = content_blocks(content.take());
+    if let Some(Value::Object(block)) = blocks.last_mut() {
+        block.insert("cache_control".into(), json!({"type": "ephemeral"}));
+    }
+    *content = Value::Array(blocks);
 }
 
 /// Tool definitions in the anthropic wire shape: OpenAI-shaped defs are
@@ -978,6 +1087,42 @@ mod tests {
         let mut e = ClaudeEngine::new(base_req(), Arc::new(MockTransport));
         let up = e.build_upstream().unwrap();
         assert!(!up.headers.iter().any(|(k, _)| *k == "anthropic-beta"));
+    }
+
+    #[test]
+    fn bedrock_drops_the_betas_it_rejects_and_converse_carries_the_rest_for_claude() {
+        let betas =
+            "context-management-2025-06-27,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20";
+        for (protocol, model, want) in [
+            (
+                Protocol::AwsAnthropic,
+                "us.anthropic.claude-opus-5-5",
+                Some(json!(["context-management-2025-06-27"])),
+            ),
+            (
+                Protocol::AwsConverse,
+                "global.anthropic.claude-opus-5-5",
+                Some(json!(["context-management-2025-06-27"])),
+            ),
+            (Protocol::AwsConverse, "us.amazon.nova-lite-v1:0", None),
+        ] {
+            let mut r = base_req();
+            r.anthropic_beta = Some(betas.to_owned());
+            r.model_param_v2 = Some(ModelParamV2::with_name(protocol, model));
+            let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
+            let body = e.build_body().unwrap();
+            assert_eq!(body.get("anthropic_beta").cloned(), want, "{model}");
+            if protocol == Protocol::AwsConverse {
+                let out = crate::converse::request(body, model);
+                assert_eq!(
+                    out.get("additionalModelRequestFields")
+                        .and_then(|extra| extra.get("anthropic_beta"))
+                        .cloned(),
+                    want,
+                    "{model}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -3110,6 +3110,7 @@ fn chat_request(body: ChatCompletionRequest) -> (Vec<ChatMsg>, ModelParamV2) {
                 name: m.name,
                 reasoning_content: m.reasoning_content,
                 reasoning_details: m.reasoning_details.map(Value::Array),
+                extra: serde_json::Map::new(),
             }
         })
         .collect();
@@ -3589,15 +3590,19 @@ async fn messages(
         message: body
             .messages
             .into_iter()
-            .map(|m| match m.content {
-                Value::String(s) => ChatMsg::text(m.role, s),
-                Value::Array(blocks) => {
-                    let text = gw_protocol::anthropic::blocks_text(&blocks);
-                    let mut msg = ChatMsg::text(m.role, text);
-                    msg.parts = Some(Value::Array(blocks));
-                    msg
-                }
-                _ => ChatMsg::text(m.role, String::new()),
+            .map(|m| {
+                let (text, parts) = match m.content {
+                    Value::String(s) => (s, None),
+                    Value::Array(blocks) => (
+                        gw_protocol::anthropic::blocks_text(&blocks),
+                        Some(Value::Array(blocks)),
+                    ),
+                    _ => (String::new(), None),
+                };
+                let mut msg = ChatMsg::text(m.role, text);
+                msg.parts = parts;
+                msg.extra = m.extra;
+                msg
             })
             .collect(),
         model_param_v2: Some(param),
@@ -5139,13 +5144,23 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
-    struct RecordingResponses {
+    #[derive(Debug)]
+    struct Recording {
+        reply: &'static [u8],
         seen: std::sync::Mutex<Option<Value>>,
     }
 
+    impl Recording {
+        fn new(reply: &'static [u8]) -> Arc<Self> {
+            Arc::new(Self {
+                reply,
+                seen: std::sync::Mutex::new(None),
+            })
+        }
+    }
+
     #[async_trait::async_trait]
-    impl gw_engines::transport::Transport for RecordingResponses {
+    impl gw_engines::transport::Transport for Recording {
         async fn send(
             &self,
             req: gw_engines::transport::UpstreamRequest,
@@ -5154,7 +5169,7 @@ mod tests {
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
                 body: gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from_static(
-                    br#"{"id":"resp_1","model":"gpt-5-responses","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#,
+                    self.reply,
                 )),
                 headers: Default::default(),
             })
@@ -5297,7 +5312,9 @@ mod tests {
 
     #[tokio::test]
     async fn messages_system_blocks_become_instructions_on_a_responses_model() {
-        let transport = Arc::new(RecordingResponses::default());
+        let transport = Recording::new(
+            br#"{"id":"resp_1","model":"gpt-5-responses","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#,
+        );
         let (router, _) = retained_view_app(transport.clone());
         let request = Request::builder()
             .method("POST")
@@ -5313,6 +5330,41 @@ mod tests {
         let sent = transport.seen.lock().unwrap().take().unwrap();
         assert_eq!(sent["instructions"], "You are terse.");
         assert!(sent.get("system").is_none(), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn messages_system_turns_reach_the_anthropic_upstream_in_place() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: claude-opus-5-5, protocol: anthropic-messages}]\naccounts: [{name: a1, provider: anthropic, protocols: [anthropic-messages]}]\naccess_keys: [{ak: k, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let transport = Recording::new(
+            br#"{"model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#,
+        );
+        let router = app(AppState::new(cfg, state, transport.clone()));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-api-key", "k")
+            .body(Body::from(
+                r#"{"model":"claude-opus-5-5","max_tokens":32,"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"},{"role":"system","content":"env","output_config":{"effort":"medium"}},{"role":"assistant","content":[{"type":"text","text":"ok"}]},{"role":"user","content":"again"},{"role":"system","content":[{"type":"text","text":"reminder","cache_control":{"type":"ephemeral"}}]}]}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = transport.seen.lock().unwrap().take().unwrap();
+        assert_eq!(
+            sent["messages"],
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "env", "output_config": {"effort": "medium"}},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": "again"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
+                ]},
+            ])
+        );
     }
 
     #[tokio::test]

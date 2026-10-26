@@ -1211,6 +1211,13 @@ impl ResponsesEngine {
             &mut body,
             gw_protocol::reasoning::EffortWire::Responses,
         );
+        if self.base.request.prompt_cache
+            && self.base.wire_kind() == crate::generation::OPENROUTER_KIND
+            && model.trim_start_matches('~').starts_with("anthropic/")
+        {
+            body.entry("cache_control")
+                .or_insert_with(|| object([("type", "ephemeral".into())]));
+        }
         body.insert("model".to_owned(), model.into());
         self.base.output_cap = body
             .get("max_output_tokens")

@@ -143,7 +143,7 @@ pub struct BatchItem {
 /// Domain types referenced by `GatewayRequest`. Per-vendor long-tail fields
 /// ride in `raw`/`extra` passthroughs rather than being individually modeled.
 pub mod domain {
-    use serde_json::Value;
+    use serde_json::{Map, Value};
 
     use crate::params::TypedParams;
 
@@ -215,6 +215,8 @@ pub mod domain {
         /// array: signed thinking, encrypted reasoning) in emission order.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reasoning_details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Map::is_empty")]
+        pub extra: Map<String, Value>,
     }
 
     impl ChatMsg {

@@ -136,7 +136,7 @@ models:
       audio_completion: 8.33         #   audio output tokens (default = completion weight)
     long_context: {threshold_tokens: 200000, prompt_weight: 2.0, completion_weight: 1.5}  # optional tier past a prompt size
     batch_discount: 0.5              # optional: /v1/batches items at this fraction of the price; must be finite and in (0.0, 1.0]
-    prompt_cache: true               # anthropic-messages only: prompt-cache breakpoints
+    prompt_cache: true               # prompt-cache breakpoints (Anthropic wires; anthropic/* on OpenRouter Responses)
     fallback_models: [gpt-4o-mini]   # optional: tried in order on an upstream 5xx / 429 / 401-403 refusal / connection failure / no healthy account (rejected at load when unknown, self or duplicate)
     variants:                        # optional weighted canary split, sticky per user
       - {model: gpt-4o, weight: 90}  #   self-reference keeps a share here
@@ -162,23 +162,36 @@ generated seconds, a `search` model's queries (one per call) — and adds to
 `cost_micros` next to any token cost;
 the count lands in the ledger's `billed_units` and the `/admin/usage`
 aggregates. An account's `cost_unit_price_micros` is the vendor side of the
-same unit, for margin. `prompt_cache` (anthropic-messages models)
-marks the system prompt and the latest user turn as Anthropic prompt-cache
-breakpoints, so each turn of a conversation re-reads its prefix at the
-cache-read rate; it is per model and off by default because a long one-shot
-prompt would pay the cache-write premium for nothing. A `/v1/messages` client
-that sends `system` as blocks with its own `cache_control` (including
-`ttl: 1h`) keeps them as sent; the gateway only marks the last system block
-when that block carries no breakpoint of its own. A `/v1/chat/completions`
-system message whose content parts carry `cache_control` keeps them on an
-Anthropic-wire model the same way. On an openai-chat model
-the client's own breakpoints on system blocks, message blocks and
-`tool_result` ride through as OpenAI content parts, which OpenRouter honors
-for Anthropic models; a breakpoint on a tool definition does not (Gemini's
-compatible endpoint rejects the field), and a later breakpoint covers the
-tools anyway. `variants` splits a
-public name across other declared same-protocol models (one level):
-entitlement and the per-(AK, model) daily counter judge the public name,
+same unit, for margin. `prompt_cache` (anthropic-messages models) marks the
+system prompt and the latest user turn as Anthropic prompt-cache breakpoints,
+so each turn of a conversation re-reads its prefix at the cache-read rate; it
+is per model and off by default because a long one-shot prompt would pay the
+cache-write premium for nothing. Client breakpoints win: the gateway marks the
+latest user turn only when the client put no breakpoint on a message block
+(`tool_result` content included) and sent no top-level `cache_control`, and
+the system prompt only when the client left it unmarked and no 1-hour
+breakpoint follows it. The turn goes first, and neither is added past
+Anthropic's four breakpoints. A `/v1/messages` client's breakpoints, `ttl: 1h`
+included, ride through as sent. On `anthropic-messages` and `aws-anthropic`
+models its mid-conversation `role: "system"` messages stay in place with their
+`output_config` and `clear_at`. They are folded into the end of `system` on
+`aws-converse`, and when the gateway serves a pre-5 Claude model in place of
+the one the client named (`fallback_models`, `variants`, a tenant's
+`fallback_model`), since those models reject a system turn; any other model
+served in place of the named one keeps them in place without their
+`output_config`, which only some models accept, and drops a turn that carried
+nothing else. On a `responses` model served by an OpenRouter account,
+`prompt_cache` on an `anthropic/*` model adds the top-level
+`cache_control: {type: ephemeral}` that OpenRouter needs to cache it, unless
+the client sent its own. A `/v1/chat/completions` system message whose content
+parts carry `cache_control` keeps them on an Anthropic-wire model the same
+way. On an openai-chat model the client's own breakpoints on system blocks,
+message blocks and `tool_result` ride through as OpenAI content parts, which
+OpenRouter honors for Anthropic models; a breakpoint on a tool definition does
+not (Gemini's compatible endpoint rejects the field), and a later breakpoint
+covers the tools anyway. `variants` splits a public name
+across other declared same-protocol models (one level): entitlement and the
+per-(AK, model) daily counter judge the public name,
 billing prices the served variant, and the response echoes the requested
 name. Selection hashes the effective user, so a user sticks to one backend
 across the fleet; a realtime session picks its variant once at the handshake
