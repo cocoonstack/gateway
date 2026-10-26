@@ -43,7 +43,7 @@ impl ClaudeEngine {
         for m in std::mem::take(&mut self.base.request.message) {
             if m.role == gw_consts::role::SYSTEM {
                 if in_place {
-                    messages.push(system_turn(m, served_as_named));
+                    messages.extend(system_turn(m, served_as_named));
                     continue;
                 }
                 match m.parts {
@@ -883,17 +883,20 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     messages.push(Value::Object(msg));
 }
 
-fn system_turn(m: gw_models::ChatMsg, served_as_named: bool) -> Value {
+fn system_turn(m: gw_models::ChatMsg, served_as_named: bool) -> Option<Value> {
     let mut turn = m.extra;
-    if !served_as_named {
-        turn.remove("output_config");
+    let content = m.parts.unwrap_or(Value::String(m.content));
+    let empty = match &content {
+        Value::String(text) => text.is_empty(),
+        Value::Array(blocks) => blocks.is_empty(),
+        _ => false,
+    };
+    if !served_as_named && turn.remove("output_config").is_some() && turn.is_empty() && empty {
+        return None;
     }
     turn.insert("role".into(), m.role.into());
-    turn.insert(
-        "content".into(),
-        m.parts.unwrap_or(Value::String(m.content)),
-    );
-    Value::Object(turn)
+    turn.insert("content".into(), content);
+    Some(Value::Object(turn))
 }
 
 fn claude_before_5(model: &str) -> bool {

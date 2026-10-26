@@ -1453,7 +1453,9 @@ async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
             ]},
         ]);
         if requested.is_some() {
-            for turn in want.as_array_mut().unwrap() {
+            let turns = want.as_array_mut().unwrap();
+            turns.retain(|turn| turn["content"] != serde_json::json!([]));
+            for turn in turns {
                 turn.as_object_mut().unwrap().remove("output_config");
             }
         }

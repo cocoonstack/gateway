@@ -179,16 +179,17 @@ models its mid-conversation `role: "system"` messages stay in place with their
 the one the client named (`fallback_models`, `variants`, a tenant's
 `fallback_model`), since those models reject a system turn; any other model
 served in place of the named one keeps them in place without their
-`output_config`, which only some models accept. On a `responses` model served
-by an OpenRouter account, `prompt_cache` on an `anthropic/*` model adds the
-top-level `cache_control: {type: ephemeral}` that OpenRouter needs to cache
-it, unless the client sent its own. A `/v1/chat/completions` system message
-whose content parts carry `cache_control` keeps them on an Anthropic-wire
-model the same way. On an openai-chat model the client's own breakpoints on
-system blocks, message blocks and `tool_result` ride through as OpenAI content
-parts, which OpenRouter honors for Anthropic models; a breakpoint on a tool
-definition does not (Gemini's compatible endpoint rejects the field), and a
-later breakpoint covers the tools anyway. `variants` splits a public name
+`output_config`, which only some models accept, and drops a turn that carried
+nothing else. On a `responses` model served by an OpenRouter account,
+`prompt_cache` on an `anthropic/*` model adds the top-level
+`cache_control: {type: ephemeral}` that OpenRouter needs to cache it, unless
+the client sent its own. A `/v1/chat/completions` system message whose content
+parts carry `cache_control` keeps them on an Anthropic-wire model the same
+way. On an openai-chat model the client's own breakpoints on system blocks,
+message blocks and `tool_result` ride through as OpenAI content parts, which
+OpenRouter honors for Anthropic models; a breakpoint on a tool definition does
+not (Gemini's compatible endpoint rejects the field), and a later breakpoint
+covers the tools anyway. `variants` splits a public name
 across other declared same-protocol models (one level): entitlement and the
 per-(AK, model) daily counter judge the public name,
 billing prices the served variant, and the response echoes the requested
