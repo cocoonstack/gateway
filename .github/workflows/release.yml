@@ -19,7 +19,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Stamp the tag into the workspace version
         run: |
           perl -pi -e "s/^version = \"[^\"]*\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml

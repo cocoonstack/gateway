@@ -39,7 +39,7 @@ jobs:
       CP_TEST_GW_BIN: ${{ github.workspace }}/target/debug/gw
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -87,5 +87,5 @@ jobs:
       - uses: taiki-e/install-action@v2.87.30
         with:
           tool: cargo-deny@0.20.2
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo deny check
