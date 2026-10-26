@@ -310,6 +310,7 @@ impl DagNode for SelectAccount {
         // post-variant: the served model's knobs ride the provider lookup
         let model = served_model(ctx.request.model_param_v2.as_ref());
         let conf = ctx.cfg.find_model(model);
+        ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
         let provider = conf.and_then(|m| m.provider.as_deref());
         let latency = ctx
             .cfg
@@ -321,7 +322,6 @@ impl DagNode for SelectAccount {
             .pool
             .select_healthy(mt, model, provider, &[], ctx.state.health.as_ref(), latency)
             .await;
-        ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
         let Some(account) = account else {
             // unsampled, an exhausted pool would read no_data forever
             note_unavailable(ctx);
