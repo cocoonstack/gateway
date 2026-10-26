@@ -198,8 +198,9 @@ the traffic while an account never or not recently (60 s) sampled ranks first
 and gets probed; equal ranks stay round-robin. The realtime surface keeps
 round-robin. On an upstream 5xx or a 401/402/403 credential or billing refusal
 the failed account is excluded and another is tried once (a PTU→paygo switch is flagged `ptu_spillover`). Consecutive failures put
-an account into cooldown (`stability.failure_threshold` / `cooldown_seconds`),
-and it auto-recovers on expiry. A streaming response that already sent bytes to
+an account into cooldown for the served model (`stability.failure_threshold` /
+`cooldown_seconds`), so it keeps serving its other models, and it
+auto-recovers on expiry. A streaming response that already sent bytes to
 the client is never failed over, but a provider error that breaks such a stream
 still counts against the account's health and the model's availability; a plain
 client disconnect counts as neither.

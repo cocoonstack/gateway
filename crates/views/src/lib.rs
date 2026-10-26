@@ -452,6 +452,7 @@ async fn realtime_ws(
         .pool
         .select_healthy(
             mt,
+            &served,
             served_conf.and_then(|m| m.provider.as_deref()),
             &[],
             snap.state.health.as_ref(),
@@ -1320,12 +1321,25 @@ async fn accounts(State(s): State<AppState>, _: GlobalAdmin) -> Response {
     let health = &s.handler.state().health;
     let mut data: Vec<Value> = Vec::with_capacity(cfg.accounts.len());
     for a in &cfg.accounts {
+        let mut cooling = Vec::new();
+        for m in cfg.models.iter().filter(|m| {
+            a.protocols.contains(&m.protocol)
+                && m.provider.as_deref().is_none_or(|p| p == a.provider)
+        }) {
+            if !health
+                .available(&gw_state::health_key(&a.name, &m.name))
+                .await
+            {
+                cooling.push(m.name.as_str());
+            }
+        }
         data.push(json!({
             "name": a.name,
             "provider": a.provider,
             "priority": a.priority,
             "tier": if a.tier.is_empty() { gw_consts::account_tier::PAYGO } else { a.tier.as_str() },
-            "health": if health.available(&a.name).await { "ok" } else { "cooling" },
+            "health": if cooling.is_empty() { "ok" } else { "cooling" },
+            "cooling_models": cooling,
             "protocols": a.protocols,
         }));
     }

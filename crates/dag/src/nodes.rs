@@ -308,10 +308,8 @@ impl DagNode for SelectAccount {
             .protocol()
             .ok_or_else(|| GatewayError::internal("select_account before resolve_model"))?;
         // post-variant: the served model's knobs ride the provider lookup
-        let conf = ctx
-            .cfg
-            .find_model(served_model(ctx.request.model_param_v2.as_ref()));
-        ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
+        let model = served_model(ctx.request.model_param_v2.as_ref());
+        let conf = ctx.cfg.find_model(model);
         let provider = conf.and_then(|m| m.provider.as_deref());
         let latency = ctx
             .cfg
@@ -321,8 +319,9 @@ impl DagNode for SelectAccount {
         let account = ctx
             .state
             .pool
-            .select_healthy(mt, provider, &[], ctx.state.health.as_ref(), latency)
+            .select_healthy(mt, model, provider, &[], ctx.state.health.as_ref(), latency)
             .await;
+        ctx.request.prompt_cache = conf.is_some_and(|m| m.prompt_cache);
         let Some(account) = account else {
             // unsampled, an exhausted pool would read no_data forever
             note_unavailable(ctx);
@@ -516,6 +515,7 @@ impl DagNode for CallEngine {
                     .pool
                     .select_healthy(
                         mt,
+                        served_model(ctx.request.model_param_v2.as_ref()),
                         provider,
                         std::slice::from_ref(&failed.name),
                         ctx.state.health.as_ref(),
@@ -599,7 +599,11 @@ async fn note_engine_outcome(
         .avail
         .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
     if let Some(account) = ctx.request.account.as_ref() {
-        ctx.state.health.record_success(&account.name).await;
+        let model = served_model(ctx.request.model_param_v2.as_ref());
+        ctx.state
+            .health
+            .record_success(&gw_state::health_key(&account.name, model))
+            .await;
         if let Some(started) = started {
             ctx.state.latency.record(&account.name, started.elapsed());
         }
@@ -630,22 +634,23 @@ fn account_fault(class: gw_consts::ErrClass) -> bool {
 async fn note_failure(ctx: &mut DagContext, account: &str) {
     let threshold = ctx.cfg.stability.failure_threshold;
     let secs = ctx.cfg.stability.cooldown_seconds;
+    let key = gw_state::health_key(account, served_model(ctx.request.model_param_v2.as_ref()));
     if !ctx
         .state
         .health
-        .record_failure(account, threshold, std::time::Duration::from_secs(secs))
+        .record_failure(&key, threshold, std::time::Duration::from_secs(secs))
         .await
     {
         return;
     }
-    ctx.state.alerts.emit(
-        "account_cooldown",
-        account.to_owned(),
-        format!("{threshold} consecutive failures; cooling {secs}s"),
-    );
     ctx.decide(
         "account_health",
-        format!("{account} entered cooldown ({secs}s)"),
+        format!("{key} entered cooldown ({secs}s)"),
+    );
+    ctx.state.alerts.emit(
+        "account_cooldown",
+        key,
+        format!("{threshold} consecutive failures; cooling {secs}s"),
     );
 }
 
