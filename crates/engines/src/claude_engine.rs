@@ -4,9 +4,7 @@
 
 use gw_models::{GResult, GatewayResponse};
 use gw_protocol::object;
-use gw_protocol::reasoning::{
-    ThinkingDialect, anthropic_thinking_dialect, anthropic_thinks_by_default, is_thinking_block,
-};
+use gw_protocol::reasoning::{ThinkingDialect, is_thinking_block};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -26,9 +24,10 @@ impl ClaudeEngine {
         let param = self.base.param()?;
         let protocol = param.protocol;
         let converse = protocol == gw_consts::Protocol::AwsConverse;
+        let served_as_named = param.fallback_from.is_none();
         let in_place = self.base.request.preserve_anthropic_wire
             && !converse
-            && (param.fallback_from.is_none() || !claude_before_5(&param.model_name));
+            && (served_as_named || !claude_before_5(&param.model_name));
         let mut system_text = if in_place {
             String::new()
         } else {
@@ -39,7 +38,7 @@ impl ClaudeEngine {
         for m in std::mem::take(&mut self.base.request.message) {
             if m.role == gw_consts::role::SYSTEM {
                 if in_place {
-                    messages.push(system_turn(m));
+                    messages.push(system_turn(m, served_as_named));
                     continue;
                 }
                 match m.parts {
@@ -871,8 +870,11 @@ fn push_turn(messages: &mut Vec<Value>, role: &str, content: Value) {
     messages.push(Value::Object(msg));
 }
 
-fn system_turn(m: gw_models::ChatMsg) -> Value {
+fn system_turn(m: gw_models::ChatMsg, served_as_named: bool) -> Value {
     let mut turn = m.extra;
+    if !served_as_named {
+        turn.remove("output_config");
+    }
     turn.insert("role".into(), m.role.into());
     turn.insert(
         "content".into(),
@@ -882,8 +884,15 @@ fn system_turn(m: gw_models::ChatMsg) -> Value {
 }
 
 fn claude_before_5(model: &str) -> bool {
-    model.contains("claude")
-        && !anthropic_thinks_by_default(anthropic_thinking_dialect(model), model)
+    model
+        .find("claude")
+        .and_then(|i| {
+            model[i..]
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+        })
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < 5)
 }
 
 fn place_breakpoints(body: &mut Map<String, Value>) {

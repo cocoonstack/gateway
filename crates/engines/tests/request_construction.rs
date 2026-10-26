@@ -1431,26 +1431,33 @@ async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
             "MiniMax-M2",
             Some("claude-opus-5-5"),
         ),
+        (
+            Protocol::AnthropicMessages,
+            "claude-sonnet-5",
+            Some("claude-opus-5-5"),
+        ),
     ] {
         let t = RecordingTransport::new(CLAUDE_OK);
         let mut req = native_system_turn_req(protocol, model);
         req.model_param_v2.as_mut().unwrap().fallback_from = requested.map(str::to_owned);
         ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
-        assert_eq!(
-            b["messages"],
-            serde_json::json!([
-                {"role": "user", "content": "hi"},
-                {"role": "system", "content": "env block", "output_config": {"effort": "medium"}},
-                {"role": "assistant", "content": "ok"},
-                {"role": "system", "content": [], "output_config": {"effort": "high"}},
-                {"role": "user", "content": "again"},
-                {"role": "system", "content": [
-                    {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
-                ]},
-            ]),
-            "{protocol:?} {model}"
-        );
+        let mut want = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "env block", "output_config": {"effort": "medium"}},
+            {"role": "assistant", "content": "ok"},
+            {"role": "system", "content": [], "output_config": {"effort": "high"}},
+            {"role": "user", "content": "again"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
+            ]},
+        ]);
+        if requested.is_some() {
+            for turn in want.as_array_mut().unwrap() {
+                turn.as_object_mut().unwrap().remove("output_config");
+            }
+        }
+        assert_eq!(b["messages"], want, "{protocol:?} {model}");
         assert_eq!(
             b["system"],
             serde_json::json!([{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]),
@@ -1472,6 +1479,18 @@ async fn native_system_turns_fold_into_the_system_prompt_on_converse_or_a_swappe
         (
             Protocol::AnthropicMessages,
             "claude-sonnet-4-6",
+            Some("claude-opus-5-5"),
+            CLAUDE_OK,
+        ),
+        (
+            Protocol::AnthropicMessages,
+            "anthropic/claude-sonnet-4.6",
+            Some("claude-opus-5-5"),
+            CLAUDE_OK,
+        ),
+        (
+            Protocol::AnthropicMessages,
+            "anthropic/claude-opus-4",
             Some("claude-opus-5-5"),
             CLAUDE_OK,
         ),
