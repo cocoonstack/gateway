@@ -14,6 +14,11 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 const DEFAULT_MAX_TOKENS: i64 = 1024;
 const THINKING_DEFAULT_MAX_TOKENS: i64 = 16384;
 const MAX_BREAKPOINTS: usize = 4;
+const BEDROCK_REJECTED_BETAS: [&str; 3] = [
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "prompt-caching-scope-2026-01-05",
+];
 
 base_engine!(ClaudeEngine);
 
@@ -102,15 +107,23 @@ impl ClaudeEngine {
         let mut body = Map::new();
         if protocol == gw_consts::Protocol::AwsAnthropic {
             body.insert("anthropic_version".into(), "bedrock-2023-05-31".into());
-            if let Some(betas) = self.base.request.anthropic_beta.as_deref() {
-                body.insert(
-                    "anthropic_beta".into(),
-                    Value::Array(betas.split(',').map(|b| Value::from(b.trim())).collect()),
-                );
-            }
         } else if !bedrock {
             body.insert("model".into(), param.model_name.clone().into());
             body.insert("stream".into(), self.base.request.stream.into());
+        }
+        if bedrock
+            && anthropic_fields
+            && let Some(betas) = self.base.request.anthropic_beta.as_deref()
+        {
+            let betas: Vec<Value> = betas
+                .split(',')
+                .map(str::trim)
+                .filter(|b| !BEDROCK_REJECTED_BETAS.contains(b))
+                .map(Value::from)
+                .collect();
+            if !betas.is_empty() {
+                body.insert("anthropic_beta".into(), Value::Array(betas));
+            }
         }
         body.insert("messages".into(), Value::Array(messages));
         let dialect = gw_protocol::reasoning::anthropic_thinking_dialect(&param.model_name);
@@ -1071,6 +1084,42 @@ mod tests {
         let mut e = ClaudeEngine::new(base_req(), Arc::new(MockTransport));
         let up = e.build_upstream().unwrap();
         assert!(!up.headers.iter().any(|(k, _)| *k == "anthropic-beta"));
+    }
+
+    #[test]
+    fn bedrock_drops_the_betas_it_rejects_and_converse_carries_the_rest_for_claude() {
+        let betas =
+            "context-management-2025-06-27,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20";
+        for (protocol, model, want) in [
+            (
+                Protocol::AwsAnthropic,
+                "us.anthropic.claude-opus-5-5",
+                Some(json!(["context-management-2025-06-27"])),
+            ),
+            (
+                Protocol::AwsConverse,
+                "global.anthropic.claude-opus-5-5",
+                Some(json!(["context-management-2025-06-27"])),
+            ),
+            (Protocol::AwsConverse, "us.amazon.nova-lite-v1:0", None),
+        ] {
+            let mut r = base_req();
+            r.anthropic_beta = Some(betas.to_owned());
+            r.model_param_v2 = Some(ModelParamV2::with_name(protocol, model));
+            let mut e = ClaudeEngine::new(r, Arc::new(MockTransport));
+            let body = e.build_body().unwrap();
+            assert_eq!(body.get("anthropic_beta").cloned(), want, "{model}");
+            if protocol == Protocol::AwsConverse {
+                let out = crate::converse::request(body, model);
+                assert_eq!(
+                    out.get("additionalModelRequestFields")
+                        .and_then(|extra| extra.get("anthropic_beta"))
+                        .cloned(),
+                    want,
+                    "{model}"
+                );
+            }
+        }
     }
 
     #[test]

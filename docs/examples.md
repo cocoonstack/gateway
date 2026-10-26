@@ -251,11 +251,12 @@ natively or by conversion. Claude Code sends a system-block array with
 `cache_control` points, its tool set, `thinking` (with `display: omitted`),
 `context_management`, mid-conversation `role: "system"` messages (the
 request's last breakpoint often sits on one), and its user id in
-`metadata.user_id`; it enables beta
-features through the `anthropic-beta` header, which the gateway forwards to
-Anthropic-wire upstreams (the header for `kind: anthropic`, the
-`anthropic_beta` body list for `aws-anthropic`). Point it at the gateway with
-the access key as the API key:
+`metadata.user_id`; it enables beta features through the `anthropic-beta`
+header, which the gateway forwards to Anthropic-wire upstreams (the header for
+`kind: anthropic`, the `anthropic_beta` body list for `aws-anthropic` and for
+Claude on `aws-converse`, minus the advisor-tool, advanced-tool-use and
+prompt-caching-scope betas Bedrock rejects). Point it at the gateway with the
+access key as the API key:
 
 ```bash
 export ANTHROPIC_BASE_URL=https://gw.example.com

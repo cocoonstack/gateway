@@ -174,7 +174,7 @@ a cost.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/v1/messages` | streaming + non-streaming; the client's `anthropic-beta` header is forwarded to Anthropic-wire upstreams (as the `anthropic_beta` body list on Bedrock) |
+| POST | `/v1/messages` | streaming + non-streaming; the client's `anthropic-beta` header is forwarded to Anthropic-wire upstreams (as the `anthropic_beta` body list on Bedrock, minus the betas Bedrock rejects) |
 
 `/v1/messages` works on both Anthropic-protocol models and OpenAI-protocol
 models — the gateway converts between the two, including the streaming event
