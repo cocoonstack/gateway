@@ -13,6 +13,7 @@ use crate::transport::{UpstreamBody, UpstreamRequest};
 
 const DEFAULT_MAX_TOKENS: i64 = 1024;
 const THINKING_DEFAULT_MAX_TOKENS: i64 = 16384;
+const MAX_BREAKPOINTS: usize = 4;
 
 base_engine!(ClaudeEngine);
 
@@ -227,7 +228,7 @@ impl ClaudeEngine {
             }
         }
         crate::base::merge_raw_extras_owned(&mut body, raw);
-        if self.base.request.prompt_cache && !has_breakpoint(&body) {
+        if self.base.request.prompt_cache {
             place_breakpoints(&mut body);
         }
         Ok(body)
@@ -859,30 +860,50 @@ fn system_turn(m: gw_models::ChatMsg) -> Value {
     Value::Object(turn)
 }
 
-fn has_breakpoint(body: &Map<String, Value>) -> bool {
-    fn marked(blocks: Option<&Value>) -> bool {
-        blocks.and_then(Value::as_array).is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|b| b.get("cache_control").is_some() || marked(b.get("content")))
-        })
-    }
-    body.contains_key("cache_control")
-        || ["tools", "system", "messages"]
-            .into_iter()
-            .any(|key| marked(body.get(key)))
-}
-
 fn place_breakpoints(body: &mut Map<String, Value>) {
-    if let Some(system) = body.get_mut("system") {
-        cache_last_block(system);
-    }
-    if let Some(Value::Array(turns)) = body.get_mut("messages")
+    let top = body.get("cache_control");
+    let top_long = top.is_some_and(is_long_ttl);
+    let (tool_marks, _) = breakpoints(body.get("tools"));
+    let (system_marks, _) = breakpoints(body.get("system"));
+    let (message_marks, messages_long) = breakpoints(body.get("messages"));
+    let mut slots = MAX_BREAKPOINTS
+        .saturating_sub(tool_marks + system_marks + message_marks + usize::from(top.is_some()));
+    if slots > 0
+        && message_marks == 0
+        && top.is_none()
+        && let Some(Value::Array(turns)) = body.get_mut("messages")
         && let Some(last) = turns.iter_mut().rfind(|t| t["role"] != "system")
         && last["role"] == "user"
     {
         cache_last_block(&mut last["content"]);
+        slots -= 1;
     }
+    if slots > 0
+        && system_marks == 0
+        && !messages_long
+        && !top_long
+        && let Some(system) = body.get_mut("system")
+    {
+        cache_last_block(system);
+    }
+}
+
+fn breakpoints(blocks: Option<&Value>) -> (usize, bool) {
+    let (mut count, mut long) = (0, false);
+    for block in blocks.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(control) = block.get("cache_control") {
+            count += 1;
+            long |= is_long_ttl(control);
+        }
+        let (nested, nested_long) = breakpoints(block.get("content"));
+        count += nested;
+        long |= nested_long;
+    }
+    (count, long)
+}
+
+fn is_long_ttl(control: &Value) -> bool {
+    control["ttl"].as_str().is_some_and(|ttl| ttl != "5m")
 }
 
 /// Content as blocks with a prompt-cache breakpoint on the last one (a breakpoint

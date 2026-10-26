@@ -1473,61 +1473,182 @@ async fn native_system_turns_fold_into_the_system_prompt_on_converse() {
 }
 
 #[tokio::test]
-async fn prompt_cache_adds_no_breakpoint_beside_the_clients() {
-    let breakpoints = |b: &Value| b.to_string().matches("cache_control").count();
-    let t = RecordingTransport::new(CLAUDE_OK);
-    let mut req = native_system_turn_req(Protocol::AnthropicMessages, "claude-opus-5-5");
-    req.prompt_cache = true;
-    if let Some(TypedParams::Chat(p)) = req.model_param_v2.as_mut().unwrap().typed.as_mut() {
-        p.system_blocks = Some(serde_json::json!([
-            {"type": "text", "text": "billing"},
-            {"type": "text", "text": "core", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-            {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-        ]));
-        p.tools = Some(serde_json::json!([
-            {"name": "t", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-        ]));
-    }
-    ClaudeEngine::new(req, t.clone()).run().await.unwrap();
-    let b = t.body_json();
-    assert_eq!(breakpoints(&b), 4, "{b}");
-    assert_eq!(b["messages"][4]["content"], "again", "{b}");
-
-    let mut tool_result = ChatMsg::text("user", "");
-    tool_result.parts = Some(
-        serde_json::json!([{"type": "tool_result", "tool_use_id": "tu",
-        "content": [{"type": "text", "text": "r", "cache_control": {"type": "ephemeral"}}]}]),
-    );
-    for (raw, tools, last) in [
+async fn prompt_cache_fills_only_the_breakpoints_the_client_left_out() {
+    let five = serde_json::json!({"type": "ephemeral"});
+    let hour = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    let text = |text: &str, control: Option<&Value>| {
+        let mut block = serde_json::json!({"type": "text", "text": text});
+        if let Some(control) = control {
+            block["cache_control"] = control.clone();
+        }
+        block
+    };
+    let tool = |name: &str| serde_json::json!({"name": name, "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}});
+    let tool_result = serde_json::json!({"type": "tool_result", "tool_use_id": "tu",
+        "content": [{"type": "text", "text": "r", "cache_control": {"type": "ephemeral"}}]});
+    let cases = [
         (
-            serde_json::json!({"cache_control": {"type": "ephemeral"}}),
+            "system only",
+            Some(vec![text("sys", Some(&five))]),
             None,
+            vec![text("q", None)],
             None,
+            2,
+            true,
+            true,
         ),
         (
-            Value::Null,
-            Some(
-                serde_json::json!([{"name": "t", "input_schema": {"type": "object"},
-                "cache_control": {"type": "ephemeral"}}]),
-            ),
+            "system 1h",
+            Some(vec![text("sys", Some(&hour))]),
             None,
+            vec![text("q", None)],
+            None,
+            2,
+            true,
+            true,
         ),
-        (Value::Null, None, Some(tool_result)),
-    ] {
+        (
+            "system and message",
+            Some(vec![text("sys", Some(&five))]),
+            None,
+            vec![text("q", Some(&five))],
+            None,
+            2,
+            true,
+            true,
+        ),
+        (
+            "message only",
+            None,
+            None,
+            vec![text("q", Some(&five))],
+            None,
+            2,
+            true,
+            true,
+        ),
+        (
+            "message 1h",
+            None,
+            None,
+            vec![text("q", Some(&hour))],
+            None,
+            1,
+            true,
+            false,
+        ),
+        (
+            "tool_result",
+            None,
+            None,
+            vec![tool_result, text("q", None)],
+            None,
+            2,
+            false,
+            true,
+        ),
+        (
+            "top-level",
+            None,
+            None,
+            vec![text("q", None)],
+            Some(&five),
+            2,
+            false,
+            true,
+        ),
+        (
+            "top-level 1h",
+            None,
+            None,
+            vec![text("q", None)],
+            Some(&hour),
+            1,
+            false,
+            false,
+        ),
+        (
+            "four taken",
+            Some(vec![
+                text("a", Some(&five)),
+                text("b", Some(&five)),
+                text("c", Some(&five)),
+            ]),
+            Some(vec![tool("t")]),
+            vec![text("q", None)],
+            None,
+            4,
+            false,
+            true,
+        ),
+        (
+            "one slot left",
+            None,
+            Some(vec![tool("t1"), tool("t2"), tool("t3")]),
+            vec![text("q", None)],
+            None,
+            4,
+            true,
+            false,
+        ),
+    ];
+    for (name, system, tools, last, top, total, user_marked, system_marked) in cases {
         let t = RecordingTransport::new(CLAUDE_OK);
+        let mut turn = ChatMsg::text("user", "");
+        turn.parts = Some(Value::Array(last));
         let mut req = chat_req(Protocol::AnthropicMessages, "claude-opus-5-5");
+        req.preserve_anthropic_wire = true;
         req.prompt_cache = true;
-        req.message.extend(last);
+        req.message = vec![
+            ChatMsg::text("user", "hi"),
+            ChatMsg::text("assistant", "ok"),
+            turn,
+        ];
         let param = req.model_param_v2.as_mut().unwrap();
-        param.raw = raw;
+        if let Some(top) = top {
+            param.raw = serde_json::json!({"cache_control": top});
+        }
         param.typed = Some(TypedParams::Chat(ChatParams {
-            tools,
+            system: Some("sys".into()),
+            system_blocks: system.map(Value::Array),
+            tools: tools.map(Value::Array),
             ..Default::default()
         }));
         ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
-        assert_eq!(breakpoints(&b), 1, "{b}");
-        assert_eq!(b["system"], "be brief", "{b}");
+        let marked = |v: &Value| {
+            v.as_array()
+                .and_then(|blocks| blocks.last())
+                .is_some_and(|block| block.get("cache_control").is_some())
+        };
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            total,
+            "{name}: {b}"
+        );
+        assert_eq!(
+            marked(&b["messages"][2]["content"]),
+            user_marked,
+            "{name}: {b}"
+        );
+        assert_eq!(marked(&b["system"]), system_marked, "{name}: {b}");
+        let mut ttls = Vec::new();
+        for key in ["tools", "system", "messages"] {
+            collect_ttls(&b[key], &mut ttls);
+        }
+        assert!(
+            !ttls.windows(2).any(|w| w == ["5m", "1h"]),
+            "{name}: {ttls:?}"
+        );
+    }
+}
+
+fn collect_ttls(v: &Value, out: &mut Vec<&'static str>) {
+    for block in v.as_array().into_iter().flatten() {
+        if let Some(control) = block.get("cache_control") {
+            out.push(if control["ttl"] == "1h" { "1h" } else { "5m" });
+        }
+        collect_ttls(&block["content"], out);
     }
 }
 

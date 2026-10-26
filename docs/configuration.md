@@ -167,9 +167,11 @@ marks the system prompt and the latest user turn as Anthropic prompt-cache
 breakpoints, so each turn of a conversation re-reads its prefix at the
 cache-read rate; it is per model and off by default because a long one-shot
 prompt would pay the cache-write premium for nothing. Client breakpoints win:
-when the request already carries any `cache_control` (top-level, on a tool, a
-system block or a message block), the gateway adds none, so the request stays
-within Anthropic's four breakpoints and the client's TTL order. A
+the gateway marks the latest user turn only when the client put no breakpoint
+on a message block (`tool_result` content included) and sent no top-level
+`cache_control`, and the system prompt only when the client left it unmarked
+and no 1-hour breakpoint follows it. The turn goes first, and neither is added
+past Anthropic's four breakpoints. A
 `/v1/messages` client's breakpoints, `ttl: 1h` included, ride through as sent,
 and on `anthropic-messages` and `aws-anthropic` models its mid-conversation
 `role: "system"` messages stay in place with their `output_config` and
