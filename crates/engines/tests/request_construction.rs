@@ -1418,28 +1418,18 @@ fn native_system_turn_req(protocol: Protocol, model: &str) -> GatewayRequest {
 
 #[tokio::test]
 async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
-    for (protocol, model, requested) in [
-        (Protocol::AnthropicMessages, "claude-opus-5-5", None),
-        (Protocol::AwsAnthropic, "anthropic.claude-opus-5-5", None),
-        (
-            Protocol::AnthropicMessages,
-            "~anthropic/claude-opus-latest",
-            Some("claude-opus-5-5"),
-        ),
-        (
-            Protocol::AnthropicMessages,
-            "MiniMax-M2",
-            Some("claude-opus-5-5"),
-        ),
-        (
-            Protocol::AnthropicMessages,
-            "claude-sonnet-5",
-            Some("claude-opus-5-5"),
-        ),
+    let am = Protocol::AnthropicMessages;
+    for (protocol, model, swapped) in [
+        (am, "claude-opus-5-5", false),
+        (Protocol::AwsAnthropic, "anthropic.claude-opus-5-5", false),
+        (am, "~anthropic/claude-opus-latest", true),
+        (am, "MiniMax-M2", true),
+        (am, "claude-sonnet-5", true),
     ] {
         let t = RecordingTransport::new(CLAUDE_OK);
         let mut req = native_system_turn_req(protocol, model);
-        req.model_param_v2.as_mut().unwrap().fallback_from = requested.map(str::to_owned);
+        req.model_param_v2.as_mut().unwrap().fallback_from =
+            swapped.then(|| "claude-opus-5-5".into());
         ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
         let mut want = serde_json::json!([
@@ -1452,7 +1442,7 @@ async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
                 {"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}
             ]},
         ]);
-        if requested.is_some() {
+        if swapped {
             let turns = want.as_array_mut().unwrap();
             turns.retain(|turn| turn["content"] != serde_json::json!([]));
             for turn in turns {
@@ -1470,36 +1460,22 @@ async fn native_system_turns_stay_in_place_on_the_anthropic_wires() {
 
 #[tokio::test]
 async fn native_system_turns_fold_into_the_system_prompt_on_converse_or_a_swapped_model() {
-    let converse_ok = r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#;
-    for (protocol, model, requested, reply) in [
-        (
-            Protocol::AwsConverse,
-            "us.amazon.nova-lite-v1:0",
-            None,
-            converse_ok,
-        ),
-        (
-            Protocol::AnthropicMessages,
-            "claude-sonnet-4-6",
-            Some("claude-opus-5-5"),
-            CLAUDE_OK,
-        ),
-        (
-            Protocol::AnthropicMessages,
-            "anthropic/claude-sonnet-4.6",
-            Some("claude-opus-5-5"),
-            CLAUDE_OK,
-        ),
-        (
-            Protocol::AnthropicMessages,
-            "anthropic/claude-opus-4",
-            Some("claude-opus-5-5"),
-            CLAUDE_OK,
-        ),
+    let am = Protocol::AnthropicMessages;
+    for (protocol, model, swapped) in [
+        (Protocol::AwsConverse, "us.amazon.nova-lite-v1:0", false),
+        (am, "claude-sonnet-4-6", true),
+        (am, "anthropic/claude-sonnet-4.6", true),
+        (am, "anthropic/claude-opus-4", true),
     ] {
+        let reply = if protocol == Protocol::AwsConverse {
+            CONVERSE_OK
+        } else {
+            CLAUDE_OK
+        };
         let t = RecordingTransport::new(reply);
         let mut req = native_system_turn_req(protocol, model);
-        req.model_param_v2.as_mut().unwrap().fallback_from = requested.map(str::to_owned);
+        req.model_param_v2.as_mut().unwrap().fallback_from =
+            swapped.then(|| "claude-opus-5-5".into());
         ClaudeEngine::new(req, t.clone()).run().await.unwrap();
         let b = t.body_json();
         let roles: Vec<&str> = b["messages"]
@@ -1509,21 +1485,13 @@ async fn native_system_turns_fold_into_the_system_prompt_on_converse_or_a_swappe
             .map(|m| m["role"].as_str().unwrap())
             .collect();
         assert_eq!(roles, ["user", "assistant", "user"], "{b}");
-        let system: Vec<&str> = b["system"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect();
-        assert_eq!(system, ["sys", "env block", "reminder"], "{b}");
+        assert_eq!(system_texts(&b), ["sys", "env block", "reminder"], "{b}");
     }
 }
 
 #[tokio::test]
 async fn a_cache_marked_system_turn_keeps_the_top_level_system_text_on_converse() {
-    let t = RecordingTransport::new(
-        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
-    );
+    let t = RecordingTransport::new(CONVERSE_OK);
     let mut env = ChatMsg::text("system", "env block");
     env.parts = Some(serde_json::json!([
         {"type": "text", "text": "env block", "cache_control": {"type": "ephemeral"}}
@@ -1537,20 +1505,12 @@ async fn a_cache_marked_system_turn_keeps_the_top_level_system_text_on_converse(
     }));
     ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    let system: Vec<&str> = b["system"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|block| block["text"].as_str())
-        .collect();
-    assert_eq!(system, ["sys", "env block"], "{b}");
+    assert_eq!(system_texts(&b), ["sys", "env block"], "{b}");
 }
 
 #[tokio::test]
 async fn a_folded_system_turn_never_puts_a_5m_breakpoint_before_a_1h_one_on_converse() {
-    let t = RecordingTransport::new(
-        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
-    );
+    let t = RecordingTransport::new(CONVERSE_OK);
     let mut user = ChatMsg::text("user", "remember ALPHA");
     user.parts = Some(
         serde_json::json!([{"type": "text", "text": "remember ALPHA",
@@ -1573,13 +1533,7 @@ async fn a_folded_system_turn_never_puts_a_5m_breakpoint_before_a_1h_one_on_conv
     }));
     ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    let system: Vec<&str> = b["system"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|block| block["text"].as_str())
-        .collect();
-    assert_eq!(system, ["terse", "one word"], "{b}");
+    assert_eq!(system_texts(&b), ["terse", "one word"], "{b}");
     assert!(!b["system"].to_string().contains("cachePoint"), "{b}");
     assert!(b["messages"][0].to_string().contains("1h"), "{b}");
 }
@@ -1598,111 +1552,23 @@ async fn prompt_cache_fills_only_the_breakpoints_the_client_left_out() {
     let tool = |name: &str| serde_json::json!({"name": name, "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}});
     let tool_result = serde_json::json!({"type": "tool_result", "tool_use_id": "tu",
         "content": [{"type": "text", "text": "r", "cache_control": {"type": "ephemeral"}}]});
+    let (f, h) = (Some(&five), Some(&hour));
+    let q = || vec![text("q", None)];
+    #[rustfmt::skip]
     let cases = [
-        (
-            "system only",
-            Some(vec![text("sys", Some(&five))]),
-            None,
-            vec![text("q", None)],
-            None,
-            2,
-            true,
-            true,
-        ),
-        (
-            "system 1h",
-            Some(vec![text("sys", Some(&hour))]),
-            None,
-            vec![text("q", None)],
-            None,
-            2,
-            true,
-            true,
-        ),
-        (
-            "system and message",
-            Some(vec![text("sys", Some(&five))]),
-            None,
-            vec![text("q", Some(&five))],
-            None,
-            2,
-            true,
-            true,
-        ),
-        (
-            "message only",
-            None,
-            None,
-            vec![text("q", Some(&five))],
-            None,
-            2,
-            true,
-            true,
-        ),
-        (
-            "message 1h",
-            None,
-            None,
-            vec![text("q", Some(&hour))],
-            None,
-            1,
-            true,
-            false,
-        ),
-        (
-            "tool_result",
-            None,
-            None,
-            vec![tool_result, text("q", None)],
-            None,
-            2,
-            false,
-            true,
-        ),
-        (
-            "top-level",
-            None,
-            None,
-            vec![text("q", None)],
-            Some(&five),
-            2,
-            false,
-            true,
-        ),
-        (
-            "top-level 1h",
-            None,
-            None,
-            vec![text("q", None)],
-            Some(&hour),
-            1,
-            false,
-            false,
-        ),
-        (
-            "four taken",
-            Some(vec![
-                text("a", Some(&five)),
-                text("b", Some(&five)),
-                text("c", Some(&five)),
-            ]),
-            Some(vec![tool("t")]),
-            vec![text("q", None)],
-            None,
-            4,
-            false,
-            true,
-        ),
-        (
-            "one slot left",
-            None,
-            Some(vec![tool("t1"), tool("t2"), tool("t3")]),
-            vec![text("q", None)],
-            None,
-            4,
-            true,
-            false,
-        ),
+        ("system only", Some(vec![text("sys", f)]), None, q(), None, 2, true, true),
+        ("system 1h", Some(vec![text("sys", h)]), None, q(), None, 2, true, true),
+        ("system and message", Some(vec![text("sys", f)]), None, vec![text("q", f)],
+            None, 2, true, true),
+        ("message only", None, None, vec![text("q", f)], None, 2, true, true),
+        ("message 1h", None, None, vec![text("q", h)], None, 1, true, false),
+        ("tool_result", None, None, vec![tool_result, text("q", None)], None, 2, false, true),
+        ("top-level", None, None, q(), f, 2, false, true),
+        ("top-level 1h", None, None, q(), h, 1, false, false),
+        ("four taken", Some(vec![text("a", f), text("b", f), text("c", f)]),
+            Some(vec![tool("t")]), q(), None, 4, false, true),
+        ("one slot left", None, Some(vec![tool("t1"), tool("t2"), tool("t3")]),
+            q(), None, 4, true, false),
     ];
     for (name, system, tools, last, top, total, user_marked, system_marked) in cases {
         let t = RecordingTransport::new(CLAUDE_OK);
@@ -1755,6 +1621,15 @@ async fn prompt_cache_fills_only_the_breakpoints_the_client_left_out() {
     }
 }
 
+fn system_texts(b: &Value) -> Vec<&str> {
+    b["system"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect()
+}
+
 fn collect_ttls(v: &Value, out: &mut Vec<&'static str>) {
     for block in v.as_array().into_iter().flatten() {
         if let Some(control) = block.get("cache_control") {
@@ -1800,33 +1675,18 @@ async fn openrouter_anthropic_responses_carry_a_top_level_cache_control() {
     use gw_models::Account;
 
     let ephemeral = serde_json::json!({"type": "ephemeral"});
-    let own = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
-    for (model, kind, prompt_cache, client, want) in [
-        (
-            "anthropic/claude-opus-5.5",
-            "openrouter",
-            true,
-            None,
-            Some(&ephemeral),
-        ),
-        (
-            "~anthropic/claude-opus-latest",
-            "openrouter",
-            true,
-            None,
-            Some(&ephemeral),
-        ),
-        (
-            "anthropic/claude-opus-5.5",
-            "openrouter",
-            true,
-            Some(&own),
-            Some(&own),
-        ),
+    let hour = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    let (e, own) = (Some(&ephemeral), Some(&hour));
+    #[rustfmt::skip]
+    let cases = [
+        ("anthropic/claude-opus-5.5", "openrouter", true, None, e),
+        ("~anthropic/claude-opus-latest", "openrouter", true, None, e),
+        ("anthropic/claude-opus-5.5", "openrouter", true, own, own),
         ("anthropic/claude-opus-5.5", "openrouter", false, None, None),
         ("openai/gpt-6-sol", "openrouter", true, None, None),
         ("anthropic/claude-opus-5.5", "openai", true, None, None),
-    ] {
+    ];
+    for (model, kind, prompt_cache, client, want) in cases {
         let t = RecordingTransport::new(RESPONSES_OK);
         let mut req = GatewayRequest {
             preserve_responses_wire: true,
@@ -1851,6 +1711,7 @@ async fn openrouter_anthropic_responses_carry_a_top_level_cache_control() {
 }
 
 const RESPONSES_OK: &str = r#"{"id":"r","object":"response","model":"gpt-6-astra","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+const CONVERSE_OK: &str = r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#;
 const CLAUDE_OK: &str = r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
 const OPENAI_OK: &str = r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
 
@@ -2490,9 +2351,7 @@ async fn bedrock_claude_signs_the_messages_body_without_model_or_stream() {
 
 #[tokio::test]
 async fn converse_request_lands_on_the_converse_path_in_converse_shape() {
-    let t = RecordingTransport::new(
-        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
-    );
+    let t = RecordingTransport::new(CONVERSE_OK);
     let mut req = chat_req(Protocol::AwsConverse, "us.meta.llama3-3-70b-instruct-v1:0");
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
@@ -2650,9 +2509,7 @@ async fn a_participant_name_reaches_the_openai_wire() {
 
 #[tokio::test]
 async fn a_marked_chat_system_stays_plain_for_a_non_claude_converse_model() {
-    let t = RecordingTransport::new(
-        r#"{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1}}"#,
-    );
+    let t = RecordingTransport::new(CONVERSE_OK);
     let mut req = chat_req(Protocol::AwsConverse, "us.xai.grok-4.6");
     req.message[0].parts = Some(serde_json::json!([
         {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}
