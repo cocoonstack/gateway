@@ -4224,12 +4224,12 @@ async fn account_cooldown_and_recovery() {
             .unwrap()
             .iter()
             .find(|a| a["name"] == "mock-spark-down")
-            .unwrap()["health"]
-            .as_str()
             .unwrap()
-            .to_owned()
+            .clone()
     };
-    assert_eq!(spark_health(&app).await, "cooling");
+    let spark = spark_health(&app).await;
+    assert_eq!(spark["health"], "cooling");
+    assert_eq!(spark["cooling_models"], serde_json::json!(["spark-lite"]));
     let r = app
         .clone()
         .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
@@ -4245,7 +4245,7 @@ async fn account_cooldown_and_recovery() {
     let mut recovered = false;
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if spark_health(&app).await == "ok" {
+        if spark_health(&app).await["health"] == "ok" {
             recovered = true;
             break;
         }

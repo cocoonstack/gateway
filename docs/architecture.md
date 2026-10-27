@@ -75,11 +75,12 @@ default, so the whole pipeline is testable offline:
 - **`UserBudgetStore`** — per-user budget overrides inside a tenant. In-process
   by default; `PostgresUserBudgets` with `storage.postgres_url`, cached and
   invalidated the same way as keys.
-- **`HealthStore`** — account cooldown/recovery. In-process breaker by
-  default; `RedisHealth` with `storage.redis_url` — a tripped account is
-  skipped by every instance. Only upstream faults count (5xx, timeouts,
-  broken streams, a 401/402/403 credential or billing refusal), never a
-  client-caused or rate-limit error.
+- **`HealthStore`** — account cooldown/recovery, per account and served
+  model, so one model's refusals never bench the account for the others.
+  In-process breaker by default; `RedisHealth` with `storage.redis_url` — a
+  tripped account is skipped for that model by every instance. Only upstream
+  faults count (5xx, timeouts, broken streams, a 401/402/403 credential or
+  billing refusal), never a client-caused or rate-limit error.
 - **`Governance`** — rate/quota/TPM counters. In-process by default;
   `RedisGovernance` shares them (including pooled tenant QPS) fleet-wide.
 - **`Moderator`** — the external content review behind `security.moderate`;

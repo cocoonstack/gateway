@@ -456,20 +456,22 @@ impl AccountPool {
             .map(Arc::clone)
     }
 
-    /// PTU accounts are preferred over paygo; `excluded` (failed-over) and
-    /// cooldown accounts are skipped; within a tier, pick by priority then
-    /// round-robin. A model bound to a `provider` only uses that provider's
-    /// accounts, and only those are health-checked.
+    /// PTU accounts are preferred over paygo; `excluded` (failed-over) accounts
+    /// and accounts cooling down for `model` are skipped; within a tier, pick by
+    /// priority then round-robin. A model bound to a `provider` only uses that
+    /// provider's accounts, and only those are health-checked.
     pub async fn select_healthy(
         &self,
         p: Protocol,
+        model: &str,
         provider: Option<&str>,
         excluded: &[String],
         health: &dyn HealthStore,
         latency: Option<&latency::Latency>,
     ) -> Option<Arc<Account>> {
         let serving = || self.accounts.iter().filter(|a| serves(a, p, provider));
-        let checks = futures::future::join_all(serving().map(|a| health.available(&a.name))).await;
+        let keys: Vec<String> = serving().map(|a| health_key(&a.name, model)).collect();
+        let checks = futures::future::join_all(keys.iter().map(|k| health.available(k))).await;
         let unhealthy: Vec<&str> = serving()
             .zip(checks)
             .filter(|(_, ok)| !ok)
@@ -988,6 +990,10 @@ pub fn epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn health_key(account: &str, model: &str) -> String {
+    format!("{account}/{model}")
+}
+
 /// Recovers a poisoned lock instead of panicking: every critical section here is infallible.
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1133,6 +1139,7 @@ mod tests {
             s.pool
                 .select_healthy(
                     Protocol::OpenaiChat,
+                    "m",
                     Some("p"),
                     &[],
                     s.health.as_ref(),
@@ -1525,19 +1532,19 @@ mod tests {
         let h = s.health.as_ref();
         let a = s
             .pool
-            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h, None)
+            .select_healthy(Protocol::OpenaiChat, "m", Some("openai"), &[], h, None)
             .await
             .unwrap();
         let b = s
             .pool
-            .select_healthy(Protocol::OpenaiChat, Some("openai"), &[], h, None)
+            .select_healthy(Protocol::OpenaiChat, "m", Some("openai"), &[], h, None)
             .await
             .unwrap();
         assert_eq!(a.name, "mock-openai-1");
         assert_eq!(b.name, "mock-openai-1");
         assert_eq!(
             s.pool
-                .select_healthy(Protocol::AnthropicMessages, None, &[], h, None)
+                .select_healthy(Protocol::AnthropicMessages, "m", None, &[], h, None)
                 .await
                 .unwrap()
                 .name,
@@ -1545,9 +1552,36 @@ mod tests {
         );
         assert!(
             s.pool
-                .select_healthy(Protocol::Video, Some("nonexistent"), &[], h, None)
+                .select_healthy(Protocol::Video, "m", Some("nonexistent"), &[], h, None)
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cooldown_benches_the_account_for_one_model_only() {
+        let yaml = "listen: {host: h, port: 1}\naccounts: [{name: only, provider: p, protocols: ['responses']}]";
+        let s = GatewayState::from_config(&GatewayConfig::from_yaml(yaml).unwrap());
+        let cd = Duration::from_secs(30);
+        assert!(
+            s.health
+                .record_failure(&health_key("only", "busy"), 1, cd)
+                .await
+        );
+        let pick = |model| {
+            s.pool.select_healthy(
+                Protocol::Responses,
+                model,
+                None,
+                &[],
+                s.health.as_ref(),
+                None,
+            )
+        };
+        assert!(pick("busy").await.is_none());
+        assert_eq!(
+            pick("calm").await.map(|a| a.name.clone()).as_deref(),
+            Some("only")
         );
     }
 
@@ -1585,7 +1619,7 @@ mod tests {
         let h = s.health.as_ref();
         let first = s
             .pool
-            .select_healthy(Protocol::OpenaiChat, Some("tencent"), &[], h, None)
+            .select_healthy(Protocol::OpenaiChat, "m", Some("tencent"), &[], h, None)
             .await
             .unwrap();
         assert_eq!(first.name, "mock-hunyuan-ptu-down");
@@ -1594,6 +1628,7 @@ mod tests {
             .pool
             .select_healthy(
                 Protocol::OpenaiChat,
+                "m",
                 Some("tencent"),
                 &["mock-hunyuan-ptu-down".into()],
                 h,

@@ -371,7 +371,7 @@ and admits on `response.create`.
 | GET | `/health` | liveness |
 | GET | `/metrics` | Prometheus registry (see [Observability](observability.md)) |
 | GET | `/internal/ledger` | billing records; `?limit=N` returns the N most recent, default 100 (oldest-first within the page; `count` is the total); global admin token only |
-| GET | `/internal/accounts` | account pool view with health; global admin token only |
+| GET | `/internal/accounts` | account pool view with health (`cooling` while any served model cools down, listed in `cooling_models`); global admin token only |
 
 `/internal/*` is an operator surface: it answers only to the global admin
 bearer (`admin.token_env`; 404 while no admin token at all is configured, 403 to a tenant token), and the raw rows

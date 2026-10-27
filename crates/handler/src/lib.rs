@@ -2362,6 +2362,44 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct RefusesOneModel {
+        model: &'static str,
+        in_band: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for RefusesOneModel {
+        async fn send(
+            &self,
+            req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            if body["model"] != self.model {
+                return gw_engines::MockTransport.send(req).await;
+            }
+            let refusal = r#"{"error":{"message":"high demand: exceeds the maximum usage size allowed during peak load","code":503}}"#;
+            let (status, body) = if self.in_band {
+                (
+                    200,
+                    gw_engines::transport::UpstreamBody::Sse(
+                        format!("data: {refusal}\n\n").into_bytes(),
+                    ),
+                )
+            } else {
+                (
+                    503,
+                    gw_engines::transport::UpstreamBody::Json(bytes::Bytes::from(refusal)),
+                )
+            };
+            Ok(gw_engines::transport::UpstreamResponse {
+                status,
+                body,
+                headers: Default::default(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct PausedStream {
         release: Arc<tokio::sync::Notify>,
     }
@@ -2485,7 +2523,10 @@ mod tests {
             let outcome = ctx.outcome.expect("outcome");
             assert!(outcome.terminal_error.is_some(), "{code} native={native}");
             assert_eq!(
-                h.state().health.available("a1").await,
+                h.state()
+                    .health
+                    .available(&gw_state::health_key("a1", "m"))
+                    .await,
                 !faults,
                 "{code} native={native}"
             );
@@ -2526,19 +2567,73 @@ mod tests {
                 .map(|error| error.class),
             Some(gw_consts::ErrClass::ModelStreamError)
         );
-        assert!(!h.state().health.available("a-down").await);
-        assert!(!h.state().health.available("a-up").await);
+        let health = &h.state().health;
+        assert!(!health.available(&gw_state::health_key("a-down", "m")).await);
+        assert!(!health.available(&gw_state::health_key("a-up", "m")).await);
         let first = alerts.try_recv().expect("first account cooldown alert");
         let second = alerts.try_recv().expect("retry account cooldown alert");
         assert_eq!(
             (first.kind, first.subject.as_str()),
-            ("account_cooldown", "a-down")
+            ("account_cooldown", "a-down/m")
         );
         assert_eq!(
             (second.kind, second.subject.as_str()),
-            ("account_cooldown", "a-up")
+            ("account_cooldown", "a-up/m")
         );
         assert!(alerts.try_recv().is_err(), "one alert per failed account");
+    }
+
+    #[tokio::test]
+    async fn a_model_cooling_down_leaves_its_only_account_serving_other_models() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub, protocol: openai-chat, variants: [{model: busy, weight: 1}]}, {name: busy, protocol: openai-chat}, {name: calm, protocol: openai-chat}]\naccounts: [{name: a1, provider: p, protocols: [openai-chat]}]\nstability: {failure_threshold: 1, cooldown_seconds: 30}\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        for (in_band, requested) in [(false, "busy"), (true, "pub")] {
+            let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+            let state = Arc::new(GatewayState::from_config(&cfg));
+            let h = OnlineHandler::new(
+                gw_state::SharedConfig::new(cfg, state),
+                Arc::new(RefusesOneModel {
+                    model: "busy",
+                    in_band,
+                }),
+            );
+            let key = h.state().auth.get(&access_key_id("k1")).await.unwrap();
+            let refused = h
+                .run(drained_stream_req(requested, "hi"), key.clone())
+                .await;
+            assert!(
+                refused.map_or(true, |ctx| ctx
+                    .outcome
+                    .is_some_and(|o| o.terminal_error.is_some())),
+                "in_band={in_band}"
+            );
+            let health = &h.state().health;
+            assert!(
+                !health.available(&gw_state::health_key("a1", "busy")).await,
+                "in_band={in_band}"
+            );
+            assert!(
+                health.available(&gw_state::health_key("a1", "calm")).await,
+                "in_band={in_band}"
+            );
+
+            let ctx = h.run(chat_req("calm", "hi"), key.clone()).await.unwrap();
+            let outcome = ctx.outcome.expect("calm is served");
+            assert!(outcome.terminal_error.is_none(), "in_band={in_band}");
+            assert_eq!(
+                ctx.request.account.as_ref().map(|a| a.name.as_str()),
+                Some("a1")
+            );
+
+            let cooling = h
+                .run(chat_req(requested, "hi"), key)
+                .await
+                .err()
+                .expect("busy is cooling");
+            assert!(
+                cooling.message.contains("no healthy upstream"),
+                "in_band={in_band}: {cooling:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2575,7 +2670,12 @@ mod tests {
         avail.flush().await;
         let minute = gw_state::epoch_secs() / 60;
         assert_eq!(avail.window("m", minute - 5, minute).await, (0, 0));
-        assert!(h.state().health.available("a1").await);
+        assert!(
+            h.state()
+                .health
+                .available(&gw_state::health_key("a1", "m"))
+                .await
+        );
         assert!(alerts.try_recv().is_err());
     }
 
