@@ -1321,18 +1321,26 @@ async fn accounts(State(s): State<AppState>, _: GlobalAdmin) -> Response {
     let health = &s.handler.state().health;
     let mut data: Vec<Value> = Vec::with_capacity(cfg.accounts.len());
     for a in &cfg.accounts {
-        let mut cooling = Vec::new();
-        for m in cfg.models.iter().filter(|m| {
-            a.protocols.contains(&m.protocol)
-                && m.provider.as_deref().is_none_or(|p| p == a.provider)
-        }) {
-            if !health
-                .available(&gw_state::health_key(&a.name, &m.name))
-                .await
-            {
-                cooling.push(m.name.as_str());
-            }
-        }
+        let served: Vec<&str> = cfg
+            .models
+            .iter()
+            .filter(|m| {
+                a.protocols.contains(&m.protocol)
+                    && m.provider.as_deref().is_none_or(|p| p == a.provider)
+            })
+            .map(|m| m.name.as_str())
+            .collect();
+        let checks = futures::future::join_all(
+            served
+                .iter()
+                .map(|m| async move { health.available(&gw_state::health_key(&a.name, m)).await }),
+        )
+        .await;
+        let cooling: Vec<&str> = served
+            .into_iter()
+            .zip(checks)
+            .filter_map(|(m, ok)| (!ok).then_some(m))
+            .collect();
         data.push(json!({
             "name": a.name,
             "provider": a.provider,
